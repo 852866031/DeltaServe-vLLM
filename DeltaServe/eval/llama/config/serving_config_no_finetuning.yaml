@@ -1,0 +1,88 @@
+# serving_config_no_finetuning.yaml — llama1 (huggyllama/llama-7b) inference-only.
+# Picked by launch_server.py when --enable-finetuning is NOT set.
+server:
+  host: 127.0.0.1
+  port: 8000
+  rank_id: 0
+  nccl_port: 28765
+  tp: 1
+
+model:
+  dir: huggyllama/llama-7b
+  tokenizer_mode: auto
+  trust_remote_code: false
+  half_model: false
+  eos_id: 2
+  mode: []
+
+serving:
+  max_total_token_num: 25000
+  max_req_input_len: 512
+  max_req_total_len: 1024
+  batch_max_tokens: null          # null = auto = 1/5 * max_total
+  running_max_req_size: 1000
+
+lora:
+  adapter_dirs:
+    - tloen/alpaca-lora-7b
+    - MBZUAI/bactrian-x-llama-7b-lora
+  pool_size_lora: 0
+  swap: true
+  prefetch: false
+  prefetch_size: 0
+  batch_num_adapters: null
+  fair_weights: []
+
+scheduler:
+  name: dserve
+  enable_abort: false
+  # Where the BatchExecutionTracker dumps per-batch scheduling decisions
+  # at finetuning exit. Path is relative to CWD; set to null to disable.
+  batch_prediction_stats_path: output/scheduler/batch_prediction_stats.csv
+
+memory:
+  enable_unified_mem_manager: true
+  unified_mem_manager_max_size_gb: 12
+  max_finetuning_tokens: 1024
+  unified_mem_manager_log_path: null
+
+cuda_graph:
+  enable_decode_cuda_graph: false
+  enable_prefill_cuda_graph: false
+  enable_bwd_cuda_graph: false
+  use_graphed_bwd_attention: true
+  attn_bn_max: 8
+  attn_l_max: 64
+
+finetune:
+  enabled: false
+  type: SFT
+  data_path: config/emotion.txt
+  lora_path: finetuning_adapter
+  num_epochs: 4
+  learning_rate: 0.001
+  weight_decay: 0.01
+  gamma: 0.9
+  max_saved_finetuning_tokens: 128
+  max_finetuning_tokens_in_batch: 128
+  optimizer_threading: true
+  start_on_launch: false
+  prepare_size: 999999
+  log_path: bwd_log.csv
+
+slo:
+  ttft_slo: 0.1
+  avg_tbt_slo: 0.15
+  max_tbt_slo: 0.35
+
+debug:
+  dummy: false
+  no_lora: false
+  no_lora_compute: false
+  no_lora_swap: false
+  no_kernel: false
+  no_mem_pool: false
+  bmm: false
+  profile: false
+  enable_gpu_profile: false
+  disable_log_stats: false

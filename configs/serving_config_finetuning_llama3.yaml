@@ -1,0 +1,93 @@
+# DeltaServe-on-vLLM serving config — finetuning (co-serving) enabled, Llama-3.
+#
+# DeltaServe-style sectioned YAML, mapped onto vLLM by
+# vllm.deltaserve.config_loader (a thin additive layer; no upstream vLLM edits).
+#
+# Sections:
+#   finetune  -> our FinetuneConfig sub-config
+#   server    -> host/port/rank for the API server (ignored by offline LLM)
+#   model / engine / parallel -> merged and passed straight to vLLM EngineArgs
+#     (any valid EngineArgs field works under these sections, no loader change)
+
+finetune:
+  enable_finetuning: true
+  backward_mps_percentage: 10        # CUDA MPS % granted to the backward process
+  # The FT adapter is the one the backward process trains; its weights are
+  # loaded fp32 and shared with the subprocess. Relative paths are resolved
+  # against THIS file's directory (configs/), so ../adapters points at the
+  # repo-root adapters.
+  finetuning_lora_path: ../adapters/llama3-toy-lora-ft
+  # Finetuning corpus: one tokenizable sample per non-empty line.
+  # data_path: ../test_dataset.txt
+  data_path: ../alpaca_1000.txt
+  max_saved_finetuning_tokens: 256   # buffer capacity; ~2 inference steps to fill
+  backward_sleep_seconds: 2.0        # simulated backward duration (observe inference)
+  num_epochs: 20
+  learning_rate: 0.00001
+  weight_decay: 0.01
+  gamma: 0.9
+  backward_fp32: false               # bulk backward matmuls: false=bf16 (default), true=fp32
+
+# SLO-aware FT admission + execution-time estimator (Phase 4).
+# Folded into FinetuneConfig by the loader. The estimator is profiled at launch
+# and refit online; FT tokens are admitted only while the predicted step time
+# keeps inference TTFT/TBT within these targets.
+slo:
+  ttft_slo: 0.2                      # time-to-first-token target (seconds)
+  avg_tbt_slo: 0.02                   # avg time-between-tokens target (seconds)
+  max_tbt_slo: 0.1                   # max single-step time while admitting FT (seconds)
+  profile_on_launch: true            # offline profiling pass before serving
+  profile_num_repeats: 2             # recorded passes per profiling shape
+  # Cap FT tokens per step relative to that step's inference prefill tokens:
+  # when >0 and prefill is present, admit at most prefill_tokens * factor FT
+  # tokens (on top of the SLO + buffer caps). -1 disables (fill up to whatever
+  # the SLO estimator and buffer allow). No effect on idle/FT-only steps.
+  ft_tokens_admission_constrain_factor: -1
+  # batch_prediction_stats_path: output/scheduler/batch_prediction_stats.csv
+
+# Observability knobs (folded into FinetuneConfig by the loader).
+debug:
+  print_weight_hash: false            # compare base/FT-adapter weight hashes at startup
+  print_activation_hash: false         # runs Llama3BackwardService.verify_activations each cycle
+  print_step_mode: true              # print (has_ft, cudagraph_mode) transitions
+
+# Inference LoRA adapter(s) served on vLLM's normal multi-LoRA path (applied
+# per-request by the caller; not the finetuning target).
+adapters:
+  lora_path_0: ../adapters/llama3-toy-lora
+
+# vLLM LoRA enablement (these are EngineArgs fields -> passed straight through).
+lora:
+  enable_lora: true
+  max_loras: 2
+  max_lora_rank: 16
+
+server:
+  host: 127.0.0.1
+  port: 8000
+  rank_id: 0                         # DeltaServe parity; reserved (single-GPU = 0)
+  # Number of frontend API server processes (a single shared EngineCore, so all
+  # DeltaServe state is unaffected). >1 shards HTTP + tokenize/detok + output
+  # processing across loops, relieving the single-frontend bottleneck. The
+  # --api-server-count CLI flag, if passed, overrides this.
+  api_server_count: 4
+
+model:
+  model: meta-llama/Meta-Llama-3-8B
+  tokenizer_mode: auto
+  trust_remote_code: false
+  dtype: auto
+  max_model_len: 2048
+
+engine:
+  gpu_memory_utilization: 0.75
+  enforce_eager: false
+  # [diag] Stop the engine from emitting per-step scheduler_stats. In
+  # multi-API-server mode that stream lands on the rank-0 frontend EVERY engine
+  # step, saturating its event loop (recv_multipart/decode/record) and stalling
+  # request accept + streaming. Our SLO predictor uses its own engine-side CUDA
+  # timing, so it's unaffected by this.
+  disable_log_stats: true
+
+parallel:
+  tensor_parallel_size: 1

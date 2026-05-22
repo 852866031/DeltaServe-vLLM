@@ -1,0 +1,97 @@
+# serving_config_finetuning_alpaca.yaml — llama3 SFT on the Alpaca-1000 p95 cut.
+# Sister of serving_config_finetuning_packed.yaml. Diffs:
+#   - finetune.data_path → data/alpaca_1000_p95.txt
+#   - cuda_graph.attn_l_max 64 → 192 (covers Alpaca-p95 max=191 token sample;
+#     keep_p95 reports max=191, p95=165, median=91 over 950 samples).
+# attn_bn_max stays at 8 — keep_p95's worst-case greedy pack at the 256-token
+# backward budget needs only Bn=6.
+server:
+  host: 127.0.0.1
+  port: 8000
+  rank_id: 0
+  nccl_port: 28765
+  tp: 1
+
+model:
+  dir: meta-llama/Meta-Llama-3-8B
+  tokenizer_mode: auto
+  trust_remote_code: false
+  half_model: false
+  eos_id: 2
+  mode: []
+
+serving:
+  max_total_token_num: 25000
+  max_req_input_len: 512
+  max_req_total_len: 1024
+  batch_max_tokens: null          # null = auto = 1/5 * max_total
+  running_max_req_size: 1000
+
+lora:
+  adapter_dirs: [adapters/llama3-toy-lora]
+  pool_size_lora: 0
+  swap: true
+  prefetch: false
+  prefetch_size: 0
+  batch_num_adapters: null
+  fair_weights: []
+
+scheduler:
+  name: dserve
+  enable_abort: false
+  # Where the BatchExecutionTracker dumps per-batch scheduling decisions
+  # at finetuning exit. Path is relative to CWD; set to null to disable.
+  batch_prediction_stats_path: output/scheduler/batch_prediction_stats.csv
+
+memory:
+  enable_unified_mem_manager: true
+  unified_mem_manager_max_size_gb: 3.5
+  max_finetuning_tokens: 256
+  unified_mem_manager_log_path: null
+  allocator: packed_kv
+
+cuda_graph:
+  enable_decode_cuda_graph: false
+  enable_bwd_cuda_graph: false
+  use_graphed_bwd_attention: true
+  attn_bn_max: 8
+  attn_l_max: 192
+  # Cap on combined prefill+decode CUDA-graph memory (GB). Once total
+  # captured graph memory reaches this, runtime captures are refused
+  # and uncaptured buckets fall back to eager. -1 = no cap.
+  max_graph_memory_gb: 6
+
+finetune:
+  enabled: true
+  type: SFT                        # SFT | SFT Profile
+  data_path: data/alpaca_1000_p95.txt
+  lora_path: adapters/llama3-toy-lora-ft
+  num_epochs: 20
+  learning_rate: 0.000005
+  weight_decay: 0.01
+  gamma: 0.9
+  max_saved_finetuning_tokens: 256
+  max_finetuning_tokens_in_batch: 128
+  optimizer_threading: true
+  start_on_launch: false
+  prepare_size: 999999
+  log_path: bwd_log.csv
+
+# Looser TTFT SLO under finetune load — co-serving is allowed to trade
+# inference latency for backward throughput.
+slo:
+  ttft_slo: 0.5
+  avg_tbt_slo: 0.15
+  max_tbt_slo: 0.35
+
+debug:
+  dummy: false
+  no_lora: false
+  no_lora_compute: false
+  no_lora_swap: false
+  no_kernel: false
+  no_mem_pool: false
+  bmm: false
+  profile: false
+  enable_gpu_profile: false
+  disable_log_stats: false
