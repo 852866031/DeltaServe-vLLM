@@ -1,0 +1,17 @@
+*.idea
+.vscode
+.DS_Store
+*.safetensors
+*.csv
+# Track request-schedule CSVs under eval/llama3/timelines/<gpu>/, but
+# never track the nutanix variant (proprietary trace). The negation
+# below re-includes the timeline files; the wildcard after it re-ignores
+# any *nutanix* CSV anywhere in the repo.
+!eval/llama3/timelines/**/timeline_*.csv
+*nutanix*
+*.png
+S-LoRA/test/llama3/adapters/llama3-toy-lora/*
+S-LoRA/test/llama3/adapters/llama3-toy-lora-ft/*
+__pycache__/
+*.so
+.claude/*

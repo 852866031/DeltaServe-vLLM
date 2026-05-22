@@ -1,0 +1,73 @@
+# DeltaServe-on-vLLM serving config — finetuning (co-serving) enabled.
+#
+# DeltaServe-style sectioned YAML, mapped onto vLLM by
+# vllm.deltaserve.config_loader (a thin additive layer; no upstream vLLM edits).
+#
+# Sections:
+#   finetune  -> our FinetuneConfig sub-config
+#   server    -> host/port/rank for the API server (ignored by offline LLM)
+#   model / engine / parallel -> merged and passed straight to vLLM EngineArgs
+#     (any valid EngineArgs field works under these sections, no loader change)
+
+finetune:
+  enable_finetuning: true
+  backward_mps_percentage: 10        # CUDA MPS % granted to the backward process
+  # The FT adapter is the one the backward process trains; its weights are
+  # loaded fp32 and shared with the subprocess. Relative paths are resolved
+  # against THIS file's directory (configs/), so ../adapters points at the
+  # repo-root adapters.
+  finetuning_lora_path: ../adapters/opt125m-toy-lora-ft
+  # Finetuning corpus: one tokenizable sample per non-empty line.
+  data_path: ../alpaca_1000.txt
+  max_saved_finetuning_tokens: 512   # buffer capacity; ~2 inference steps to fill
+  backward_sleep_seconds: 2.0        # simulated backward duration (observe inference)
+  num_epochs: 3
+  # learning_rate: 0.00001
+  # weight_decay: 0.01
+  # gamma: 0.9
+
+# SLO-aware FT admission + execution-time estimator (Phase 4).
+slo:
+  ttft_slo: 1.0                      # time-to-first-token target (seconds)
+  avg_tbt_slo: 0.1                   # avg time-between-tokens target (seconds)
+  max_tbt_slo: 0.2                   # max single-step time while admitting FT (seconds)
+  profile_on_launch: true            # offline profiling pass before serving
+  profile_num_repeats: 2             # recorded passes per profiling shape
+
+# Observability knobs (folded into FinetuneConfig by the loader).
+debug:
+  print_weight_hash: false            # compare base/FT-adapter weight hashes at startup
+  print_activation_hash: false        # compare accumulated FT activation hashes (one-shot)
+  print_step_mode: true              # print (has_ft, cudagraph_mode) transitions
+
+# Inference LoRA adapter(s) served on vLLM's normal multi-LoRA path (applied
+# per-request by the caller; not the finetuning target). List as many as you
+# like with indexed keys, just like handing adapter dirs to a normal vLLM.
+adapters:
+  lora_path_0: ../adapters/opt125m-toy-lora
+  # lora_path_1: ../adapters/another-adapter
+
+# vLLM LoRA enablement (these are EngineArgs fields -> passed straight through).
+lora:
+  enable_lora: true
+  max_loras: 2
+  max_lora_rank: 16
+
+server:
+  host: 127.0.0.1
+  port: 8000
+  rank_id: 0                         # DeltaServe parity; reserved (single-GPU = 0)
+
+model:
+  model: facebook/opt-125m           # tester model; matches the opt125m adapters
+  tokenizer_mode: auto
+  trust_remote_code: false
+  dtype: auto
+  max_model_len: 1024
+
+engine:
+  gpu_memory_utilization: 0.75
+  enforce_eager: false
+
+parallel:
+  tensor_parallel_size: 1

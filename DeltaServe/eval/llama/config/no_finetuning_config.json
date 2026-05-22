@@ -1,0 +1,18 @@
+{
+  "finetuning_data_path": "/home/jiaxuan/Documents/Projects/slora-plus/S-LoRA/test/eval/config/emotion.txt",
+  "finetuning_lora_path": "/home/jiaxuan/Documents/Projects/slora-plus/S-LoRA/test/eval/finetuning_adapter",
+  "finetuning_type": "SFT",
+  "finetuning_prepare_size": 999999,
+  "num_epochs": 4,
+  "learning_rate": 1e-3,
+  "weight_decay": 0.01,
+  "gamma": 0.9,
+  "eval_steps": 100,
+  "max_saved_finetuning_tokens": 128,
+  "max_finetuning_tokens_in_batch": 128,
+  "optimizer_threading": true,
+  "start_on_launch": false,
+  "ttft_slo": 0.1,
+  "avg_tbt_slo": 0.15,
+  "max_tbt_slo": 0.35
+}
