@@ -22,14 +22,20 @@ def vllm_version_matches_substr(substr: str) -> bool:
     """
     from importlib.metadata import PackageNotFoundError, version
 
+    # [DeltaServe] Distribution renamed to "dserve-vllm"; try that first and
+    # fall back to upstream "vllm" so the lookup works in either install.
     try:
-        vllm_version = version("vllm")
-    except PackageNotFoundError as e:
-        logger.warning(
-            "The vLLM package was not found, so its version could not be "
-            "inspected. This may cause platform detection to fail."
-        )
-        raise e
+        vllm_version = version("dserve-vllm")
+    except PackageNotFoundError:
+        try:
+            vllm_version = version("vllm")
+        except PackageNotFoundError as e:
+            logger.warning(
+                "Neither 'dserve-vllm' nor 'vllm' distribution was found, "
+                "so the package version could not be inspected. This may "
+                "cause platform detection to fail."
+            )
+            raise e
     return substr in vllm_version
 
 

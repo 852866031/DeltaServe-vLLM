@@ -71,11 +71,17 @@ def main():
             description="vLLM CLI",
             epilog=VLLM_SUBCMD_PARSER_EPILOG.format(subcmd="[subcommand]"),
         )
+        # [DeltaServe] Distribution renamed to "dserve-vllm"; fall back to
+        # upstream "vllm" so --version works in either install.
+        try:
+            _dist_version = importlib.metadata.version("dserve-vllm")
+        except importlib.metadata.PackageNotFoundError:
+            _dist_version = importlib.metadata.version("vllm")
         parser.add_argument(
             "-v",
             "--version",
             action="version",
-            version=importlib.metadata.version("vllm"),
+            version=_dist_version,
         )
         subparsers = parser.add_subparsers(required=False, dest="subparser")
         cmds = {}
