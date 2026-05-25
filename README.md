@@ -460,6 +460,11 @@ Output suffix convention: `<co?>_<mode>` — e.g. `--co --loose` produces
 latency / throughput / SLO figure.
 
 #### Other useful flags
+- `--f` / `-f` — capture server stdout/stderr to
+  `eval/output/server<suffix>.log` instead of streaming to the terminal.
+  Default is **stream-to-terminal** so you see startup banners and any crash
+  trace live; pass `--f` for long unattended runs where you'd rather follow
+  the file with `tail -f`.
 - `--warmup_count N` / `--warmup_duration_s S` — tune the warmup phase
   (default: 1000 reqs or 10 s, whichever ends first).
 - `--api-server-count N` — shard the OpenAI frontend across N processes
@@ -467,6 +472,12 @@ latency / throughput / SLO figure.
   the bottleneck (Phase-4 finding); default `null` = 1 frontend.
 - `--timeline-gpu {5090,A100}` — override the GPU-subdir auto-detection if
   you want to replay an A100-recorded trace on a 5090 or vice versa.
+
+> **Ctrl+C behavior:** the first Ctrl+C sets a stop event so the bench
+> winds down cleanly (writes whatever results are recorded so far, then
+> terminates the server with SIGINT + 30 s grace). A **second Ctrl+C** force
+> kills the server via SIGKILL and aborts — useful if the server is stuck
+> in a long await (e.g. FlashInfer JIT or model load).
 
 ### Note on a fresh clone
 
