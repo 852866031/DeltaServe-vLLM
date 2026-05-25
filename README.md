@@ -70,18 +70,37 @@ conda activate dserve-vllm
 pip install uv
 
 # 4. Editable install of the dserve-vllm package (precompiled wheel path —
-#    fast, no full CUDA source build needed). VLLM_PRECOMPILED_WHEEL_COMMIT
-#    pins the `.so` files to the upstream vLLM commit this fork was vendored
-#    from; without it the install falls back to a nightly wheel that may
-#    have ABI-incompatible vllm._C symbols (the project's `main` shares no
-#    history with vllm-project/vllm:main, so git merge-base can't find a
-#    base commit on its own).
+#    fast, no full CUDA source build needed). Three env vars pin the install:
+#    - VLLM_PRECOMPILED_WHEEL_COMMIT pins the `.so` files to the upstream
+#      vLLM commit this fork was vendored from (without it, git merge-base
+#      can't find a base commit because our main shares no history with
+#      vllm-project/vllm:main, and the install falls back to a nightly wheel
+#      that may have ABI-incompatible vllm._C symbols).
+#    - VLLM_VERSION_OVERRIDE pins the package version string. setuptools-scm
+#      can't derive one (no tags in this repo, no shared history with
+#      upstream's tags); without the override the install errors. The value
+#      below matches what `pip show vllm` reported on this fork before the
+#      package rename.
+#    - VLLM_USE_PRECOMPILED=1 enables the wheel-grafting code path.
 cd dserve-vllm
-VLLM_PRECOMPILED_WHEEL_COMMIT=117afeea4665367a3066c1df58d4082d07fcc946 \
+VLLM_VERSION_OVERRIDE=0.21.1rc1.dev123+g117afeea4.precompiled \
+    VLLM_PRECOMPILED_WHEEL_COMMIT=117afeea4665367a3066c1df58d4082d07fcc946 \
     VLLM_USE_PRECOMPILED=1 \
     uv pip install --editable . --torch-backend=auto
 cd ..
 ```
+
+> **Tip — persist the env vars** so you don't have to retype them on the next
+> install (and so any subprocess you spawn in this env inherits them):
+> ```bash
+> conda env config vars set \
+>     VLLM_VERSION_OVERRIDE=0.21.1rc1.dev123+g117afeea4.precompiled \
+>     VLLM_PRECOMPILED_WHEEL_COMMIT=117afeea4665367a3066c1df58d4082d07fcc946 \
+>     VLLM_USE_PRECOMPILED=1
+> conda activate dserve-vllm   # reactivate to apply
+> ```
+> After this, the install command collapses to:
+> `uv pip install --editable . --torch-backend=auto`.
 
 > **Without `uv`** — plain `pip` does not support `--torch-backend`, so install
 > torch from the right index first, then do the editable install without the
@@ -91,7 +110,8 @@ cd ..
 > #   CUDA 12.x → cu128    CUDA 13.x → cu130
 > pip install torch --index-url https://download.pytorch.org/whl/cu128
 > cd dserve-vllm
-> VLLM_PRECOMPILED_WHEEL_COMMIT=117afeea4665367a3066c1df58d4082d07fcc946 \
+> VLLM_VERSION_OVERRIDE=0.21.1rc1.dev123+g117afeea4.precompiled \
+>     VLLM_PRECOMPILED_WHEEL_COMMIT=117afeea4665367a3066c1df58d4082d07fcc946 \
 >     VLLM_USE_PRECOMPILED=1 \
 >     pip install --editable .
 > cd ..
@@ -210,32 +230,53 @@ sm_120), pulls **torch cu130 (CUDA 13.0)** via `--torch-backend=auto`, and
 brings the pinned `flashinfer-python` as a dependency. **No full source
 compile.**
 
-`VLLM_PRECOMPILED_WHEEL_COMMIT` pins the `.so` files to the upstream vLLM
-commit this fork was vendored from
-([`117afeea4`](https://github.com/vllm-project/vllm/commit/117afeea4)) — the
-project's `git log` records this as the vendoring base. We pin because our
-`main` branch was committed as a squashed snapshot of that upstream commit
-and shares no history with `vllm-project/vllm:main`, so the install would
-otherwise fall back to a nightly wheel with possibly-incompatible
-`vllm._C` symbols.
+Three env vars pin the install (same as the
+[general install](#installation--general-most-gpus); see that section for the
+full rationale):
+
+- **`VLLM_VERSION_OVERRIDE`** — pins the package version string. setuptools-scm
+  can't derive one for this repo (no tags, no shared history with upstream's
+  tags), so without the override the install errors. The value below matches
+  what `pip show vllm` reported on this fork before the package rename.
+- **`VLLM_PRECOMPILED_WHEEL_COMMIT`** — pins the `.so` files to the upstream
+  vLLM commit this fork was vendored from
+  ([`117afeea4`](https://github.com/vllm-project/vllm/commit/117afeea4)).
+  Without it the install falls back to a nightly wheel with possibly
+  ABI-incompatible `vllm._C` symbols.
+- **`VLLM_USE_PRECOMPILED=1`** — enables the wheel-grafting code path (no
+  full source build).
 
 ```bash
 # Need uv for --torch-backend=auto (plain pip doesn't have this flag).
 pip install uv
 
 cd dserve-vllm
-VLLM_PRECOMPILED_WHEEL_COMMIT=117afeea4665367a3066c1df58d4082d07fcc946 \
+VLLM_VERSION_OVERRIDE=0.21.1rc1.dev123+g117afeea4.precompiled \
+    VLLM_PRECOMPILED_WHEEL_COMMIT=117afeea4665367a3066c1df58d4082d07fcc946 \
     VLLM_USE_PRECOMPILED=1 \
     uv pip install --editable . --torch-backend=auto
 cd ..
 ```
+
+> **Tip — persist the env vars** so you don't have to retype them on the next
+> install:
+> ```bash
+> conda env config vars set \
+>     VLLM_VERSION_OVERRIDE=0.21.1rc1.dev123+g117afeea4.precompiled \
+>     VLLM_PRECOMPILED_WHEEL_COMMIT=117afeea4665367a3066c1df58d4082d07fcc946 \
+>     VLLM_USE_PRECOMPILED=1
+> conda activate dserve-vllm   # reactivate to apply
+> ```
+> After this, the install command collapses to:
+> `uv pip install --editable . --torch-backend=auto`.
 
 > **Without `uv`** — install torch cu130 from PyTorch's index first, then do
 > the editable install without `--torch-backend`:
 > ```bash
 > pip install torch --index-url https://download.pytorch.org/whl/cu130
 > cd dserve-vllm
-> VLLM_PRECOMPILED_WHEEL_COMMIT=117afeea4665367a3066c1df58d4082d07fcc946 \
+> VLLM_VERSION_OVERRIDE=0.21.1rc1.dev123+g117afeea4.precompiled \
+>     VLLM_PRECOMPILED_WHEEL_COMMIT=117afeea4665367a3066c1df58d4082d07fcc946 \
 >     VLLM_USE_PRECOMPILED=1 \
 >     pip install --editable .
 > cd ..
