@@ -47,17 +47,24 @@ _HERE = Path(__file__).resolve().parent          # eval/
 _ROOT = _HERE.parent                             # repo root
 _CONFIG = _ROOT / "configs" / "serving_config_finetuning_llama3.yaml"
 
-# Per-GPU base model. The 5090 box has Llama-3-8B in HF cache and resolves
-# the HF id offline (HF_HUB_OFFLINE=1, HF_HOME=/mnt/storage/huggingface).
-# The A100 lab box keeps Llama-3.1-8B at a direct path in scratch; pass it
-# in as a filesystem path so vLLM bypasses the Hub. Architecturally Llama-3
-# and Llama-3.1-8B are compatible, so the toy LoRA still loads — the
-# adapter shapes match either base.
-_BASE_MODEL_BY_GPU = {
-    "5090": "meta-llama/Meta-Llama-3-8B",
-    "A100": "/home/jiaxuan_chen/scratch/models--meta-llama--Meta-Llama-3.1-8B",
+# Per-GPU base model + HF cache root. Both boxes resolve via the HF cache
+# machinery (offline), so we pass HF repo ids (not direct paths) and point
+# HF_HOME at each box's cache root. The A100 cache happens to live in
+# scratch; on the 5090 it's the shared storage mount. Architecturally
+# Llama-3 and Llama-3.1-8B are compatible, so the toy LoRA loads against
+# either base — the adapter shapes match.
+_GPU_ENV = {
+    "5090": {
+        "model": "meta-llama/Meta-Llama-3-8B",
+        "hf_home": "/mnt/storage/huggingface",
+    },
+    "A100": {
+        "model": "meta-llama/Meta-Llama-3.1-8B",
+        "hf_home": "/home/jiaxuan_chen/scratch",
+    },
 }
-_BASE_MODEL_DEFAULT = _BASE_MODEL_BY_GPU["5090"]
+_BASE_MODEL_DEFAULT = _GPU_ENV["5090"]["model"]
+_HF_HOME_DEFAULT = _GPU_ENV["5090"]["hf_home"]
 _SERVED_NAME = "llama3"
 _INFER_LORA_DIR = _ROOT / "adapters" / "llama3-toy-lora"
 _INFER_LORA_NAME = "llama3-toy-lora"
@@ -432,9 +439,15 @@ async def main() -> None:
     ap.add_argument("--model", default=None,
                     help="Base model id (HF) or local path. Default is "
                          "per-GPU: " + ", ".join(
-                             f"{g}={m}" for g, m in _BASE_MODEL_BY_GPU.items()
+                             f"{g}={v['model']}" for g, v in _GPU_ENV.items()
                          ) + ". Use this to override (e.g. for a new local "
                          "checkpoint).")
+    ap.add_argument("--hf-home", default=None,
+                    help="HF cache root (sets HF_HOME for the server). "
+                         "Default is per-GPU: " + ", ".join(
+                             f"{g}={v['hf_home']}" for g, v in _GPU_ENV.items()
+                         ) + ". Respected only if HF_HOME is not already in "
+                         "your env.")
     ap.add_argument("--f", "-f", dest="log_to_file", action="store_true",
                     help="Capture server stdout/stderr to "
                          "eval/output/server<suffix>.log instead of streaming "
@@ -469,12 +482,15 @@ async def main() -> None:
     if bwd_log and os.path.exists(bwd_log):
         os.remove(bwd_log)  # fresh log per run
 
-    # Resolve the base model: explicit --model wins, else look up by detected
-    # GPU, else fall back to the 5090 default.
-    base_model = args.model or _BASE_MODEL_BY_GPU.get(args.timeline_gpu,
-                                                     _BASE_MODEL_DEFAULT)
-    src = "--model" if args.model else f"auto (gpu={args.timeline_gpu})"
-    print(f"[bench] base model: {base_model}  [{src}]", flush=True)
+    # Resolve the base model + HF cache root: explicit CLI flags win, else
+    # look up by detected GPU, else fall back to the 5090 defaults.
+    gpu_env = _GPU_ENV.get(args.timeline_gpu, _GPU_ENV["5090"])
+    base_model = args.model or gpu_env["model"]
+    hf_home = args.hf_home or gpu_env["hf_home"]
+    model_src = "--model" if args.model else f"auto (gpu={args.timeline_gpu})"
+    hf_src = "--hf-home" if args.hf_home else f"auto (gpu={args.timeline_gpu})"
+    print(f"[bench] base model: {base_model}  [{model_src}]", flush=True)
+    print(f"[bench] HF_HOME:    {hf_home}  [{hf_src}]", flush=True)
 
     server = f"http://127.0.0.1:{_PORT}"
     cmd = build_server_cmd(args.co, bwd_log, args.api_server_count,
@@ -484,7 +500,7 @@ async def main() -> None:
           + (f" | bwd_log -> {bwd_log}" if bwd_log else ""), flush=True)
 
     env = dict(os.environ)
-    env.setdefault("HF_HOME", "/mnt/storage/huggingface")
+    env.setdefault("HF_HOME", hf_home)
     env.setdefault("HF_HUB_OFFLINE", "1")
     env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
     env["PYTHONSAFEPATH"] = "1"
