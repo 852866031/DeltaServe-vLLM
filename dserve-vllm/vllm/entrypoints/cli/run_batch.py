@@ -27,8 +27,14 @@ class RunBatchSubcommand(CLISubcommand):
     def cmd(args: argparse.Namespace) -> None:
         from vllm.entrypoints.openai.run_batch import main as run_batch_main
 
+        # [DeltaServe] Distribution renamed to "dserve-vllm"; fall back to
+        # upstream "vllm" so version logging works in either install.
+        try:
+            _dist_version = importlib.metadata.version("dserve-vllm")
+        except importlib.metadata.PackageNotFoundError:
+            _dist_version = importlib.metadata.version("vllm")
         logger.info(
-            "vLLM batch processing API version %s", importlib.metadata.version("vllm")
+            "vLLM batch processing API version %s", _dist_version
         )
         logger.info("args: %s", args)
 
