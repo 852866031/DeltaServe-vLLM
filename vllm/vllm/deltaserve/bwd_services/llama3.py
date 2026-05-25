@@ -486,9 +486,14 @@ class Llama3BackwardService(BackwardService):
             self.lora.setdefault(layer, {}).setdefault(proj, {})[ab] = param
             params.append(param)
 
+        # ``fused=True`` uses PyTorch's CUDA-fused AdamW kernel — one launch
+        # for all 256 LoRA tensors (8 per layer × 32 layers) instead of
+        # per-tensor dispatch. Numerically identical to the default AdamW;
+        # cuts a few ms per backward on Llama-3-8B. Requires CUDA tensors
+        # (all our LoRA masters are on the worker device).
         self.optimizer = torch.optim.AdamW(
             params, lr=float(meta["learning_rate"]), betas=(0.9, 0.999),
-            weight_decay=float(meta["weight_decay"]))
+            weight_decay=float(meta["weight_decay"]), fused=True)
         self.scheduler = torch.optim.lr_scheduler.StepLR(
             self.optimizer, step_size=1, gamma=float(meta["gamma"]))
         dprint(

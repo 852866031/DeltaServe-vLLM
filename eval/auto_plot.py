@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""auto_plot.py — 4-panel per-mode plots for DeltaServe-on-vLLM benchmarks.
+"""auto_plot.py — 5-panel per-mode plots for DeltaServe-on-vLLM benchmarks.
 
 Self-contained port of DeltaServe/eval/llama3/auto_plot.py (helpers inlined,
 csv+numpy only — no pandas). For each workload-shape mode it builds one
-4-subplot PNG:
+5-subplot PNG (4 in the first row, 1 in the second row):
 
   1. Scheduled request timeline (req/s bars + output tok/s line) from
      timelines/<gpu>/timeline_<mode>.csv
@@ -11,6 +11,9 @@ csv+numpy only — no pandas). For each workload-shape mode it builds one
   3. Throughput tok/s: inference contribution + finetune contribution bands
      (FT band from bwd_log<suffix>.csv)
   4. TTFT SLO satisfaction rate vs the 95% target
+  5. E2E latency percentile curve (empirical CDF; x = percentile 0–100,
+     y = latency at that percentile). Shows the tail shape that panel 2's
+     time-series scatter hides.
 
 Inputs (under eval/output/, suffix = '<base>_<mode>' from auto_benchmark.py):
   timeline_results<base>_<mode>.csv
@@ -291,6 +294,70 @@ def plot_latency_vs_time(ax, res, label, color):
     ax.legend()
 
 
+def plot_latency_percentile(ax, res, label, color):
+    """E2E latency empirical CDF / percentile curve.
+
+    x-axis: percentile (0–100). y-axis: latency value at that percentile.
+    Surfaces tail shape that the time-scatter in ``plot_latency_vs_time``
+    hides — e.g., a fat right tail looks like a near-vertical climb on the
+    right side here, vs a few high dots on the time series.
+
+    The p99 marker is the prominent feature: a heavier vertical guide at
+    x=99 (drawn once across overlay calls), plus a per-series horizontal
+    tick at that series' p99 latency value, color-matched and annotated so
+    the value reads off the y-axis directly. p50 / p95 stay as faint guides
+    for context.
+
+    Supports being called twice on the same ``ax`` for overlay comparisons
+    (e.g. co-serving vs inf-only) — each call adds a labeled curve plus a
+    p99 horizontal tick. Annotations stack vertically to avoid overlap."""
+    ok = res["ok"]
+    lat = res["latency_s"][ok]
+    lat = lat[np.isfinite(lat)]
+    if lat.size == 0:
+        ax.set_title("E2E Latency Percentile (no data)")
+        return
+    sorted_lat = np.sort(lat)
+    # Empirical-CDF percentiles: rank i in [1..n] → percentile (i / n) × 100.
+    pct = (np.arange(1, sorted_lat.size + 1, dtype=float) / sorted_lat.size) * 100.0
+    p50 = float(np.percentile(lat, 50))
+    p95 = float(np.percentile(lat, 95))
+    p99 = float(np.percentile(lat, 99))
+    series_label = (f"{label} (p50 {p50:.2f}s · p95 {p95:.2f}s · p99 {p99:.2f}s)")
+    ax.plot(pct, sorted_lat, color=color, linewidth=1.8, label=series_label)
+
+    # Guides drawn once total (not per-series): faint p50 / p95 ticks plus a
+    # heavier p99 line so the tail is the visual anchor.
+    if not getattr(ax, "_pct_guides_drawn", False):
+        for p in (50, 95):
+            ax.axvline(p, color="0.78", linestyle=":", linewidth=0.7, zorder=1)
+        ax.axvline(99, color="0.35", linestyle="--", linewidth=1.4, zorder=1.5,
+                   label="p99")
+        ax._pct_guides_drawn = True
+
+    # Per-series p99 horizontal tick: x=0 → x=99 at y=p99, color-matched to
+    # the series. Annotation sits just right of the vertical p99 guide;
+    # multiple series stack vertically (tracked on the axis).
+    ax.hlines(p99, 0, 99, colors=color, linestyles="--",
+              linewidth=1.2, alpha=0.85, zorder=2)
+    series_idx = getattr(ax, "_pct_series_count", 0)
+    ax._pct_series_count = series_idx + 1
+    ax.annotate(f"{label} p99 = {p99:.3f}s",
+                xy=(99, p99), xytext=(8, 8 + 14 * series_idx),
+                textcoords="offset points", color=color, fontsize=8,
+                ha="left", va="bottom",
+                bbox=dict(boxstyle="round,pad=0.2", facecolor="white",
+                          edgecolor=color, alpha=0.85, linewidth=0.6))
+
+    ax.set_xlim(0, 100)
+    # ylim max should be max of the curve times 1.2, ymin should be of min*0.8
+    ax.set_ylim(sorted_lat.min() * 0.8, sorted_lat.max() * 1.2)
+    ax.set_xlabel("Percentile")
+    ax.set_ylabel("Latency (s)")
+    ax.set_title("E2E Latency by Percentile (p99 highlighted)")
+    ax.legend(loc="upper left", fontsize=8)
+
+
 def plot_throughput_curves(ax, res, tl, bwd_log, color_inf,
                            bin_s=1.0, smoothing_window_s=None):
     # Map request idx -> timeline max_new_tokens via row_id.
@@ -431,29 +498,46 @@ def make_figure_for_mode(mode, base_suffix, output_dir, plots_dir,
     bwd_log = parse_bwd_log_csv(bwd_log_csv, t0_wall=t0_wall)
     color = MODE_COLORS.get(mode, "tab:gray")
 
-    fig, axes = plt.subplots(1, 4, figsize=(24, 5))
-    plot_request_timeline(axes[0], tl)
-    plot_latency_vs_time(axes[1], res, label=mode, color=color)
+    # 2-row layout: 4 panels in row 1 (timeline / E2E vs time / throughput /
+    # TTFT satisfaction), 1 panel in row 2 (E2E latency percentile curve).
+    # Row-2 columns 1-3 are intentionally left blank — matplotlib doesn't
+    # render an axis we don't add. ``constrained_layout`` handles the partial
+    # second row cleanly (``tight_layout`` warns on incomplete rows).
+    fig = plt.figure(figsize=(24, 10), constrained_layout=True)
+    gs = fig.add_gridspec(2, 4)
+    ax_timeline = fig.add_subplot(gs[0, 0])
+    ax_latency = fig.add_subplot(gs[0, 1])
+    ax_throughput = fig.add_subplot(gs[0, 2])
+    ax_ttft = fig.add_subplot(gs[0, 3])
+    ax_latency_pct = fig.add_subplot(gs[1, 0])
+
+    plot_request_timeline(ax_timeline, tl)
+    plot_latency_vs_time(ax_latency, res, label=mode, color=color)
+    plot_latency_percentile(ax_latency_pct, res, label=mode, color=color)
     # If this is a co-serving run, overlay the inference-only (no-co) E2E
-    # latency for the same mode when its results exist — only on the E2E panel,
-    # so the co-serving overhead is visible at a glance.
+    # latency for the same mode when its results exist — on BOTH the E2E
+    # time-series panel and the percentile panel, so the co-serving overhead
+    # is visible both as a function of time AND in the tail distribution.
     if base_suffix:
         infonly_csv = os.path.join(output_dir, f"timeline_results_{mode}.csv")
         if (os.path.exists(infonly_csv)
                 and os.path.abspath(infonly_csv) != os.path.abspath(results_csv)):
             try:
-                plot_latency_vs_time(axes[1], load_results(infonly_csv),
+                infonly_res = load_results(infonly_csv)
+                plot_latency_vs_time(ax_latency, infonly_res,
                                      label="inf-only", color="tab:gray")
+                plot_latency_percentile(ax_latency_pct, infonly_res,
+                                        label="inf-only", color="tab:gray")
             except Exception as e:
                 print(f"[auto_plot] skip inf-only overlay for {mode}: {e}")
-    plot_throughput_curves(axes[2], res, tl, bwd_log, color_inf=color,
+    plot_throughput_curves(ax_throughput, res, tl, bwd_log, color_inf=color,
                            smoothing_window_s=throughput_window_s)
-    plot_ttft_satisfaction(axes[3], res, slo_s=slo_s, window_s=window_s,
+    plot_ttft_satisfaction(ax_ttft, res, slo_s=slo_s, window_s=window_s,
                            avg_tbt_slo=avg_tbt_slo)
 
     config_tag = base_suffix.lstrip("_") or "baseline"
     fig.suptitle(f"{mode}  ({config_tag})")
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    # constrained_layout handles the partial-row GridSpec; no tight_layout call.
     os.makedirs(plots_dir, exist_ok=True)
     fig.savefig(out_path, dpi=160)
     plt.close(fig)
