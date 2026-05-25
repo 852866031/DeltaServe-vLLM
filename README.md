@@ -385,6 +385,12 @@ The script is committed (`scripts/init_adapters_llama3.py`), so you only need
 to run it. From the repo root, inside the `dserve-vllm` conda env:
 
 ```bash
+# One-time: install the training-side deps that aren't in dserve-vllm's own
+# requirements. peft + datasets are needed by init_adapters_llama3.py to
+# train the adapter; pandas + matplotlib are needed later by the eval
+# plotter (eval/auto_plot.py).
+pip install peft datasets pandas matplotlib
+
 # One-time: log in so HuggingFace can fetch the gated Llama-3-8B weights.
 huggingface-cli login
 
