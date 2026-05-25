@@ -237,7 +237,7 @@ weights live in the normal caching allocator and are IPC-shareable.
   adapter q_proj LoRA-A L0/L11) prints on both parent and child and matches
   (`parent==child: True`) → content-level zero-copy proof. ✅ (Note: serving then
   hit the FlashInfer sm_120 JIT issue — environmental, post-sharing, see
-  `vllm_setup_5090.md`.)
+  `README.md`.)
 
 ### Tooling — logging, config print, launcher inference adapter ✅
 
@@ -259,7 +259,7 @@ shared with the backward process, not applied to inference).
 
 > Note: `VLLM_USE_FLASHINFER_SAMPLER=0` is a per-shell runtime workaround for the
 > Blackwell FlashInfer sampler JIT; do NOT bake it into committed config (per
-> `vllm_setup_5090.md` — keep arch-specific backend overrides out of the fork).
+> `README.md` — keep arch-specific backend overrides out of the fork).
 
 ### Step 4 — IPC handshake (pause event + work pipe) ⬜
 

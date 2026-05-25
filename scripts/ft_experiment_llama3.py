@@ -16,7 +16,7 @@ decision prints stream live, e.g.:
   [backward] buffer-full signal ... loss=... logit_grad norm=...
   [coord]    backward done ... -> FT admission OPEN
 
-Usage (inside the dserve-vllm conda env, with CUDA env from vllm_setup_5090.md):
+Usage (inside the dserve-vllm conda env, with CUDA env from README.md):
 
     HF_HOME=/mnt/storage/huggingface HF_HUB_OFFLINE=1 \
     VLLM_USE_FLASHINFER_SAMPLER=0 python ft_experiment_llama3.py
@@ -118,21 +118,21 @@ def main():
 
     # Build the server command from the YAML (paths resolved to absolute).
     # Import here, after argparse, with the repo root removed from sys.path so
-    # `import vllm` resolves to the installed package, not the ./vllm dir.
+    # `import vllm` resolves to the installed package, not the ./dserve-vllm dir.
     _strip = {str(_HERE), str(_ROOT)}
     sys.path[:] = [p for p in sys.path if os.path.abspath(p or ".") not in _strip]
     from vllm.deltaserve.config_loader import load_yaml_config, split_config
 
     cfg = load_yaml_config(args.config)
     engine_kwargs, _, _ = split_config(cfg)
-    engine_kwargs.pop("model", None)  # model is a positional arg to `vllm serve`
+    engine_kwargs.pop("model", None)  # model is a positional arg to `dserve-vllm serve`
 
-    # Use the `vllm` console script (`vllm serve <model>`), NOT
+    # Use the `dserve-vllm` console script (`dserve-vllm serve <model>`), NOT
     # `python -m vllm.entrypoints.openai.api_server`: the latter triggers a
     # circular import (api_server -> arg_utils -> `from vllm import SamplingParams`
     # before vllm/__init__ finishes). The console script imports in the right
-    # order, and its bin dir on sys.path[0] avoids the ./vllm shadowing.
-    vllm_bin = str(Path(sys.executable).parent / "vllm")
+    # order, and its bin dir on sys.path[0] avoids any source-tree shadowing.
+    vllm_bin = str(Path(sys.executable).parent / "dserve-vllm")
     cmd = [vllm_bin, "serve", args.model]
     cmd += _engine_cli_args(engine_kwargs)
     cmd += _finetune_cli_args(cfg.get("finetune") or {})
@@ -148,9 +148,9 @@ def main():
     env.setdefault("HF_HOME", "/mnt/storage/huggingface")
     env.setdefault("HF_HUB_OFFLINE", "1")
     env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
-    # `python -m ...` prepends the subprocess CWD to sys.path. From the project
-    # root that means the ./vllm repo dir shadows the installed `vllm` package.
-    # Run the server from a neutral CWD and disable the unsafe-path prepend.
+    # `python -m ...` prepends the subprocess CWD to sys.path. Keep the path
+    # clean of any source-tree shadowing of the installed `vllm` package by
+    # running from a neutral CWD and disabling the unsafe-path prepend.
     env["PYTHONSAFEPATH"] = "1"
     server_cwd = tempfile.gettempdir()
 

@@ -1,12 +1,16 @@
 # DeltaServe fork — changes from plain vLLM
 
-Every change we make to the upstream vLLM tree (`vllm/`), organized by stage.
-This is the "what did we touch and why" manifest; `INTEGRATION_PROGRESS.md` is the
-"how far along / how verified" tracker. **Keep this in sync** as new changes land.
+Every change we make to the vendored vLLM source tree (the `vllm/` Python
+package, which lives under `dserve-vllm/vllm/` from the repo root), organized
+by stage. This is the "what did we touch and why" manifest;
+`INTEGRATION_PROGRESS.md` is the "how far along / how verified" tracker.
+**Keep this in sync** as new changes land.
 
-Scope: the `vllm/` source tree only (changes *from plain vLLM*). Project-root
-tooling that *consumes* these (configs, tests, launcher, adapters) is listed at the
-bottom for cross-reference but is not itself a vLLM change.
+Scope: only the inner `vllm/` Python package (the published `dserve-vllm`
+distribution wraps it). Project-root tooling that *consumes* these (configs,
+tests, launcher, adapters) is listed at the bottom for cross-reference but is
+not itself a vLLM change. Paths below are written relative to the package
+root (`dserve-vllm/vllm/<path>` from the repo root).
 
 Two kinds of change:
 - **NEW** files — net-new code, all under `vllm/deltaserve/` (+ one config dataclass).

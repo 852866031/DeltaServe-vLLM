@@ -13,12 +13,15 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vllm"
-authors = [{name = "vLLM Team"}]
+name = "dserve-vllm"
+authors = [
+    {name = "DeltaServe Team"},
+    {name = "vLLM Team"},
+]
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 readme = "README.md"
-description = "A high-throughput and memory-efficient inference and serving engine for LLMs"
+description = "DeltaServe co-serving layer (LoRA-SFT backward interleaved with inference) on top of vLLM's V1 engine — vendored vLLM fork."
 classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -40,14 +43,17 @@ Documentation="https://docs.vllm.ai/en/latest/"
 Slack="https://slack.vllm.ai/"
 
 [project.scripts]
-vllm = "vllm.entrypoints.cli.main:main"
+dserve-vllm = "vllm.entrypoints.cli.main:main"
 
 [project.entry-points."vllm.general_plugins"]
 lora_filesystem_resolver = "vllm.plugins.lora_resolvers.filesystem_resolver:register_filesystem_resolver"
 lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_hub_resolver"
 
 [tool.setuptools_scm]
-# no extra settings needed, presence enables setuptools-scm
+# dserve-vllm lives inside the DeltaServe-vLLM parent git repo (it does not
+# have its own .git/). Let setuptools-scm walk up to find the parent so it
+# can derive the package version from git tags/commits.
+search_parent_directories = true
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -8,7 +8,7 @@ vLLM's config system and CLI, all CPU-only (no model load).
     python tests/test_phase1_step1.py --gpu     # also load opt-125m and show
                                                 # the worker's runtime print
 
-Run inside the `dserve-vllm` conda env (see vllm_setup_5090.md).
+Run inside the `dserve-vllm` conda env (see README.md).
 Exits 0 if all checks pass, 1 otherwise.
 """
 
