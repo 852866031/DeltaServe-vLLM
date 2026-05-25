@@ -524,7 +524,7 @@ class EngineCore:
         import time as _t
         from vllm.deltaserve import dprint
         _ts = _t.strftime("%H:%M:%S") + f".{int((_t.time() % 1) * 1000):03d}"
-        dprint(f"[batch-sched {_ts}] total={total} ft={ft}")
+        #dprint(f"[batch-sched {_ts}] total={total} ft={ft}")
 
     def _maybe_log_batch_done(self, scheduler_output) -> None:
         """[DeltaServe] One-line log right after future.result() unblocks on
