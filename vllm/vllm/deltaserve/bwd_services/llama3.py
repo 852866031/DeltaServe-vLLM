@@ -25,7 +25,6 @@ tensors per layer get gradients.
 
 import math
 import re
-import time
 
 import torch
 import torch.nn as nn
@@ -113,7 +112,24 @@ def _proj(xin, w_base, A, B, scaling):
 
 def _proj_backward(xin, gy, w_base, A, B, scaling, cdt=torch.float32):
     """Grad of _proj, computed in the bulk compute dtype ``cdt`` (bf16 in prod,
-    fp32 in the gradcheck). Returns (grad_xin, grad_A, grad_B)."""
+    fp32 in the gradcheck). Returns (grad_xin, grad_A, grad_B).
+
+    Casts the weights inside the function on every call. This is intentional
+    and matches DeltaServe's precision contract (bf16 compute for projection
+    backward, fp32 LoRA master).
+
+    Why we don't amortize the casts: DeltaServe packs all 8 LoRA tensors per
+    layer into a single ``[2, 4r, H, Hd]`` buffer cast once at the layer
+    boundary (SFT_service.py:424). We use separate qA/qB/… tensors so the
+    cast count is the cardinality of distinct tensors (7 base + 8 LoRA = 15),
+    and that's the same whether we cast inline or pre-cast. The real-cast
+    count is also mode-symmetric:
+      - bf16 cdt (default): 7 base ``.to(bf16)`` are no-ops, 8 LoRA fp32→bf16
+        are real casts. Total: 8 real casts/layer.
+      - fp32 cdt (``backward_fp32=True``, rare): 7 base bf16→fp32 are real
+        casts (heavier — base tensors are big, e.g. ``down`` is [D, inter]),
+        8 LoRA ``.to(fp32)`` are no-ops. Total: 7 real casts/layer.
+    Amortizing wouldn't change either count. Keep this layout."""
     xin = xin.to(cdt)
     gy = gy.to(cdt)
     grad_xin = gy @ w_base.to(cdt)
@@ -192,21 +208,15 @@ def layer_forward(x, lw, scaling, cos, sin, seq_lens, b_start, dims, eps,
             "gate": gate, "up": up}
 
 
-def layer_backward(grad_out, cache, lw, scaling, cos, sin, seq_lens, b_start,
-                   dims, eps, cdt=torch.float32):
-    """Manual gradient of one layer. Bulk matmuls (FFN-bwd, LoRA-grad, rope/proj-bwd)
-    run in ``cdt`` (bf16 in prod, fp32 for the gradcheck); the **attention core**
-    (scores/softmax-bwd/dQ/dK/dV) and **RMSNorm backward** always run in fp32 (the
-    load-bearing precision rules — DeltaServe). Returns (grad_x, grads in cdt).
-    MLP/norms frozen."""
-    Hq, Hkv, Hd, kv_size = dims
-    n = grad_out.shape[0]
-    D = Hq * Hd
-    scale = 1.0 / math.sqrt(Hd)
-    kv_repeat = Hq // Hkv
-    gout = grad_out.to(cdt)
+def ffn_backward_core(grad_out, cache, lw, eps, cdt=torch.float32):
+    """FFN-block backward (frozen MLP, with residual): returns grad_resid_mid.
 
-    # --- FFN backward (frozen MLP): grad w.r.t. resid_mid (incl. residual) ---
+    Captures the shape-stable bulk of the per-layer backward: cast-in, FFN
+    silu/sigmoid + 3 GEMMs against frozen down/gate/up, rmsnorm-post_ln backward,
+    plus the residual add. Inputs are all sized by the chained ``grad_out``
+    (``[n, D]``) and ``cache`` slices captured at the same n. Pure function over
+    its inputs so it can be wrapped 1:1 by a CUDA graph at fixed n=s_max."""
+    gout = grad_out.to(cdt)
     gate = cache["gate"].to(cdt)
     up = cache["up"].to(cdt)
     sig = torch.sigmoid(gate)
@@ -216,29 +226,56 @@ def layer_backward(grad_out, cache, lw, scaling, cos, sin, seq_lens, b_start,
     grad_up = grad_h_mid * silu
     grad_gate = grad_h_mid * up * silu_grad
     grad_x_norm2 = grad_gate @ lw["gate"].to(cdt) + grad_up @ lw["up"].to(cdt)
-    grad_resid_mid = rmsnorm_backward(cache["resid_mid"], grad_x_norm2,
-                                      lw["post_ln"], eps).to(cdt) + gout
+    return rmsnorm_backward(cache["resid_mid"], grad_x_norm2,
+                            lw["post_ln"], eps).to(cdt) + gout
 
-    # --- O backward (cdt) ---
-    grad_ctx_flat, grad_oA, grad_oB = _proj_backward(
-        cache["ctx_flat"], grad_resid_mid, lw["o"], lw["oA"], lw["oB"], scaling, cdt)
 
-    # --- attention backward (per-sample, GQA): core in fp32, results back to cdt ---
-    grad_ctx = grad_ctx_flat.view(n, Hq, Hd)
-    grad_qh = grad_out.new_zeros((n, Hq, Hd), dtype=cdt)
-    grad_kh = grad_out.new_zeros((n, Hkv, Hd), dtype=cdt)
-    grad_vh = grad_out.new_zeros((n, Hkv, Hd), dtype=cdt)
-    qh, kh, vh = cache["qh"].float(), cache["kh"].float(), cache["vh"].float()
+def attn_backward_core(qh, kh, vh, grad_ctx, seq_lens, b_start, dims, cdt=torch.float32,
+                       *, grad_qh_buf=None, grad_kh_buf=None, grad_vh_buf=None):
+    """Per-sample GQA attention backward (eager). Returns (grad_qh, grad_kh,
+    grad_vh) in flat ``[n, H_*, Hd]`` layout, in ``cdt``. Per-sample shapes
+    (variable seq_lens) prevent CUDA-graph capture; the runner uses a padded
+    variant for the graphed fast path and silently falls back to this when a
+    batch overflows the padded bounds. Scores/softmax/dQ/dK/dV always run in
+    fp32 (the load-bearing GQA precision rule).
+
+    If ``grad_qh_buf/kh_buf/vh_buf`` are provided (persistent buffers sized at
+    s_max), the function zeroes their first n rows in-place and returns views
+    into them — saves L=32 fresh-allocation zero-fills per backward. Falls
+    back to fresh allocation when not provided (preserves the gradcheck path,
+    which has no service to own persistent buffers)."""
+    Hq, Hkv, Hd, _ = dims
+    scale = 1.0 / math.sqrt(Hd)
+    kv_repeat = Hq // Hkv
+    n = grad_ctx.shape[0]
+    device = grad_ctx.device
+    # Use the persistent buffers only when they're large enough for n. They're
+    # sized at s_max for the production path (n ≤ s_max always); the runner's
+    # eager-fallback inside Llama3GraphedBackward.attn_backward also passes
+    # its own static_grad_* (also s_max). The undersized branch fires only in
+    # contrived parity tests that exceed s_max — we silently alloc fresh.
+    if grad_qh_buf is not None and grad_qh_buf.shape[0] >= n:
+        grad_qh_buf[:n].zero_()
+        grad_kh_buf[:n].zero_()
+        grad_vh_buf[:n].zero_()
+        grad_qh = grad_qh_buf[:n]
+        grad_kh = grad_kh_buf[:n]
+        grad_vh = grad_vh_buf[:n]
+    else:
+        grad_qh = torch.zeros((n, Hq, Hd), dtype=cdt, device=device)
+        grad_kh = torch.zeros((n, Hkv, Hd), dtype=cdt, device=device)
+        grad_vh = torch.zeros((n, Hkv, Hd), dtype=cdt, device=device)
+    qh_f, kh_f, vh_f = qh.float(), kh.float(), vh.float()
     for st, ln in zip(b_start, seq_lens):
-        q_blk = qh[st:st + ln].transpose(0, 1)       # [Hq, L, Hd] fp32
-        k_blk = kh[st:st + ln].transpose(0, 1)       # [Hkv, L, Hd] fp32
-        v_blk = vh[st:st + ln].transpose(0, 1)
+        q_blk = qh_f[st:st + ln].transpose(0, 1)     # [Hq, L, Hd] fp32
+        k_blk = kh_f[st:st + ln].transpose(0, 1)     # [Hkv, L, Hd] fp32
+        v_blk = vh_f[st:st + ln].transpose(0, 1)
         if kv_repeat != 1:
             k_rep = k_blk.repeat_interleave(kv_repeat, 0)
             v_rep = v_blk.repeat_interleave(kv_repeat, 0)
         else:
             k_rep, v_rep = k_blk, v_blk
-        mask = torch.triu(torch.ones(ln, ln, dtype=torch.bool, device=gout.device), 1)
+        mask = torch.triu(torch.ones(ln, ln, dtype=torch.bool, device=device), 1)
         scores = (q_blk @ k_rep.transpose(-1, -2)) * scale   # fp32
         scores = scores.masked_fill(mask, -1e9)
         att = torch.softmax(scores, dim=-1)          # [Hq, L, L] fp32
@@ -257,6 +294,39 @@ def layer_backward(grad_out, cache, lw, scaling, cos, sin, seq_lens, b_start,
         grad_qh[st:st + ln] = grad_q_blk.transpose(0, 1).to(cdt)
         grad_kh[st:st + ln] = grad_k_kv.transpose(0, 1).to(cdt)
         grad_vh[st:st + ln] = grad_v_kv.transpose(0, 1).to(cdt)
+    return grad_qh, grad_kh, grad_vh
+
+
+def layer_backward(grad_out, cache, lw, scaling, cos, sin, seq_lens, b_start,
+                   dims, eps, cdt=torch.float32,
+                   *, grad_qh_buf=None, grad_kh_buf=None, grad_vh_buf=None):
+    """Manual gradient of one layer. Bulk matmuls (FFN-bwd, LoRA-grad, rope/proj-bwd)
+    run in ``cdt`` (bf16 in prod, fp32 for the gradcheck); the **attention core**
+    (scores/softmax-bwd/dQ/dK/dV) and **RMSNorm backward** always run in fp32 (the
+    load-bearing precision rules — DeltaServe). Returns (grad_x, grads in cdt).
+    MLP/norms frozen. Composes ``ffn_backward_core`` + ``attn_backward_core`` so
+    the eager and graphed paths share one definition of the math.
+
+    ``grad_{qh,kh,vh}_buf`` are optional persistent buffers passed through to
+    ``attn_backward_core`` — used by the service to avoid 96 zero-fill kernel
+    launches per backward. Not provided by the gradcheck test."""
+    Hq, Hkv, Hd, kv_size = dims
+    n = grad_out.shape[0]
+    D = Hq * Hd
+
+    # --- FFN backward (frozen MLP): grad w.r.t. resid_mid (incl. residual) ---
+    grad_resid_mid = ffn_backward_core(grad_out, cache, lw, eps, cdt)
+
+    # --- O backward (cdt) ---
+    grad_ctx_flat, grad_oA, grad_oB = _proj_backward(
+        cache["ctx_flat"], grad_resid_mid, lw["o"], lw["oA"], lw["oB"], scaling, cdt)
+
+    # --- attention backward (per-sample, GQA): core in fp32, results back to cdt ---
+    grad_ctx = grad_ctx_flat.view(n, Hq, Hd)
+    grad_qh, grad_kh, grad_vh = attn_backward_core(
+        cache["qh"], cache["kh"], cache["vh"], grad_ctx,
+        seq_lens, b_start, dims, cdt,
+        grad_qh_buf=grad_qh_buf, grad_kh_buf=grad_kh_buf, grad_vh_buf=grad_vh_buf)
 
     grad_q = rope_backward(grad_qh, cos, sin).reshape(n, D)
     grad_k = rope_backward(grad_kh, cos, sin).reshape(n, kv_size)
@@ -325,6 +395,16 @@ class Llama3BackwardService(BackwardService):
         self.base: dict = {}            # layer -> {q,k,v,o,gate,up,down,in_ln,post_ln}
         self.optimizer = None
         self.scheduler = None
+        # CUDA-graph runner (Phase 5). Attached in _build_state when
+        # meta["backward_cuda_graph"] is True; None means all-eager (today's
+        # behaviour). See vllm/deltaserve/bwd_services/llama3_graph.py.
+        self.graph_runner = None
+        # Persistent grad_qh/kh/vh buffers (allocated in _build_state once
+        # dims + cdt are known). Reused across layers and backwards by the
+        # eager attn_backward_core path via its grad_*_buf kwargs.
+        self._grad_qh_buf = None
+        self._grad_kh_buf = None
+        self._grad_vh_buf = None
 
     # -- build master params + optimizer once weights are received -----------
 
@@ -417,6 +497,49 @@ class Llama3BackwardService(BackwardService):
             f"wd={meta['weight_decay']}, gamma={meta['gamma']}"
         )
 
+        # Persistent grad_qh/kh/vh buffers for the eager attn_backward_core path
+        # (passed via attn_backward_core's optional grad_*_buf kwargs). Sized at
+        # s_max so they fit any backward, sliced to [:n] per call. Saves 96
+        # zero-fill kernel launches per backward (32 layers × 3 tensors). The
+        # graphed path has its own static buffers in Llama3GraphedBackward.
+        s_max = int(meta.get("max_saved_finetuning_tokens", 0))
+        if s_max > 0:
+            dev = self.lm_w.device
+            cdt = self.bwd_dtype
+            self._grad_qh_buf = torch.zeros((s_max, self.Hq, self.Hd),
+                                            dtype=cdt, device=dev)
+            self._grad_kh_buf = torch.zeros((s_max, self.Hkv, self.Hd),
+                                            dtype=cdt, device=dev)
+            self._grad_vh_buf = torch.zeros((s_max, self.Hkv, self.Hd),
+                                            dtype=cdt, device=dev)
+        else:
+            self._grad_qh_buf = self._grad_kh_buf = self._grad_vh_buf = None
+
+        # [Phase 5] Optional CUDA-graph runner. Per-layer FFN-bwd + padded-attn-bwd
+        # graphs, captured lazily on first replay. Falls back per-layer on capture
+        # or shape-fit failure (gradient values unchanged in either case).
+        if meta.get("backward_cuda_graph"):
+            from vllm.deltaserve.bwd_services.llama3_graph import (
+                Llama3GraphedBackward,
+            )
+            s_max = int(meta.get("max_saved_finetuning_tokens", 0))
+            bn_max = int(meta.get("backward_cuda_graph_attn_bn_max", 8))
+            l_max = int(meta.get("backward_cuda_graph_attn_l_max", 64))
+            if s_max <= 0:
+                dprint(
+                    "[backward] backward_cuda_graph requested but "
+                    "max_saved_finetuning_tokens not provided; keeping eager")
+            else:
+                try:
+                    self.graph_runner = Llama3GraphedBackward(
+                        self, s_max=s_max, bn_max=bn_max, l_max=l_max)
+                except Exception as e:  # noqa: BLE001
+                    import traceback
+                    dprint(f"[backward] graph runner init failed: {e}; "
+                           f"falling back to eager backward")
+                    traceback.print_exc()
+                    self.graph_runner = None
+
     def _layer_weights(self, i: int) -> dict:
         """Base (compute dtype) + fp32 LoRA params for layer i, as one dict."""
         lw = dict(self.base[i])
@@ -431,6 +554,8 @@ class Llama3BackwardService(BackwardService):
     def process_backward(self, activations, sample_lens, n, epoch):
         if not self._built:
             raise RuntimeError("llama3 backward state not built (weights not shared)")
+        # Mode tag for the one-line cycle log (set in BackwardService dispatcher).
+        self._last_mode = "graph" if self.graph_runner is not None else "eager"
         seq_lens = [int(s) for s in sample_lens]
         b_start, acc = [], 0
         for s in seq_lens:
@@ -443,16 +568,6 @@ class Llama3BackwardService(BackwardService):
         cos, sin = rope_cos_sin(positions, self.Hd, self.theta)
         ids = activations["concat_input_ids"][:n]
 
-        use_cuda = activations["final_in"].is_cuda
-        # Time the backward on the GPU. DeltaServe rule: synchronize before reading
-        # the wall clock, else you measure host dispatch, not GPU completion. The
-        # remat (forward) vs grad split is measured with paired CUDA events so the
-        # "saved-activation contribution" is observable without serializing the loop.
-        fwd_ev, bwd_ev = [], []
-        if use_cuda:
-            torch.cuda.synchronize()
-        t0 = time.perf_counter()
-
         self.optimizer.zero_grad(set_to_none=True)
 
         # Head: loss + grad w.r.t. final_in (pre-final-norm residual = layer_in[L]).
@@ -464,30 +579,36 @@ class Llama3BackwardService(BackwardService):
         # — lets the remat skip the gate_up matmul (the layer's biggest recompute).
         saved_gu = activations.get("mlp_gate_up")
 
+        # If the graphed runner is attached, build per-backward scatter indices
+        # + key-pad mask once (re-used across all L layers' padded-attention
+        # replays). Eager fallback for batches that overflow the padded budget.
+        if self.graph_runner is not None:
+            self.graph_runner.begin_backward(n, seq_lens, b_start)
+
         # Per-layer manual backward, chaining the input gradient down the stack.
         for i in reversed(range(self.L)):
-            # [Phase 5] Yield the GPU to an inference prefill if one is running.
-            self._maybe_pause()
+            if self.graph_runner is None:
+                # Eager path (today's behaviour). Pause at the layer boundary
+                # before the layer's compute — original yield cadence.
+                self._maybe_pause()
             lw = self._layer_weights(i)
             x = activations["layer_in"][i][:n]
             gu = saved_gu[i][:n] if saved_gu else None
             with torch.no_grad():
-                if use_cuda:
-                    e0, e1, e2 = (torch.cuda.Event(enable_timing=True)
-                                  for _ in range(3))
-                    e0.record()
                 cache = layer_forward(x, lw, self.scaling, cos, sin,
                                       seq_lens, b_start, self.dims, self.eps,
                                       saved_gate_up=gu)
-                if use_cuda:
-                    e1.record()
-                grad_x, grads = layer_backward(g, cache, lw, self.scaling, cos, sin,
-                                               seq_lens, b_start, self.dims, self.eps,
-                                               cdt=self.bwd_dtype)
-                if use_cuda:
-                    e2.record()
-                    fwd_ev.append((e0, e1))
-                    bwd_ev.append((e1, e2))
+                if self.graph_runner is None:
+                    grad_x, grads = layer_backward(
+                        g, cache, lw, self.scaling, cos, sin,
+                        seq_lens, b_start, self.dims, self.eps,
+                        cdt=self.bwd_dtype,
+                        grad_qh_buf=self._grad_qh_buf,
+                        grad_kh_buf=self._grad_kh_buf,
+                        grad_vh_buf=self._grad_vh_buf)
+                else:
+                    grad_x, grads = self._layer_backward_graphed(
+                        i, g, cache, lw, cos, sin, seq_lens, b_start)
             # Write grads to the fp32 master params (cast up from the bulk compute
             # dtype; PEFT layout matches), then per-layer clip to 1.0 (DeltaServe).
             ld = self.lora.get(i, {})
@@ -512,27 +633,88 @@ class Llama3BackwardService(BackwardService):
         # the whole backward, so the adapter is idle until the done-reply reopens it.
         self._publish_to_served()
 
-        if use_cuda:
-            torch.cuda.synchronize()
-        total_ms = (time.perf_counter() - t0) * 1000.0
-        if use_cuda and fwd_ev:
-            remat_ms = sum(a.elapsed_time(b) for a, b in fwd_ev)   # layer-forward remat
-            grad_ms = sum(a.elapsed_time(b) for a, b in bwd_ev)    # manual gradients
-            dprint(
-                f"[backward] total {total_ms:.1f} ms | remat-forward {remat_ms:.1f} ms "
-                f"({100 * remat_ms / total_ms:.0f}%) + manual-grad {grad_ms:.1f} ms "
-                f"({100 * grad_ms / total_ms:.0f}%) over {self.L} layers"
-            )
-        else:
-            dprint(f"[backward] total {total_ms:.1f} ms")
         return loss, n_valid
+
+    @torch.no_grad()
+    def _layer_backward_graphed(self, i, g, cache, lw, cos, sin,
+                                seq_lens, b_start):
+        """Graphed per-layer backward: Graph A (FFN-bwd) → eager O-bwd → pause
+        (yield GPU to inference) → Graph B (padded-attn-bwd) → eager tail
+        (RoPE / Q-K-V proj / in_ln rmsnorm). Same gradient values as the eager
+        ``layer_backward``; differs only in *when* host dispatch happens.
+
+        Pause cadence: once per layer, between the two graphs — the eager
+        path's once-per-layer pause-at-start is preserved, just relocated to
+        the mid-layer point so each graph runs without yielding (the captured
+        region can't host an mp.Event.wait anyway)."""
+        cdt = self.bwd_dtype
+        Hq, _, Hd, kv_size = self.dims
+        n = g.shape[0]
+        D = Hq * Hd
+
+        # --- Graph A: FFN-bwd (frozen MLP, with residual) ---
+        grad_resid_mid = self.graph_runner.ffn_backward(i, g, cache, lw)
+
+        # --- Eager: O-projection backward (LoRA grad lives here) ---
+        grad_ctx_flat, grad_oA, grad_oB = _proj_backward(
+            cache["ctx_flat"], grad_resid_mid, lw["o"],
+            lw["oA"], lw["oB"], self.scaling, cdt)
+
+        # --- Yield GPU to inference between graphs (preserves the load-bearing
+        # per-layer pause cadence; mp.Event.wait can't run inside a graph). ---
+        self._maybe_pause()
+
+        # --- Graph B: padded-attention backward CORE ---
+        grad_ctx = grad_ctx_flat.view(n, Hq, Hd)
+        grad_qh, grad_kh, grad_vh = self.graph_runner.attn_backward(
+            i, cache["qh"], cache["kh"], cache["vh"], grad_ctx,
+            seq_lens, b_start, self.dims)
+
+        # --- Eager tail: RoPE bwd → Q/K/V proj bwd → in_ln rmsnorm bwd ---
+        grad_q = rope_backward(grad_qh, cos, sin).reshape(n, D)
+        grad_k = rope_backward(grad_kh, cos, sin).reshape(n, kv_size)
+        grad_v = grad_vh.reshape(n, kv_size)
+        xn1 = cache["x_norm1"]
+        gx_q, grad_qA, grad_qB = _proj_backward(
+            xn1, grad_q, lw["q"], lw["qA"], lw["qB"], self.scaling, cdt)
+        gx_k, grad_kA, grad_kB = _proj_backward(
+            xn1, grad_k, lw["k"], lw["kA"], lw["kB"], self.scaling, cdt)
+        gx_v, grad_vA, grad_vB = _proj_backward(
+            xn1, grad_v, lw["v"], lw["vA"], lw["vB"], self.scaling, cdt)
+        grad_x_norm1 = gx_q + gx_k + gx_v
+        grad_x = rmsnorm_backward(
+            cache["x"], grad_x_norm1, lw["in_ln"], self.eps).to(cdt) + grad_resid_mid
+
+        grads = {"qA": grad_qA, "qB": grad_qB, "kA": grad_kA, "kB": grad_kB,
+                 "vA": grad_vA, "vB": grad_vB, "oA": grad_oA, "oB": grad_oB}
+        return grad_x, grads
 
     @torch.no_grad()
     def _publish_to_served(self) -> None:
         """Write the trained fp32 master into vLLM's served LoRA stacked buffers
         (DeltaServe's load-time refresh): per (layer, proj), clamp + cast to the
         served dtype, with α/r baked into B (vLLM applies scale=1). No transpose —
-        PEFT A [r,in] / B [out,r] match vLLM's stacked layout."""
+        PEFT A [r,in] / B [out,r] match vLLM's stacked layout.
+
+        The scaling convention is load-bearing: vLLM's punica forward calls
+        ``add_lora_linear(..., 1.0, ...)`` (see
+        ``vllm/lora/layers/base_linear.py:226``) — the third positional arg
+        ``scale`` is hardcoded to 1.0, NOT taken from the adapter's stored
+        ``LoRALayerWeights.scaling`` (alpha/r). We multiply ``pb * self.scaling``
+        here so the net inference effect is
+        ``(x @ A) @ (B·s) · 1.0 = s · (x · A · B)`` — the correct PEFT LoRA
+        forward with one scaling application. If vLLM ever switches that
+        callsite to pass the per-adapter scaling instead of 1.0, this publish
+        MUST drop the ``* self.scaling`` multiplication or inference will see
+        ``scaling²`` and silently degrade output quality.
+
+        Locking: relies on the FT adapter being pre-loaded into a dedicated
+        served-LoRA slot at startup (see ``_maybe_share_ft_served_lora`` in
+        ``v1/worker/gpu_worker.py``). No inference request can land on this
+        slot, so the in-place write is race-free with concurrent inference.
+        FT admission is closed for the entire backward cycle (coordinator
+        keeps ``pending_backward=True`` until the child acks), so even FT
+        requests can't read the slot mid-publish."""
         if not self.lora_buffers:
             return
         slot = int(self.lora_buffers["slot"])

@@ -55,7 +55,13 @@ class FinetuneInjector:
         self._counter = 0
 
     def next_ft_requests(self, token_budget: int) -> list[Request]:
-        """Greedily pack FT samples up to `token_budget` tokens into Requests."""
+        """Greedily pack FT samples up to `token_budget` tokens into Requests.
+        Claims the chosen samples in the store (removing them from the
+        selectable pool); the scheduler is responsible for
+        ``commit_claimed`` after the backward finishes, or
+        ``release_claimed`` on rollback. Each emitted Request carries its
+        source sample at ``req._ft_sample`` so downstream code can route
+        commit/release without a secondary lookup table."""
         if token_budget <= 0 or self.store.data_path is None:
             return []
         popped = []
@@ -71,8 +77,9 @@ class FinetuneInjector:
 
         if not popped:
             return []
-        # Mark trained so the next step draws different samples (cycles epochs).
-        self.store.confirmed_trained(popped)
+        # Claim samples: remove from selectable pool but defer trained=True
+        # until the backward acks via commit_claimed.
+        self.store.claim(popped)
         return [self._make_request(s) for s in popped]
 
     def _make_request(self, sample) -> Request:
@@ -86,4 +93,6 @@ class FinetuneInjector:
             block_hasher=self.block_hasher,
         )
         req.is_finetuning = True
+        # Source sample reference for the store's commit/release routing.
+        req._ft_sample = sample
         return req

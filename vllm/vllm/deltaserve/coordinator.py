@@ -23,11 +23,22 @@ All decisions are printed via ``dprint`` (green, main process).
 import csv
 import datetime
 import os
+import threading
 import time
 
 import torch
 
 from vllm.deltaserve import dprint
+
+
+class FTAborted(Exception):
+    """[forward_interruptible / tier C] Sentinel raised from an FT activation
+    hook when ``FinetuneCoordinator.ft_abort_event`` is set mid-forward
+    (signal: a late inference ADD arrived while an FT-only batch was on the
+    GPU). Caught at ``execute_model``'s outermost boundary, which then runs
+    ``_rollback_ft_step`` and returns an empty ModelRunnerOutput. Narrowly
+    typed so nothing else in PyTorch swallows it."""
+    pass
 
 _COORDINATOR: "FinetuneCoordinator | None" = None
 
@@ -62,6 +73,17 @@ class FinetuneCoordinator:
         # buffer-write order); forwarded to the backward process so it can split
         # the flat buffers into samples and shift-by-1 for next-token targets.
         self.sample_lens: list[int] = []
+        # Parallel to ``sample_lens``: the source FinetuningSample objects in
+        # buffer-write order. Used to call ``store.commit_claimed`` when the
+        # backward acks completion (via ``on_backward_done`` below), so the
+        # "trained=True" bit is only set after a backward has actually
+        # processed the sample's activations (fixes the prior behaviour of
+        # marking samples trained at admit time). [forward_interruptible]
+        self.buffer_samples: list = []
+        # Hook invoked from poll_backward on success with the FinetuningSample
+        # list that was in the buffer. Set by the scheduler at init; defaults
+        # to no-op so non-FT paths / tests are unaffected.
+        self.on_backward_done = None
         self.admission_open = True
         self.pending_backward = False
         # [async] An epoch boundary was reached (set by the scheduler when the
@@ -127,6 +149,19 @@ class FinetuneCoordinator:
         # full-device synchronize) to guarantee the capture copies are visible
         # to the backward process before it reads the shared buffer.
         self.capture_done_evt = None
+        # [forward_interruptible / tier C] Set by the input-socket thread on
+        # every ADD that lands while ``ft_only_in_flight`` is True. Checked
+        # by the activation hooks at every layer boundary; when set, the
+        # hook raises ``FTAborted`` and ``execute_model`` rolls back.
+        # threading.Event so the cross-thread set/check is GIL-safe and the
+        # cost when not set is one C-level bool load.
+        self.ft_abort_event = threading.Event()
+        # [forward_interruptible / tier C] True only while an FT-only forward
+        # is on the GPU. Cheap gate for the input thread so the abort-event
+        # set is skipped entirely when no FT-only batch is running. Set
+        # before kernel dispatch in execute_model and cleared in its
+        # finally block.
+        self.ft_only_in_flight = False
 
     def push_sample(self, features, duration, was_graph, predicted) -> None:
         self._completed_samples.append((features, duration, was_graph, predicted))
@@ -159,20 +194,60 @@ class FinetuneCoordinator:
         # the scheduler reserves a per-step offset via reserve().)
         return self.fill_count + self.reserved_fill
 
-    def reserve(self, n: int) -> int:
+    def reserve(self, n: int, samples: list | None = None) -> int:
         """Reserve n FT rows for a scheduled step and return the buffer write
         offset they own. Called by the scheduler AFTER the FT partition (only the
-        rows that actually scheduled). Committed by record_capture post-forward."""
+        rows that actually scheduled). Committed by record_capture post-forward.
+
+        ``samples`` is the parallel list of FinetuningSamples (one per
+        scheduled FT request) — appended to ``buffer_samples`` so the
+        backward-done hook can later commit-train exactly the samples whose
+        activations contributed to that backward."""
         offset = self.fill_count + self.reserved_fill
         self.reserved_fill += int(n)
+        if samples:
+            self.buffer_samples.extend(samples)
         return offset
+
+    def release_reserve(self, n: int, samples: list | None = None) -> None:
+        """[forward_interruptible] Symmetric counterpart to ``reserve``: undo
+        the bump when the FT scheduling for a step is rolled back (Phase B
+        post-schedule pre-empt) or its forward is aborted (Phase C mid-
+        forward abort). Clamps at 0 so a stray over-release can't drive
+        ``reserved_fill`` negative. Also drops the matching samples from
+        ``buffer_samples`` (by request_id) so the next backward-commit
+        doesn't try to commit-train samples that never had their activations
+        actually saved."""
+        self.reserved_fill = max(0, self.reserved_fill - int(n))
+        if samples and self.buffer_samples:
+            drop = {s.request_id for s in samples}
+            self.buffer_samples = [
+                s for s in self.buffer_samples if s.request_id not in drop]
+
+    def snapshot_admission(self) -> tuple:
+        """[forward_interruptible] Capture the flags ``note_injection`` may
+        flip during this ``schedule()`` call so ``_rollback_ft_step`` can
+        restore them. Notably does NOT include ``reserved_fill`` — that's
+        undone via ``release_reserve(n)``, and restoring a snapshotted
+        ``reserved_fill`` would clobber any intervening commit (e.g. a prior
+        in-flight FT batch's ``record_capture`` between the snapshot of N+1
+        and the rollback of N+1 under pipelined stepping). Only the
+        scheduler-only state goes here."""
+        return (self.admission_open, self.epoch_flush_pending)
+
+    def restore_admission(self, snap: tuple) -> None:
+        """[forward_interruptible] Inverse of ``snapshot_admission``. Only
+        restores ``admission_open`` + ``epoch_flush_pending``; reserved_fill
+        is the responsibility of ``release_reserve`` (see snapshot docstring)."""
+        self.admission_open, self.epoch_flush_pending = snap
 
     def request_epoch_flush(self) -> None:
         """Scheduler signals the corpus epoch has drained; the flush fires once
         in-flight saves settle (reserved_fill == 0)."""
         self.epoch_flush_pending = True
 
-    def note_injection(self, next_sample_len: int | None) -> None:
+    def note_injection(self, next_sample_len: int | None,
+                       admitted_now: int = 0) -> None:
         """Called by the scheduler right after each FT injection, with the
         smallest sample that could still be added (peek-next, no mark; None if
         the epoch is drained). Raises the flush flag (``epoch_flush_pending``)
@@ -181,12 +256,21 @@ class FinetuneCoordinator:
         partial buffer gets trained instead of wedging at a near-full level
         during idle. The backward trigger (``record_capture`` / ``try_epoch_flush``)
         consumes the flag and ``_trigger_backward`` unsets it. No-op on an empty
-        buffer (nothing to train) or while a backward is already pending."""
+        buffer (nothing to train) or while a backward is already pending.
+
+        ``admitted_now`` is the FT token count just admitted in this same
+        schedule call, BEFORE ``reserve()`` runs. Under async scheduling we want
+        the close check to use POST-admit free space (``space_remaining`` -
+        ``admitted_now``); otherwise the admission_open flag is one schedule()
+        call late under pipelining (the next schedule sees correct budget via
+        ``reserved_fill`` so this isn't a correctness bug — just lets the engine
+        skip an empty FT-only step and reach idle/inference sooner)."""
         if self.pending_backward:
             return
-        if (self.fill_count + self.reserved_fill) <= 0:
+        if (self.fill_count + self.reserved_fill + admitted_now) <= 0:
             return
-        if next_sample_len is None or next_sample_len > self.space_remaining():
+        effective_space = self.space_remaining() - admitted_now
+        if next_sample_len is None or next_sample_len > effective_space:
             self.epoch_flush_pending = True
             self.admission_open = False
 
@@ -271,7 +355,13 @@ class FinetuneCoordinator:
             self.backward_process.set_pause(False)
 
     def poll_backward(self) -> None:
-        """Non-blocking: reopen admission once the backward pass has finished."""
+        """Non-blocking: reopen admission once the backward pass has finished.
+
+        On completion, invokes ``on_backward_done(buffer_samples)`` (set by
+        the scheduler at init) so the store can call ``commit_claimed`` on
+        exactly the samples whose activations were just trained on. Done
+        BEFORE clearing ``buffer_samples`` so the hook sees the full list.
+        """
         if not self.pending_backward or self.backward_process is None:
             return
         resp = self.backward_process.poll_response()
@@ -280,16 +370,27 @@ class FinetuneCoordinator:
                     and resp.get("event") == "activations_processed"):
                 self._write_bwd_log_row(
                     int(resp.get("n", 0)), resp.get("loss"))
+            # Commit the in-buffer claimed samples → trained=True (one-shot
+            # snapshot so the hook can mutate state freely).
+            if self.on_backward_done is not None and self.buffer_samples:
+                trained_now = list(self.buffer_samples)
+                try:
+                    self.on_backward_done(trained_now)
+                except Exception as e:
+                    dprint(f"[coord] on_backward_done hook failed: {e}")
             self.fill_count = 0
             self.reserved_fill = 0
             self.sample_lens = []
+            self.buffer_samples = []
             self.pending_backward = False
             self.admission_open = True
 
     def _write_bwd_log_row(self, n: int, loss) -> None:
         """Append one finetune-throughput row to bwd_log_path. Timestamp is
-        ISO-second wall-clock (when the backward reported done), matching the
-        format the eval plotter parses."""
+        ISO wall-clock (milliseconds) when the backward reported done — fine
+        enough for ~80ms backward cadence, so multiple backwards in the same
+        second don't collapse into one bucket on the eval plotter's
+        time-aligned throughput band."""
         try:
             self._bwd_idx += 1
             self._bwd_total_tokens += int(n)
@@ -304,7 +405,7 @@ class FinetuneCoordinator:
                                 "batch_tokens", "batch_loss",
                                 "total_processed_tokens"])
                 w.writerow([
-                    datetime.datetime.now().isoformat(timespec="seconds"),
+                    datetime.datetime.now().isoformat(timespec="milliseconds"),
                     self.current_epoch, self._bwd_idx, int(n),
                     "" if loss is None else loss, self._bwd_total_tokens,
                 ])

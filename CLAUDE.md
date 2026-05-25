@@ -39,9 +39,13 @@ DeltaServe-vLLM/                    ← this repo root (where we write integrati
 
 ## Current status
 
-**Phases 1–4 code-complete & GPU-validated end-to-end on the 5090 (Phases 1–3 gradcheck-verified).**
-The real co-serving training loop works on Llama-3-8B; opt-125m is a frozen loss-only reference path.
-The `_maybe_pause` GPU-yielding contract is wired (prefill-gated, fire-and-forget).
+**Phases 1–4 code-complete & GPU-validated end-to-end on the 5090 (Phases 1–3
+gradcheck-verified). Phase 6 (`forward_interruptible`) + Phase 6.1 (slice activation
+save) code-complete; GPU validation of the pre-emption pipeline is the user's next
+run.** The real co-serving training loop works on Llama-3-8B; opt-125m is a frozen
+loss-only reference path. The `_maybe_pause` GPU-yielding contract is wired
+(prefill-gated, fire-and-forget). The `forward_interruptible` pre-emption pipeline
+defaults to OFF — when off, behaviour is bit-identical to pre-Phase-6.
 
 **Key Phase-4 finding (read this):** the inference-TTFT spikes that closed FT admission were **not**
 co-serving / GPU / backward contention — they were a **vLLM frontend** stall. vLLM attaches per-step
@@ -49,10 +53,38 @@ co-serving / GPU / backward contention — they were a **vLLM frontend** stall. 
 stalling HTTP accept + SSE streaming. Fix: **`disable_log_stats` now auto-defaults ON whenever
 `enable_finetuning`** (`engine/arg_utils.py:create_engine_config`); the SLO estimator uses its own
 engine-side timing, so it's unaffected. Frontend output processing can also be sharded with
-`--api-server-count N` (1 shared EngineCore + N frontends). **Current focus: optimizing inference
-E2E latency under co-serving — the SLO gate is over-admitting FT.** Lever:
-`finetune.ft_tokens_admission_constrain_factor` (cap FT tokens ≤ `prefill_tokens · factor` per step;
-`-1` disables).
+`--api-server-count N` (1 shared EngineCore + N frontends).
+
+**Phase 6 (`forward_interruptible`) — three-tier inference pre-emption of FT-only stepping.**
+Behind one config flag (`finetune.forward_interruptible`, default `False` → bit-identical
+to today when off). When on, late-arriving inference requests pre-empt FT-only stepping at
+three windows: **(A)** pre-schedule grace poll on `input_queue` (default 2 ms via
+`ft_only_admission_grace_ms`); **(B)** post-schedule rollback when an arrival lands between
+`schedule()` and `execute_model()` (releases KV + claimed samples + reservation, re-schedules
+once); **(C)** mid-forward abort — per-layer hooks in `accumulate.py` raise `FTAborted` when
+the input-socket thread sets `coord.ft_abort_event`, runner zeros the partial-write tail
+and returns a sentinel, engine rolls back. Also introduces the 3-phase store API
+(`claim` / `commit_claimed` / `release_claimed`), which fixes the pre-existing bookkeeping
+flaw of marking samples `trained=True` at admit time before any backward processed them.
+
+**Phase 6.1 — slice-based FT activation save.** Per-layer hooks gather FT rows via
+`val[start:start+n]` (a view) instead of `val[mask]` (an `index_select` kernel) on the
+fast path; mask gather kept as silent fallback when the FT-True positions are interleaved
+(which can happen when an FT request fills a freed inference slot mid-batch).
+
+**Eval tooling fixes.** Throughput-panel alignment: `auto_benchmark.py` now writes
+`bench_meta<suffix>.json` with the recording-phase wall-clock t=0, and `auto_plot.py`
+anchors the FT (wall-clock) series to it so inference and FT peaks share the same time
+origin. Backward-log timestamps are now millisecond-resolution
+(`isoformat(timespec="milliseconds")`) so per-backward events at ~80 ms cadence don't
+collapse into 1-Hz buckets.
+
+**Current focus:** GPU-validating the `forward_interruptible` pipeline on the existing
+`eval/auto_benchmark.py` replay (P99 TTFT outlier reduction is the headline metric).
+Independent lever (orthogonal to Phase 6): `finetune.ft_tokens_admission_constrain_factor`
+(cap FT tokens ≤ `prefill_tokens · factor` per step; `-1` disables) — still useful for
+trading FT throughput against inference latency when pre-emption is off or for tuning the
+SLO gate's admission shape.
 
 Two living docs track the detail:
 
@@ -95,11 +127,14 @@ What works today (single-GPU, verified on the 5090):
   server and `auto_plot.py` renders the 4-panel latency/throughput/SLO figure.
   (Configs: `configs/serving_config_finetuning_{llama3,opt}.yaml`.)
 
-Next: **optimize inference-request E2E latency under co-serving** — the SLO gate currently
-over-admits FT, so co-serving inflates inference E2E more than the SLOs intend. Tune the admission
-budgets / estimator and use `ft_tokens_admission_constrain_factor`. Then **Phase 5** — backward CUDA
-graphs + attention batching. Known open issues: FT loss divergence in the loose-co eval run
-(training-quality, not the SLO gate); avg-TBT admission gate deferred.
+Next: **GPU-validate `forward_interruptible` on the eval replay** (set
+`finetune.forward_interruptible: true` in the YAML, re-run `eval/auto_benchmark.py --co`,
+compare TTFT P50/P95/P99 vs the same replay with the feature off). Then **Phase 5** —
+backward CUDA graphs + attention batching. Known open issues: FT loss divergence in the
+loose-co eval run (training-quality, not the SLO gate); avg-TBT admission gate deferred;
+pre-existing minor leak in the runner's `self.requests` (`CachedRequestState`) for FT
+requests — they're never added to `finished_req_ids`, so the per-request state lingers
+(small, bounded by `num FT requests ever`, not a correctness issue).
 
 > Historical note: the original Phase-1 plan called the activation save "capture"; it
 > was renamed **accumulate** to avoid confusion with CUDA-graph capture.
@@ -200,6 +235,15 @@ phase's test passes.
    throughput; admission backs off under inference bursts.
 5. **Phase 5 (later) — optimizations & assets.** Backward CUDA graphs, dedicated FT activation
    pool if needed, eval/analysis tooling port, multi-TP correctness.
+6. **Phase 6 — inference pre-emption of FT-only stepping (`forward_interruptible`). ✅ code.**
+   Three tiers (A: pre-schedule grace; B: post-schedule rollback; C: mid-forward abort via
+   per-layer hooks) behind one config flag. Adds the 3-phase store API (`claim` /
+   `commit_claimed` / `release_claimed`) and an `FTAborted` sentinel for the runner/engine
+   to thread. Default off → bit-identical behaviour. Pending: GPU validation on the eval
+   replay (target: P99 TTFT outlier reduction from ~80 ms toward ~30 ms).
+7. **Phase 6.1 — slice-based FT activation save. ✅ code.** Per-layer hooks gather FT
+   rows via a slice view instead of `index_select` on the fast path; mask gather is the
+   silent fallback when FT positions are interleaved with non-FT.
 
 ## Key DeltaServe co-serving contracts to preserve (from DeltaServe/CLAUDE.md)
 
@@ -222,3 +266,12 @@ phase's test passes.
 5. For Phase 1: `DeltaServe/dserve/server/router/model_infer/model_rpc.py:120-195`
    (spawn + MPS + buffer share) and `vllm/vllm/v1/worker/gpu_worker.py`
    (`Worker.__init__`, `init_device`, `load_model`) + `vllm/vllm/v1/engine/tensor_ipc.py`.
+6. For Phase 6 (`forward_interruptible`): the plan file
+   `.claude/plans/can-you-make-a-elegant-cherny.md` for the end-to-end design +
+   verification path; in-tree the integration points are
+   `vllm/vllm/deltaserve/coordinator.py` (`FTAborted`, abort event, snapshot/restore),
+   `vllm/vllm/deltaserve/finetuning_store.py` (3-phase claim/commit/release API),
+   `vllm/vllm/deltaserve/ft_scheduler.py:_rollback_ft_step`,
+   `vllm/vllm/deltaserve/accumulate.py` (hook abort check + slice fast path),
+   `vllm/vllm/v1/engine/core.py` (tiers A + B + sentinel routing), and
+   `vllm/vllm/v1/worker/gpu_model_runner.py` (tier C abort wrap + entry-time check).

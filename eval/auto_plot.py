@@ -130,10 +130,18 @@ def load_timeline(csv_path: str) -> dict:
             "row_id": np.arange(len(ts), dtype=float)}
 
 
-def parse_bwd_log_csv(csv_path: str):
+def parse_bwd_log_csv(csv_path: str, t0_wall: Optional[datetime.datetime] = None):
     """Returns (rel_time_s, cum_tokens, avg_tok_s). Columns:
     timestamp, ..., batch_tokens, total_processed_tokens. Missing/empty ->
-    empty arrays (FT band just won't render)."""
+    empty arrays (FT band just won't render).
+
+    ``t0_wall`` (if given) anchors the returned ``rel_time_s`` to that wall
+    clock — must match the inference log's t=0 origin so the two series
+    align on the same time axis. If None, falls back to anchoring at the
+    first row's wall clock (legacy behaviour; shifts FT left by the
+    benchmark-to-first-backward gap and makes inference/FT peaks appear
+    in-phase when they're really antiphase).
+    """
     if not os.path.exists(csv_path):
         return np.array([]), np.array([]), float("nan")
     has_total = False
@@ -152,17 +160,27 @@ def parse_bwd_log_csv(csv_path: str):
             rows.append((dt, total_val, _f(row.get("batch_tokens"))))
     if not rows:
         return np.array([]), np.array([]), float("nan")
-    # Collapse same-second rows to the last (1s timestamp resolution).
+    # De-dup by timestamp keeping the last row at each instant. With the
+    # current ms-resolution writer this is effectively a no-op (timestamps
+    # are unique per backward); kept for backwards-compat with old s-
+    # resolution logs that collapsed multiple backwards per second.
     dedup = {}
     for dt, total_val, batch_tok in rows:
         dedup[dt] = (total_val, batch_tok)
     items = sorted(dedup.items(), key=lambda x: x[0])
-    t0 = items[0][0]
-    rel = np.array([(dt - t0).total_seconds() for dt, _ in items], dtype=float)
+    anchor = t0_wall if t0_wall is not None else items[0][0]
+    rel = np.array([(dt - anchor).total_seconds() for dt, _ in items], dtype=float)
     if has_total:
         cum = np.array([v[0] for _, v in items], dtype=float)
     else:
         cum = np.cumsum(np.array([v[1] for _, v in items], dtype=float))
+    # Drop rows that fall strictly before the anchor (can happen at sub-second
+    # granularity around the benchmark start cutoff); the FT throughput math
+    # downstream assumes monotonically increasing rel times >= 0.
+    if rel.size and (rel < 0).any():
+        keep = rel >= 0
+        rel = rel[keep]
+        cum = cum[keep]
     elapsed = float(rel[-1]) if len(rel) else 0.0
     total = float(cum[-1]) if len(cum) else 0.0
     return rel, cum, (total / elapsed if elapsed > 0 else float("nan"))
@@ -388,14 +406,29 @@ def make_figure_for_mode(mode, base_suffix, output_dir, plots_dir,
     full = f"{base_suffix}_{mode}"
     results_csv = os.path.join(output_dir, f"timeline_results{full}.csv")
     bwd_log_csv = os.path.join(output_dir, f"bwd_log{full}.csv")
+    meta_json = os.path.join(output_dir, f"bench_meta{full}.json")
     timeline_csv = os.path.join(timeline_csv_dir, f"timeline_{mode}.csv")
-    # results + timeline required; bwd_log optional (no-co runs).
+    # results + timeline required; bwd_log + meta optional (no-co runs / old runs).
     ensure_exists(timeline_csv)
     ensure_exists(results_csv)
 
     tl = load_timeline(timeline_csv)
     res = load_results(results_csv)
-    bwd_log = parse_bwd_log_csv(bwd_log_csv)
+    # Pick up the benchmark's wall-clock t0 from the meta file if present, so
+    # the FT series anchors at the same origin as the inference series. Falls
+    # back to first-bwd-row anchoring (legacy behaviour) if missing.
+    t0_wall = None
+    if os.path.exists(meta_json):
+        try:
+            import json as _json
+            with open(meta_json) as f:
+                _meta = _json.load(f)
+            _iso = _meta.get("t_first_wall_iso")
+            if _iso:
+                t0_wall = datetime.datetime.fromisoformat(_iso)
+        except Exception as _e:
+            print(f"[auto_plot] meta load failed ({meta_json}): {_e}")
+    bwd_log = parse_bwd_log_csv(bwd_log_csv, t0_wall=t0_wall)
     color = MODE_COLORS.get(mode, "tab:gray")
 
     fig, axes = plt.subplots(1, 4, figsize=(24, 5))
@@ -441,7 +474,7 @@ def main():
                     help="TTFT SLO (s). Default: slo.ttft_slo from the finetuning YAML.")
     ap.add_argument("--config-yaml", default=CONFIG_YAML)
     ap.add_argument("--window", type=float, default=5.0)
-    ap.add_argument("--throughput-window", type=float, default=None)
+    ap.add_argument("--throughput-window", type=float, default=3)
     args = ap.parse_args()
 
     slo_s = args.slo

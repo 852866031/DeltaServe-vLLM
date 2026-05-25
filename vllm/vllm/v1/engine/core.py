@@ -434,6 +434,16 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+        # [forward_interruptible / tier B] If a request landed between the
+        # prior drain and now and the just-built batch is FT-only, undo it
+        # and re-schedule so the late arrival rides this step.
+        _rb = self._maybe_rollback_ft_for_late_arrival(scheduler_output)
+        if _rb is not None:
+            scheduler_output = _rb
+        # [DeltaServe] log the moment the scheduler emits a non-decode-only
+        # batch (about to be handed to the executor). Pairs with [batch ...]
+        # (host launch) and [batch-done] (GPU completion) for a 3-point view.
+        self._maybe_log_batch_scheduled(scheduler_output)
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -444,6 +454,21 @@ class EngineCore:
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
 
+        # [DeltaServe] mark the point at which the host knows this batch's
+        # forward is done (future.result() above unblocks on GPU completion
+        # under async). Pairs with the [batch ...] launch log so you can see
+        # actual GPU wall time per scheduled batch. No new sync — the .result()
+        # above already blocked.
+        self._maybe_log_batch_done(scheduler_output)
+
+        # [forward_interruptible / tier C] The runner returns an empty
+        # sentinel ModelRunnerOutput with ``_ft_aborted=True`` when a hook
+        # bailed the forward mid-flight. Roll back the FT scheduling and
+        # skip update_from_output (the output has no real per-request data).
+        if getattr(model_output, "_ft_aborted", False):
+            self.scheduler._rollback_ft_step(scheduler_output)
+            return {}, False
+
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
@@ -452,6 +477,71 @@ class EngineCore:
         )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+
+    def _classify_batch_for_log(
+        self, scheduler_output
+    ) -> tuple[int, int, int] | None:
+        """[DeltaServe] Decode-only / zero-token gate shared by [batch-sched]
+        and [batch-done]. Returns (total, prefill, ft) if the batch should be
+        logged, or None for zero-token / decode-only batches (matches the
+        launch-side [batch ...] gate in
+        gpu_model_runner._log_finetuning_batch). Callers MUST check their own
+        per-print flag before invoking — this only does the per-batch shape
+        check, not the config gate, so the hot path is one bool load when the
+        flag is off."""
+        total = scheduler_output.total_num_scheduled_tokens
+        if total == 0:
+            return None  # empty step (FT closed + no inference) — nothing ran
+        ft_ids = getattr(scheduler_output, "finetune_req_ids", set())
+        new_ids = {r.req_id for r in scheduler_output.scheduled_new_reqs}
+        ft = 0
+        prefill = 0
+        for rid, nt in scheduler_output.num_scheduled_tokens.items():
+            if rid in ft_ids:
+                ft += nt
+            elif rid in new_ids or nt > 1:
+                prefill += nt
+        if prefill == 0 and ft == 0:
+            return None  # decode-only — match the [batch ...] log's gate
+        return total, prefill, ft
+
+    def _maybe_log_batch_scheduled(self, scheduler_output) -> None:
+        """[DeltaServe] One-line log right after schedule() returns a
+        non-decode-only batch. Gated on ``print_scheduler_add`` (or the
+        ``print_step_mode`` master switch). Useful for measuring host-side
+        prep time (gap to [batch]) and scheduling cadence under async
+        pipelining (multiple [batch-sched] before the first [batch-done] =
+        schedule(N+1) overlapping forward(N))."""
+        _ftc = self.vllm_config.finetune_config
+        # Hot-path early-out: one attribute load + short-circuit OR. No
+        # classify / string-format / time call when both flags are off.
+        if not (_ftc.print_scheduler_add or _ftc.print_step_mode):
+            return
+        cls = self._classify_batch_for_log(scheduler_output)
+        if cls is None:
+            return
+        total, _prefill, ft = cls
+        import time as _t
+        from vllm.deltaserve import dprint
+        _ts = _t.strftime("%H:%M:%S") + f".{int((_t.time() % 1) * 1000):03d}"
+        dprint(f"[batch-sched {_ts}] total={total} ft={ft}")
+
+    def _maybe_log_batch_done(self, scheduler_output) -> None:
+        """[DeltaServe] One-line log right after future.result() unblocks on
+        GPU completion. Gated on ``print_engine_batch_done`` (or
+        ``print_step_mode``). Total/ft match [batch-sched] and [batch] so the
+        three correlate by (total, ft)."""
+        _ftc = self.vllm_config.finetune_config
+        if not (_ftc.print_engine_batch_done or _ftc.print_step_mode):
+            return
+        cls = self._classify_batch_for_log(scheduler_output)
+        if cls is None:
+            return
+        total, _prefill, ft = cls
+        import time as _t
+        from vllm.deltaserve import dprint
+        _ts = _t.strftime("%H:%M:%S") + f".{int((_t.time() % 1) * 1000):03d}"
+        dprint(f"[batch-done {_ts}] total={total} ft={ft}")
 
     def _profiling_step(self) -> None:
         """One synchronous schedule→execute→update step for the launch profiler.
@@ -667,6 +757,17 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
+            # [forward_interruptible / tier B] Pre-empt an FT-only batch if a
+            # late inference arrival landed before kernels are launched.
+            _rb = self._maybe_rollback_ft_for_late_arrival(scheduler_output)
+            if _rb is not None:
+                scheduler_output = _rb
+            # [DeltaServe] log the moment the scheduler emits a non-decode-only
+            # batch. Under step_with_batch_queue this fires BEFORE the prior
+            # batch's [batch-done] when pipelining is overlapping schedule(N+1)
+            # with forward(N); that ordering is the visible signal that async
+            # scheduling is working.
+            self._maybe_log_batch_scheduled(scheduler_output)
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -676,6 +777,17 @@ class EngineCore:
 
             if self.is_pooling_model or not model_executed:
                 # No sampling required (no requests scheduled).
+                future = cast(Future[ModelRunnerOutput], exec_future)
+            elif (exec_future.done()
+                  and getattr(exec_future.result(), "_ft_aborted", False)):
+                # [forward_interruptible / tier C] Entry-time abort path:
+                # the runner returned its sentinel ModelRunnerOutput WITHOUT
+                # setting execute_model_state, so calling sample_tokens here
+                # would return None (gpu_model_runner.sample_tokens early-
+                # exits on missing state) and trip the "unexpected error"
+                # check at the bottom of this function. Route the sentinel
+                # straight through as the batch_queue future; the abort
+                # handler after pop() will see _ft_aborted and roll back.
                 future = cast(Future[ModelRunnerOutput], exec_future)
             else:
                 if not scheduler_output.pending_structured_output_tokens:
@@ -723,12 +835,29 @@ class EngineCore:
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
 
-        # Before processing the model output, process any aborts that happened
-        # during the model execution.
-        self._process_aborts_queue()
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
-        )
+        # [DeltaServe] this batch's forward is now known done (future.result()
+        # above unblocked on GPU completion). Pairs with the launch-side
+        # [batch ...] log so per-batch GPU latency is visible. Under
+        # step_with_batch_queue this fires for the OLDEST in-flight batch, so
+        # the log order matches the queue pop order, not the schedule order.
+        self._maybe_log_batch_done(scheduler_output)
+
+        # [forward_interruptible / tier C] Rollback if the runner bailed the
+        # forward mid-flight. The output sentinel has no real per-request
+        # data, so skip update_from_output. Don't return early — the
+        # deferred-sampling path below applies to the NEXT batch (which may
+        # be a real inference batch with structured output / spec decode),
+        # so falling through with empty engine_core_outputs is correct.
+        if getattr(model_output, "_ft_aborted", False):
+            self.scheduler._rollback_ft_step(scheduler_output)
+            engine_core_outputs: dict[int, EngineCoreOutputs] = {}
+        else:
+            # Before processing the model output, process any aborts that
+            # happened during the model execution.
+            self._process_aborts_queue()
+            engine_core_outputs = self.scheduler.update_from_output(
+                scheduler_output, model_output
+            )
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -1079,6 +1208,14 @@ class EngineCoreProc(EngineCore):
                 internal_dp_balancing,
             )
 
+            # [forward_interruptible / tier C] Cache the coordinator handle
+            # for the input thread so it can set the abort event on ADD
+            # without an attribute walk through the scheduler. None when
+            # finetuning is off (the cheap-gate check in process_input_sockets
+            # then short-circuits on the None check alone).
+            self._ft_coord_handle = getattr(
+                self.scheduler, "_coord", None)
+
             # Background Threads and Queues for IO. These enable us to
             # overlap ZMQ socket IO with GPU since they release the GIL,
             # and to overlap some serialization/deserialization with the
@@ -1404,8 +1541,94 @@ class EngineCoreProc(EngineCore):
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
 
+    def _maybe_rollback_ft_for_late_arrival(self, scheduler_output):
+        """[forward_interruptible / tier B] If ``schedule()`` produced an
+        FT-only batch AND a request landed on ``input_queue`` in the window
+        between the prior drain and now, abandon the FT batch, admit the
+        arrival(s), and re-call ``schedule()`` so the inference request can
+        ride the upcoming step instead of waiting through an FT-only
+        forward. Bounded to one retry — if the re-scheduled batch is also
+        FT-only (e.g. the arrival was an ABORT), we proceed with it.
+
+        Returns the new ``SchedulerOutput`` on rollback, or None if no
+        rollback fired (caller uses the original output). Fast-exit when
+        ``forward_interruptible`` is off or the batch isn't FT-only.
+        """
+        _ftc = getattr(self.vllm_config, "finetune_config", None)
+        if _ftc is None or not _ftc.forward_interruptible:
+            return None
+        total = scheduler_output.total_num_scheduled_tokens
+        if total == 0:
+            return None
+        ft_ids = getattr(scheduler_output, "finetune_req_ids", None)
+        # FT-only iff every scheduled request id is in finetune_req_ids
+        # (length match is the cheap form of that check — a non-FT request
+        # in the batch wouldn't be in finetune_req_ids).
+        if not ft_ids or len(ft_ids) != len(
+                scheduler_output.num_scheduled_tokens):
+            return None
+        if self.input_queue.empty():
+            return None
+        # Roll back the FT scheduling so the samples / KV / admission flags
+        # look like schedule() never ran.
+        sched = self.scheduler
+        if not hasattr(sched, "_rollback_ft_step"):
+            return None  # not a FinetuneScheduler — defensive
+        sched._rollback_ft_step(scheduler_output)
+        # Drain everything that landed (may include the ABORT that prompted
+        # the trip too — _handle_client_request is the right entry point
+        # for all request types).
+        while True:
+            try:
+                req = self.input_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._handle_client_request(*req)
+        # Re-schedule with the new requests visible.
+        return sched.schedule()
+
+    def _maybe_ft_only_grace_poll(self) -> None:
+        """[forward_interruptible / tier A] When the next schedule() call
+        would produce an FT-only batch, briefly block on ``input_queue`` to
+        catch inference arrivals that landed in the gap between the previous
+        drain and now. On hit, drain any siblings non-blockingly so a burst
+        of co-arriving requests all ride the same upcoming batch. Adds a
+        bounded wait only when (a) the feature is on, (b) a grace window is
+        configured, and (c) the scheduler reports no inference is queued —
+        so inference-bearing steps and the default (feature off) path are
+        unaffected.
+
+        Cheap fast-exit when off: one attribute load and a short-circuit OR.
+        """
+        _ftc = getattr(self.vllm_config, "finetune_config", None)
+        if _ftc is None or not _ftc.forward_interruptible:
+            return
+        grace_s = _ftc.ft_only_admission_grace_ms / 1000.0
+        if grace_s <= 0:
+            return
+        sched = self.scheduler
+        if not getattr(sched, "would_step_be_ft_only", lambda: False)():
+            return
+        try:
+            req = self.input_queue.get(timeout=grace_s)
+        except queue.Empty:
+            return
+        self._handle_client_request(*req)
+        # Drain any siblings that landed during the wait (burst arrivals).
+        while True:
+            try:
+                req = self.input_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._handle_client_request(*req)
+
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
+
+        # [forward_interruptible / tier A] If the next step would be FT-only,
+        # briefly wait on the input queue for inference arrivals so they can
+        # ride this step instead of waiting through an FT-only forward.
+        self._maybe_ft_only_grace_poll()
 
         # Step the engine core.
         outputs, model_executed = self.step_fn()
@@ -1477,7 +1700,8 @@ class EngineCoreProc(EngineCore):
             if self._reject_add_in_shutdown(req):
                 return
             _ftc = getattr(self.vllm_config, "finetune_config", None)
-            if _ftc is not None and _ftc.print_step_mode:
+            if _ftc is not None and (
+                    _ftc.print_engine_req_recv or _ftc.print_step_mode):
                 # Scheduler-side request counter (shared via the coordinator
                 # singleton) — drives the runner's "log every batch" mode.
                 _coord = getattr(self.scheduler, "_coord", None)
@@ -1678,6 +1902,18 @@ class EngineCoreProc(EngineCore):
 
                     # Push to input queue for core busy loop.
                     self.input_queue.put_nowait((request_type, request))
+
+                    # [forward_interruptible / tier C] Signal a mid-forward
+                    # abort if an inference ADD landed while an FT-only batch
+                    # is on the GPU. Cheap fast-exit when ft_only_in_flight
+                    # is False (typical case — no FT-only forward running):
+                    # one attribute load on the cached coord handle. Set on
+                    # the coordinator (shared with the main thread via the
+                    # process-wide singleton in deltaserve.coordinator).
+                    if request_type == EngineCoreRequestType.ADD:
+                        _coord = getattr(self, "_ft_coord_handle", None)
+                        if _coord is not None and _coord.ft_only_in_flight:
+                            _coord.ft_abort_event.set()
 
     def process_output_sockets(
         self, output_paths: list[str], coord_output_path: str | None, engine_index: int

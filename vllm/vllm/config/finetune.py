@@ -60,6 +60,28 @@ class FinetuneConfig:
     softmax, RMSNorm, LM head / final norm, fp32 LoRA master) are always fp32 either
     way. Set True for strictly more accurate gradients at ~2x backward matmul cost."""
 
+    backward_cuda_graph: bool = False
+    """Capture the FFN-backward and padded-attention-backward sub-regions of each
+    layer's manual SFT backward as CUDA graphs (one of each per layer), keyed at
+    the fixed activation-buffer width (max_saved_finetuning_tokens). Cuts host
+    dispatch overhead on Llama-3's 32-layer backward from ~3 ms toward ~0. Eager
+    fallback per-layer on capture or shape-fit failure; gradient values are
+    bit-identical to the eager path (same math, just replayed). _maybe_pause()
+    is preserved and called between the two graphs each layer, so the GPU-yield
+    contract for the Phase-5 pause and Phase-6 forward_interruptible paths is
+    unaffected. Default off; mirrors DeltaServe's SFT_service_graph.py."""
+
+    backward_cuda_graph_attn_bn_max: int = 8
+    """[backward_cuda_graph] Padded-attention max distinct samples per backward.
+    Batches with more samples silently fall back to the eager per-sample attention
+    loop for that one backward. Mirrors DeltaServe's ATTN_BN_MAX (=8 default)."""
+
+    backward_cuda_graph_attn_l_max: int = 64
+    """[backward_cuda_graph] Padded-attention max per-sample sequence length.
+    Batches whose max sample length exceeds this fall back to eager attention.
+    Quadratic in compute (scores tensor is [bn_max, Hq, l_max, l_max]); oversizing
+    tanks throughput. Mirrors DeltaServe's ATTN_L_MAX (=64 default)."""
+
     max_prepare: int | None = None
     """Cap on how many corpus lines to load (None = all). DeltaServe's
     finetune.prepare_size."""
@@ -127,6 +149,29 @@ class FinetuneConfig:
     finetune-throughput log the eval harness (eval/auto_plot.py) reads. None
     disables. Written from the coordinator when a backward reports done."""
 
+    # --- Inference pre-emption of FT-only stepping (A + B + C tiers) ---
+    forward_interruptible: bool = False
+    """Master switch for the inference-preemption pipeline. When True, late-
+    arriving inference requests can pre-empt FT-only stepping at three points:
+    (A) before ``schedule()`` commits — a small blocking grace poll on the
+    engine input queue when the next step would be FT-only; (B) between
+    ``schedule()`` and ``execute_model()`` — if the produced batch is FT-only
+    and an arrival landed in the meantime, the FT scheduling is rolled back
+    and re-tried; (C) during the FT-only forward itself — the input-socket
+    thread sets an abort event on each ADD while an FT-only batch is in
+    flight, and the per-layer activation hooks raise a sentinel exception
+    that ``execute_model`` catches and treats as an empty step. When False
+    (default), every hook short-circuits and behaviour is bit-identical to
+    today."""
+
+    ft_only_admission_grace_ms: float = 2.0
+    """[forward_interruptible] Tier-A grace window (ms) the engine main loop
+    blocks on the input queue before scheduling what would be an FT-only
+    step. Catches inference arrivals that landed in the window between the
+    previous busy-loop drain and the upcoming schedule call. Cost is roughly
+    ``ms / ft_forward_ms`` of FT throughput during idle; benefit scales with
+    inference QPS. Set 0 to disable A while keeping B and C."""
+
     # --- debug / observability ---
     print_weight_hash: bool = False
     """Print + cross-process compare the base/FT-adapter weight hashes at startup."""
@@ -135,5 +180,30 @@ class FinetuneConfig:
     """Print + cross-process compare the captured FT activation hashes (one-shot)."""
 
     print_step_mode: bool = False
-    """Print each step's (has_ft, cudagraph_mode) when it changes — used to verify
-    that non-finetuning batches run under a CUDA graph while FT batches run eager."""
+    """Convenience master switch: when True, enables all four per-batch /
+    per-request debug prints below (``print_scheduler_add``,
+    ``print_engine_batch_exec``, ``print_engine_batch_done``,
+    ``print_engine_req_recv``). Existing configs that set this flag continue
+    to get the same combined output. Set the individual flags below instead
+    if you want to enable just one or two of them."""
+
+    print_scheduler_add: bool = False
+    """[batch-sched] log: emitted right after ``scheduler.schedule()`` returns
+    a non-decode-only batch (about to be handed to the executor). One per
+    scheduled non-decode-only batch."""
+
+    print_engine_batch_exec: bool = False
+    """[batch] log: emitted inside the model runner's ``execute_model`` right
+    before kernel launch / cudagraph replay, for non-decode-only batches.
+    Includes per-sample decode KV sizes and whether the step ran as a graph."""
+
+    print_engine_batch_done: bool = False
+    """[batch-done] log: emitted on the engine main thread right after
+    ``future.result()`` unblocks on GPU completion of a non-decode-only batch.
+    Pairs with [batch-sched] / [batch] so per-batch GPU latency is visible."""
+
+    print_engine_req_recv: bool = False
+    """[engine-recv] log: emitted when the engine's main loop pulls a client
+    request (ADD) off the input queue and adds it to the scheduler. Timestamp
+    is when the MAIN thread drained the queue, not when the engine process
+    received the ZMQ message."""

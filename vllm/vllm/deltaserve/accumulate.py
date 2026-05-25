@@ -64,7 +64,25 @@ class FinetuneAccumulator:
         self._cur_mask = None
         self._cur_n = 0
         self._cur_offset = 0  # accumulating write offset into the buffers
+        # Slice fast-path: when the FT-token region is a contiguous span in
+        # the flat batch layout (the common case — FT requests at the end of
+        # waiting → at the tail of req_ids), hooks gather rows with a slice
+        # view instead of a boolean-mask index_select. Saves one CUDA kernel
+        # + one allocation per hook firing (~33 per Llama-3 FT forward).
+        # Falls back to the mask path when ``_cur_contiguous`` is False
+        # (e.g. an FT request landed in a freed inference slot mid-batch).
+        self._cur_start = 0
+        self._cur_contiguous = False
         self._handles: list = []
+        # [forward_interruptible / tier C] When set, each hook raises
+        # ``FTAborted`` after its copy work — bails the model forward at the
+        # current layer boundary so the engine can run inference instead.
+        # Wired to ``FinetuneCoordinator.ft_abort_event`` at runner setup;
+        # None disables the check (when forward_interruptible is off or no
+        # coordinator). One ``Event.is_set()`` call per hook firing — that's
+        # a C-level atomic bool load, the cheapest cross-thread signal
+        # available.
+        self._abort_event = None
 
         # Discover capture points by module name:
         #   layers.{i}.input_layernorm -> layer_in[i]   (auto-detected; absent on opt)
@@ -148,11 +166,26 @@ class FinetuneAccumulator:
                 val = args[0] + args[1]
             else:
                 val = args[0]
-            rows = val[self._cur_mask]
+            # Fast path: FT rows are a contiguous span [_cur_start,
+            # _cur_start + _cur_n). Slice is a view; no kernel, no alloc.
+            # Fallback: boolean-mask index_select (interleaved FT in batch).
+            if self._cur_contiguous:
+                rows = val[self._cur_start:self._cur_start + self._cur_n]
+            else:
+                rows = val[self._cur_mask]
             off = self._cur_offset
             n = min(rows.shape[0], self.max_saved - off)
             if n > 0:
                 buf[off:off + n].copy_(rows[:n].to(self.dtype))
+            # [forward_interruptible / tier C] After the copy (so the partial
+            # buffer state is at least consistent up to this layer), check
+            # the abort signal and bail at this layer boundary. Raising from
+            # a forward hook unwinds the model.forward() call via Python
+            # exception — execute_model catches FTAborted and rolls back.
+            _evt = self._abort_event
+            if _evt is not None and _evt.is_set():
+                from vllm.deltaserve.coordinator import FTAborted
+                raise FTAborted()
 
         return pre_hook
 
@@ -161,30 +194,62 @@ class FinetuneAccumulator:
             if not self._active or self._cur_n == 0:
                 return
             out = output[0] if isinstance(output, tuple) else output
-            rows = out[self._cur_mask]
+            if self._cur_contiguous:
+                rows = out[self._cur_start:self._cur_start + self._cur_n]
+            else:
+                rows = out[self._cur_mask]
             off = self._cur_offset
             n = min(rows.shape[0], self.max_saved - off)
             if n > 0:
                 buf[off:off + n].copy_(rows[:n].to(self.dtype))
+            # [forward_interruptible / tier C] See _make_pre_hook for the
+            # rationale. Bailing from a post-hook means the model still has
+            # work after gate_up_proj in this layer (down_proj + residual
+            # add + the next input_layernorm) — those will run before the
+            # next layer's pre_hook gets a chance to raise. Negligible
+            # extra cost; the pre_hook is the load-bearing check.
+            _evt = self._abort_event
+            if _evt is not None and _evt.is_set():
+                from vllm.deltaserve.coordinator import FTAborted
+                raise FTAborted()
 
         return out_hook
 
-    def begin_step(self, mask_gpu, num_ft: int, offset: int = 0) -> None:
+    def begin_step(self, mask_gpu, num_ft: int, offset: int = 0,
+                   start: int = 0, contiguous: bool = False) -> None:
+        """Arm the per-step accumulation state read by the hooks.
+
+        ``start`` / ``contiguous`` are the slice fast-path metadata. When
+        ``contiguous`` is True the hooks use ``val[start:start+num_ft]``
+        (a view, no kernel); otherwise they fall back to ``val[mask_gpu]``.
+        Default ``contiguous=False`` keeps callers that didn't pass the new
+        args on the mask path.
+        """
         self._cur_mask = mask_gpu
         self._cur_n = int(num_ft)
         self._cur_offset = int(offset)
+        self._cur_start = int(start)
+        self._cur_contiguous = bool(contiguous)
         self._active = True
 
     def accumulate_final(self, hidden_states, input_ids_flat, mask_gpu,
-                         num_ft: int, offset: int = 0) -> None:
+                         num_ft: int, offset: int = 0,
+                         start: int = 0, contiguous: bool = False) -> None:
+        """Save FT-token pre-LM-head hidden states + their input ids. Slice
+        fast path mirrors the per-layer hooks: when ``contiguous`` is True,
+        gather via ``[start:start+num_ft]`` (view); else mask-gather."""
         if num_ft == 0:
             return
-        rows = hidden_states[mask_gpu]
+        if contiguous:
+            rows = hidden_states[start:start + num_ft]
+            ids = input_ids_flat[start:start + num_ft]
+        else:
+            rows = hidden_states[mask_gpu]
+            ids = input_ids_flat[mask_gpu]
         n = min(rows.shape[0], self.max_saved - offset)
         if n <= 0:
             return
         self.final_hidden[offset:offset + n].copy_(rows[:n].to(self.dtype))
-        ids = input_ids_flat[mask_gpu]
         self.concat_input_ids[offset:offset + n].copy_(ids[:n].to(torch.int64))
 
     def end_step(self) -> None:
@@ -192,3 +257,32 @@ class FinetuneAccumulator:
         self._cur_mask = None
         self._cur_n = 0
         self._cur_offset = 0
+        self._cur_start = 0
+        self._cur_contiguous = False
+
+    def zero_offset_range(self, off: int, n: int) -> None:
+        """[forward_interruptible / tier C] Zero the [off:off+n] slice of
+        every hook-target buffer so the partial bytes from an aborted
+        forward don't leak into debugging / hashing flows. Safe to call
+        from the runner's abort path: ``fill_count`` already gates the
+        backward from reading these rows (so this is a hygiene-only step,
+        not correctness), but it makes the buffer state easy to reason
+        about and keeps an accidental re-read deterministic.
+
+        Cost: one GPU memset per buffer (32 layer_in + maybe final_in +
+        maybe 32 mlp_gate_up + concat_input_ids + final_hidden), each over
+        n rows of hidden-size — sub-millisecond in aggregate at typical
+        sizes."""
+        if n <= 0 or off < 0:
+            return
+        n = min(n, self.max_saved - off)
+        if n <= 0:
+            return
+        for buf in self.layer_in:
+            buf[off:off + n].zero_()
+        if self.final_in is not None:
+            self.final_in[off:off + n].zero_()
+        self.final_hidden[off:off + n].zero_()
+        self.concat_input_ids[off:off + n].zero_()
+        for buf in self.mlp_gate_up:
+            buf[off:off + n].zero_()

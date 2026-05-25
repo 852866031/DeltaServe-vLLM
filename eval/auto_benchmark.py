@@ -494,6 +494,19 @@ async def main() -> None:
             server, timeline_rows, stop, model, record=True, label="timeline")
         write_results_csv(out_csv, results)
 
+        # Persist the benchmark wall-clock t0 so the plotter can anchor the
+        # finetune log (which has wall-clock timestamps) to the same origin
+        # as the inference log (which is monotonic-relative to this same t0).
+        # Without this the FT series anchors at the first backward row's
+        # wall clock, which lags benchmark t0 by however long it took the
+        # first backward to fire — shifts the FT curve left and makes
+        # inference/FT peaks appear in-phase when they're actually antiphase.
+        if t_first_wall is not None:
+            import json as _json
+            meta_path = str(OUTPUT_DIR / f"bench_meta{suffix}.json")
+            with open(meta_path, "w") as f:
+                _json.dump({"t_first_wall_iso": t_first_wall.isoformat()}, f)
+
         # Give the server a moment to flush any in-flight backward row, then
         # trim the bwd_log to the timeline window.
         if args.co and bwd_log and t_first_wall is not None:
