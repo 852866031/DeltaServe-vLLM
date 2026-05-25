@@ -12,7 +12,7 @@ generation. Prints to watch for during startup (green in a TTY):
     [deltaserve] [backward] child ready pid=...
 
 Usage (inside the dserve-vllm conda env, with the CUDA env from
-vllm_setup_5090.md exported):
+README.md exported):
 
     HF_HUB_OFFLINE=1 python launch_deltaserve.py
     HF_HUB_OFFLINE=1 python launch_deltaserve.py --model facebook/opt-125m   # fast
@@ -24,10 +24,10 @@ import os
 import sys
 from pathlib import Path
 
-# This script lives at the project root, which contains the ./vllm repo dir.
-# That dir would shadow the *installed* `vllm` package (the editable install
-# adds the inner package via a .pth). Drop the project root from sys.path so
-# `import vllm` resolves to the real package, not the repo folder.
+# This script lives in scripts/ inside the project root. The repo's
+# dserve-vllm/ folder is not importable as `vllm` (no top-level __init__),
+# but as a precaution we drop the project root from sys.path so `import vllm`
+# always resolves to the installed package via the editable .pth.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)  # repo root (this script lives in scripts/)
 sys.path[:] = [p for p in sys.path

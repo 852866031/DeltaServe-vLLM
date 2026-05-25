@@ -45,14 +45,17 @@ slo:
   # when >0 and prefill is present, admit at most prefill_tokens * factor FT
   # tokens (on top of the SLO + buffer caps). -1 disables (fill up to whatever
   # the SLO estimator and buffer allow). No effect on idle/FT-only steps.
-  ft_tokens_admission_constrain_factor: 3
+  ft_tokens_admission_constrain_factor: 1
   # batch_prediction_stats_path: output/scheduler/batch_prediction_stats.csv
 
 # Observability knobs (folded into FinetuneConfig by the loader).
 debug:
   print_weight_hash: false            # compare base/FT-adapter weight hashes at startup
   print_activation_hash: false         # runs Llama3BackwardService.verify_activations each cycle
-  print_step_mode: true              # print (has_ft, cudagraph_mode) transitions
+  print_scheduler_add: true              # print (has_ft, cudagraph_mode) transitions
+  print_engine_batch_exec: true     
+  print_engine_batch_done: false     # print each Engine.batch() call's batch size and contents
+  print_engine_req_recv: false     # print each Engine request as it's received (before batching)
 
 # Inference LoRA adapter(s) served on vLLM's normal multi-LoRA path (applied
 # per-request by the caller; not the finetuning target).

@@ -22,20 +22,22 @@ estimator) and re-host it on vLLM's inference + LoRA + scheduling substrate."
 DeltaServe-vLLM/                    ← this repo root (where we write integration code & this file)
 ├── DeltaServe/                     ← READ-ONLY reference. The original co-serving framework.
 │   └── CLAUDE.md                   ← authoritative DeltaServe architecture doc (read it)
-├── vllm/                           ← OUR CODING DIR. Cloned vLLM, verified to run on this 5090.
+├── dserve-vllm/                    ← OUR CODING DIR + the published package source (name="dserve-vllm").
+│   ├── pyproject.toml              ← distribution name & `dserve-vllm` console script
+│   ├── vllm/                       ← inner Python package (still `import vllm`)
 │   └── AGENTS.md                   ← upstream vLLM contribution rules (mostly N/A — we're a research fork)
 ├── configs/                        ← serving_config_finetuning_{opt,llama3}.yaml (DeltaServe-style YAML)
 ├── scripts/                        ← entry points: ft_experiment_{opt,llama3}.py, launch_deltaserve.py, …
 ├── adapters/                       ← toy LoRA adapters (opt125m / llama3; inference + "-ft" FT target)
 ├── INTEGRATION_PROGRESS.md         ← plan + per-stage progress. Source of truth for *what* to build & *how far*.
 ├── VLLM_FORK_CHANGES.md            ← every change vs upstream vLLM (navigate the fork)
-└── vllm_setup_5090.md              ← reproducible build/run setup for the RTX 5090
+└── README.md                       ← install guide (general + full RTX 5090 section)
 ```
 
 - **`DeltaServe/` is read-only** — reference for ideas and implementation details.
   Never edit it; use it to verify how a mechanism worked in the original.
-- **`vllm/` is where we write integration code.** It is a normal git checkout of vLLM
-  (not yet a divergent fork — see version note below).
+- **`dserve-vllm/` is where we write integration code.** It is a vendored fork of vLLM;
+  the distribution name + CLI are `dserve-vllm`, the Python import name is still `vllm`.
 
 ## Current status
 
@@ -92,7 +94,7 @@ Two living docs track the detail:
 - **`VLLM_FORK_CHANGES.md`** — every change vs upstream vLLM (new files + edits),
   with "what it does" / "used by". **Read this to navigate the fork.**
 
-All net-new code lives in **`vllm/vllm/deltaserve/`** (logging, config loader, backward
+All net-new code lives in **`dserve-vllm/vllm/deltaserve/`** (logging, config loader, backward
 process, per-model backward services in `bwd_services/`, finetuning store, FT injector, FT
 scheduler, activation accumulator, coordinator). Upstream edits are small and tagged `[DeltaServe]`.
 
@@ -194,11 +196,11 @@ Insertion points for DeltaServe pieces:
   graphs). Editable install via `VLLM_USE_PRECOMPILED=1`.
 - **RTX 5090 = Blackwell sm_120.** vLLM's precompiled kernels cover sm_120 (no full source
   build needed). FlashInfer JIT-compiles sm_120 kernels on first run (one-time). See
-  `vllm_setup_5090.md` for the exact CUDA-13.0-in-conda-env recipe — the env (`dserve-vllm`)
+  `README.md` for the exact CUDA-13.0-in-conda-env recipe — the env (`dserve-vllm`)
   must own its `nvcc ≥ 12.9` or FlashInfer fails with a misleading "requires sm75" error.
-- **Setup uses conda** (`dserve-vllm` env), per `vllm_setup_5090.md`. vLLM's `AGENTS.md`
+- **Setup uses conda** (`dserve-vllm` env), per `README.md`. vLLM's `AGENTS.md`
   prescribes `uv`/`.venv` and strict upstream-PR rules — those are for upstream contributors;
-  we are a research fork, so follow `vllm_setup_5090.md` for env management.
+  we are a research fork, so follow `README.md` for env management.
 - Models live in `HF_HOME=/mnt/storage/huggingface` (set `HF_HUB_OFFLINE=1`):
   `meta-llama/Meta-Llama-3-8B` (base), `-Instruct`, plus LoRA adapters for the multi-LoRA path.
 
@@ -262,16 +264,16 @@ phase's test passes.
 1. This file.
 2. `INTEGRATION_PROGRESS.md` — plan + progress: design invariants, runtime pipeline, per-phase status, next step, risks.
 3. `DeltaServe/CLAUDE.md` — original architecture; co-serving contract; SFT backward.
-4. `vllm_setup_5090.md` — how to build/run on this machine.
+4. `README.md` — how to build/run on this machine.
 5. For Phase 1: `DeltaServe/dserve/server/router/model_infer/model_rpc.py:120-195`
-   (spawn + MPS + buffer share) and `vllm/vllm/v1/worker/gpu_worker.py`
-   (`Worker.__init__`, `init_device`, `load_model`) + `vllm/vllm/v1/engine/tensor_ipc.py`.
+   (spawn + MPS + buffer share) and `dserve-vllm/vllm/v1/worker/gpu_worker.py`
+   (`Worker.__init__`, `init_device`, `load_model`) + `dserve-vllm/vllm/v1/engine/tensor_ipc.py`.
 6. For Phase 6 (`forward_interruptible`): the plan file
    `.claude/plans/can-you-make-a-elegant-cherny.md` for the end-to-end design +
    verification path; in-tree the integration points are
-   `vllm/vllm/deltaserve/coordinator.py` (`FTAborted`, abort event, snapshot/restore),
-   `vllm/vllm/deltaserve/finetuning_store.py` (3-phase claim/commit/release API),
-   `vllm/vllm/deltaserve/ft_scheduler.py:_rollback_ft_step`,
-   `vllm/vllm/deltaserve/accumulate.py` (hook abort check + slice fast path),
-   `vllm/vllm/v1/engine/core.py` (tiers A + B + sentinel routing), and
-   `vllm/vllm/v1/worker/gpu_model_runner.py` (tier C abort wrap + entry-time check).
+   `dserve-vllm/vllm/deltaserve/coordinator.py` (`FTAborted`, abort event, snapshot/restore),
+   `dserve-vllm/vllm/deltaserve/finetuning_store.py` (3-phase claim/commit/release API),
+   `dserve-vllm/vllm/deltaserve/ft_scheduler.py:_rollback_ft_step`,
+   `dserve-vllm/vllm/deltaserve/accumulate.py` (hook abort check + slice fast path),
+   `dserve-vllm/vllm/v1/engine/core.py` (tiers A + B + sentinel routing), and
+   `dserve-vllm/vllm/v1/worker/gpu_model_runner.py` (tier C abort wrap + entry-time check).

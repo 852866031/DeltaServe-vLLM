@@ -4,8 +4,9 @@
 Port of DeltaServe/eval/llama3/auto_benchmark.py adapted to the vLLM OpenAI
 server:
 
-- Launches `vllm serve` (Llama-3-8B + the inference LoRA adapter, finetuning
-  enabled when --co) in its own process group; streams server logs live.
+- Launches `dserve-vllm serve` (Llama-3-8B + the inference LoRA adapter,
+  finetuning enabled when --co) in its own process group; streams server logs
+  live.
 - Waits for /health, then runs a warmup phase (first N timeline rows, replayed
   on the timeline schedule, NOT recorded), an optional rest, then the full
   timeline (recorded).
@@ -21,7 +22,7 @@ Hardcoded (per the eval setup): base model Llama-3-8B, FT adapter
 adapters/llama3-toy-lora-ft (via the finetuning YAML), inference adapter
 adapters/llama3-toy-lora, port/rank matching ft_experiment_llama3.py.
 
-Usage (dserve-vllm env, CUDA env per vllm_setup_5090.md):
+Usage (dserve-vllm env, CUDA env per README.md):
     python eval/auto_benchmark.py --co --loose
     python eval/auto_benchmark.py --tight        # inference-only (no FT)
 """
@@ -74,7 +75,7 @@ def detect_gpu_subdir() -> str:
 
 
 # ----------------------------------------------------------------------
-# Server launch (vllm serve, from the YAML — mirrors ft_experiment_llama3.py)
+# Server launch (dserve-vllm serve, from the YAML — mirrors ft_experiment_llama3.py)
 # ----------------------------------------------------------------------
 def _engine_cli_args(engine_kwargs: dict) -> list[str]:
     args: list[str] = []
@@ -100,18 +101,18 @@ def _finetune_cli_args(section: dict) -> list[str]:
 
 def build_server_cmd(co: bool, bwd_log_path: Optional[str],
                      api_server_count: Optional[int] = None) -> list[str]:
-    """Build the `vllm serve` command. Imports config_loader with the repo root
-    stripped from sys.path so `vllm` resolves to the installed package, not the
-    ./vllm checkout."""
+    """Build the `dserve-vllm serve` command. Imports config_loader with the
+    repo root stripped from sys.path so `vllm` resolves to the installed
+    package, not any source-tree copy."""
     sys.path[:] = [p for p in sys.path
                    if os.path.abspath(p or ".") not in {str(_HERE), str(_ROOT)}]
     from vllm.deltaserve.config_loader import load_yaml_config, split_config
 
     cfg = load_yaml_config(str(_CONFIG))
     engine_kwargs, _, _ = split_config(cfg)
-    engine_kwargs.pop("model", None)  # positional to `vllm serve`
+    engine_kwargs.pop("model", None)  # positional to `dserve-vllm serve`
 
-    vllm_bin = str(Path(sys.executable).parent / "vllm")
+    vllm_bin = str(Path(sys.executable).parent / "dserve-vllm")
     cmd = [vllm_bin, "serve", _BASE_MODEL]
     cmd += _engine_cli_args(engine_kwargs)
     # Serve the inference LoRA adapter by name (requests target it).
