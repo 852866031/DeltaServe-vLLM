@@ -48,19 +48,26 @@ _ROOT = _HERE.parent                             # repo root
 _CONFIG = _ROOT / "configs" / "serving_config_finetuning_llama3.yaml"
 
 # Per-GPU base model + HF cache root. Both boxes resolve via the HF cache
-# machinery (offline), so we pass HF repo ids (not direct paths) and point
-# HF_HOME at each box's cache root. The A100 cache happens to live in
-# scratch; on the 5090 it's the shared storage mount. Architecturally
-# Llama-3 and Llama-3.1-8B are compatible, so the toy LoRA loads against
-# either base — the adapter shapes match.
+# machinery (offline), so we pass HF repo ids (not direct paths). HF looks
+# for `<HF_HUB_CACHE>/models--<org>--<model>/...`; the default cache root
+# is `$HF_HOME/hub/`, but if the box's `models--*` dirs live somewhere
+# without that `hub/` intermediate (e.g. directly under scratch), set
+# `hf_hub_cache` explicitly to skip the indirection.
 _GPU_ENV = {
     "5090": {
         "model": "meta-llama/Meta-Llama-3-8B",
         "hf_home": "/mnt/storage/huggingface",
+        # 5090: standard layout, models live under $HF_HOME/hub/, default
+        # resolver behavior works without HF_HUB_CACHE.
+        "hf_hub_cache": None,
     },
     "A100": {
         "model": "meta-llama/Meta-Llama-3.1-8B",
         "hf_home": "/home/jiaxuan_chen/scratch",
+        # A100: models are directly under /home/jiaxuan_chen/scratch/
+        # (no `hub/` intermediate), so override HF_HUB_CACHE to point
+        # there directly.
+        "hf_hub_cache": "/home/jiaxuan_chen/scratch",
     },
 }
 _BASE_MODEL_DEFAULT = _GPU_ENV["5090"]["model"]
@@ -448,6 +455,12 @@ async def main() -> None:
                              f"{g}={v['hf_home']}" for g, v in _GPU_ENV.items()
                          ) + ". Respected only if HF_HOME is not already in "
                          "your env.")
+    ap.add_argument("--hf-hub-cache", default=None,
+                    help="Override HF_HUB_CACHE (the dir directly containing "
+                         "`models--<org>--<model>/`). Defaults to the per-GPU "
+                         "value (only set when the box's cache layout skips "
+                         "the standard $HF_HOME/hub/ intermediate; A100 box "
+                         "needs this).")
     ap.add_argument("--f", "-f", dest="log_to_file", action="store_true",
                     help="Capture server stdout/stderr to "
                          "eval/output/server<suffix>.log instead of streaming "
@@ -482,15 +495,19 @@ async def main() -> None:
     if bwd_log and os.path.exists(bwd_log):
         os.remove(bwd_log)  # fresh log per run
 
-    # Resolve the base model + HF cache root: explicit CLI flags win, else
-    # look up by detected GPU, else fall back to the 5090 defaults.
+    # Resolve the base model + HF cache + HF hub cache: explicit CLI flags
+    # win, else look up by detected GPU, else fall back to the 5090 defaults.
     gpu_env = _GPU_ENV.get(args.timeline_gpu, _GPU_ENV["5090"])
     base_model = args.model or gpu_env["model"]
     hf_home = args.hf_home or gpu_env["hf_home"]
+    hf_hub_cache = args.hf_hub_cache or gpu_env.get("hf_hub_cache")
     model_src = "--model" if args.model else f"auto (gpu={args.timeline_gpu})"
     hf_src = "--hf-home" if args.hf_home else f"auto (gpu={args.timeline_gpu})"
-    print(f"[bench] base model: {base_model}  [{model_src}]", flush=True)
-    print(f"[bench] HF_HOME:    {hf_home}  [{hf_src}]", flush=True)
+    print(f"[bench] base model:    {base_model}  [{model_src}]", flush=True)
+    print(f"[bench] HF_HOME:       {hf_home}  [{hf_src}]", flush=True)
+    if hf_hub_cache:
+        hc_src = "--hf-hub-cache" if args.hf_hub_cache else f"auto (gpu={args.timeline_gpu})"
+        print(f"[bench] HF_HUB_CACHE:  {hf_hub_cache}  [{hc_src}]", flush=True)
 
     server = f"http://127.0.0.1:{_PORT}"
     cmd = build_server_cmd(args.co, bwd_log, args.api_server_count,
@@ -501,6 +518,8 @@ async def main() -> None:
 
     env = dict(os.environ)
     env.setdefault("HF_HOME", hf_home)
+    if hf_hub_cache:
+        env.setdefault("HF_HUB_CACHE", hf_hub_cache)
     env.setdefault("HF_HUB_OFFLINE", "1")
     env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
     env["PYTHONSAFEPATH"] = "1"
