@@ -71,11 +71,18 @@ layer, not an inference engine. Box-by-box DeltaServe→vLLM mapping lives in `C
    `sample_lens`, reopens FT admission. Real completions stay byte-identical to a no-FT
    baseline throughout.
 
-## Next step (Phase 3 remainder — prioritized; opt frozen)
+## Next step
 
-See "Phase 3 — Real backward pass" below for the per-step plan and concerns. From here on
-we **prioritize Llama-3**; opt-125m stays at its current stage (loss-only) as a reference
-path and is not developed further.
+Phase 6 (`forward_interruptible` + slice activation save) is code-complete; pending
+**GPU validation on a co-serving replay**. Once verified, the residual TTFT outliers
+under co-serving should drop from "~80 ms (one full FT-only forward)" toward
+"~30 ms (irrecoverable in-flight kernels only)" with `forward_interruptible: true` in
+the YAML. See the new **Phase 6** section below for the full design + verification
+plan.
+
+After that, Phase 5 (backward CUDA graphs + attention batching) remains the largest
+optimization target. From here on we **prioritize Llama-3**; opt-125m stays at its
+current stage (loss-only) as a reference path and is not developed further.
 
 ---
 
@@ -751,6 +758,90 @@ step). Next focus is tuning admission so co-serving inference E2E stays within t
 follow-ups: avg-TBT gate (needs per-request last-token tracking); **FT loss divergence** in the
 loose-co run (training-quality — LR / corpus / publish cadence — separate from the SLO scheduler).
 
+## Phase 6 — Inference pre-emption of FT-only stepping (`forward_interruptible`) 🟡 (code complete; GPU validation pending)
+
+Three-tier system that catches late-arriving inference requests at progressively later
+points in the pipeline, all behind ONE config gate `finetune.forward_interruptible`
+(default `False` — bit-identical behaviour to today when off, via short-circuit
+attribute loads at every check site). Closes all windows where a late HTTP arrival
+could land except "after the kernel-launch returned" (unfixable without separate CUDA
+streams).
+
+Tier-by-tier in window order (smallest → largest):
+
+- **Tier A — pre-schedule grace window. ✅ (code).**
+  When the FT scheduler reports `would_step_be_ft_only()`, the engine main loop does a
+  bounded blocking poll on `input_queue` (default 2 ms via `ft_only_admission_grace_ms`)
+  before letting `schedule()` commit. If a request arrives in the window, it gets
+  admitted and the upcoming batch becomes co-serve. Cost: `X / (X + ft_forward_ms)`
+  FT throughput hit during idle (~2.5% at X=2 ms / forward=80 ms). Catch probability
+  scales with QPS — `R × X` for uniform Poisson arrivals.
+
+- **Tier B — post-schedule, pre-execute rollback. ✅ (code).**
+  After `schedule()` returns, if the batch is FT-only AND `input_queue` is non-empty,
+  `_rollback_ft_step(scheduler_output)` undoes all FT-side state (`_free_blocks` for
+  the FT requests, `coord.release_reserve(n, samples=)`, `store.release_claimed`,
+  `coord.restore_admission(snap)`), drains the queue, and re-schedules once. Bounded
+  to one retry.
+
+- **Tier C — mid-forward abort. ✅ (code).**
+  The input-socket thread sets `coord.ft_abort_event` on each ADD whenever
+  `coord.ft_only_in_flight` is True (cheap gate — no-op outside FT-only forwards).
+  Each `accumulate.py` hook checks `event.is_set()` after its copy work and raises
+  the `FTAborted` sentinel; the runner catches it inside `execute_model`, zeros the
+  partial-write tail at this batch's offset (`accumulator.zero_offset_range`), and
+  returns an empty `ModelRunnerOutput(_ft_aborted=True)`. The engine sees the sentinel
+  after `future.result()`, calls `_rollback_ft_step`, and skips `update_from_output`.
+  Pipeline-depth-2 contamination is handled by an entry-time abort check inside
+  `execute_model` (bails before queueing any kernels when the event is already set);
+  rollback clears the event so the next FT-only batch starts fresh. Savings ceiling
+  is partial (~30–60% of the FT forward, bounded by already-queued GPU kernels).
+
+**Store API change (load-bearing for B + C).** Replaces one-way
+`FinetuningStore.confirmed_trained` with a 3-phase API:
+- `claim(samples)` — admit time: remove from `len_buckets` / `sorted_lengths`, track
+  in `_claimed: set[int]`. `trained` stays False.
+- `commit_claimed(samples)` — backward-done time: `trained[idx] = True`, drop from
+  `_claimed`. Called via `coord.on_backward_done = store.commit_claimed`, fired from
+  `coord.poll_backward` on the success response. **Fixes the pre-existing flaw** where
+  samples were marked `trained=True` at admit time, before any backward had actually
+  processed their activations — meaning a sample admitted then rolled back would have
+  been silently counted as trained.
+- `release_claimed(samples)` — rollback time: return samples to the selectable pool.
+- `advance_epoch()` now refuses while any sample is `_claimed` (in-flight), so an
+  epoch boundary can't silently orphan in-flight FT samples.
+
+**Coordinator changes.** `release_reserve(n, samples=)` symmetric to `reserve`;
+`snapshot_admission()` / `restore_admission(snap)` for the admission flags
+(deliberately **does NOT** capture/restore `reserved_fill` — that's what
+`release_reserve` is for, and restoring a snapshotted `reserved_fill` would clobber a
+pipelined intervening commit between snapshot and rollback); `buffer_samples` list
+tracking which `FinetuningSample`s contributed to the current activation buffer (so
+`on_backward_done` can route the commit to exactly the right samples);
+`ft_abort_event` (`threading.Event`) + `ft_only_in_flight` (bool) for tier-C signalling.
+
+**Activation buffer behaviour on abort.** Reservation accounting rolls back cleanly
+(`reserved_fill -= n`, `buffer_samples` minus this batch's samples); the partial-write
+tail at `[off : off+n]` is zeroed across all hook-target buffers
+(`accumulator.zero_offset_range`); KV blocks are freed via `_free_blocks`. `fill_count`
+is untouched (it's only bumped in `record_capture`, which the abort path skips), so
+the next FT batch reuses the same offset and overwrites any stale bytes that would
+have been there. InputBatch state cleans up on the NEXT step's `_update_states` via
+the existing "unscheduled" path (same mechanism that handles the normal FT retire).
+
+## Phase 6.1 — Slice-based FT activation save ✅ (code)
+
+Per-layer hooks (`input_layernorm`, `model.norm`, `mlp.gate_up_proj`) now use a slice
+view `val[start : start + n]` on the fast path instead of `val[mask]` (an
+`index_select` kernel + gather allocation). `_build_finetune_mask` also computes
+`_ft_start` + `_ft_contiguous` (first/last True positions; contiguous iff
+`last_excl - first == n`). `begin_step` + `accumulate_final` accept the new args;
+the hooks branch on `_cur_contiguous` and fall back to the mask path silently when
+the FT-True positions are interleaved with non-FT (e.g. an FT request lands in a
+freed inference slot mid-batch — common is contiguous, but not guaranteed). Same
+bytes either way; saves one CUDA kernel + one allocation per hook firing
+(~33 per Llama-3 FT forward).
+
 ## Phase 5 — Optimizations & assets ⬜
 
 - **Pause/resume `_maybe_pause` — the GPU-yielding co-serving contract. ✅ IMPLEMENTED (prefill-gated).**
@@ -765,13 +856,48 @@ loose-co run (training-quality — LR / corpus / publish cadence — separate fr
   detected from the scheduler-stashed `_ft_step_features.t_in > 0`. (opt service is loss-only / no
   per-layer loop, so it doesn't pause.)
 - **Backward CUDA graphs** (padded-attention path; port `SFT_service_graph.py`, honoring the
-  persistent-buffer rules for LoRA `.grad` / attention `ctx`).
+  persistent-buffer rules for LoRA `.grad` / attention `ctx`). ✅ IMPLEMENTED (P5.2 in
+  `VLLM_FORK_CHANGES.md`): per-layer FFN graph + single shared padded-attention graph,
+  pre-captured at child startup. Flag: `finetune.backward_cuda_graph` (default off). Math is
+  bit-identical to the eager path (gradcheck-verified by `tests/test_llama3_backward_graph.py`).
 - **Backward latency:** batch/pad the per-sample attention loop into one kernel (the likely
   hotspot at small n); profile with the existing `[backward] remat-forward vs manual-grad` split.
   (Already done: bf16 bulk default, `gate_up` save skips the MLP recompute, dropped unused
   `down`/`out` recompute.)
 - A dedicated FT activation pool only if vLLM's allocator gets in the way; eval/analysis tooling
   port (`auto_benchmark`/`auto_plot`); multi-TP correctness (backward per-rank).
+
+### Future activation-save optimization — save post-RoPE `qh, kh, vh` per layer
+
+Currently the backward re-derives `qh, kh, vh` from `layer_in[i]` via
+RMSNorm-in_ln + Q/K/V proj + RoPE each backward (~16 GFLOPs/layer on
+Llama-3-8B at n=256). Saving these directly in the forward (mirroring the
+existing `mlp_gate_up` pattern in `FinetuneAccumulator`) would eliminate that
+recompute.
+
+- **Cost:** +99 MB at `max_saved_finetuning_tokens=256` (~18% buffer growth):
+  `qh` `[s_max, Hq=32, Hd=128]` bf16 ≈ 2.1 MB/layer × 32 = 67 MB;
+  `kh`/`vh` `[s_max, Hkv=8, Hd=128]` bf16 ≈ 0.5 MB/layer × 32 each = 32 MB total.
+- **Recovery:** ~16 GFLOPs/layer × 32 = ~500 GFLOPs eliminated per backward
+  — roughly 5 ms on a 5090. Best perf/memory ratio of any save candidate
+  (5.2 GFLOPs/MB; `mlp_gate_up` is 2.0; `ctx_flat` would be 0.33).
+- **Implementation sketch:**
+  - Post-hooks on `self_attn.{q,k,v}_proj` applying RoPE in-hook
+    (positions = `arange(0, seq_len)` per FT sample — already known to the
+    accumulator via the per-sample length list).
+  - Three new buffers in `FinetuneAccumulator`, threaded through CUDA-IPC
+    `share_activations`.
+  - A `saved_qh/kh/vh` parameter on `layer_forward` that short-circuits the
+    Q/K/V/RoPE path when populated. The Q/K/V LoRA-A backward still needs
+    `x_norm1` for `grad_A = grad_Z.t() @ x_norm1` — recompute RMSNorm in the
+    backward (~5 MFLOPs, free) rather than also saving it.
+- **Trade-offs ranked** (see `backward-review-issues.md` §F):
+  | candidate | GFLOPs saved/layer | +MB | ratio (GFLOPs/MB) |
+  |---|---|---|---|
+  | qh/kh/vh post-RoPE | 16 | 99 | **5.2** |
+  | mlp_gate_up (existing) | 30 | 469 | 2.0 |
+  | ctx_flat | 0.7 | 67 | 0.33 |
+  | x_norm1 alone | 0.005 | 67 | 0.002 |
 
 ## Top risks
 

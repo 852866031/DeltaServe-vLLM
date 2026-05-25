@@ -9,8 +9,16 @@ line) and serves samples by length-bucketed selection:
   - ``pop_best_under(max_tokens)`` returns the *untrained* sample with the
     largest ``input_len <= max_tokens`` (does NOT mark it trained), so a step
     packs the biggest sample that fits its remaining FT token budget.
-  - ``confirmed_trained(samples)`` marks samples trained for the current epoch.
-  - ``advance_epoch()`` resets marks for another pass.
+  - ``claim(samples)`` reserves samples for an in-flight FT step: removes
+    them from the selectable pool but does NOT yet mark them trained.
+    ``commit_claimed(samples)`` finalises (sets ``trained=True``) after the
+    backward has actually trained on their activations.
+    ``release_claimed(samples)`` is the rollback path — returns samples to
+    the selectable pool (used when an FT-only step is pre-empted by a late
+    inference arrival under ``forward_interruptible``).
+  - ``advance_epoch()`` resets marks for another pass; will refuse while any
+    sample is claimed-but-not-yet-committed, so an in-flight backward can't
+    be silently orphaned across an epoch boundary.
 
 This is pure Python (no GPU / vLLM coupling). The DeltaServe original lives at
 ``dserve/server/router/finetuning_store.py``; we drop the parts coupled to
@@ -68,6 +76,12 @@ class FinetuningStore:
         # length -> deque of untrained sample indices (current epoch)
         self.len_buckets: dict[int, deque] = defaultdict(deque)
         self.sorted_lengths: list[int] = []
+        # Indices claimed for an in-flight FT step / backward (not in buckets,
+        # not yet trained). On rollback (release_claimed) they go back to the
+        # buckets; on completion (commit_claimed) they get trained=True. Used
+        # by forward_interruptible — keeps epoch boundaries honest by
+        # blocking advance_epoch until all in-flight samples are reconciled.
+        self._claimed: set[int] = set()
         # immutable templates rebuilt per epoch
         self._bucket_template: dict[int, tuple[int, ...]] = {}
         self._sorted_template: list[int] = []
@@ -122,6 +136,10 @@ class FinetuningStore:
             length: deque(idxs) for length, idxs in self._bucket_template.items()
         }
         self.sorted_lengths = list(self._sorted_template)
+        # Defensive: advance_epoch refuses to fire with _claimed non-empty, so
+        # this should already be (). Clearing anyway to keep state coherent
+        # if the guard is ever bypassed (e.g. profiling reset paths).
+        self._claimed = set()
 
     # -- selection ---------------------------------------------------------
 
@@ -164,14 +182,19 @@ class FinetuningStore:
 
     # -- marking / epochs --------------------------------------------------
 
-    def confirmed_trained(self, samples: list[FinetuningSample]) -> int:
-        """Mark samples trained this epoch and drop them from the buckets."""
+    def claim(self, samples: list[FinetuningSample]) -> int:
+        """Reserve samples for an in-flight FT step: remove them from the
+        selectable pool and track in ``_claimed``. Does NOT yet mark them
+        trained — that waits for ``commit_claimed`` after the backward acks.
+        Symmetric with ``release_claimed`` for rollback. Returns count
+        actually claimed (skips already-claimed or already-trained samples).
+        """
         by_len: dict[int, set] = {}
         for sample in samples:
             idx = self.id2idx.get(sample.request_id)
-            if idx is None or self.trained[idx]:
+            if idx is None or self.trained[idx] or idx in self._claimed:
                 continue
-            self.trained[idx] = True
+            self._claimed.add(idx)
             by_len.setdefault(self.samples[idx].input_len, set()).add(idx)
 
         marked = 0
@@ -190,16 +213,77 @@ class FinetuningStore:
             marked += len(to_remove)
         return marked
 
+    def commit_claimed(self, samples: list[FinetuningSample]) -> int:
+        """Finalise: mark claimed samples as trained for the current epoch
+        and drop them from ``_claimed``. Called from the coordinator's
+        backward-done hook, so a sample is only ``trained=True`` once the
+        backward has actually processed its activations. Idempotent on
+        already-committed samples; silently skips samples not in
+        ``_claimed`` (e.g. spurious double-commit).
+        """
+        marked = 0
+        for sample in samples:
+            idx = self.id2idx.get(sample.request_id)
+            if idx is None or idx not in self._claimed:
+                continue
+            self._claimed.discard(idx)
+            self.trained[idx] = True
+            marked += 1
+        return marked
+
+    def release_claimed(self, samples: list[FinetuningSample]) -> int:
+        """Rollback: return claimed samples to the selectable pool. Used when
+        an FT-only step is pre-empted by a late inference arrival and the FT
+        scheduling has to be undone. ``trained`` stays False; the indices
+        reappear in ``len_buckets`` / ``sorted_lengths``. Idempotent.
+        """
+        by_len: dict[int, list[int]] = {}
+        for sample in samples:
+            idx = self.id2idx.get(sample.request_id)
+            if idx is None or idx not in self._claimed:
+                continue
+            self._claimed.discard(idx)
+            by_len.setdefault(self.samples[idx].input_len, []).append(idx)
+        n = 0
+        for length, idxs in by_len.items():
+            dq = self.len_buckets.get(length)
+            if dq is None:
+                self.len_buckets[length] = deque(idxs)
+                p = bisect_left(self.sorted_lengths, length)
+                if (p == len(self.sorted_lengths)
+                        or self.sorted_lengths[p] != length):
+                    self.sorted_lengths.insert(p, length)
+            else:
+                dq.extend(idxs)
+            n += len(idxs)
+        return n
+
     def advance_epoch(self) -> bool:
-        """Start the next epoch (reset marks). False if no epochs remain."""
+        """Start the next epoch (reset marks). False if no epochs remain OR
+        if any sample is still claimed-but-not-yet-committed (we must not
+        cross an epoch boundary with in-flight samples — they'd be silently
+        orphaned). Caller retries on a later step once the backward
+        finishes or a rollback releases the claimed samples."""
         if self.current_epoch >= self.total_epochs:
+            return False
+        if self._claimed:
             return False
         self.current_epoch += 1
         self._reset_epoch_structures()
         return True
 
     def has_next(self) -> bool:
+        """True iff a sample can be selected right now (not counting claimed
+        in-flight samples — those can't be re-admitted until released or
+        committed). Combined with ``current_epoch < total_epochs`` and
+        ``len(_claimed) > 0`` by callers to decide if FT has any work."""
         return bool(self.len_buckets)
+
+    def has_claimed(self) -> bool:
+        """True iff any sample is currently claimed in-flight (not yet
+        committed or released). Used by the scheduler to decide whether to
+        keep stepping the engine even with an empty selectable pool."""
+        return bool(self._claimed)
 
     def __len__(self) -> int:
         return len(self.samples)

@@ -38,12 +38,73 @@ Two kinds of change:
 | P5.1 — `_maybe_pause` GPU-yield contract (prefill-gated) | — | `deltaserve/backward_process.py`* (`_gpu_grant` mp.Event + `set_pause`), `deltaserve/bwd_services/base.py`* (`service_main` arg + `_maybe_pause`), `deltaserve/bwd_services/llama3.py`* (per-layer `_maybe_pause` call), `deltaserve/coordinator.py`* (`gpu_pause_backward`/`gpu_resume_backward`), `v1/worker/gpu_model_runner.py` (pause around prefill forwards) |
 | P4b — async scheduling enabled (reserve-at-inject) | — | `config/vllm.py`* (async default ON for FT, was force-off), `deltaserve/ft_scheduler.py`* (inherit `AsyncScheduler`; reserve scheduled-FT rows + stash per-step write offset; per-step duration read; epoch-flush request + hold admission), `deltaserve/coordinator.py`* (`reserved_fill`, `reserve`, `request_epoch_flush`/`try_epoch_flush`, triggers gated on `reserved==0`), `v1/worker/gpu_model_runner.py` (use stashed write offset; stash per-step `_ft_step_duration`), `v1/engine/core.py`* (profiling `reset_coord` clears new fields) |
 | P4c — deferred timing + control plane + fixes | `entrypoints/serve/finetune/api_router.py` (POST `/start_finetuning`) | `deltaserve/coordinator.py`* (`ft_started`+`start_finetuning`, `bwd_log` writer, `_trigger_backward` no-op while profiling, `try_epoch_flush` no longer gated on admission_open — epoch-flush deadlock fix), `deltaserve/ft_scheduler.py`* (deferred CUDA-event timing → coordinator queue drain; `has_requests` refined to not spin on a stuck partial buffer; FT-partition only touches this-step injects — async leak fix; TTFT queue-wait term; `ft_started` gate), `deltaserve/backward_process.py`* (`notify_buffer_full`/`poll_response` tolerate dead child at shutdown), `deltaserve/bwd_services/base.py`* (`_total_tokens_trained` in backward log), `v1/worker/gpu_model_runner.py` (deferred timing ring; `[batch]` log occupancy + admit-state + wall-clock ts; `deltaserve_start_finetuning` worker RPC in `gpu_worker.py`), `config/finetune.py`* (`bwd_log_path`, `start_on_launch`), `entrypoints/serve/__init__.py` (attach finetune router) |
+| P4d — admission close tightening (async) | — | `deltaserve/coordinator.py`* (`note_injection` takes `admitted_now`, uses post-admit free space), `deltaserve/ft_scheduler.py`* (computes `admitted_now` from `next_ft_requests` output and passes through) |
+| P6 — `forward_interruptible` (A + B + C tiers) inference pre-emption | — | `config/finetune.py`* (`forward_interruptible` master switch + `ft_only_admission_grace_ms`), `deltaserve/coordinator.py`* (`FTAborted` sentinel, `ft_abort_event`/`ft_only_in_flight`, `release_reserve(n, samples=)`, `snapshot_admission`/`restore_admission` — restores ONLY admit/flush flags, NOT reserved_fill; `buffer_samples` + `on_backward_done` hook so the store commits claimed samples only after the backward acks), `deltaserve/finetuning_store.py`* (`claim` / `commit_claimed` / `release_claimed` 3-phase API replaces one-way `confirmed_trained`; `advance_epoch` refuses while `_claimed` non-empty; `has_claimed`), `deltaserve/ft_injector.py`* (calls `claim` at admit, stashes `req._ft_sample`), `deltaserve/ft_scheduler.py`* (registers `coord.on_backward_done = store.commit_claimed`; admission snapshot at top of `schedule`; passes samples to `coord.reserve`; releases unscheduled-FT samples; `_rollback_ft_step(scheduler_output)` helper used by both tiers B and C; clears `ft_abort_event` at end of rollback; `would_step_be_ft_only()` predicate for tier A), `deltaserve/accumulate.py`* (per-hook `is_set()` check raises `FTAborted` after copy work; `zero_offset_range(off, n)` zeros all hook-target buffers on the aborted offset; `_abort_event` wired from `gpu_worker._maybe_setup_finetuning_accumulator`), `v1/worker/gpu_model_runner.py` (`execute_model` arms `_ft_only_run` and wraps `_model_forward` in try/`except FTAborted`; entry-time bail when event already set — handles pipeline-depth-2 contamination; sentinel `ModelRunnerOutput(_ft_aborted=True)` on bail; `accumulator.zero_offset_range` cleanup; `finally` clears `ft_only_in_flight` + `accumulator.end_step()`), `v1/worker/gpu_worker.py`* (wires `accumulator._abort_event = coord.ft_abort_event` when feature on), `v1/engine/core.py`* (`_maybe_ft_only_grace_poll` before `step_fn` — tier A grace window on `input_queue`; `_maybe_rollback_ft_for_late_arrival` after `schedule()` — tier B; sentinel routing in `step_with_batch_queue` skips `sample_tokens` for aborted batches; abort handler after `future.result()` calls `_rollback_ft_step` and skips `update_from_output`; input thread sets `coord.ft_abort_event` on ADD when `ft_only_in_flight` via cached `_ft_coord_handle`) |
+| P6.1 — slice-based FT activation save | — | `deltaserve/accumulate.py`* (`_cur_start` / `_cur_contiguous` fields; `begin_step` + `accumulate_final` accept `start` + `contiguous` kwargs; pre/out hooks slice `val[start:start+n]` on the fast path, fall back to `val[mask]` when not contiguous), `v1/worker/gpu_model_runner.py` (`_build_finetune_mask` also computes `_ft_start` + `_ft_contiguous` from first/last True positions; `execute_model` passes them to `accumulator.begin_step` + `accumulator.accumulate_final`) |
+| P5.2 — CUDA-graph backward (per-layer FFN + padded-attention) | `deltaserve/bwd_services/llama3_graph.py`, `tests/test_llama3_backward_graph.py` | `config/finetune.py`* (`backward_cuda_graph` master switch + `backward_cuda_graph_attn_{bn_max,l_max}` padded-attn bounds), `deltaserve/bwd_services/llama3.py`* (extract `ffn_backward_core` / `attn_backward_core` from `layer_backward`; instantiate `Llama3GraphedBackward` in `_build_state` when flag set; new `_layer_backward_graphed` composes graph-A + eager O-bwd + `_maybe_pause` + graph-B + eager tail; `process_backward` per-layer loop dispatches to graphed runner when present), `v1/worker/gpu_worker.py` (meta dict forwards `backward_cuda_graph` + bn_max/l_max + `max_saved_finetuning_tokens` to the child) |
+| Eng obs — per-batch lifecycle trace + ms bwd-log timestamps | — | `config/finetune.py`* (`print_scheduler_add`, `print_engine_batch_exec`, `print_engine_batch_done`, `print_engine_req_recv` — independent gates for the per-batch lifecycle prints; `print_step_mode` becomes a convenience master switch for all four), `deltaserve/coordinator.py`* (`_write_bwd_log_row` uses `isoformat(timespec="milliseconds")`), `v1/engine/core.py`* (`_classify_batch_for_log` decode-only / zero-token gate; `_maybe_log_batch_scheduled` after `schedule()` + `_maybe_log_batch_done` after `future.result()`; engine-recv print gate switched to OR of `print_engine_req_recv | print_step_mode`), `v1/worker/gpu_model_runner.py` (`_log_finetuning_batch` gate switched to OR of `print_engine_batch_exec | print_step_mode`) |
 
 `*` = same file extended in a later stage.
 
 > **P5.1:** the backward yields the GPU at every layer boundary while the main process runs an
 > inference **prefill** forward (TTFT-critical); decode-only steps let the backward co-run. The
 > grant is an `mp.Event` (SET = may run); the runner clears it around prefill forwards.
+
+> **P6 (forward_interruptible):** three-tier inference pre-emption of FT-only stepping, all
+> behind one config flag (`finetune.forward_interruptible`, default OFF — zero cost when off via
+> short-circuit attribute loads at each hook site).
+> **A** — pre-schedule grace: when the next step would be FT-only, briefly block on
+> `input_queue` so late HTTP arrivals make it into this step.
+> **B** — post-schedule rollback: if `schedule()` produced an FT-only batch and `input_queue`
+> is non-empty, undo the FT scheduling (free KV, release reserve + claimed samples, restore
+> admission flags) and re-schedule once.
+> **C** — mid-forward abort: the input-socket thread sets `coord.ft_abort_event` on each ADD
+> while `coord.ft_only_in_flight`; the activation-accumulation hooks check the event after
+> their copy work and raise `FTAborted`; the runner catches it, zeros the partial-write tail
+> at the aborted offset, returns an empty `ModelRunnerOutput(_ft_aborted=True)`; the engine
+> sees the sentinel after `future.result()` and runs `_rollback_ft_step`.
+> The 3-phase store API (`claim` / `commit_claimed` / `release_claimed`) is load-bearing — it
+> also fixes the pre-existing bookkeeping flaw where samples were marked `trained=True` at
+> admit time (before the backward had actually processed them). `advance_epoch` now refuses
+> while any sample is claimed in-flight. `snapshot_admission` deliberately does NOT capture
+> `reserved_fill` — that's undone via `release_reserve(n)`, and restoring a snapshotted
+> `reserved_fill` would clobber an intervening pipelined commit (`record_capture` between
+> snapshot and rollback). See `.claude/plans/can-you-make-a-elegant-cherny.md` for the
+> end-to-end design + verification path.
+
+> **P6.1 (slice activation save):** when the FT-True positions in the mask form a contiguous
+> span (the common case — FT requests admitted at the tail of waiting and not interleaved by
+> InputBatch slot reuse), per-layer hooks gather with a slice `val[start:start+n]` (view, no
+> kernel, no allocation) instead of `val[mask]` (index_select). Contiguity is **not**
+> guaranteed (FT can land in a freed inference slot mid-batch via
+> `_register_add_request` + `condense()`), so the mask path is kept as a silent fallback.
+
+> **P5.2 (backward CUDA graph):** mirrors DeltaServe `models/llama/SFT_service_graph.py`.
+> Two graphs per layer behind one flag (`finetune.backward_cuda_graph`, default OFF):
+> **Graph A** — FFN-backward at fixed `[s_max, D]` (s_max=`max_saved_finetuning_tokens`,
+> the same width the activation buffers are pre-allocated at, so the graph is shape-stable
+> by construction). **Graph B** — padded-attention backward CORE at `[bn_max, l_max]`,
+> scatter (flat → padded) → captured scores/softmax/dQ/dK/dV → gather back to flat.
+> **All `L` per-layer graphs are pre-captured up-front in the runner constructor's
+> `prepare()`**, paid once at child startup (before the first `share_activations` ack)
+> against zero-initialized static buffers — capture only depends on shapes/addresses,
+> not values, so replay-time staging produces the correct gradients. The first real
+> backward sees only replay cost; no warmup + capture stalls land on a live co-serving
+> step. Silent eager fallback per-layer on capture or shape-fit failure (those layers
+> get added to `ffn_failed` / `attn_failed`). `_maybe_pause()` is still called once per
+> layer — relocated from the layer top to **between Graph A and Graph B** since the
+> host-side `mp.Event.wait` can't run inside a captured region. Static IO buffers (g,
+> resid_mid, gate, up, qh/kh/vh/grad_ctx pads, grad outputs, bn_idx/pos_idx, masks) are
+> allocated OUTSIDE the shared graph pool — the load-bearing rule for avoiding pool-
+> aliasing NaN traps (DeltaServe reference lines 111–113 vs the `graph_pool_handle()` at
+> 114). LoRA-grad ownership stays with the eager Q/K/V/O proj backwards, so
+> `nn.Parameter.grad` lifecycle is unchanged vs eager. **Layer forward-remat
+> (`layer_forward`) is NOT graphed** — it runs eagerly between layers, matching the
+> reference. Graphing it would require a third per-layer graph with padded-attention
+> forward scaffolding; treated as a follow-up if dispatch overhead in the eager remat
+> becomes the bottleneck. The graphed and eager paths share `ffn_backward_core` /
+> `attn_backward_core`, so gradient values are bit-identical (verified by
+> `tests/test_llama3_backward_graph.py`).
 
 > **P4 design notes:** one **merged** 6-param step estimator
 > `T ≈ α·S + β·T_in + γ·T_ft + δ·B_d + ε·K + c` (vLLM runs one mixed prefill+decode
@@ -72,9 +133,15 @@ Two kinds of change:
 `num_epochs`, `max_prepare`, `max_saved_finetuning_tokens`, `backward_sleep_seconds`,
 the SLO knobs (`ttft_slo` / `avg_tbt_slo` / `max_tbt_slo`, grouped under a `slo:` YAML
 section) + **`ft_tokens_admission_constrain_factor`** (P4e: cap FT tokens ≤
-`prefill_tokens · factor` per prefill step; `-1` disables), and the debug knobs
-`print_weight_hash` / `print_activation_hash` / `print_step_mode` (grouped under a
-`debug:` YAML section). `slo` + `debug` keys are folded into FinetuneConfig by the loader.
+`prefill_tokens · factor` per prefill step; `-1` disables), the P6 functional knobs
+`forward_interruptible` (master switch for inference pre-emption of FT-only stepping —
+tiers A + B + C) + `ft_only_admission_grace_ms` (tier-A grace window in ms, default 2.0,
+0 disables A while keeping B and C), and the debug knobs
+`print_weight_hash` / `print_activation_hash` / `print_step_mode` plus the per-batch
+lifecycle gates `print_scheduler_add` / `print_engine_batch_exec` /
+`print_engine_batch_done` / `print_engine_req_recv` (each independently togglable;
+`print_step_mode` is a convenience master switch that enables all four). `slo` + `debug`
+keys are folded into FinetuneConfig by the loader.
 **Used by:** `config/__init__.py` (export), `config/vllm.py` (attached as
 `VllmConfig.finetune_config` + read in `__post_init__`), `engine/arg_utils.py`
 (`EngineArgs` field + `--finetune-config` CLI), `deltaserve/config_loader.py`,
@@ -339,8 +406,8 @@ arrival at the engine). No other engine-loop changes.
 | `scripts/ft_experiment_{opt,llama3}.py` | co-serving harness: launches a real `vllm serve` HTTP server with finetuning, fires a completion every 1s ×N, then shuts it down (server stdout streams the decision logs) |
 | `scripts/train_opt125m_lora.py` | trains the opt-125m toy LoRA adapters |
 | `scripts/bench_activation_save.py` | microbenchmark: activation-save overhead per FT step |
-| `eval/auto_benchmark.py` | launches `vllm serve` (±`--co`), replays a request timeline, streams `/v1/completions` (ttft = first chunk), writes `timeline_results<suffix>.csv`. P4d/e: `--api-server-count N` (or YAML `server.api_server_count`) shards the frontend; reads `server.api_server_count` from the config |
-| `eval/auto_plot.py` | 4-panel per-mode figure. P4d: TTFT panel annotates avg/p90 TTFT + avg TBT (flagged vs `slo.{ttft_slo,avg_tbt_slo}`); E2E-latency panel overlays the inf-only (no-co) curve when its results exist |
+| `eval/auto_benchmark.py` | launches `vllm serve` (±`--co`), replays a request timeline, streams `/v1/completions` (ttft = first chunk), writes `timeline_results<suffix>.csv`. P4d/e: `--api-server-count N` (or YAML `server.api_server_count`) shards the frontend; reads `server.api_server_count` from the config. Also writes `bench_meta<suffix>.json` with `t_first_wall_iso` so the plotter can anchor the FT (wall-clock) series at the same t=0 as the inference (monotonic) series — fixes the throughput-panel misalignment where inference and FT peaks appeared in-phase due to the FT log anchoring at first-backward-row instead of benchmark start |
+| `eval/auto_plot.py` | 4-panel per-mode figure. P4d: TTFT panel annotates avg/p90 TTFT + avg TBT (flagged vs `slo.{ttft_slo,avg_tbt_slo}`); E2E-latency panel overlays the inf-only (no-co) curve when its results exist. Loads `bench_meta<suffix>.json` (if present) and passes `t0_wall` to `parse_bwd_log_csv` so the FT series is anchored at benchmark t=0; falls back to legacy first-row anchoring when the meta is missing. `--throughput-window` flag tunes the rolling-mean width on the throughput panel (auto-pick in `[5, 60]` seconds when unset) |
 | `adapters/{opt125m,llama3}-toy-lora{,-ft}/` | the inference + FT adapters |
 | `alpaca_1000.txt` | FT corpus |
 | `tests/test_config_loader.py`, `test_finetuning_store.py`, `test_phase1_step2.py`, `test_phase1_step3.py`, `test_phase1_m1.py`, `test_phase1_m2.py`, `test_merged_estimator.py`, `test_profiling_shapes.py` | CPU/GPU verification |

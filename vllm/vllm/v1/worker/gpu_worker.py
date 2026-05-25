@@ -471,6 +471,18 @@ class Worker(WorkerBase):
             "weight_decay": float(ft_cfg.weight_decay),
             "gamma": float(ft_cfg.gamma),
             "backward_fp32": bool(ft_cfg.backward_fp32),
+            # CUDA-graph backward (Phase 5). The child instantiates a
+            # Llama3GraphedBackward runner when the flag is set; bn_max/l_max
+            # bound the padded-attention region, s_max comes from
+            # max_saved_finetuning_tokens (same value sizes the activation
+            # buffers, so the FFN graph and the activation pool are aligned).
+            "backward_cuda_graph": bool(ft_cfg.backward_cuda_graph),
+            "backward_cuda_graph_attn_bn_max":
+                int(ft_cfg.backward_cuda_graph_attn_bn_max),
+            "backward_cuda_graph_attn_l_max":
+                int(ft_cfg.backward_cuda_graph_attn_l_max),
+            "max_saved_finetuning_tokens":
+                int(ft_cfg.max_saved_finetuning_tokens),
         }
 
         dprint(
@@ -538,6 +550,12 @@ class Worker(WorkerBase):
         coordinator = get_coordinator(capacity=cap, per_step_budget=cap)
         coordinator.backward_process = backward_process
         coordinator.backward_sleep_s = float(ft_cfg.backward_sleep_seconds)
+        # [forward_interruptible / tier C] Wire the accumulator's per-layer
+        # abort check to the coordinator's threading.Event. The hook does a
+        # cheap None-check first, so this is zero-cost when the feature is
+        # off (event simply never gets set by the input thread).
+        if ft_cfg.forward_interruptible:
+            accumulator._abort_event = coordinator.ft_abort_event
 
         # Inject into the runner: it sets the per-step mask + drives accumulation,
         # the accumulating offset, and the one-shot hash verification.

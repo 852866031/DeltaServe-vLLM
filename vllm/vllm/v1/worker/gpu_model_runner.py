@@ -3949,11 +3949,21 @@ class GPUModelRunner(
         tensor [total_num_scheduled_tokens] or None). Token spans come from the
         InputBatch request order (req_ids) + the per-request scheduled-token
         counts — NOT scheduler-dict order.
+
+        Also computes (self._ft_start, self._ft_contiguous) for the slice-
+        based fast path in the accumulator: if all FT-True positions form a
+        single uninterrupted span, hooks can use ``val[start:start+n]``
+        instead of ``val[mask]`` (saves the index_select kernel + gather
+        allocation per layer). Contiguity isn't guaranteed by vLLM (an FT
+        request can fill a freed inference slot mid-batch), so the mask is
+        kept as the fallback path.
         """
         self._ft_has = False
         self._ft_mask_gpu = None
         self._ft_num = 0
         self._ft_sample_lens = []
+        self._ft_start = 0
+        self._ft_contiguous = False
         ft_ids = getattr(scheduler_output, "finetune_req_ids", None)
         if not ft_ids:
             return
@@ -3961,18 +3971,28 @@ class GPUModelRunner(
         cu = np.concatenate(([0], np.cumsum(num_scheduled_tokens_np))).astype(np.int64)
         mask = np.zeros(total, dtype=bool)
         sample_lens: list[int] = []
+        ft_first = -1
+        ft_last = -1
         for i, req_id in enumerate(req_ids):
             if req_id in ft_ids:
                 mask[cu[i]:cu[i + 1]] = True
                 # req_ids order == the order rows appear in hidden_states[mask],
                 # so these per-sample lengths line up with the buffer writes.
                 sample_lens.append(int(cu[i + 1] - cu[i]))
+                if ft_first < 0:
+                    ft_first = int(cu[i])
+                ft_last = int(cu[i + 1])  # exclusive end
         n = int(mask.sum())
         if n == 0:
             return
         self._ft_has = True
         self._ft_num = n
         self._ft_sample_lens = sample_lens
+        # Slice-path metadata: span is [ft_first, ft_last). Contiguous iff the
+        # span's length equals the total FT token count (no inference rows
+        # interleaved within the span).
+        self._ft_start = ft_first
+        self._ft_contiguous = (ft_last - ft_first) == n
         self._ft_mask_gpu = torch.from_numpy(mask).to(
             self.device, non_blocking=True
         )
@@ -3982,8 +4002,12 @@ class GPUModelRunner(
         """[DeltaServe] Print this batch's shape — prefill/ft token counts and the
         per-sample KV-cache size (context length) of each decoding request — plus
         whether it actually ran a CUDA graph (from the real dispatch decision).
-        Gated on print_step_mode; skipped for decode-only batches."""
-        if not self.vllm_config.finetune_config.print_step_mode:
+        Gated on ``print_engine_batch_exec`` (or the ``print_step_mode`` master
+        switch); skipped for decode-only batches."""
+        _ftc = self.vllm_config.finetune_config
+        # Hot-path early-out: one attribute load + short-circuit OR before any
+        # per-batch accounting below.
+        if not (_ftc.print_engine_batch_exec or _ftc.print_step_mode):
             return
         _coord = getattr(self, "_ft_coordinator", None)
         if _coord is not None and getattr(_coord, "profiling", False):
@@ -4335,7 +4359,9 @@ class GPUModelRunner(
         else:
             self._ft_offset = coord.current_offset() if coord is not None else 0
         if self._ft_has and accumulator is not None and save_acts:
-            accumulator.begin_step(self._ft_mask_gpu, self._ft_num, self._ft_offset)
+            accumulator.begin_step(
+                self._ft_mask_gpu, self._ft_num, self._ft_offset,
+                start=self._ft_start, contiguous=self._ft_contiguous)
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -4395,36 +4421,75 @@ class GPUModelRunner(
             if _pause_bwd:
                 coord.gpu_pause_backward()
             _start_evt.record()
+        # [forward_interruptible / tier C] Arm the per-layer abort path if
+        # this is a pure FT-only forward (any inference present would suffer
+        # from a mid-forward abort, so we never abort co-serve batches). The
+        # gate is cheap: one bool check on self._ft_has + an arithmetic
+        # equality + the config flag.
+        _ft_only_run = bool(
+            self._ft_has
+            and coord is not None
+            and self.vllm_config.finetune_config.forward_interruptible
+            and self._ft_num == num_tokens_unpadded
+        )
+        _ft_aborted = False
+        if _ft_only_run:
+            # Pipeline-depth-2 contamination: a prior FT-only batch already
+            # tripped the abort flag, but THIS batch was scheduled before
+            # the flag was set. Bail at entry — no kernels queued, full
+            # forward saved.
+            if coord.ft_abort_event.is_set():
+                _ft_aborted = True
+            else:
+                # Mark the live FT-only forward so the input thread starts
+                # signalling, and ensure the hook's check sees a clean event.
+                coord.ft_only_in_flight = True
+
         _forward_ok = False
         try:
-            with (
-                set_forward_context(
-                    attn_metadata,
-                    self.vllm_config,
-                    num_tokens=num_tokens_padded,
-                    num_tokens_across_dp=num_tokens_across_dp,
-                    cudagraph_runtime_mode=cudagraph_mode,
-                    batch_descriptor=batch_desc,
-                    ubatch_slices=ubatch_slices_padded,
-                    slot_mapping=slot_mappings,
-                    # [DeltaServe] bypass the compiled graph on FT steps so the
-                    # submodule forward hooks (Milestone 2) reliably fire.
-                    skip_compiled=has_encoder_input or self._ft_has,
-                ),
-                record_function_or_nullcontext("gpu_model_runner: forward"),
-                self.maybe_get_kv_connector_output(
-                    scheduler_output,
-                    defer_finalize=defer_kv_connector_finalize,
-                ) as kv_connector_output,
-            ):
-                model_output = self._model_forward(
-                    input_ids=input_ids,
-                    positions=positions,
-                    intermediate_tensors=intermediate_tensors,
-                    inputs_embeds=inputs_embeds,
-                    **model_kwargs,
-                )
-            _forward_ok = True
+            if _ft_aborted:
+                # Entry-time abort: skip the forward entirely.
+                model_output = None
+            else:
+                with (
+                    set_forward_context(
+                        attn_metadata,
+                        self.vllm_config,
+                        num_tokens=num_tokens_padded,
+                        num_tokens_across_dp=num_tokens_across_dp,
+                        cudagraph_runtime_mode=cudagraph_mode,
+                        batch_descriptor=batch_desc,
+                        ubatch_slices=ubatch_slices_padded,
+                        slot_mapping=slot_mappings,
+                        # [DeltaServe] bypass the compiled graph on FT steps so the
+                        # submodule forward hooks (Milestone 2) reliably fire.
+                        skip_compiled=has_encoder_input or self._ft_has,
+                    ),
+                    record_function_or_nullcontext("gpu_model_runner: forward"),
+                    self.maybe_get_kv_connector_output(
+                        scheduler_output,
+                        defer_finalize=defer_kv_connector_finalize,
+                    ) as kv_connector_output,
+                ):
+                    try:
+                        model_output = self._model_forward(
+                            input_ids=input_ids,
+                            positions=positions,
+                            intermediate_tensors=intermediate_tensors,
+                            inputs_embeds=inputs_embeds,
+                            **model_kwargs,
+                        )
+                    except Exception as _e:
+                        # Mid-forward abort fired from an activation hook
+                        # (raised FTAborted). Only catch that one — anything
+                        # else is a real error.
+                        from vllm.deltaserve.coordinator import FTAborted
+                        if isinstance(_e, FTAborted):
+                            _ft_aborted = True
+                            model_output = None
+                        else:
+                            raise
+            _forward_ok = not _ft_aborted
         finally:
             # [Phase 4] Record the end event into the ring slot (no synchronize
             # — the duration is read RING steps later, off the hot path). Only
@@ -4447,6 +4512,33 @@ class GPUModelRunner(
             # so a failed forward can't leave the backward stalled.
             if _pause_bwd:
                 coord.gpu_resume_backward()
+            # [forward_interruptible / tier C] Always clear the live-FT-only
+            # marker — even on aborted / failed forwards — so the input
+            # thread stops trying to set the abort event for future batches.
+            # accumulator.end_step() resets _active so a subsequent inference
+            # batch's hooks are no-ops; without this the next batch could
+            # see stale _active=True from the bailed-out FT step and try to
+            # copy garbage rows.
+            if _ft_only_run and coord is not None:
+                coord.ft_only_in_flight = False
+            if _ft_aborted and accumulator is not None:
+                accumulator.end_step()
+
+        # [forward_interruptible / tier C] On abort the post-forward path
+        # (logits, sampling, final-hidden capture, KV-connector wait) is
+        # invalid because model_output is None — short-circuit with a
+        # sentinel empty output flagged for the engine to roll back. Also
+        # zero the partial-write tail at this batch's offset so a debugger
+        # / hash check sees a clean buffer; the backward already wouldn't
+        # read these rows (fill_count guards), but zeroing keeps the state
+        # easy to reason about and is cheap.
+        if _ft_aborted:
+            if accumulator is not None:
+                accumulator.zero_offset_range(self._ft_offset, self._ft_num)
+            from vllm.v1.outputs import ModelRunnerOutput
+            out = ModelRunnerOutput(req_ids=[], req_id_to_index={})
+            out._ft_aborted = True
+            return out
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4486,6 +4578,8 @@ class GPUModelRunner(
                             self._ft_mask_gpu,
                             self._ft_num,
                             self._ft_offset,
+                            start=self._ft_start,
+                            contiguous=self._ft_contiguous,
                         )
                         accumulator.end_step()
                         self._maybe_verify_ft_accumulation()

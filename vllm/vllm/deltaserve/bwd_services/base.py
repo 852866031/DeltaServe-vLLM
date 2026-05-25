@@ -92,6 +92,9 @@ class BackwardService:
         # [Phase 5] Shared GPU-yield event (set by service_main). SET = may run;
         # CLEARED = the main process is running an inference prefill → yield.
         self._gpu_grant = None
+        # Tag for the per-cycle one-line log: trainer subclasses set this to
+        # "graph" or "eager" depending on which backward path they took.
+        self._last_mode: str = "eager"
 
     def _maybe_pause(self) -> None:
         """GPU-yield contract: block at a layer boundary while the main process
@@ -304,6 +307,9 @@ class BackwardService:
         epoch = int(msg.get("epoch", 0))
 
         loss = None
+        n_valid = 0
+        start_evt = end_evt = None
+        cpu_elapsed_ms: float | None = None
         # Run the backward BEFORE cleaning the buffers (clean zeros them). Skip
         # cleanly when there is nothing to compute (e.g. save_activations off leaves
         # the buffers zeroed, or weights/state not built).
@@ -316,31 +322,61 @@ class BackwardService:
             try:
                 if self._verify:
                     self.verify_activations(self.activations, n)
-                loss, n_valid = self.process_backward(
-                    self.activations, sample_lens, n, epoch)
+                # Time the backward with CUDA events instead of a wall-clock-
+                # after-sync — this lets us defer the host sync to end-of-cycle
+                # (after buffer zeroing), coalescing two syncs into one. The
+                # event-derived timing is GPU-strict; the previous wall-clock
+                # path included host overhead between perf_counter calls.
+                if torch.cuda.is_available():
+                    start_evt = torch.cuda.Event(enable_timing=True)
+                    end_evt = torch.cuda.Event(enable_timing=True)
+                    start_evt.record()
+                    loss, n_valid = self.process_backward(
+                        self.activations, sample_lens, n, epoch)
+                    end_evt.record()
+                else:
+                    t0 = time.perf_counter()
+                    loss, n_valid = self.process_backward(
+                        self.activations, sample_lens, n, epoch)
+                    cpu_elapsed_ms = (time.perf_counter() - t0) * 1000.0
                 self._total_tokens_trained += int(n_valid)
-                dprint(
-                    f"[backward] signal (n={n}, samples={len(sample_lens)}, "
-                    f"valid_tokens={n_valid}, epoch={epoch}); loss={loss:.6f}"
-                    f" | total_tokens_trained={self._total_tokens_trained}"
-                )
             except Exception as e:  # noqa: BLE001 — keep the cycle alive on error
                 import traceback
                 dprint(f"[backward] backward failed: {e}")
                 traceback.print_exc()
+                # Drop the events so we don't query an incomplete pair below.
+                start_evt = end_evt = None
         else:
             dprint(
-                f"[backward] signal (n={n}); skipping "
-                f"(no data / save_activations off)"
+                f"[backward] skipped (n={n}, "
+                f"no data / save_activations off)"
             )
 
         # Clean the shared buffers. Trainers did the real GPU work already; the
         # loss-only/simulated path sleeps to make the co-serving cycle observable.
+        # The single torch.cuda.synchronize() below covers BOTH the backward (via
+        # the recorded events) and the zero-fill — the previous code had a sync
+        # right after process_backward + another sync after the zero-loop.
         if self.activations:
             for value in self.activations.values():
                 for t in (value if isinstance(value, list) else [value]):
                     t.zero_()
             torch.cuda.synchronize()
+
+        # Emit the per-cycle log AFTER the sync so the events are queryable.
+        if can_compute and loss is not None:
+            if start_evt is not None and end_evt is not None:
+                total_ms = start_evt.elapsed_time(end_evt)
+            elif cpu_elapsed_ms is not None:
+                total_ms = cpu_elapsed_ms
+            else:
+                total_ms = float("nan")
+            dprint(
+                f"[backward] {total_ms:.1f}ms ({self._last_mode}) "
+                f"loss={loss:.6f} "
+                f"total_trained={self._total_tokens_trained}"
+            )
+
         if not self.is_trainer:
             time.sleep(sleep_s)
         conn.send({"event": "activations_processed", "n": n, "loss": loss})

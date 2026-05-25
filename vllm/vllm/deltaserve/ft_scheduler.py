@@ -80,6 +80,15 @@ class FinetuneScheduler(AsyncScheduler):
         # closed until POST /start_finetuning flips it (the launch profiler
         # bypasses this, so profiling is unaffected).
         self._coord.ft_started = bool(getattr(ft_cfg, "start_on_launch", True))
+        # [forward_interruptible] Register the backward-done hook: when the
+        # coordinator's poll_backward observes the backward acked completion,
+        # the FT samples that contributed to that backward get their
+        # ``trained=True`` bit set (only then — replaces the previous
+        # behaviour of marking trained at admit time, which was incorrect
+        # under rollback because a sample admitted then rolled back would
+        # have been silently marked trained without any backward work).
+        self._coord.on_backward_done = (
+            lambda samples: self._ft_injector.store.commit_claimed(samples))
 
         # [Phase 4] SLO execution-time estimator + per-step tracker. The launch
         # profiler seeds these before serving; every served step is recorded and
@@ -276,6 +285,24 @@ class FinetuneScheduler(AsyncScheduler):
             return store.has_next() or store.current_epoch < store.total_epochs
         return False
 
+    def would_step_be_ft_only(self) -> bool:
+        """[forward_interruptible / tier A] True iff the next schedule() call
+        would produce an FT-only batch — no inference requests in
+        ``self.running`` (excluding in-flight FT requests awaiting retire) and
+        none in ``self.waiting`` (FT samples aren't injected until inside
+        ``schedule()``, so the waiting queue at this point only holds
+        inference). Engine main loop consults this before its grace poll to
+        decide whether to spend the wait window.
+
+        Cheap: walks ``self.running`` once with an attribute check. Called at
+        most once per busy-loop iteration."""
+        if self.waiting:
+            return False
+        for req in self.running:
+            if not getattr(req, "is_finetuning", False):
+                return False
+        return True
+
     def write_estimator_stats(self) -> None:
         """Dump predicted-vs-actual step stats (called on FT exit)."""
         self._tracker.write_prediction_stats_csv(self._stats_csv_path)
@@ -352,6 +379,12 @@ class FinetuneScheduler(AsyncScheduler):
         # will carry the flush.
         self._coord.try_epoch_flush()
 
+        # [forward_interruptible] Snapshot admission state before any FT
+        # injection / note_injection / reserve mutates it. Stashed on the
+        # output so _rollback_ft_step can restore it verbatim if this batch
+        # turns out to be FT-only and a pre-emption fires before dispatch.
+        _admit_snap = self._coord.snapshot_admission()
+
         # [Phase 4] FT rides along PREFILL steps only. Skip FT on decode-only
         # steps (decode tokens present, no prefill tokens): adding FT prefill
         # there would spike the decoders' TBT with no prefill to amortize
@@ -371,20 +404,29 @@ class FinetuneScheduler(AsyncScheduler):
             ft_tokens_admission_constrain_factor
         if _factor != -1 and feats.t_in > 0:
             budget = min(budget, int(feats.t_in * _factor))
+        admitted_now = 0
         if not self._profiling_mode and budget > 0:
             reqs = self._ft_injector.next_ft_requests(budget)
             for req in reqs:
                 self._enqueue_waiting_request(req)
                 self.requests[req.request_id] = req
+            admitted_now = sum(r.num_prompt_tokens for r in reqs)
 
         # After injecting, hand the coordinator the smallest sample that could
         # still be added (peek-next, no mark). It raises the flush flag when the
         # buffer can't grow — epoch drained (None) or the next sample won't fit
         # the free space (would overflow) — so the partial buffer gets trained
         # instead of wedging at a near-full level during idle (e.g. stuck at
-        # 208/256). The backward trigger consumes the flag.
+        # 208/256). The backward trigger consumes the flag. ``admitted_now``
+        # makes the close check use POST-admit free space (the reserve() call
+        # below hasn't run yet, so space_remaining alone reads the prior step's
+        # reservations only). Under async this closes admission at the exact
+        # schedule where the buffer becomes "full enough that the next sample
+        # won't fit" rather than one schedule call later.
         _nxt = self._ft_injector.store.pop_next()
-        self._coord.note_injection(_nxt.input_len if _nxt is not None else None)
+        self._coord.note_injection(
+            _nxt.input_len if _nxt is not None else None,
+            admitted_now=admitted_now)
 
         # Track the FT corpus epoch so the backward can StepLR per epoch
         # (next_ft_requests advances it via the store's advance_epoch).
@@ -404,6 +446,7 @@ class FinetuneScheduler(AsyncScheduler):
         # update_from_output could no longer find it to free → leak → the running
         # batch fills to max_num_seqs and the engine stalls.)
         scheduled_ft: set[str] = set()
+        dropped_ft_samples: list = []   # released back to store below
         for req_id, req in list(self.requests.items()):
             if not req.is_finetuning:
                 continue
@@ -413,19 +456,39 @@ class FinetuneScheduler(AsyncScheduler):
                 # Fresh inject that didn't schedule this step — safe to drop.
                 self.waiting.remove_requests([req])
                 del self.requests[req_id]
+                _s = getattr(req, "_ft_sample", None)
+                if _s is not None:
+                    dropped_ft_samples.append(_s)
             # else: in-flight from a prior step — leave for its own retire.
         output.finetune_req_ids = scheduled_ft
+        # [forward_interruptible] Release samples we claimed at admit but
+        # didn't actually schedule — return them to the selectable pool so
+        # the next step can pick them up. (Today this path is rare; before
+        # the store-API split these samples were silently lost.)
+        if dropped_ft_samples:
+            self._ft_injector.store.release_claimed(dropped_ft_samples)
 
         # [async] Reserve the activation-buffer rows for the FT samples that
         # ACTUALLY scheduled this step, and stash their disjoint write offset for
         # the runner. Reserved at schedule (not committed at forward) so that
         # under pipelining two in-flight steps never overlap their writes or
         # overflow the buffer. record_capture commits + reconciles post-forward.
+        # The samples are appended to the coordinator's ``buffer_samples`` so
+        # the backward-done hook can commit-train exactly the right samples.
         if scheduled_ft:
             ft_tokens = sum(output.num_scheduled_tokens.get(rid, 0)
                             for rid in scheduled_ft)
+            ft_samples = [getattr(self.requests[rid], "_ft_sample", None)
+                          for rid in scheduled_ft]
+            ft_samples = [s for s in ft_samples if s is not None]
             if ft_tokens > 0:
-                output._ft_write_offset = self._coord.reserve(ft_tokens)
+                output._ft_write_offset = self._coord.reserve(
+                    ft_tokens, samples=ft_samples)
+            output._ft_samples = ft_samples
+            output._ft_tokens_reserved = ft_tokens
+        # Stash the admission snapshot on the output so _rollback_ft_step
+        # can restore it cleanly if this batch is pre-empted before dispatch.
+        output._ft_admit_snapshot = _admit_snap
 
         # [Phase 4] Stamp the regime + predicted duration for THIS step now,
         # while all requests are still present and the dispatcher reflects the
@@ -453,6 +516,72 @@ class FinetuneScheduler(AsyncScheduler):
             1 for r in self.running if not getattr(r, "is_finetuning", False))
         output._ft_waiting = len(self.waiting)
         return output
+
+    def _rollback_ft_step(self, scheduler_output: SchedulerOutput) -> int:
+        """[forward_interruptible / tiers B + C] Undo all FT-side state
+        changes for the FT requests in ``scheduler_output``. Returns the
+        number of FT requests that were rolled back.
+
+        Used in two places:
+          - **Tier B** (engine, post-schedule pre-execute): a late inference
+            arrival landed between ``schedule()`` returning and
+            ``execute_model()`` being called; we abandon the FT-only batch
+            and re-schedule with the inference request now in waiting.
+          - **Tier C** (runner, mid-forward abort): the activation hook
+            raised on a late ADD; the runner caught it and calls this from
+            ``execute_model``'s exception handler.
+
+        Steps mirror the FT retire path in ``update_from_output`` but also
+        return samples to the store, undo the coordinator's reservation,
+        and restore admission flags so the next ``schedule()`` sees the
+        same state as if this step never happened. Idempotent: calling
+        twice on the same scheduler_output is a no-op the second time.
+        """
+        ft_ids = getattr(scheduler_output, "finetune_req_ids", set())
+        if not ft_ids:
+            return 0
+        # Free KV + drop from scheduler state — mirrors the FT retire path
+        # in update_from_output. Note: _free_blocks itself removes the
+        # request from self.requests (scheduler.py:1863), so we do NOT
+        # del self.requests[req_id] again afterwards (would KeyError).
+        for req_id in list(ft_ids):
+            req = self.requests.get(req_id)
+            if req is None:
+                continue
+            req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+            if req in self.running:
+                self.running.remove(req)
+            self._free_blocks(req)
+        # Restore the activation-buffer reservation and the in-flight
+        # samples list on the coordinator.
+        samples = getattr(scheduler_output, "_ft_samples", None) or []
+        n_reserved = getattr(scheduler_output, "_ft_tokens_reserved", 0)
+        if n_reserved or samples:
+            self._coord.release_reserve(n_reserved, samples=samples)
+        # Return claimed samples to the selectable pool so the next schedule
+        # can re-admit them (the engine's re-schedule call after rollback,
+        # or a later step after admission has been re-evaluated).
+        if samples:
+            self._ft_injector.store.release_claimed(samples)
+        # Restore admission flags so note_injection's effect from this
+        # schedule() is undone (admission_open / epoch_flush_pending).
+        snap = getattr(scheduler_output, "_ft_admit_snapshot", None)
+        if snap is not None:
+            self._coord.restore_admission(snap)
+        # Clear the tier-C abort event so the next FT-only batch starts with
+        # a clean signal — otherwise a stale "set" from this cycle would
+        # immediately bail every subsequent FT-only batch's entry check
+        # (pipeline-depth contamination). Safe to clear unconditionally:
+        # the late ADD that originally tripped this event is already on
+        # input_queue and will get a fresh trigger on the NEXT FT-only batch
+        # via the input thread's per-ADD set.
+        self._coord.ft_abort_event.clear()
+        # Mark the scheduler_output as rolled back so any double-call
+        # (e.g. C then accidental B) is a no-op.
+        scheduler_output.finetune_req_ids = set()
+        scheduler_output._ft_samples = []
+        scheduler_output._ft_tokens_reserved = 0
+        return len(ft_ids)
 
     def update_from_output(
         self,
