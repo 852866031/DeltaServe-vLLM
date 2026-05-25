@@ -46,7 +46,18 @@ import aiohttp
 _HERE = Path(__file__).resolve().parent          # eval/
 _ROOT = _HERE.parent                             # repo root
 _CONFIG = _ROOT / "configs" / "serving_config_finetuning_llama3.yaml"
-_BASE_MODEL = "meta-llama/Meta-Llama-3-8B"
+
+# Per-GPU base model. The 5090 box has Llama-3-8B in HF cache and resolves
+# the HF id offline (HF_HUB_OFFLINE=1, HF_HOME=/mnt/storage/huggingface).
+# The A100 lab box keeps Llama-3.1-8B at a direct path in scratch; pass it
+# in as a filesystem path so vLLM bypasses the Hub. Architecturally Llama-3
+# and Llama-3.1-8B are compatible, so the toy LoRA still loads — the
+# adapter shapes match either base.
+_BASE_MODEL_BY_GPU = {
+    "5090": "meta-llama/Meta-Llama-3-8B",
+    "A100": "/home/jiaxuan_chen/scratch/models--meta-llama--Meta-Llama-3.1-8B",
+}
+_BASE_MODEL_DEFAULT = _BASE_MODEL_BY_GPU["5090"]
 _SERVED_NAME = "llama3"
 _INFER_LORA_DIR = _ROOT / "adapters" / "llama3-toy-lora"
 _INFER_LORA_NAME = "llama3-toy-lora"
@@ -100,7 +111,8 @@ def _finetune_cli_args(section: dict) -> list[str]:
 
 
 def build_server_cmd(co: bool, bwd_log_path: Optional[str],
-                     api_server_count: Optional[int] = None) -> list[str]:
+                     api_server_count: Optional[int] = None,
+                     base_model: str = _BASE_MODEL_DEFAULT) -> list[str]:
     """Build the `dserve-vllm serve` command. Imports config_loader with the
     repo root stripped from sys.path so `vllm` resolves to the installed
     package, not any source-tree copy."""
@@ -113,7 +125,7 @@ def build_server_cmd(co: bool, bwd_log_path: Optional[str],
     engine_kwargs.pop("model", None)  # positional to `dserve-vllm serve`
 
     vllm_bin = str(Path(sys.executable).parent / "dserve-vllm")
-    cmd = [vllm_bin, "serve", _BASE_MODEL]
+    cmd = [vllm_bin, "serve", base_model]
     cmd += _engine_cli_args(engine_kwargs)
     # Serve the inference LoRA adapter by name (requests target it).
     cmd += ["--lora-modules", f"{_INFER_LORA_NAME}={_INFER_LORA_DIR}"]
@@ -173,10 +185,16 @@ async def start_finetuning(server: str) -> bool:
 
 
 async def wait_for_health(server: str, max_wait_s: float = 600.0,
-                          poll_s: float = 1.0) -> None:
+                          poll_s: float = 1.0,
+                          stop: Optional[asyncio.Event] = None) -> None:
     t0 = time.monotonic()
     async with aiohttp.ClientSession() as session:
         while True:
+            # Honor Ctrl+C: if the caller's stop event fires, bail
+            # immediately instead of polling out to max_wait_s.
+            if stop is not None and stop.is_set():
+                print("[bench] interrupted while waiting for server health", flush=True)
+                return
             try:
                 async with session.get(f"{server}/health", timeout=2) as r:
                     if r.status == 200:
@@ -186,7 +204,15 @@ async def wait_for_health(server: str, max_wait_s: float = 600.0,
                 pass
             if time.monotonic() - t0 > max_wait_s:
                 raise TimeoutError(f"server not healthy within {max_wait_s}s")
-            await asyncio.sleep(poll_s)
+            # Sleep cooperatively so a stop.set() wakes us within poll_s.
+            if stop is not None:
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=poll_s)
+                    continue  # loop will see stop.is_set() and return
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(poll_s)
 
 
 async def send_one_request(
@@ -403,6 +429,17 @@ async def main() -> None:
                     help="Number of frontend API server processes (shared "
                          "single EngineCore). >1 shards output processing. "
                          "Overrides server.api_server_count in the YAML.")
+    ap.add_argument("--model", default=None,
+                    help="Base model id (HF) or local path. Default is "
+                         "per-GPU: " + ", ".join(
+                             f"{g}={m}" for g, m in _BASE_MODEL_BY_GPU.items()
+                         ) + ". Use this to override (e.g. for a new local "
+                         "checkpoint).")
+    ap.add_argument("--f", "-f", dest="log_to_file", action="store_true",
+                    help="Capture server stdout/stderr to "
+                         "eval/output/server<suffix>.log instead of streaming "
+                         "to this terminal. Off by default (logs print live so "
+                         "you can see startup banners and any crash trace).")
     args = ap.parse_args()
 
     if sum(bool(x) for x in (args.loose, args.tight, args.nutanix)) > 1:
@@ -432,13 +469,19 @@ async def main() -> None:
     if bwd_log and os.path.exists(bwd_log):
         os.remove(bwd_log)  # fresh log per run
 
+    # Resolve the base model: explicit --model wins, else look up by detected
+    # GPU, else fall back to the 5090 default.
+    base_model = args.model or _BASE_MODEL_BY_GPU.get(args.timeline_gpu,
+                                                     _BASE_MODEL_DEFAULT)
+    src = "--model" if args.model else f"auto (gpu={args.timeline_gpu})"
+    print(f"[bench] base model: {base_model}  [{src}]", flush=True)
+
     server = f"http://127.0.0.1:{_PORT}"
-    server_log = str(OUTPUT_DIR / f"server{suffix}.log")
-    cmd = build_server_cmd(args.co, bwd_log, args.api_server_count)
+    cmd = build_server_cmd(args.co, bwd_log, args.api_server_count,
+                           base_model=base_model)
     print("[bench] launching:", " ".join(cmd), flush=True)
     print(f"[bench] results -> {out_csv}"
           + (f" | bwd_log -> {bwd_log}" if bwd_log else ""), flush=True)
-    print(f"[bench] server log -> {server_log}  (tail -f to watch live)", flush=True)
 
     env = dict(os.environ)
     env.setdefault("HF_HOME", "/mnt/storage/huggingface")
@@ -447,18 +490,57 @@ async def main() -> None:
     env["PYTHONSAFEPATH"] = "1"
     env["PYTHONUNBUFFERED"] = "1"
 
-    # Capture all server stdout/stderr (scheduler / coordinator / backward
-    # prints) to a file so the run can be inspected after the fact.
-    logf = open(server_log, "w")
+    # --f → capture all server stdout/stderr (scheduler / coordinator /
+    # backward prints) to a file so the run can be inspected after the fact.
+    # Otherwise inherit the parent's stdio so they print live to the
+    # terminal. The file path is reported either way so the user knows where
+    # to look (or that nothing was written).
+    logf = None
+    server_log: Optional[str] = None
+    if args.log_to_file:
+        server_log = str(OUTPUT_DIR / f"server{suffix}.log")
+        logf = open(server_log, "w")
+        popen_kwargs = dict(stdout=logf, stderr=subprocess.STDOUT)
+        print(f"[bench] server log -> {server_log}  (tail -f to watch live)",
+              flush=True)
+    else:
+        popen_kwargs = dict()  # inherit parent stdio → terminal
+        print("[bench] server log -> terminal (pass --f to capture to file)",
+              flush=True)
     proc = subprocess.Popen(cmd, env=env, cwd=tempfile.gettempdir(),
-                            start_new_session=True,
-                            stdout=logf, stderr=subprocess.STDOUT)
+                            start_new_session=True, **popen_kwargs)
+
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGINT, stop.set)
+
+    # SIGINT handling: first Ctrl+C sets the stop event so loops can wind
+    # down cleanly. A second Ctrl+C escalates to SIGKILL on the server's
+    # process group + raises KeyboardInterrupt, so the user is never
+    # trapped if a long await (e.g. wait_for_health during model load, or
+    # a hung _run_rows row) isn't checking stop fast enough.
+    _ctrlc = {"count": 0}
+
+    def _on_sigint() -> None:
+        _ctrlc["count"] += 1
+        if _ctrlc["count"] == 1:
+            print("\n[bench] Ctrl+C — shutting down "
+                  "(press again to force kill)", flush=True)
+            stop.set()
+        else:
+            print("\n[bench] Ctrl+C (force) — SIGKILLing server now",
+                  flush=True)
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                pass
+            # Restore default SIGINT so a third Ctrl+C cleanly kills us too.
+            loop.remove_signal_handler(signal.SIGINT)
+            raise KeyboardInterrupt
+
+    loop.add_signal_handler(signal.SIGINT, _on_sigint)
 
     try:
-        await wait_for_health(server, args.startup_timeout)
+        await wait_for_health(server, args.startup_timeout, stop=stop)
         if stop.is_set():
             return
 
@@ -517,11 +599,15 @@ async def main() -> None:
         stop.set()
         print("[bench] shutting down server", flush=True)
         terminate(proc)
-        try:
-            logf.close()
-        except Exception:
-            pass
-        print(f"[bench] done | server log: {server_log}", flush=True)
+        if logf is not None:
+            try:
+                logf.close()
+            except Exception:
+                pass
+        if server_log is not None:
+            print(f"[bench] done | server log: {server_log}", flush=True)
+        else:
+            print("[bench] done", flush=True)
 
 
 if __name__ == "__main__":
