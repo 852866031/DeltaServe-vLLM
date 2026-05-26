@@ -41,13 +41,13 @@ DeltaServe-vLLM/                    ← this repo root (where we write integrati
 
 ## Current status
 
-**Phases 1–4 code-complete & GPU-validated end-to-end on the 5090 (Phases 1–3
-gradcheck-verified). Phase 6 (`forward_interruptible`) + Phase 6.1 (slice activation
-save) code-complete; GPU validation of the pre-emption pipeline is the user's next
-run.** The real co-serving training loop works on Llama-3-8B; opt-125m is a frozen
-loss-only reference path. The `_maybe_pause` GPU-yielding contract is wired
-(prefill-gated, fire-and-forget). The `forward_interruptible` pre-emption pipeline
-defaults to OFF — when off, behaviour is bit-identical to pre-Phase-6.
+**Phases 1–4, 5.2, 5.3, 6, 6.1 all code-complete (Phases 1–3 gradcheck-verified,
+Phase 5.2 graph/eager parity-verified); Phase 6 GPU validation of the pre-emption
+pipeline is the user's next run.** The real co-serving training loop works on
+Llama-3-8B; opt-125m is a frozen loss-only reference path. The `_maybe_pause`
+GPU-yielding contract is wired (prefill-gated, fire-and-forget). The
+`forward_interruptible` pre-emption pipeline defaults to OFF — when off,
+behaviour is bit-identical to pre-Phase-6.
 
 **Key Phase-4 finding (read this):** the inference-TTFT spikes that closed FT admission were **not**
 co-serving / GPU / backward contention — they were a **vLLM frontend** stall. vLLM attaches per-step
@@ -74,19 +74,59 @@ flaw of marking samples `trained=True` at admit time before any backward process
 fast path; mask gather kept as silent fallback when the FT-True positions are interleaved
 (which can happen when an FT request fills a freed inference slot mid-batch).
 
-**Eval tooling fixes.** Throughput-panel alignment: `auto_benchmark.py` now writes
+**Phase 5.2 — backward CUDA graphs. ✅ code + parity verified.** Per-layer FFN-backward
+graph + ONE shared padded-attention backward graph (the core has no per-layer weights, so
+32 captures would be wasted), pre-captured up-front in
+`Llama3GraphedBackward.prepare()` against zero-initialized static buffers. First real
+backward sees only replay cost. Gated by `finetune.backward_cuda_graph` (default OFF).
+Bounds: `backward_cuda_graph_attn_{bn_max,l_max}`. Silent eager fallback per-layer on
+capture or shape-fit failure. `_maybe_pause()` is preserved at the once-per-layer
+cadence — relocated to between Graph A and Graph B (mp.Event.wait can't run inside a
+captured region). Gradcheck + graph parity in `tests/test_llama3_backward{,_graph}.py`
+(12 + 21 cases).
+
+**Phase 5.3 — perf polish + admission strategies + bug fixes.** Several shipped:
+- **`match_with_prefill_workload`** — leaky-bucket admission strategy
+  (`config/finetune.py`, default False). Accumulates inference-prefill tokens
+  seen but not yet "spent" on FT; admits ONE FT sample sized exactly to the
+  next-sample's `input_len` when accumulated credit suffices; resets on any FT
+  admit. Mutually exclusive with `ft_tokens_admission_constrain_factor`.
+- **Oversized-sample drop fix** (`finetuning_store.py:load()`): samples with
+  `input_len > max_saved_finetuning_tokens` are dropped at load with a warning.
+  Previously they sat in the pool forever, deadlocking FT admission once
+  fittable samples ran out (`has_next()=True` but `pop_best_under(cap)=None`,
+  `advance_epoch` never fires). Surfaced by `pure_ft_bench.py` on alpaca_1000
+  (3 samples >256-token cap).
+- **Fused AdamW** + **persistent grad_qh/kh/vh buffers** in the backward — ~3-5
+  ms / backward saved (8 LoRA tensors × 32 layers → one fused kernel; 96
+  zero-fills/backward eliminated).
+- **One-shot `set_corpus_meta` IPC** from scheduler → child after
+  `FinetuningStore.load()` — replaces sending corpus size on every
+  `notify_buffer_full`.
+- **Per-cycle backward log** is now one line:
+  `[backward] Xms (graph/eager) loss=… total_trained=… n=… epoch=… N/total tokens`
+  (CUDA-event timing; 2 syncs/cycle → 1 via cleanup-sync drain).
+
+**Eval tooling fixes.** Throughput-panel alignment: `auto_benchmark.py` writes
 `bench_meta<suffix>.json` with the recording-phase wall-clock t=0, and `auto_plot.py`
-anchors the FT (wall-clock) series to it so inference and FT peaks share the same time
-origin. Backward-log timestamps are now millisecond-resolution
-(`isoformat(timespec="milliseconds")`) so per-backward events at ~80 ms cadence don't
-collapse into 1-Hz buckets.
+anchors the FT (wall-clock) series to it. Backward-log timestamps are now ms-resolution.
+**Output files now carry the FT factor:** `_co_factor_<X>_<mode>.csv` (or
+`_factor_off` for the -1 disabled sentinel) so A/B runs across factors don't overwrite.
+**`auto_plot.py`** has a 5-panel layout (4 in row 1 + new E2E latency percentile
+panel in row 2 with p99 highlighted) and a `--factor X` CLI arg that auto-detects
+the smallest factor present in `output/` if not specified — factor appears in the
+plot title. **`eval/pure_ft_bench.py`** is the pure-FT (no inference traffic)
+benchmark — launches the server, POSTs `/start_finetuning`, idles for `--duration`,
+trims + summarizes the bwd_log.
 
 **Current focus:** GPU-validating the `forward_interruptible` pipeline on the existing
 `eval/auto_benchmark.py` replay (P99 TTFT outlier reduction is the headline metric).
-Independent lever (orthogonal to Phase 6): `finetune.ft_tokens_admission_constrain_factor`
-(cap FT tokens ≤ `prefill_tokens · factor` per step; `-1` disables) — still useful for
-trading FT throughput against inference latency when pre-emption is off or for tuning the
-SLO gate's admission shape.
+Independent levers (orthogonal to Phase 6):
+- `finetune.match_with_prefill_workload` (new P5.3 leaky-bucket admission) vs
+  `ft_tokens_admission_constrain_factor` (proportional cap) — A/B with
+  `auto_benchmark.py --co` and the new `_factor_*` suffix.
+- `finetune.backward_cuda_graph` (P5.2) — compare backward latency in the
+  per-cycle log between on/off.
 
 Two living docs track the detail:
 
@@ -109,10 +149,15 @@ What works today (single-GPU, verified on the 5090):
 - Per-token FT activations **accumulated** into shared GPU buffers: residual-stream layer inputs
   (`layer_in[i]`), `final_in`, `final_hidden`, `concat_input_ids`, and the MLP pre-activations
   (`mlp_gate_up[i]`, to skip the gate_up recompute in the backward).
-- **Real LoRA SFT backward** (`Llama3BackwardService`): manual fp32 per-layer backward
-  (re-materialized from the saved layer inputs), AdamW + StepLR on the fp32 master, then the
-  trained weights are **published into vLLM's served LoRA buffers** so inference uses them. The
-  backward fires on buffer-full **or** epoch-end. Gradchecked vs autograd to ~1e-7.
+- **Real LoRA SFT backward** (`Llama3BackwardService`): manual per-layer backward
+  in bf16 (cdt) by default — re-materialized from the saved layer inputs — with fp32-strict
+  attention scores / softmax / RMSNorm / LM head per the DeltaServe precision contract.
+  **Fused AdamW** (one CUDA kernel for all 256 LoRA tensors) + StepLR on the fp32 master,
+  then the trained weights are **published into vLLM's served LoRA buffers** so inference
+  uses them (the served slot is reserved at startup; punica reads with scale=1.0 because
+  we bake `α/r` into B at publish time). The backward fires on buffer-full **or**
+  epoch-end. Gradchecked vs autograd to ~1e-7. Optional **CUDA-graph backward** (P5.2)
+  cuts per-cycle dispatch ~5 ms on Llama-3-8B with `finetune.backward_cuda_graph: true`.
 - A co-serving **coordinator**: signals the backward when the activation buffer is full, can't grow
   (the **peek-next** smallest-untrained sample won't fit the free space → `note_injection` raises the
   flush flag), or at an epoch boundary; reopens admission when done. Per-step FT budget is the full
@@ -126,17 +171,29 @@ What works today (single-GPU, verified on the 5090):
 - **`scripts/ft_experiment_{llama3,opt}.py`** — launch a real `vllm serve` HTTP server with
   finetuning and fire periodic prompts so co-serving decisions stream live. **`eval/`** —
   `auto_benchmark.py` replays request timelines (`eval/timelines/5090/`) against a co-serving
-  server and `auto_plot.py` renders the 4-panel latency/throughput/SLO figure.
-  (Configs: `configs/serving_config_finetuning_{llama3,opt}.yaml`.)
+  server (output files now tagged `_factor_<X>_<mode>` so A/B runs across FT admission
+  factors don't overwrite); `auto_plot.py` renders the **5-panel** latency / throughput /
+  SLO / **E2E percentile (p99 highlighted)** figure and takes `--factor X` (auto-detects
+  smallest if omitted); `pure_ft_bench.py` runs a pure-FT workload (no inference traffic)
+  for isolated backward-throughput measurement. (Configs:
+  `configs/serving_config_finetuning_{llama3,opt}.yaml`.)
 
 Next: **GPU-validate `forward_interruptible` on the eval replay** (set
 `finetune.forward_interruptible: true` in the YAML, re-run `eval/auto_benchmark.py --co`,
-compare TTFT P50/P95/P99 vs the same replay with the feature off). Then **Phase 5** —
-backward CUDA graphs + attention batching. Known open issues: FT loss divergence in the
-loose-co eval run (training-quality, not the SLO gate); avg-TBT admission gate deferred;
-pre-existing minor leak in the runner's `self.requests` (`CachedRequestState`) for FT
-requests — they're never added to `finished_req_ids`, so the per-request state lingers
-(small, bounded by `num FT requests ever`, not a correctness issue).
+compare TTFT P50/P95/P99 vs the same replay with the feature off). Phase 5.2 (backward
+CUDA graphs) has shipped; the **next backward-throughput lever is F1 — save post-RoPE
+qh/kh/vh per layer** (mirror the existing `mlp_gate_up` save pattern). Documented as
+future work in `INTEGRATION_PROGRESS.md` Phase 5 section; expected ~5 ms / backward win
+for +99 MB at s_max=256 (best perf/MB ratio of the candidates).
+
+Known open issues: FT loss divergence in the loose-co eval run (training-quality, not
+the SLO gate); avg-TBT admission gate deferred; pre-existing minor leak in the
+runner's `self.requests` (`CachedRequestState`) for FT requests — they're never added
+to `finished_req_ids`, so the per-request state lingers (small, bounded by `num FT
+requests ever`, not a correctness issue); dead-child deadlock surface (if the backward
+subprocess crashes, `_claimed` stays non-empty forever → FT admission wedges silently
+after a one-shot 5 s warning — documented in `.claude/plans/backward-review-issues.md`
+as C7, deliberately deferred).
 
 > Historical note: the original Phase-1 plan called the activation save "capture"; it
 > was renamed **accumulate** to avoid confusion with CUDA-graph capture.
@@ -235,8 +292,19 @@ phase's test passes.
 4. **Phase 4 — SLO-aware scheduler + estimator.** Replace fixed FT injection with DeltaServe's
    SLO-aware admission gate + cost estimator. SLO satisfaction near target at non-trivial FT
    throughput; admission backs off under inference bursts.
-5. **Phase 5 (later) — optimizations & assets.** Backward CUDA graphs, dedicated FT activation
-   pool if needed, eval/analysis tooling port, multi-TP correctness.
+5. **Phase 5 — optimizations.**
+   - **5.1 ✅** `_maybe_pause` GPU-yield contract (prefill-gated).
+   - **5.2 ✅** Backward CUDA graphs: per-layer FFN-bwd + single shared
+     padded-attn-bwd, pre-captured at child startup. Flag:
+     `finetune.backward_cuda_graph`.
+   - **5.3 ✅** Perf polish + admission strategies + bug fixes: fused AdamW,
+     persistent grad buffers, sync coalescing, one-shot `set_corpus_meta` IPC,
+     restructured per-cycle log, `match_with_prefill_workload` leaky-bucket
+     admission, oversized-sample drop at load (FT deadlock fix), eval-tooling
+     additions (factor suffix, p99 panel, `pure_ft_bench.py`).
+   - **(future)** Save post-RoPE qh/kh/vh per layer (best perf/MB remaining
+     activation-save candidate); dedicated FT activation pool if vLLM's
+     allocator gets in the way; multi-TP correctness (backward per-rank).
 6. **Phase 6 — inference pre-emption of FT-only stepping (`forward_interruptible`). ✅ code.**
    Three tiers (A: pre-schedule grace; B: post-schedule rollback; C: mid-forward abort via
    per-layer hooks) behind one config flag. Adds the 3-phase store API (`claim` /

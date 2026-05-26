@@ -42,8 +42,13 @@ import torch
 
 from vllm.deltaserve import dprint
 from vllm.deltaserve.bwd_services.llama3 import (
+    _proj,
+    apply_rope,
     attn_backward_core,
     ffn_backward_core,
+    layer_forward,
+    rmsnorm,
+    rope_cos_sin,
 )
 
 
@@ -92,6 +97,16 @@ class Llama3GraphedBackward:
         # layers fall back to the eager ``attn_backward_core``.
         self._attn_graph: torch.cuda.CUDAGraph | None = None
         self.attn_failed: bool = False
+        # Per-layer forward (rematerialization) graphs. Must be per-layer
+        # because Q/K/V/O base + LoRA weights are layer-specific (same reason
+        # FFN-bwd is per-layer). Captured against ``static_layer_in`` +
+        # ``static_cos/sin`` + ``static_saved_gate_up`` reading layer-i
+        # weights; writes into static_resid_mid/gate/up (= Graph A inputs)
+        # + static_qh_pad/kh_pad/vh_pad (= Graph B inputs) + the flat
+        # static_x_norm1/qh_flat/kh_flat/vh_flat/ctx_flat needed by the
+        # eager backward tail. Per-layer eager fallback (``fwd_failed``).
+        self._fwd_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self.fwd_failed: set[int] = set()
 
         # Single graph pool for both regions. Static IO is allocated BEFORE
         # any capture call so it lives in the default caching allocator, not
@@ -176,6 +191,36 @@ class Llama3GraphedBackward:
         self.static_grad_kh = torch.zeros((s, Hkv, Hd), dtype=cdt, device=dev)
         self.static_grad_vh = torch.zeros((s, Hkv, Hd), dtype=cdt, device=dev)
 
+        # ---- Forward-recompute graph IO ----
+        # Inputs (per-layer): residual-stream input layer_in[i] in model dtype.
+        # Outputs go into static buffers reused by the rest of the backward:
+        #   - static_resid_mid / static_gate / static_up are ALSO Graph A's
+        #     inputs (the FFN-bwd reads them directly — no copy needed between
+        #     F-graph and A-graph).
+        #   - static_qh_pad / kh_pad / vh_pad are ALSO Graph B's inputs (the
+        #     forward scatters directly into the padded layout — no
+        #     _stage_attn_inputs hop between F-graph and B-graph).
+        # Flat duplicates are kept for the eager backward tail (RoPE-bwd,
+        # Q/K/V-proj-bwd, in_ln rmsnorm-bwd) which still needs flat views.
+        self.static_layer_in = torch.zeros((s, D), dtype=mdt, device=dev)
+        # cos/sin shared across the L layers' forward graphs — only depend
+        # on per-backward positions, so staged ONCE per backward in
+        # ``begin_backward``. fp32 (matches rope_cos_sin's output dtype).
+        self.static_cos = torch.zeros((s, Hd // 2), dtype=torch.float32, device=dev)
+        self.static_sin = torch.zeros((s, Hd // 2), dtype=torch.float32, device=dev)
+        # Saved MLP gate||up captured in the forward (one buffer per layer
+        # in the accumulator; we stage the current layer's into one static
+        # buffer per backward call). Skipping the gate_up matmul is the
+        # production path (see Llama3BackwardService.process_backward).
+        self.static_saved_gate_up = torch.zeros((s, 2 * inter), dtype=mdt, device=dev)
+        # Outputs (flat, model dtype): the rest of the cache the eager tail
+        # consumes. qh/kh/vh flat are written alongside the padded scatter.
+        self.static_x_norm1 = torch.zeros((s, D), dtype=mdt, device=dev)
+        self.static_qh_flat = torch.zeros((s, Hq, Hd), dtype=mdt, device=dev)
+        self.static_kh_flat = torch.zeros((s, Hkv, Hd), dtype=mdt, device=dev)
+        self.static_vh_flat = torch.zeros((s, Hkv, Hd), dtype=mdt, device=dev)
+        self.static_ctx_flat = torch.zeros((s, D), dtype=mdt, device=dev)
+
     # ---------------------------------------------------------------- prepare
 
     def prepare(self) -> None:
@@ -200,19 +245,33 @@ class Llama3GraphedBackward:
                 dprint(f"[bwd-graph] FFN layer {i} startup capture failed: "
                        f"{e}; will fall back to eager at runtime")
 
-        # Padded-attention: ONE captured graph reused across all L layers
-        # (the core has no layer-dependent weights). Arm a fitting dummy
-        # batch so scatter indices and key-pad mask are valid for capture
-        # (kernels still see zero values, fine — only shapes/addresses are
-        # captured).
+        # Padded-attention + forward: arm a fitting dummy batch so scatter
+        # indices, key-pad mask, AND cos/sin are valid for capture (kernels
+        # still see zero values for everything else — only shapes/addresses
+        # are captured).
         dummy_l = min(self.l_max, self.s_max)
         self.begin_backward(dummy_l, [dummy_l], [0])
+
         try:
             self._capture_attn()
         except Exception as e:  # noqa: BLE001
             self.attn_failed = True
             dprint(f"[bwd-graph] attn startup capture failed: {e}; "
                    f"all layers will fall back to eager at runtime")
+
+        # Forward: one graph per layer (Q/K/V/O base + LoRA addresses vary).
+        # Same dummy-batch arming as attn — cos/sin already staged by
+        # begin_backward above. Stage zero layer_in / saved_gate_up via
+        # the static buffers' default zero state (already zero from
+        # _alloc_static_buffers).
+        for i in range(L):
+            try:
+                self._capture_forward(i, self.svc._layer_weights(i))
+            except Exception as e:  # noqa: BLE001
+                self.fwd_failed.add(i)
+                dprint(f"[bwd-graph] forward layer {i} startup capture failed: "
+                       f"{e}; will fall back to eager at runtime")
+
         # Reset per-backward state — the real first backward calls
         # begin_backward again with its own seq_lens.
         self._cur_n = 0
@@ -224,11 +283,12 @@ class Llama3GraphedBackward:
         self._fallback_warned = False
 
         captured_ffn = L - len(self.ffn_failed)
+        captured_fwd = L - len(self.fwd_failed)
         attn_status = "0/1" if self.attn_failed else "1/1"
         elapsed = (time.perf_counter() - t0) * 1000.0
         dprint(
-            f"[bwd-graph] pre-captured FFN {captured_ffn}/{L} + "
-            f"attn {attn_status} in {elapsed:.0f}ms")
+            f"[bwd-graph] pre-captured forward {captured_fwd}/{L} + "
+            f"FFN {captured_ffn}/{L} + attn {attn_status} in {elapsed:.0f}ms")
 
     # ----------------------------------------------------------- per-backward
 
@@ -249,6 +309,32 @@ class Llama3GraphedBackward:
             and bn <= self.bn_max
             and max_l <= self.l_max
         )
+
+        # Stage cos/sin ALWAYS (used by both the graphed forward and the
+        # eager forward fallback when the padded-attention budget overflows
+        # — the fallback in ``Llama3GraphedBackward.forward`` reads
+        # ``static_cos/sin[:n]``). Build positions on CPU = concat(arange(s)
+        # for s in seq_lens), pad with zeros — RoPE(zeros, cos=any, sin=any)
+        # = zeros because the q/k inputs are already zero in the tail.
+        # We size exactly to s_max here; in production n ≤ s_max so the full
+        # sequence fits, and any pathological n > s_max (only seen in the
+        # gradcheck overflow test) just truncates — that path doesn't use
+        # the forward graph fallback, only ``attn_backward``.
+        if n > 0:
+            pos_cpu: list[int] = []
+            for s in seq_lens:
+                if len(pos_cpu) >= self.s_max:
+                    break
+                want = min(int(s), self.s_max - len(pos_cpu))
+                pos_cpu.extend(range(want))
+            pos_cpu.extend([0] * (self.s_max - len(pos_cpu)))
+            pos_t = torch.tensor(pos_cpu, dtype=torch.long, device=self.device)
+            cos, sin = rope_cos_sin(pos_t, self.Hd, float(self.svc.theta))
+            self.static_cos.copy_(cos)
+            self.static_sin.copy_(sin)
+        else:
+            self.static_cos.zero_()
+            self.static_sin.zero_()
 
         if not self._attn_fit:
             if not self._fallback_warned:
@@ -515,3 +601,226 @@ class Llama3GraphedBackward:
         return (self.static_grad_qh[:n],
                 self.static_grad_kh[:n],
                 self.static_grad_vh[:n])
+
+    # ------------------------------------------------------ forward recompute
+
+    def _padded_attn_forward_core(self) -> None:
+        """Captureable padded-attention FORWARD. Reads
+        ``static_qh_pad/kh_pad/vh_pad`` + masks (just scattered by the upstream
+        Q/K/V/RoPE region of the same forward graph), writes the flat
+        ``static_ctx_flat`` via padded-compute + gather.
+
+        Math mirrors the per-sample loop in ``layer_forward`` (lines 175-191
+        of llama3.py): GQA repeat_interleave, fp32 scores/softmax, causal +
+        key-pad mask, ``att @ v`` cast back to model dtype. Output layout
+        is the flat ``[n, Hq*Hd]`` that the eager O-proj backward
+        consumes."""
+        bn, lm = self.bn_max, self.l_max
+        Hq, Hkv, Hd = self.Hq, self.Hkv, self.Hd
+        D = Hq * Hd
+        kv_repeat = self.kv_repeat
+        mdt = self.model_dtype
+
+        # Same masking layout as the backward graph: broadcast over heads.
+        attn_mask = (self.static_causal_mask.unsqueeze(0).unsqueeze(0)
+                     | self.static_key_pad_mask.unsqueeze(1).unsqueeze(1))
+
+        if kv_repeat != 1:
+            kh_rep = self.static_kh_pad.repeat_interleave(kv_repeat, dim=2)
+            vh_rep = self.static_vh_pad.repeat_interleave(kv_repeat, dim=2)
+        else:
+            kh_rep = self.static_kh_pad
+            vh_rep = self.static_vh_pad
+
+        # [bn, Hq, l, Hd] fp32 — scores/softmax always fp32 (GQA precision rule).
+        q_att = self.static_qh_pad.permute(0, 2, 1, 3).contiguous().float()
+        k_att = kh_rep.permute(0, 2, 1, 3).contiguous().float()
+        v_att = vh_rep.permute(0, 2, 1, 3).contiguous().float()
+
+        scores = (q_att @ k_att.transpose(-1, -2)) * self.scale
+        scores = scores.masked_fill(attn_mask, -1e9)
+        att = torch.softmax(scores, dim=-1)
+        # Fully-masked rows (entirely padded samples) → softmax = NaN; map to 0.
+        att = torch.nan_to_num(att, nan=0.0)
+        ctx_att = att @ v_att                       # [bn, Hq, l, Hd] fp32
+
+        # Back to [bn, l, Hq, Hd], cast to model dtype.
+        ctx_pad = ctx_att.permute(0, 2, 1, 3).contiguous().to(mdt)
+        # Gather padded → flat [s_max, D]. Tail rows gather from (0,0); caller
+        # only reads [:n].
+        gathered = ctx_pad[self.static_bn_idx, self.static_pos_idx]   # [s, Hq, Hd]
+        self.static_ctx_flat.copy_(gathered.reshape(self.s_max, D))
+
+    def _forward_core(self, lw: dict) -> None:
+        """The captureable layer-forward body (no eager helpers, no python loop
+        over samples). Reads ``static_layer_in`` + ``static_cos/sin`` +
+        ``static_saved_gate_up``; writes:
+
+          - ``static_x_norm1`` (eager Q/K/V LoRA-A bwd input)
+          - ``static_qh_flat / kh_flat / vh_flat`` (eager RoPE-bwd input)
+          - ``static_qh_pad  / kh_pad  / vh_pad`` (Graph B input — scattered)
+          - ``static_ctx_flat`` (eager O-proj bwd input)
+          - ``static_resid_mid`` (Graph A input)
+          - ``static_gate / static_up`` (Graph A input — sliced from saved_gate_up)
+
+        Mirrors ``layer_forward`` with ``saved_gate_up != None``; differs only
+        in being shape-stable at the fixed ``s_max`` slab and writing into
+        static buffers in place."""
+        s, D, inter = self.s_max, self.D, self.inter
+        Hq, Hkv, Hd = self.Hq, self.Hkv, self.Hd
+        kv_size = Hkv * Hd
+        scaling = float(self.svc.scaling)
+        mdt = self.model_dtype
+
+        # 1) RMSNorm(in_ln) on [s_max, D]
+        x_norm1 = rmsnorm(self.static_layer_in, lw["in_ln"], self.eps)
+        self.static_x_norm1.copy_(x_norm1)
+
+        # 2) Q/K/V projections (base + LoRA) — LoRA `.data` refs are stable.
+        q = _proj(x_norm1, lw["q"], lw["qA"], lw["qB"], scaling)          # [s, D]
+        k = _proj(x_norm1, lw["k"], lw["kA"], lw["kB"], scaling)          # [s, kv]
+        v = _proj(x_norm1, lw["v"], lw["vA"], lw["vB"], scaling)
+
+        # 3) RoPE on q, k; pack v.
+        qh = apply_rope(q.view(s, Hq, Hd), self.static_cos, self.static_sin)
+        kh = apply_rope(k.view(s, Hkv, Hd), self.static_cos, self.static_sin)
+        vh = v.view(s, Hkv, Hd)
+        # Flat writes (model dtype) — read by the eager RoPE-bwd tail.
+        self.static_qh_flat.copy_(qh)
+        self.static_kh_flat.copy_(kh)
+        self.static_vh_flat.copy_(vh)
+        # Scatter into padded layout (Graph B inputs). All s_max rows write,
+        # so we MUST use accumulate=True: tail rows (k ≥ n) have
+        # (bn_idx, pos_idx) = (0, 0), which coincides with the legit
+        # (sample 0, position 0) slot — without accumulate they'd overwrite
+        # it (last-write-wins). With accumulate=True, the legit row adds
+        # qh[real_0] and tail rows add 0 (input tail is zero because
+        # rmsnorm(0)·W = 0 and 0·W^T = 0). Pre-zeroed in
+        # ``stage_forward_inputs`` so accumulate starts from a clean slab.
+        self.static_qh_pad.index_put_(
+            (self.static_bn_idx, self.static_pos_idx), qh, accumulate=True)
+        self.static_kh_pad.index_put_(
+            (self.static_bn_idx, self.static_pos_idx), kh, accumulate=True)
+        self.static_vh_pad.index_put_(
+            (self.static_bn_idx, self.static_pos_idx), vh, accumulate=True)
+
+        # 4) Padded-attention forward → static_ctx_flat.
+        self._padded_attn_forward_core()
+
+        # 5) O projection (base + LoRA) → resid_mid = layer_in + o.
+        o = _proj(self.static_ctx_flat, lw["o"], lw["oA"], lw["oB"], scaling)
+        self.static_resid_mid.copy_(self.static_layer_in + o)
+
+        # 6) Slice saved gate||up into separate gate/up. Skip the gate_up
+        #    matmul (the "saved_gate_up != None" path in eager layer_forward).
+        self.static_gate.copy_(self.static_saved_gate_up[:, :inter])
+        self.static_up.copy_(self.static_saved_gate_up[:, inter:])
+
+    def _capture_forward(self, layer_id: int, lw: dict) -> None:
+        """Capture the per-layer forward-recompute graph. Static buffers must
+        already be initialized (we stage zeros up-front in ``prepare``; real
+        backwards stage real values into them via ``stage_forward_inputs``)."""
+        for _ in range(self._N_WARMUP):
+            self._forward_core(lw)
+        torch.cuda.synchronize()
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, pool=self._graph_pool, stream=self._stream):
+            self._forward_core(lw)
+        self._fwd_graphs[layer_id] = g
+
+    def stage_forward_inputs(self, layer_in: torch.Tensor,
+                             saved_gate_up: torch.Tensor, n: int) -> None:
+        """Copy this layer's inputs into the static slabs (zero the tail).
+        ``cos/sin`` are staged once per backward in ``begin_backward``; the
+        ``static_*_pad`` buffers are zeroed here so the in-graph scatter
+        produces zero rows at the tail.
+
+        Cheap: 2 ``copy_`` + 1 ``zero_`` per layer (plus the pad zero_,
+        amortized across both the forward write and the Graph B input)."""
+        s = self.s_max
+        if layer_in.dtype != self.model_dtype:
+            layer_in = layer_in.to(self.model_dtype)
+        self.static_layer_in[:n].copy_(layer_in)
+        if n < s:
+            self.static_layer_in[n:].zero_()
+        if saved_gate_up.dtype != self.model_dtype:
+            saved_gate_up = saved_gate_up.to(self.model_dtype)
+        self.static_saved_gate_up[:n].copy_(saved_gate_up)
+        if n < s:
+            self.static_saved_gate_up[n:].zero_()
+        # Zero the padded q/k/v staging targets before the scatter so tail
+        # writes (to slot (0,0)) don't leave stale data from a prior layer.
+        self.static_qh_pad.zero_()
+        self.static_kh_pad.zero_()
+        self.static_vh_pad.zero_()
+
+    def forward(self, layer_id: int, lw: dict, layer_in: torch.Tensor,
+                saved_gate_up: torch.Tensor, n: int) -> dict:
+        """Graphed layer forward-recompute. Returns the cache dict of static
+        views the downstream backward consumes — same shape contract as the
+        eager ``layer_forward``.
+
+        Silent eager fallback when (a) the padded budget didn't fit
+        (``_attn_fit`` False), or (b) this layer's capture/replay raised
+        (added to ``fwd_failed``). Eager fallback calls ``layer_forward(...)``
+        and returns its dict directly."""
+        if not self._attn_fit or layer_id in self.fwd_failed:
+            return layer_forward(layer_in, lw, self.svc.scaling,
+                                 self.static_cos[:n], self.static_sin[:n],
+                                 self._cur_seq_lens, self._cur_b_start,
+                                 (self.Hq, self.Hkv, self.Hd, self.Hkv * self.Hd),
+                                 self.eps, saved_gate_up=saved_gate_up)
+
+        self.stage_forward_inputs(layer_in, saved_gate_up, n)
+
+        if layer_id not in self._fwd_graphs:
+            try:
+                self._capture_forward(layer_id, lw)
+            except Exception as e:  # noqa: BLE001
+                self.fwd_failed.add(layer_id)
+                dprint(f"[bwd-graph] forward capture failed for layer "
+                       f"{layer_id}: {e}; falling back to eager forward")
+                return layer_forward(layer_in, lw, self.svc.scaling,
+                                     self.static_cos[:n], self.static_sin[:n],
+                                     self._cur_seq_lens, self._cur_b_start,
+                                     (self.Hq, self.Hkv, self.Hd,
+                                      self.Hkv * self.Hd),
+                                     self.eps, saved_gate_up=saved_gate_up)
+
+        try:
+            self._fwd_graphs[layer_id].replay()
+        except Exception as e:  # noqa: BLE001
+            self.fwd_failed.add(layer_id)
+            dprint(f"[bwd-graph] forward replay failed for layer "
+                   f"{layer_id}: {e}; falling back to eager forward")
+            return layer_forward(layer_in, lw, self.svc.scaling,
+                                 self.static_cos[:n], self.static_sin[:n],
+                                 self._cur_seq_lens, self._cur_b_start,
+                                 (self.Hq, self.Hkv, self.Hd,
+                                  self.Hkv * self.Hd),
+                                 self.eps, saved_gate_up=saved_gate_up)
+
+        return self.cache_views(n)
+
+    def cache_views(self, n: int) -> dict:
+        """View dict over the static forward outputs at [:n]. Same keys/shapes
+        as ``layer_forward``'s return so the downstream ``layer_backward`` /
+        ``_layer_backward_graphed`` reads it transparently. The caller must
+        consume this before the NEXT layer's forward replay overwrites the
+        buffers (the per-layer loop already does this — each iteration's
+        backward fully consumes its cache before the next iteration's forward
+        runs)."""
+        # ``x`` = the layer's input (= layer_in[i] view) — used by the eager
+        # in_ln rmsnorm backward. Same slab the forward read from.
+        return {
+            "x": self.static_layer_in[:n],
+            "x_norm1": self.static_x_norm1[:n],
+            "qh": self.static_qh_flat[:n],
+            "kh": self.static_kh_flat[:n],
+            "vh": self.static_vh_flat[:n],
+            "ctx_flat": self.static_ctx_flat[:n],
+            "resid_mid": self.static_resid_mid[:n],
+            "gate": self.static_gate[:n],
+            "up": self.static_up[:n],
+        }

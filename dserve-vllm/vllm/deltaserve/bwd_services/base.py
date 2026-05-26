@@ -392,16 +392,17 @@ class BackwardService:
             for value in self.activations.values():
                 for t in (value if isinstance(value, list) else [value]):
                     t.zero_()
-            torch.cuda.synchronize()
+            #torch.cuda.synchronize()
 
         # Emit the per-cycle log AFTER the sync so the events are queryable.
         if can_compute and loss is not None:
-            if start_evt is not None and end_evt is not None:
-                total_ms = start_evt.elapsed_time(end_evt)
-            elif cpu_elapsed_ms is not None:
-                total_ms = cpu_elapsed_ms
-            else:
-                total_ms = float("nan")
+            # if start_evt is not None and end_evt is not None:
+            #     total_ms = start_evt.elapsed_time(end_evt)
+            # elif cpu_elapsed_ms is not None:
+            #     total_ms = cpu_elapsed_ms
+            # else:
+            #     total_ms = float("nan")
+            total_ms = float("nan")
             # Normalise loss to a float for both the format string and the
             # non-finite check below — `loss` may be a 0-d tensor or a
             # Python float depending on the subclass.

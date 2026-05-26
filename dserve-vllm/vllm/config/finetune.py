@@ -61,15 +61,19 @@ class FinetuneConfig:
     way. Set True for strictly more accurate gradients at ~2x backward matmul cost."""
 
     backward_cuda_graph: bool = False
-    """Capture the FFN-backward and padded-attention-backward sub-regions of each
-    layer's manual SFT backward as CUDA graphs (one of each per layer), keyed at
-    the fixed activation-buffer width (max_saved_finetuning_tokens). Cuts host
-    dispatch overhead on Llama-3's 32-layer backward from ~3 ms toward ~0. Eager
-    fallback per-layer on capture or shape-fit failure; gradient values are
-    bit-identical to the eager path (same math, just replayed). _maybe_pause()
-    is preserved and called between the two graphs each layer, so the GPU-yield
-    contract for the Phase-5 pause and Phase-6 forward_interruptible paths is
-    unaffected. Default off; mirrors DeltaServe's SFT_service_graph.py."""
+    """Capture the per-layer forward-recompute, FFN-backward, and padded-
+    attention-backward sub-regions of each layer's manual SFT backward as CUDA
+    graphs (forward + FFN bwd are one graph each per layer; attn bwd is ONE
+    shared graph reused across all layers), keyed at the fixed activation-
+    buffer width (max_saved_finetuning_tokens). Cuts host dispatch overhead on
+    Llama-3's 32-layer backward. Eager fallback per-layer on capture or
+    shape-fit failure; gradient values are bit-identical to the eager path
+    (same math, just replayed). The forward graph falls back to eager for any
+    layer whose saved gate||up is absent (e.g. ``save_activations: false``).
+    _maybe_pause() is preserved and called between the FFN-bwd and
+    attn-bwd graphs each layer, so the GPU-yield contract for the Phase-5
+    pause and Phase-6 forward_interruptible paths is unaffected. Default
+    off; mirrors DeltaServe's SFT_service_graph.py."""
 
     backward_cuda_graph_attn_bn_max: int = 8
     """[backward_cuda_graph] Padded-attention max distinct samples per backward.
@@ -122,7 +126,34 @@ class FinetuneConfig:
     FT prefill can't dwarf the inference prefill it rides along with. When -1
     (default), this constraint is ignored — FT fills up to whatever the SLO
     estimator and buffer space allow. No effect on prefill-free steps (idle /
-    FT-only fills), where prefill is zero."""
+    FT-only fills), where prefill is zero.
+
+    Mutually exclusive with ``match_with_prefill_workload`` — when the latter
+    is True, this factor is ignored (the leaky-bucket strategy fully replaces
+    the per-step proportional cap)."""
+
+    match_with_prefill_workload: bool = False
+    """Alternate FT admission strategy: a leaky-bucket gate that defers FT
+    admission until enough inference prefill tokens have been observed to
+    "earn" the next FT sample.
+
+    When True, the scheduler maintains an internal counter
+    ``_unspent_prefill``. On every prefill-carrying step (t_in > 0):
+      * If ``_unspent_prefill + t_in >= peek_next_ft_sample.input_len`` →
+        admit that one FT sample, reset the counter to 0.
+      * Else → don't admit FT this step, accumulate
+        ``_unspent_prefill += t_in``.
+    FT-only / idle steps and decode-only steps follow the existing flow
+    (full buffer fill on idle, skip on decode-only).
+
+    Any successful FT admission (this gate, FT-only fill, or any future
+    path) resets the counter to 0, so credit is consumed atomically and
+    can't be double-spent.
+
+    Replaces ``ft_tokens_admission_constrain_factor`` when enabled — the
+    factor cap is bypassed, since this gate already controls FT-per-prefill
+    ratio (one sample per ~sample-length tokens of observed prefill).
+    Default False keeps the previous factor-based behaviour."""
 
     profile_on_launch: bool = True
     """Run the offline execution-time profiling pass at launch (before serving)

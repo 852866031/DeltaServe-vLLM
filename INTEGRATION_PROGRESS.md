@@ -80,9 +80,11 @@ under co-serving should drop from "~80 ms (one full FT-only forward)" toward
 the YAML. See the new **Phase 6** section below for the full design + verification
 plan.
 
-After that, Phase 5 (backward CUDA graphs + attention batching) remains the largest
-optimization target. From here on we **prioritize Llama-3**; opt-125m stays at its
-current stage (loss-only) as a reference path and is not developed further.
+Phase 5.2 (backward CUDA graphs) and 5.3 (perf polish + admission strategies + bug
+fixes) have shipped — see the bottom of the **Phase 5** section for what landed and
+what's next (save post-RoPE qh/kh/vh per layer is the next FT-throughput candidate,
+documented as future work). From here on we **prioritize Llama-3**; opt-125m stays at
+its current stage (loss-only) as a reference path and is not developed further.
 
 ---
 
@@ -289,13 +291,16 @@ at startup, length-bucketed selection. Pure Python, no GPU/vLLM coupling.
 |---|---|
 | `vllm/config/finetune.py` | `data_path`, `num_epochs`, `max_prepare`, `max_saved_finetuning_tokens` |
 | `configs/serving_config_finetuning.yaml` | `finetune.data_path: ../alpaca_1000.txt` (+ `num_epochs`, `max_saved_finetuning_tokens`) |
-| `vllm/deltaserve/finetuning_store.py` *(new)* | `FinetuningSample` + `FinetuningStore` (`load`, `pop_best_under`, `pop_next`, `confirmed_trained`, `advance_epoch`, `has_next`) |
+| `vllm/deltaserve/finetuning_store.py` *(new)* | `FinetuningSample` + `FinetuningStore` (`load`, `pop_best_under`, `pop_next`, 3-phase `claim`/`commit_claimed`/`release_claimed` (Phase 6, replaces the original `confirmed_trained`), `advance_epoch`, `has_next`, `has_claimed`). `load()` also drops samples with `input_len > max_saved_finetuning_tokens` (P5.3 fix — they'd otherwise sit in the pool forever and deadlock FT admission once fittable samples drain). |
 | `alpaca_1000.txt` *(repo root, user-provided)* | 1000-sample corpus, one per line |
 
 **Behavior ported faithfully:** `pop_best_under(max_tokens)` returns the largest
-*untrained* sample with `input_len <= max_tokens` (peek, no mark); `confirmed_trained`
-marks + drops from length buckets; `advance_epoch` resets marks (total_epochs gates
-the count). Dropped vs DeltaServe: Req/Batch coupling, bwd-loss bookkeeping (Phase 3).
+*untrained* sample with `input_len <= max_tokens` (peek, no mark); the 3-phase store
+API (`claim` reserves, `commit_claimed` marks trained, `release_claimed` rolls back —
+Phase 6 replacement for the original `confirmed_trained`) ensures `_claimed`
+samples are reconciled per backward; `advance_epoch` resets marks (total_epochs gates
+the count) and refuses while any sample is claimed in-flight. Dropped vs DeltaServe:
+Req/Batch coupling, bwd-loss bookkeeping (Phase 3).
 
 **Not yet wired** into the engine — the store is constructed/used during FT
 injection (next step), scheduler-side, with the engine's tokenizer.
@@ -842,7 +847,7 @@ freed inference slot mid-batch — common is contiguous, but not guaranteed). Sa
 bytes either way; saves one CUDA kernel + one allocation per hook firing
 (~33 per Llama-3 FT forward).
 
-## Phase 5 — Optimizations & assets ⬜
+## Phase 5 — Optimizations & assets 🟡 (5.1, 5.2, 5.3 shipped; multi-TP + dedicated FT pool open)
 
 - **Pause/resume `_maybe_pause` — the GPU-yielding co-serving contract. ✅ IMPLEMENTED (prefill-gated).**
   An `mp.Event` GPU-grant (SET = backward may run; CLEARED = yield) is created in
@@ -864,8 +869,31 @@ bytes either way; saves one CUDA kernel + one allocation per hook firing
   hotspot at small n); profile with the existing `[backward] remat-forward vs manual-grad` split.
   (Already done: bf16 bulk default, `gate_up` save skips the MLP recompute, dropped unused
   `down`/`out` recompute.)
-- A dedicated FT activation pool only if vLLM's allocator gets in the way; eval/analysis tooling
-  port (`auto_benchmark`/`auto_plot`); multi-TP correctness (backward per-rank).
+- **Phase 5.3 — perf polish + admission strategies + bug fixes. ✅ SHIPPED.** Bundled set
+  documented in detail in `VLLM_FORK_CHANGES.md` (P5.3 stage row + design note):
+  - `match_with_prefill_workload` — leaky-bucket FT admission strategy. Accumulates
+    inference-prefill tokens seen but not yet "spent" on FT; admits ONE FT sample
+    sized to the next sample's `input_len` when accumulated credit suffices; resets on
+    any FT admit. Mutually exclusive with `ft_tokens_admission_constrain_factor`.
+    Config: `finetune.match_with_prefill_workload: true`. Default False.
+  - **Oversized-sample drop at load** (`finetuning_store.py:load()`) — fixes a real
+    deadlock when only samples with `input_len > max_saved_finetuning_tokens` remain
+    in the pool. Surfaced by `pure_ft_bench.py` on `alpaca_1000.txt`.
+  - **Fused AdamW** (`bwd_services/llama3.py` — `torch.optim.AdamW(..., fused=True)`)
+    + **persistent grad_qh/kh/vh buffers** in `attn_backward_core` + **single shared
+    padded-attn graph** in `Llama3GraphedBackward` (was per-layer; the core has no
+    layer-specific weights so 32 captures was wasteful).
+  - **One-shot `set_corpus_meta` IPC** replaces sending the corpus total on every
+    `notify_buffer_full`. **Per-cycle log line** restructured to one line with
+    `epoch=N processed/total tokens` progress.
+  - **CUDA syncs** in `_handle_process_activations` coalesced 2 → 1 (timing now via
+    CUDA events; cleanup sync drains the GPU before the events are queried).
+  - **eval/auto_benchmark** output files tagged `_factor_<X>` (or `_factor_off` for
+    `-1`); `eval/auto_plot` 5-panel layout with E2E latency percentile + p99
+    highlighted + `--factor X` (auto-detects smallest) + factor in plot title;
+    **`eval/pure_ft_bench.py`** new pure-FT (no inference traffic) benchmark.
+- A dedicated FT activation pool only if vLLM's allocator gets in the way; multi-TP
+  correctness (backward per-rank). (eval/analysis tooling port: ✅ done in P5.3 above.)
 
 ### Future activation-save optimization — save post-RoPE `qh, kh, vh` per layer
 

@@ -46,6 +46,7 @@ Two kinds of change:
 | P6 — `forward_interruptible` (A + B + C tiers) inference pre-emption | — | `config/finetune.py`* (`forward_interruptible` master switch + `ft_only_admission_grace_ms`), `deltaserve/coordinator.py`* (`FTAborted` sentinel, `ft_abort_event`/`ft_only_in_flight`, `release_reserve(n, samples=)`, `snapshot_admission`/`restore_admission` — restores ONLY admit/flush flags, NOT reserved_fill; `buffer_samples` + `on_backward_done` hook so the store commits claimed samples only after the backward acks), `deltaserve/finetuning_store.py`* (`claim` / `commit_claimed` / `release_claimed` 3-phase API replaces one-way `confirmed_trained`; `advance_epoch` refuses while `_claimed` non-empty; `has_claimed`), `deltaserve/ft_injector.py`* (calls `claim` at admit, stashes `req._ft_sample`), `deltaserve/ft_scheduler.py`* (registers `coord.on_backward_done = store.commit_claimed`; admission snapshot at top of `schedule`; passes samples to `coord.reserve`; releases unscheduled-FT samples; `_rollback_ft_step(scheduler_output)` helper used by both tiers B and C; clears `ft_abort_event` at end of rollback; `would_step_be_ft_only()` predicate for tier A), `deltaserve/accumulate.py`* (per-hook `is_set()` check raises `FTAborted` after copy work; `zero_offset_range(off, n)` zeros all hook-target buffers on the aborted offset; `_abort_event` wired from `gpu_worker._maybe_setup_finetuning_accumulator`), `v1/worker/gpu_model_runner.py` (`execute_model` arms `_ft_only_run` and wraps `_model_forward` in try/`except FTAborted`; entry-time bail when event already set — handles pipeline-depth-2 contamination; sentinel `ModelRunnerOutput(_ft_aborted=True)` on bail; `accumulator.zero_offset_range` cleanup; `finally` clears `ft_only_in_flight` + `accumulator.end_step()`), `v1/worker/gpu_worker.py`* (wires `accumulator._abort_event = coord.ft_abort_event` when feature on), `v1/engine/core.py`* (`_maybe_ft_only_grace_poll` before `step_fn` — tier A grace window on `input_queue`; `_maybe_rollback_ft_for_late_arrival` after `schedule()` — tier B; sentinel routing in `step_with_batch_queue` skips `sample_tokens` for aborted batches; abort handler after `future.result()` calls `_rollback_ft_step` and skips `update_from_output`; input thread sets `coord.ft_abort_event` on ADD when `ft_only_in_flight` via cached `_ft_coord_handle`) |
 | P6.1 — slice-based FT activation save | — | `deltaserve/accumulate.py`* (`_cur_start` / `_cur_contiguous` fields; `begin_step` + `accumulate_final` accept `start` + `contiguous` kwargs; pre/out hooks slice `val[start:start+n]` on the fast path, fall back to `val[mask]` when not contiguous), `v1/worker/gpu_model_runner.py` (`_build_finetune_mask` also computes `_ft_start` + `_ft_contiguous` from first/last True positions; `execute_model` passes them to `accumulator.begin_step` + `accumulator.accumulate_final`) |
 | P5.2 — CUDA-graph backward (per-layer FFN + padded-attention) | `deltaserve/bwd_services/llama3_graph.py`, `tests/test_llama3_backward_graph.py` | `config/finetune.py`* (`backward_cuda_graph` master switch + `backward_cuda_graph_attn_{bn_max,l_max}` padded-attn bounds), `deltaserve/bwd_services/llama3.py`* (extract `ffn_backward_core` / `attn_backward_core` from `layer_backward`; instantiate `Llama3GraphedBackward` in `_build_state` when flag set; new `_layer_backward_graphed` composes graph-A + eager O-bwd + `_maybe_pause` + graph-B + eager tail; `process_backward` per-layer loop dispatches to graphed runner when present), `v1/worker/gpu_worker.py` (meta dict forwards `backward_cuda_graph` + bn_max/l_max + `max_saved_finetuning_tokens` to the child) |
+| P5.3 — perf polish + admission strategies + bug fixes | `eval/pure_ft_bench.py` | `config/finetune.py`* (new `match_with_prefill_workload` admission strategy), `deltaserve/finetuning_store.py`* (drop samples with `input_len > max_saved_finetuning_tokens` at load — fixes FT-admission deadlock when only oversized samples remain in the pool), `deltaserve/ft_scheduler.py`* (`_unspent_prefill` leaky-bucket counter; admission shaper branches between factor-cap and match-with-prefill-workload; `set_corpus_meta` IPC after `store.load()`), `deltaserve/backward_process.py`* (new `set_corpus_meta(total_tokens_per_epoch)` one-shot IPC method), `deltaserve/bwd_services/base.py`* (per-cycle log line restructured to one line: `[backward] Xms (graph/eager) loss=… total_trained=… n=… epoch=… N/total tokens`; persistent `_grad_qh/kh/vh_buf` allocation; CUDA-event timing replaces wall-clock-after-sync; sync coalesced from 2/cycle → 1/cycle; new `set_corpus_meta` cmd handler), `deltaserve/bwd_services/llama3.py`* (fused AdamW via `torch.optim.AdamW(..., fused=True)`; persistent `grad_qh/kh/vh_buf` plumbed into `attn_backward_core` via opt-in kwargs; `_publish_to_served` docstring expanded with scaling-contract / FT-slot-exclusivity notes), `deltaserve/bwd_services/llama3_graph.py`* (single shared padded-attn graph reused across all L layers — `_attn_graphs` dict collapsed to one `_attn_graph` since the core has no per-layer weights), `eval/auto_benchmark.py` (factor tag `_factor_<X>` appended to output suffix on `--co` runs; `_load_yaml_cfg()` helper shared with `build_server_cmd`), `eval/auto_plot.py` (5-panel layout with new E2E latency percentile panel + p99 highlighted; `--factor` CLI arg with auto-detection of smallest factor; factor in plot title) |
 | Eng obs — per-batch lifecycle trace + ms bwd-log timestamps | — | `config/finetune.py`* (`print_scheduler_add`, `print_engine_batch_exec`, `print_engine_batch_done`, `print_engine_req_recv` — independent gates for the per-batch lifecycle prints; `print_step_mode` becomes a convenience master switch for all four), `deltaserve/coordinator.py`* (`_write_bwd_log_row` uses `isoformat(timespec="milliseconds")`), `v1/engine/core.py`* (`_classify_batch_for_log` decode-only / zero-token gate; `_maybe_log_batch_scheduled` after `schedule()` + `_maybe_log_batch_done` after `future.result()`; engine-recv print gate switched to OR of `print_engine_req_recv | print_step_mode`), `v1/worker/gpu_model_runner.py` (`_log_finetuning_batch` gate switched to OR of `print_engine_batch_exec | print_step_mode`) |
 
 `*` = same file extended in a later stage.
@@ -110,6 +111,77 @@ Two kinds of change:
 > `attn_backward_core`, so gradient values are bit-identical (verified by
 > `tests/test_llama3_backward_graph.py`).
 
+> **P5.3 (perf polish + admission strategies + bug fixes):**
+> • **`match_with_prefill_workload`** — alternate FT admission strategy
+>   (`config/finetune.py`, default False). Maintains a leaky-bucket counter
+>   `_unspent_prefill` of inference prefill tokens seen but not yet "spent" on
+>   FT. On each prefill-carrying step (t_in > 0): peek the smallest untrained
+>   FT sample; if `_unspent_prefill + t_in >= sample.input_len`, admit that ONE
+>   sample sized exactly to it (the per-step pack-multiple-samples path is
+>   bypassed) and reset the counter; otherwise accumulate `+= t_in` and skip
+>   FT this step. Any successful FT admission (any path) resets the counter
+>   unconditionally so credit is consumed atomically. Mutually exclusive with
+>   `ft_tokens_admission_constrain_factor` — the flag wins when both are set.
+>   FT-only/idle steps and decode-only steps follow the existing flow.
+> • **Oversized-sample deadlock fix** (`finetuning_store.py:load()`): samples
+>   with `input_len > max_saved_finetuning_tokens` are now dropped at load
+>   time with a one-line warning. Previously they sat in the selectable pool
+>   forever — `has_next()` stayed True so `advance_epoch` never fired, but
+>   `pop_best_under(cap)` returned None so the injector returned empty;
+>   `note_injection(next_sample_len > effective_space, 0)` closed admission;
+>   the empty buffer meant no flush trigger fired; `has_requests()` returned
+>   False; engine idled forever. Surfaced by `pure_ft_bench.py` on
+>   `alpaca_1000.txt` (3 samples > 256-token cap, 813 tokens dropped, FT
+>   cycled cleanly through `num_epochs` afterward).
+> • **One-shot `set_corpus_meta` IPC** (`backward_process.py`,
+>   `bwd_services/base.py`, `ft_scheduler.py`): the FT corpus token count is
+>   constant for the run, so it's sent ONCE from the engine core to the
+>   backward child right after `FinetuningStore.load()` completes — rather
+>   than bundled into every `notify_buffer_full`. Child stores it on
+>   `self._total_tokens_per_epoch` and uses it for the per-epoch progress
+>   meter in the per-cycle log.
+> • **Per-cycle log line** (`bwd_services/base.py`): now one structured line
+>   per backward — `[backward] Xms (graph/eager) loss=… total_trained=…
+>   n=… epoch=… N/total tokens` — derived from CUDA events around
+>   `process_backward()` so timing is GPU-strict, not wall-clock-after-sync.
+>   The `N/total tokens` part is the in-epoch progress (resets at epoch
+>   advance). CUDA sync coalesced from 2/cycle (timing + cleanup) to 1
+>   (cleanup only; timing reads the events after the cleanup sync, which
+>   has already drained the GPU).
+> • **Fused AdamW** (`bwd_services/llama3.py`): `torch.optim.AdamW(...,
+>   fused=True)`. 256 LoRA tensors (8 per layer × 32 layers) go through a
+>   single CUDA fused kernel instead of per-tensor dispatch — ~3-5 ms saved
+>   per backward. Numerically identical.
+> • **Persistent `grad_qh/kh/vh_buf`** (`bwd_services/llama3.py`): allocated
+>   once on the service in `_build_state` at `s_max`, passed through to
+>   `attn_backward_core` via opt-in kwargs (the gradcheck test path passes
+>   None and gets fresh allocs — unchanged behavior). Eliminates 96
+>   zero-fills/backward (32 layers × 3 tensors).
+> • **Single shared padded-attention graph** (`bwd_services/llama3_graph.py`):
+>   the padded-attn core reads only static IO + masks + indices, NO layer-
+>   specific weights — so 32 identical per-layer captures are wasteful. The
+>   `_attn_graphs: dict[int, CUDAGraph]` was collapsed to one
+>   `_attn_graph: CUDAGraph | None` reused across all L layers, with
+>   `attn_failed` becoming a single bool. ~1.5-3 s saved at startup capture +
+>   smaller graph-pool footprint.
+> • **eval/auto_benchmark `_factor_<X>` suffix** — output files on `--co` runs
+>   now carry the FT-admission factor (`_co_factor_1_loose.csv` etc.) so A/B
+>   runs across factors don't overwrite each other. `-1` (disabled) renders
+>   as `off`. Implemented via `_load_yaml_cfg()` helper shared with
+>   `build_server_cmd` to avoid double YAML loads.
+> • **eval/auto_plot 5-panel + factor + p99** — second-row E2E latency
+>   percentile panel (empirical CDF) with the p99 marker highlighted across
+>   series (heavier vertical guide, color-matched horizontal ticks with the
+>   p99 value annotated). `--factor X` CLI arg picks which `_factor_<X>`
+>   set to plot; if absent, auto-detects from `output/` and picks the
+>   smallest (`off` = -1 sorts smallest). Factor appears in the plot title.
+> • **`eval/pure_ft_bench.py`** — new pure-FT benchmark script (no inference
+>   traffic). Launches the server with FT enabled, POSTs `/start_finetuning`,
+>   idles for `--duration` seconds, trims the bwd_log to the post-POST
+>   window, and summarizes (cycles, span, total trained, avg tok/s,
+>   per-cycle batch_tokens + dt stats). Useful for validating Phase 5
+>   graph/perf changes in isolation.
+
 > **P4 design notes:** one **merged** 6-param step estimator
 > `T ≈ α·S + β·T_in + γ·T_ft + δ·B_d + ε·K + c` (vLLM runs one mixed prefill+decode
 > batch, so prefill+decode estimators collapse into one). γ kept in BOTH eager and
@@ -136,16 +208,24 @@ Two kinds of change:
 `backward_mps_percentage`, `finetuning_lora_path` (FT adapter), `data_path`,
 `num_epochs`, `max_prepare`, `max_saved_finetuning_tokens`, `backward_sleep_seconds`,
 the SLO knobs (`ttft_slo` / `avg_tbt_slo` / `max_tbt_slo`, grouped under a `slo:` YAML
-section) + **`ft_tokens_admission_constrain_factor`** (P4e: cap FT tokens ≤
-`prefill_tokens · factor` per prefill step; `-1` disables), the P6 functional knobs
-`forward_interruptible` (master switch for inference pre-emption of FT-only stepping —
-tiers A + B + C) + `ft_only_admission_grace_ms` (tier-A grace window in ms, default 2.0,
-0 disables A while keeping B and C), and the debug knobs
-`print_weight_hash` / `print_activation_hash` / `print_step_mode` plus the per-batch
-lifecycle gates `print_scheduler_add` / `print_engine_batch_exec` /
-`print_engine_batch_done` / `print_engine_req_recv` (each independently togglable;
-`print_step_mode` is a convenience master switch that enables all four). `slo` + `debug`
-keys are folded into FinetuneConfig by the loader.
+section) + the two **mutually exclusive FT admission shapers**: P4e's
+**`ft_tokens_admission_constrain_factor`** (cap FT tokens ≤ `prefill_tokens · factor`
+per prefill step; `-1` disables) and P5.3's **`match_with_prefill_workload`**
+(leaky-bucket — accumulate observed prefill tokens, admit ONE FT sample when
+accumulated ≥ next sample's input_len, reset on any FT admit; default False; wins
+over the factor when both set). P5.2's **backward CUDA-graph knobs** —
+**`backward_cuda_graph`** master switch (default False) + the padded-attention
+bounds **`backward_cuda_graph_attn_bn_max`** (default 8) + **`backward_cuda_graph_attn_l_max`**
+(default 64). The **`backward_fp32`** bulk-compute precision flag (P3.4, default
+False = bf16). The P6 functional knobs `forward_interruptible` (master switch for
+inference pre-emption of FT-only stepping — tiers A + B + C) +
+`ft_only_admission_grace_ms` (tier-A grace window in ms, default 2.0, 0 disables A
+while keeping B and C). The debug knobs `print_weight_hash` / `print_activation_hash`
+/ `print_step_mode` plus the per-batch lifecycle gates `print_scheduler_add` /
+`print_engine_batch_exec` / `print_engine_batch_done` / `print_engine_req_recv`
+(each independently togglable; `print_step_mode` is a convenience master switch
+that enables all four). `slo` + `debug` keys are folded into FinetuneConfig by
+the loader.
 **Used by:** `config/__init__.py` (export), `config/vllm.py` (attached as
 `VllmConfig.finetune_config` + read in `__post_init__`), `engine/arg_utils.py`
 (`EngineArgs` field + `--finetune-config` CLI), `deltaserve/config_loader.py`,
