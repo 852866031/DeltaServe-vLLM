@@ -267,6 +267,107 @@ def test_forward_graph_parity():
                        out[key], ref[key], _FP32_TOL)
 
 
+def test_layer_forward_saved_qkv_parity():
+    """Eager `layer_forward(..., saved_qh/kh/vh=...)` must match the recompute
+    path when the saved q/k/v are the SAME tensors the recompute would produce.
+    This is the equivalence the production save-then-skip path relies on:
+    if we save what the inference forward produced and re-feed it to the
+    backward's layer_forward, the cache must be bit-identical to recomputing
+    it (modulo RMSNorm in_ln being recomputed in both paths)."""
+    print("test_layer_forward_saved_qkv_parity:")
+    torch.manual_seed(5)
+    Hq, Hkv, Hd = 4, 2, 16
+    D, kv_size, inter, r = Hq * Hd, Hkv * Hd, 32, 4
+    eps = 1e-5
+    scaling, theta = 2.0, 500000.0
+    dims = (Hq, Hkv, Hd, kv_size)
+
+    lw = _make_layer_weights(D, kv_size, inter, r, MDT)
+    seq_lens = [5, 3]
+    n = sum(seq_lens)
+    b_start = [0, 5]
+    positions = torch.cat([torch.arange(s, device=DEVICE) for s in seq_lens])
+    cos, sin = L.rope_cos_sin(positions, Hd, theta)
+    layer_in = torch.randn(n, D, device=DEVICE, dtype=MDT)
+    saved_gu = torch.randn(n, 2 * inter, device=DEVICE, dtype=MDT)
+
+    # Recompute path
+    ref = L.layer_forward(layer_in, lw, scaling, cos, sin,
+                          seq_lens, b_start, dims, eps, saved_gate_up=saved_gu)
+    # Saved-qkv path: feed back the exact qh/kh/vh the recompute produced as
+    # flat [n, q_size]/[n, kv_size]. cos/sin shouldn't be touched but pass
+    # them for signature compat.
+    saved_qh_flat = ref["qh"].reshape(n, Hq * Hd).contiguous()
+    saved_kh_flat = ref["kh"].reshape(n, Hkv * Hd).contiguous()
+    saved_vh_flat = ref["vh"].reshape(n, Hkv * Hd).contiguous()
+    out = L.layer_forward(layer_in, lw, scaling, cos, sin,
+                          seq_lens, b_start, dims, eps,
+                          saved_gate_up=saved_gu,
+                          saved_qh=saved_qh_flat, saved_kh=saved_kh_flat,
+                          saved_vh=saved_vh_flat)
+    for key in ("x", "x_norm1", "qh", "kh", "vh",
+                "ctx_flat", "resid_mid", "gate", "up"):
+        _check(f"saved-qkv {key}", out[key], ref[key], _FP32_TOL)
+
+
+def test_forward_graph_saved_qkv_parity():
+    """Graphed forward in save_attn_qkv mode must match eager layer_forward
+    given the same saved q/k/v. Exercises the captured fast-path branch in
+    Llama3GraphedBackward._forward_core when self.save_attn_qkv=True."""
+    print("test_forward_graph_saved_qkv_parity:")
+    torch.manual_seed(6)
+    Hq, Hkv, Hd = 4, 2, 16
+    D, kv_size, inter, r = Hq * Hd, Hkv * Hd, 32, 4
+    L_, eps, cdt = 2, 1e-5, torch.float32
+    s_max, bn_max, l_max = 16, 4, 8
+    scaling, theta = 2.0, 500000.0
+    dims = (Hq, Hkv, Hd, kv_size)
+
+    lws = [_make_layer_weights(D, kv_size, inter, r, MDT) for _ in range(L_)]
+    # Service mock with save_attn_qkv=True — runner reads it via getattr.
+    svc = _mk_svc(D, L_, Hq, Hkv, Hd, inter, eps, MDT, cdt, lws=lws,
+                  scaling=scaling, theta=theta)
+    svc.save_attn_qkv = True
+    runner = Llama3GraphedBackward(svc, s_max=s_max, bn_max=bn_max, l_max=l_max)
+    assert runner.save_attn_qkv, "runner should pick up save_attn_qkv from svc"
+
+    for batch_idx, seq_lens in enumerate([[5, 3], [8, 4]]):
+        n = sum(seq_lens)
+        b_start = [sum(seq_lens[:i]) for i in range(len(seq_lens))]
+        runner.begin_backward(n, seq_lens, b_start)
+
+        positions = torch.cat([
+            torch.arange(s, device=DEVICE) for s in seq_lens])
+        cos, sin = L.rope_cos_sin(positions, Hd, theta)
+
+        for i in range(L_):
+            lw = lws[i]
+            layer_in = torch.randn(n, D, device=DEVICE, dtype=MDT)
+            saved_gu = torch.randn(n, 2 * inter, device=DEVICE, dtype=MDT)
+            # Build saved qh/kh/vh = exactly what the inference forward
+            # would have produced (Q/K/V proj + RoPE on this layer_in).
+            ref_full = L.layer_forward(layer_in, lw, scaling, cos, sin,
+                                       seq_lens, b_start, dims, eps,
+                                       saved_gate_up=saved_gu)
+            saved_qh = ref_full["qh"].reshape(n, Hq * Hd).contiguous()
+            saved_kh = ref_full["kh"].reshape(n, Hkv * Hd).contiguous()
+            saved_vh = ref_full["vh"].reshape(n, Hkv * Hd).contiguous()
+            # Eager reference using the saved path (skips Q/K/V/RoPE).
+            ref = L.layer_forward(layer_in, lw, scaling, cos, sin,
+                                  seq_lens, b_start, dims, eps,
+                                  saved_gate_up=saved_gu,
+                                  saved_qh=saved_qh, saved_kh=saved_kh,
+                                  saved_vh=saved_vh)
+            # Graphed.
+            out = runner.forward(i, lw, layer_in, saved_gu, n,
+                                 saved_qh=saved_qh, saved_kh=saved_kh,
+                                 saved_vh=saved_vh)
+            for key in ("x", "x_norm1", "qh", "kh", "vh",
+                        "ctx_flat", "resid_mid", "gate", "up"):
+                _check(f"batch{batch_idx} layer{i} {key}",
+                       out[key], ref[key], _FP32_TOL)
+
+
 def test_forward_overflow_fallback():
     """Batches that overflow (bn_max, l_max) must silently fall back to the
     eager ``layer_forward`` (and still produce the correct cache)."""
@@ -308,6 +409,8 @@ def main():
     test_attn_graph_parity()
     test_attn_overflow_fallback()
     test_forward_graph_parity()
+    test_layer_forward_saved_qkv_parity()
+    test_forward_graph_saved_qkv_parity()
     test_forward_overflow_fallback()
     print(f"\n{_passed} passed, {_failed} failed")
     sys.exit(1 if _failed else 0)

@@ -48,16 +48,28 @@ from vllm.deltaserve import dprint
 _LAYER_IN_SUFFIX = "input_layernorm"  # residual stream entering each layer
 _FINAL_NORM_SUFFIX = ".norm"          # final norm (input = pre-final-norm residual)
 _MLP_GATEUP_SUFFIX = "mlp.gate_up_proj"  # MLP pre-activation (gate||up) output
+_SELF_ATTN_ATTN_SUFFIX = "self_attn.attn"  # post-RoPE q/k/v: hook sees args=(q,k,v)
 
 
 class FinetuneAccumulator:
     def __init__(self, model, max_saved: int, hidden_size: int, device,
-                 dtype, intermediate_size: int | None = None) -> None:
+                 dtype, intermediate_size: int | None = None,
+                 q_size: int | None = None,
+                 kv_size: int | None = None,
+                 save_attn_qkv: bool = False) -> None:
         self.max_saved = int(max_saved)
         self.hidden_size = int(hidden_size)
         self.intermediate_size = int(intermediate_size) if intermediate_size else 0
+        self.q_size = int(q_size) if q_size else 0
+        self.kv_size = int(kv_size) if kv_size else 0
         self.device = device
         self.dtype = dtype
+        # Opt-in: save post-RoPE q/k/v per layer to skip Q/K/V proj + RoPE
+        # recompute in the backward. Only meaningful when the attn dims are
+        # known; otherwise treated as disabled (the hook target's args layout
+        # is model-specific and we don't infer it without dims).
+        self._save_attn_qkv = (bool(save_attn_qkv)
+                               and self.q_size > 0 and self.kv_size > 0)
 
         # Per-step state (set by begin_step, read by hooks).
         self._active = False
@@ -88,8 +100,10 @@ class FinetuneAccumulator:
         #   layers.{i}.input_layernorm -> layer_in[i]   (auto-detected; absent on opt)
         #   model.norm                 -> final_in
         #   layers.{i}.mlp.gate_up_proj -> mlp_gate_up[i] (frozen MLP pre-activation)
+        #   layers.{i}.self_attn.attn  -> attn_qh/kh/vh[i] (post-RoPE q,k,v: feature-gated)
         self._layer_in_modules: dict[int, torch.nn.Module] = {}
         self._gate_up_modules: dict[int, torch.nn.Module] = {}
+        self._self_attn_attn_modules: dict[int, torch.nn.Module] = {}
         self._final_norm_module: torch.nn.Module | None = None
         for name, mod in model.named_modules():
             if name.endswith(_LAYER_IN_SUFFIX):
@@ -100,12 +114,19 @@ class FinetuneAccumulator:
                 m = re.search(r"layers\.(\d+)\.", name)
                 if m is not None:
                     self._gate_up_modules[int(m.group(1))] = mod
+            elif name.endswith(_SELF_ATTN_ATTN_SUFFIX):
+                m = re.search(r"layers\.(\d+)\.", name)
+                if m is not None:
+                    self._self_attn_attn_modules[int(m.group(1))] = mod
             elif name.endswith(_FINAL_NORM_SUFFIX) and ".layers." not in name:
                 self._final_norm_module = mod
         self.num_layers = (max(self._layer_in_modules) + 1
                            if self._layer_in_modules else 0)
         # Save the MLP gate||up only if we found the modules AND know its width.
         self._save_gate_up = bool(self._gate_up_modules) and self.intermediate_size > 0
+        # Save post-RoPE q/k/v only if requested, dims known, AND modules found.
+        self._save_attn_qkv = (self._save_attn_qkv
+                               and bool(self._self_attn_attn_modules))
 
         # Pre-allocated buffers (plain torch.zeros — outside any CUDA-graph pool).
         def _buf(width=None):
@@ -120,6 +141,19 @@ class FinetuneAccumulator:
         self.mlp_gate_up = ([_buf(2 * self.intermediate_size)
                              for _ in range(self.num_layers)]
                             if self._save_gate_up else [])
+        # Per-layer post-RoPE q/k/v buffers (only when save_attn_qkv is on).
+        # Stored as flat [s_max, q_size] / [s_max, kv_size] — same layout the
+        # vLLM attention call sees just before self_attn.attn(q,k,v). The
+        # backward reshapes to [n, H, Hd] on the fly.
+        self.attn_qh = ([_buf(self.q_size)
+                         for _ in range(self.num_layers)]
+                        if self._save_attn_qkv else [])
+        self.attn_kh = ([_buf(self.kv_size)
+                         for _ in range(self.num_layers)]
+                        if self._save_attn_qkv else [])
+        self.attn_vh = ([_buf(self.kv_size)
+                         for _ in range(self.num_layers)]
+                        if self._save_attn_qkv else [])
         self.buffers = {
             "final_hidden": self.final_hidden,
             "concat_input_ids": self.concat_input_ids,
@@ -130,6 +164,10 @@ class FinetuneAccumulator:
             self.buffers["final_in"] = self.final_in
         if self.mlp_gate_up:
             self.buffers["mlp_gate_up"] = self.mlp_gate_up
+        if self.attn_qh:
+            self.buffers["attn_qh"] = self.attn_qh
+            self.buffers["attn_kh"] = self.attn_kh
+            self.buffers["attn_vh"] = self.attn_vh
 
     def register_hooks(self) -> None:
         for layer, mod in self._layer_in_modules.items():
@@ -145,14 +183,24 @@ class FinetuneAccumulator:
                 self._handles.append(
                     mod.register_forward_hook(
                         self._make_out_hook(self.mlp_gate_up[layer])))
+        if self._save_attn_qkv:
+            for layer, mod in self._self_attn_attn_modules.items():
+                self._handles.append(
+                    mod.register_forward_pre_hook(
+                        self._make_attn_qkv_pre_hook(
+                            self.attn_qh[layer],
+                            self.attn_kh[layer],
+                            self.attn_vh[layer])))
         dprint(
             f"[accumulate] residual-stream pre-hooks on "
             f"{len(self._layer_in_modules)} input_layernorm + "
             f"{int(self._final_norm_module is not None)} final norm; "
-            f"gate_up post-hooks on {len(self._gate_up_modules) if self._save_gate_up else 0}"
+            f"gate_up post-hooks on {len(self._gate_up_modules) if self._save_gate_up else 0}; "
+            f"attn-qkv pre-hooks on {len(self._self_attn_attn_modules) if self._save_attn_qkv else 0}"
             f"; buffers [{self.max_saved}, {self.hidden_size}] x {self.num_layers} "
             f"layers (+ final_in/final_hidden"
-            f"{'/mlp_gate_up' if self._save_gate_up else ''})"
+            f"{'/mlp_gate_up' if self._save_gate_up else ''}"
+            f"{'/attn_qh+kh+vh' if self._save_attn_qkv else ''})"
         )
 
     def _make_pre_hook(self, buf):
@@ -182,6 +230,38 @@ class FinetuneAccumulator:
             # the abort signal and bail at this layer boundary. Raising from
             # a forward hook unwinds the model.forward() call via Python
             # exception — execute_model catches FTAborted and rolls back.
+            _evt = self._abort_event
+            if _evt is not None and _evt.is_set():
+                from vllm.deltaserve.coordinator import FTAborted
+                raise FTAborted()
+
+        return pre_hook
+
+    def _make_attn_qkv_pre_hook(self, qh_buf, kh_buf, vh_buf):
+        """Hook fires on ``self_attn.attn(q, k, v)`` — q, k are POST-RoPE, v
+        is straight from the qkv_proj split. q/k/v are flat ``[n_total, ...]``
+        in the same row order as the rest of the batch, so we gather FT rows
+        via the same contiguous-or-mask path as the residual-stream hooks."""
+        def pre_hook(module, args):
+            if not self._active or self._cur_n == 0:
+                return
+            # args = (q, k, v); q/k post-RoPE, all flat in batch-row order.
+            q, k, v = args[0], args[1], args[2]
+            if self._cur_contiguous:
+                qrows = q[self._cur_start:self._cur_start + self._cur_n]
+                krows = k[self._cur_start:self._cur_start + self._cur_n]
+                vrows = v[self._cur_start:self._cur_start + self._cur_n]
+            else:
+                qrows = q[self._cur_mask]
+                krows = k[self._cur_mask]
+                vrows = v[self._cur_mask]
+            off = self._cur_offset
+            n = min(qrows.shape[0], self.max_saved - off)
+            if n > 0:
+                qh_buf[off:off + n].copy_(qrows[:n].to(self.dtype))
+                kh_buf[off:off + n].copy_(krows[:n].to(self.dtype))
+                vh_buf[off:off + n].copy_(vrows[:n].to(self.dtype))
+            # tier-C abort (same idiom as the other hooks).
             _evt = self._abort_event
             if _evt is not None and _evt.is_set():
                 from vllm.deltaserve.coordinator import FTAborted
@@ -285,4 +365,10 @@ class FinetuneAccumulator:
         self.final_hidden[off:off + n].zero_()
         self.concat_input_ids[off:off + n].zero_()
         for buf in self.mlp_gate_up:
+            buf[off:off + n].zero_()
+        for buf in self.attn_qh:
+            buf[off:off + n].zero_()
+        for buf in self.attn_kh:
+            buf[off:off + n].zero_()
+        for buf in self.attn_vh:
             buf[off:off + n].zero_()

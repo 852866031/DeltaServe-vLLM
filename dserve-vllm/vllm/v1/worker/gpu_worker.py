@@ -483,6 +483,11 @@ class Worker(WorkerBase):
                 int(ft_cfg.backward_cuda_graph_attn_l_max),
             "max_saved_finetuning_tokens":
                 int(ft_cfg.max_saved_finetuning_tokens),
+            # When True, the forward saves post-RoPE q/k/v per layer to
+            # ``activations["attn_qh"/"attn_kh"/"attn_vh"]``. The backward
+            # short-circuits the Q/K/V proj + RoPE recompute (RMSNorm
+            # in_ln stays — cheap and needed for Q/K/V LoRA-A grad).
+            "save_attn_qkv": bool(ft_cfg.save_attn_qkv),
         }
 
         dprint(
@@ -521,8 +526,21 @@ class Worker(WorkerBase):
 
         ft_cfg = self.vllm_config.finetune_config
         model = self.get_model()
-        hidden_size = self.model_config.hf_config.hidden_size
+        hf_config = self.model_config.hf_config
+        hidden_size = hf_config.hidden_size
         dtype = next(model.parameters()).dtype
+
+        # Derive q_size / kv_size for the optional post-RoPE attn-qkv save —
+        # the hook target's q/k/v args are flat [n_total, q_size] /
+        # [n_total, kv_size] so we need these widths to allocate the buffers.
+        # Same formulas the backward service uses to slice qkv_proj
+        # (gpu_worker meta + bwd_services/llama3._build_state).
+        num_heads = int(hf_config.num_attention_heads)
+        head_dim = int(getattr(hf_config, "head_dim", None)
+                       or hidden_size // num_heads)
+        num_kv_heads = int(getattr(hf_config, "num_key_value_heads", num_heads))
+        q_size = num_heads * head_dim
+        kv_size = num_kv_heads * head_dim
 
         accumulator = FinetuneAccumulator(
             model=model,
@@ -530,8 +548,10 @@ class Worker(WorkerBase):
             hidden_size=hidden_size,
             device=self.device,
             dtype=dtype,
-            intermediate_size=getattr(
-                self.model_config.hf_config, "intermediate_size", None),
+            intermediate_size=getattr(hf_config, "intermediate_size", None),
+            q_size=q_size,
+            kv_size=kv_size,
+            save_attn_qkv=bool(ft_cfg.save_attn_qkv),
         )
         accumulator.register_hooks()
         ack = backward_process.share_activations(
