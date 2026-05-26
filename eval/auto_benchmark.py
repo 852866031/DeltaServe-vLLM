@@ -124,17 +124,47 @@ def _finetune_cli_args(section: dict) -> list[str]:
     return args
 
 
+def _load_yaml_cfg() -> dict:
+    """Load the finetuning YAML once, with the repo root stripped from
+    ``sys.path`` so ``vllm`` resolves to the installed package (not any
+    source-tree copy). Same trick used by ``build_server_cmd``; factored out
+    so ``main()`` can read knobs (e.g. the FT admission factor) for the
+    output-file suffix without re-implementing the path dance."""
+    sys.path[:] = [p for p in sys.path
+                   if os.path.abspath(p or ".") not in {str(_HERE), str(_ROOT)}]
+    from vllm.deltaserve.config_loader import load_yaml_config
+    return load_yaml_config(str(_CONFIG))
+
+
+def _ft_factor_tag(cfg: dict) -> str:
+    """Render ``slo.ft_tokens_admission_constrain_factor`` as a filesystem-
+    safe suffix tag. ``-1`` (the disabled sentinel) becomes ``off`` so a
+    no-cap run reads as ``..._factor_off`` instead of ``..._factor_-1.0``.
+    Integer values render without a decimal; floats keep ``%g`` precision."""
+    factor = ((cfg.get("slo") or {})
+              .get("ft_tokens_admission_constrain_factor"))
+    if factor is None:
+        # Belt + suspenders: some YAMLs may put it under finetune instead.
+        factor = ((cfg.get("finetune") or {})
+                  .get("ft_tokens_admission_constrain_factor"))
+    if factor is None:
+        factor = -1.0
+    f = float(factor)
+    if f == -1.0:
+        return "off"
+    if f.is_integer():
+        return str(int(f))
+    return f"{f:g}"
+
+
 def build_server_cmd(co: bool, bwd_log_path: Optional[str],
                      api_server_count: Optional[int] = None,
                      base_model: str = _BASE_MODEL_DEFAULT) -> list[str]:
     """Build the `dserve-vllm serve` command. Imports config_loader with the
     repo root stripped from sys.path so `vllm` resolves to the installed
     package, not any source-tree copy."""
-    sys.path[:] = [p for p in sys.path
-                   if os.path.abspath(p or ".") not in {str(_HERE), str(_ROOT)}]
-    from vllm.deltaserve.config_loader import load_yaml_config, split_config
-
-    cfg = load_yaml_config(str(_CONFIG))
+    cfg = _load_yaml_cfg()
+    from vllm.deltaserve.config_loader import split_config
     engine_kwargs, _, _ = split_config(cfg)
     engine_kwargs.pop("model", None)  # positional to `dserve-vllm serve`
 
@@ -485,9 +515,16 @@ async def main() -> None:
     timeline_rows = load_timeline_csv(args.timeline_csv)
     print(f"[bench] loaded {len(timeline_rows)} rows from {args.timeline_csv}", flush=True)
 
-    # Output suffix: <co?>_<mode>. Mirrors the plotter's {base}_{mode} scheme
-    # (base = '_co' or '').
+    # Output suffix: <co?>_factor_<f>_<mode>. The factor tag (only on --co
+    # runs) lets A/B comparisons across ``ft_tokens_admission_constrain_factor``
+    # values land in distinct files; -1 / disabled is shown as "off".
+    # Mirrors the plotter's {base}_{mode} scheme (base = '_co_factor_X' or '').
     base = "_co" if args.co else ""
+    if args.co:
+        factor_tag = _ft_factor_tag(_load_yaml_cfg())
+        base = f"{base}_factor_{factor_tag}"
+        print(f"[bench] ft_tokens_admission_constrain_factor tag: "
+              f"_factor_{factor_tag}", flush=True)
     suffix = base + (f"_{mode}" if mode else "")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_csv = str(OUTPUT_DIR / f"timeline_results{suffix}.csv")
