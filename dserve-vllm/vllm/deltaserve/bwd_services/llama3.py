@@ -591,6 +591,13 @@ class Llama3BackwardService(BackwardService):
             self.graph_runner.begin_backward(n, seq_lens, b_start)
 
         # Per-layer manual backward, chaining the input gradient down the stack.
+        # Graph runner takes the forward+backward fast path when:
+        #   - runner is attached, AND
+        #   - the padded-attention budget fits this backward (decided once
+        #     in begin_backward → ``graph_runner._attn_fit``), AND
+        #   - this layer's saved gate||up is available (production default).
+        # Otherwise the layer runs the eager ``layer_forward`` + the
+        # appropriate backward path.
         for i in reversed(range(self.L)):
             if self.graph_runner is None:
                 # Eager path (today's behaviour). Pause at the layer boundary
@@ -600,9 +607,17 @@ class Llama3BackwardService(BackwardService):
             x = activations["layer_in"][i][:n]
             gu = saved_gu[i][:n] if saved_gu else None
             with torch.no_grad():
-                cache = layer_forward(x, lw, self.scaling, cos, sin,
-                                      seq_lens, b_start, self.dims, self.eps,
-                                      saved_gate_up=gu)
+                if (self.graph_runner is not None
+                        and self.graph_runner._attn_fit
+                        and gu is not None):
+                    # Graphed forward: writes cache straight into the
+                    # static buffers Graph A / Graph B already read.
+                    cache = self.graph_runner.forward(i, lw, x, gu, n)
+                else:
+                    cache = layer_forward(
+                        x, lw, self.scaling, cos, sin,
+                        seq_lens, b_start, self.dims, self.eps,
+                        saved_gate_up=gu)
                 if self.graph_runner is None:
                     grad_x, grads = layer_backward(
                         g, cache, lw, self.scaling, cos, sin,

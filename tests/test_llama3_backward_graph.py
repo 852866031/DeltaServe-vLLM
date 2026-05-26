@@ -68,16 +68,22 @@ def _make_layer_weights(D, kv_size, inter, r, dtype):
     }
 
 
-def _mk_svc(D, L_, Hq, Hkv, Hd, inter, eps, mdt, cdt, lws=None):
+def _mk_svc(D, L_, Hq, Hkv, Hd, inter, eps, mdt, cdt, lws=None,
+            scaling=2.0, theta=500000.0):
     """Minimal stand-in for Llama3BackwardService — the runner reads dims/dtypes
     and calls ``_layer_weights(i)`` during startup graph capture. If ``lws`` is
     provided, ``_layer_weights`` returns ``lws[i]``; otherwise it raises so the
-    runner's startup capture path can't accidentally succeed without weights."""
+    runner's startup capture path can't accidentally succeed without weights.
+
+    ``scaling`` and ``theta`` are needed once the forward graph is in the
+    runner (LoRA scaling for ``_proj``; RoPE base for cos/sin staging in
+    ``begin_backward``)."""
     svc = SimpleNamespace(
         device_index=0,
         D=D, L=L_, Hq=Hq, Hkv=Hkv, Hd=Hd, inter=inter,
         kv_size=Hkv * Hd, eps=eps,
         base_dtype=mdt, bwd_dtype=cdt,
+        scaling=scaling, theta=theta,
     )
     if lws is None:
         def _missing(i):
@@ -216,10 +222,93 @@ def test_attn_overflow_fallback():
     assert not runner._attn_fit, "expected _attn_fit=False for overflow batch"
 
 
+def test_forward_graph_parity():
+    """Per-layer forward-recompute graph replay must match the eager
+    ``layer_forward`` output cache (all 9 entries: x, x_norm1, qh, kh, vh,
+    ctx_flat, resid_mid, gate, up) for batches that fit (bn_max, l_max).
+    Uses ``saved_gate_up`` (production path)."""
+    print("test_forward_graph_parity:")
+    torch.manual_seed(3)
+    Hq, Hkv, Hd = 4, 2, 16
+    D, kv_size, inter, r = Hq * Hd, Hkv * Hd, 32, 4
+    L_, eps, cdt = 2, 1e-5, torch.float32
+    s_max, bn_max, l_max = 16, 4, 8
+    scaling, theta = 2.0, 500000.0
+    dims = (Hq, Hkv, Hd, kv_size)
+
+    lws = [_make_layer_weights(D, kv_size, inter, r, MDT) for _ in range(L_)]
+    svc = _mk_svc(D, L_, Hq, Hkv, Hd, inter, eps, MDT, cdt, lws=lws,
+                  scaling=scaling, theta=theta)
+    runner = Llama3GraphedBackward(svc, s_max=s_max, bn_max=bn_max, l_max=l_max)
+
+    for batch_idx, seq_lens in enumerate([[5, 3], [8, 4]]):
+        n = sum(seq_lens)
+        b_start = [sum(seq_lens[:i]) for i in range(len(seq_lens))]
+        runner.begin_backward(n, seq_lens, b_start)
+
+        positions = torch.cat([
+            torch.arange(s, device=DEVICE) for s in seq_lens])
+        cos, sin = L.rope_cos_sin(positions, Hd, theta)
+
+        for i in range(L_):
+            lw = lws[i]
+            layer_in = torch.randn(n, D, device=DEVICE, dtype=MDT)
+            saved_gu = torch.randn(n, 2 * inter, device=DEVICE, dtype=MDT)
+
+            # Eager reference.
+            ref = L.layer_forward(layer_in, lw, scaling, cos, sin,
+                                  seq_lens, b_start, dims, eps,
+                                  saved_gate_up=saved_gu)
+            # Graphed.
+            out = runner.forward(i, lw, layer_in, saved_gu, n)
+            for key in ("x", "x_norm1", "qh", "kh", "vh",
+                        "ctx_flat", "resid_mid", "gate", "up"):
+                _check(f"batch{batch_idx} layer{i} {key}",
+                       out[key], ref[key], _FP32_TOL)
+
+
+def test_forward_overflow_fallback():
+    """Batches that overflow (bn_max, l_max) must silently fall back to the
+    eager ``layer_forward`` (and still produce the correct cache)."""
+    print("test_forward_overflow_fallback:")
+    torch.manual_seed(4)
+    Hq, Hkv, Hd = 4, 2, 16
+    D, kv_size, inter, r = Hq * Hd, Hkv * Hd, 32, 4
+    L_, eps, cdt = 1, 1e-5, torch.float32
+    s_max, bn_max, l_max = 32, 2, 4
+    scaling, theta = 2.0, 500000.0
+    dims = (Hq, Hkv, Hd, kv_size)
+
+    lws = [_make_layer_weights(D, kv_size, inter, r, MDT) for _ in range(L_)]
+    svc = _mk_svc(D, L_, Hq, Hkv, Hd, inter, eps, MDT, cdt, lws=lws,
+                  scaling=scaling, theta=theta)
+    runner = Llama3GraphedBackward(svc, s_max=s_max, bn_max=bn_max, l_max=l_max)
+
+    # Overflow on l: max sample length 6 > l_max=4 → fallback.
+    seq_lens = [6, 4]
+    n = sum(seq_lens)
+    b_start = [0, 6]
+    runner.begin_backward(n, seq_lens, b_start)
+    positions = torch.cat([torch.arange(s, device=DEVICE) for s in seq_lens])
+    cos, sin = L.rope_cos_sin(positions, Hd, theta)
+    layer_in = torch.randn(n, D, device=DEVICE, dtype=MDT)
+    saved_gu = torch.randn(n, 2 * inter, device=DEVICE, dtype=MDT)
+
+    ref = L.layer_forward(layer_in, lws[0], scaling, cos, sin,
+                          seq_lens, b_start, dims, eps, saved_gate_up=saved_gu)
+    out = runner.forward(0, lws[0], layer_in, saved_gu, n)
+    for key in ("x", "x_norm1", "qh", "kh", "vh",
+                "ctx_flat", "resid_mid", "gate", "up"):
+        _check(f"overflow {key}", out[key], ref[key], _FP32_TOL)
+    assert not runner._attn_fit, "expected _attn_fit=False for overflow batch"
+
+
 def main():
     test_ffn_graph_parity()
     test_attn_graph_parity()
     test_attn_overflow_fallback()
+    test_forward_graph_parity()
+    test_forward_overflow_fallback()
     print(f"\n{_passed} passed, {_failed} failed")
     sys.exit(1 if _failed else 0)
 

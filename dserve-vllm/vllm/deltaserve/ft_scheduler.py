@@ -120,6 +120,16 @@ class FinetuneScheduler(AsyncScheduler):
         self._async = bool(self.scheduler_config.async_scheduling)
         self._last_step_pred_s = 0.0
 
+        # [match_with_prefill_workload] Leaky-bucket counter of inference
+        # prefill tokens we've observed but NOT spent on FT admission. When
+        # the corresponding finetune-config flag is on, this gates each
+        # prefill-step's FT admit: hold off until enough has accumulated to
+        # cover the next FT sample's size, then admit ONE sample + reset.
+        # Set to 0 on every successful FT admission (including FT-only
+        # batches), so credit is consumed atomically per admit. Inert when
+        # the flag is off — the counter just stays at 0.
+        self._unspent_prefill: int = 0
+
         dprint(
             f"[ft-sched] FinetuneScheduler active | capacity={capacity} "
             f"per_step_budget={self._coord.per_step_budget} "
@@ -423,13 +433,41 @@ class FinetuneScheduler(AsyncScheduler):
         decode_only = feats.b_d > 0 and feats.t_in == 0
         budget = 0 if decode_only else self._slo_ft_budget(
             feats, earliest_arrival)
-        # Optional cap: on prefill-carrying steps, limit FT tokens to
-        # `prefill_tokens * factor` (config ft_tokens_admission_constrain_factor)
-        # so FT prefill can't dwarf the inference prefill it rides with. factor
-        # == -1 disables it; prefill-free (idle/FT-only) steps are unaffected.
-        _factor = self.vllm_config.finetune_config.\
-            ft_tokens_admission_constrain_factor
-        if _factor != -1 and feats.t_in > 0:
+        # Two mutually-exclusive shapers on the SLO/buffer-derived budget for
+        # prefill-carrying steps (idle/FT-only and decode-only steps are
+        # untouched):
+        #   1. ``match_with_prefill_workload`` (leaky bucket): defer FT admit
+        #      until enough prefill has been observed to "earn" the next FT
+        #      sample, then admit exactly that one sample.
+        #   2. ``ft_tokens_admission_constrain_factor`` (proportional cap):
+        #      admit at most ``t_in * factor`` FT tokens this step.
+        # Flag 1 wins when both are set (factor is ignored — the leaky bucket
+        # already controls FT:prefill ratio).
+        ft_cfg = self.vllm_config.finetune_config
+        _match_prefill = bool(getattr(ft_cfg, "match_with_prefill_workload",
+                                      False))
+        _factor = ft_cfg.ft_tokens_admission_constrain_factor
+        if _match_prefill and feats.t_in > 0:
+            # Peek the next FT sample we'd admit (smallest untrained in the
+            # selectable pool). None → corpus drained, nothing to admit.
+            _peek = self._ft_injector.store.pop_next()
+            if _peek is None:
+                budget = 0
+            elif self._unspent_prefill + feats.t_in >= _peek.input_len:
+                # Triggered: cap budget so we admit exactly this one sample.
+                # ``next_ft_requests`` will pop it via pop_best_under(<=budget)
+                # and claim. The accumulator resets in the post-admit block
+                # below (gated on admitted_now > 0).
+                budget = min(budget, _peek.input_len)
+                dprint(
+                    f"[ft-sched] match_with_prefill: triggered "
+                    f"(unspent={self._unspent_prefill}+t_in={feats.t_in} "
+                    f">= next_sample={_peek.input_len}), budget={budget}")
+            else:
+                # Not enough credit yet — accumulate and skip FT this step.
+                self._unspent_prefill += int(feats.t_in)
+                budget = 0
+        elif _factor != -1 and feats.t_in > 0:
             budget = min(budget, int(feats.t_in * _factor))
         admitted_now = 0
         if not self._profiling_mode and budget > 0:
@@ -438,6 +476,13 @@ class FinetuneScheduler(AsyncScheduler):
                 self._enqueue_waiting_request(req)
                 self.requests[req.request_id] = req
             admitted_now = sum(r.num_prompt_tokens for r in reqs)
+        # [match_with_prefill_workload] Any successful FT admission resets the
+        # accumulator — credit is consumed atomically per admit. Done
+        # unconditionally (no gate on ``_match_prefill``) so toggling the flag
+        # mid-run doesn't leave a stale counter; harmless when off (counter
+        # stays at 0 already).
+        if admitted_now > 0:
+            self._unspent_prefill = 0
 
         # After injecting, hand the coordinator the smallest sample that could
         # still be added (peek-next, no mark). It raises the flush flag when the
