@@ -89,16 +89,30 @@ class FinetuningStore:
     # -- loading -----------------------------------------------------------
 
     def load(self) -> int:
-        """Read + tokenize the corpus. Returns the number of samples loaded."""
+        """Read + tokenize the corpus. Returns the number of samples loaded.
+
+        Samples with ``input_len > max_saved_finetuning_tokens`` are silently
+        DROPPED — they can never fit the activation buffer, and leaving them in
+        the pool deadlocks FT admission once all fittable samples have been
+        trained (``pop_best_under(cap)`` returns None but ``has_next()`` stays
+        True, so ``advance_epoch`` never fires and ``note_injection`` keeps
+        ``admission_open=False``). Count + sample lengths are reported in the
+        warning so the user knows to raise ``max_saved_finetuning_tokens`` (or
+        shorten the corpus) if the drop is significant."""
         if self.data_path is None:
             return 0
         loaded = 0
+        dropped_lens: list[int] = []
+        cap = self.max_saved_finetuning_tokens
         with open(self.data_path, encoding="utf-8") as f:
             for line in f:
                 text = line.strip()
                 if not text:
                     continue
                 prompt_ids = list(self.tokenize(text))
+                if len(prompt_ids) > cap:
+                    dropped_lens.append(len(prompt_ids))
+                    continue
                 sample = FinetuningSample(
                     request_id=uuid.uuid4().hex,
                     prompt_ids=prompt_ids,
@@ -121,6 +135,15 @@ class FinetuningStore:
             f"(min={self._sorted_template[0] if self._sorted_template else 0}, "
             f"max={self._sorted_template[-1] if self._sorted_template else 0})"
         )
+        if dropped_lens:
+            dprint(
+                f"[ft-store] dropped {len(dropped_lens)} oversized samples "
+                f"(input_len > max_saved_finetuning_tokens={cap}); "
+                f"{sum(dropped_lens)} tokens skipped. "
+                f"Lengths: {sorted(dropped_lens)}. "
+                f"Raise ``finetune.max_saved_finetuning_tokens`` to include "
+                f"them, or accept the loss."
+            )
         return loaded
 
     def _build_templates(self) -> None:

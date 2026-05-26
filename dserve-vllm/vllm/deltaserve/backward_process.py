@@ -297,6 +297,23 @@ class BackwardProcess:
             raise TimeoutError("[deltaserve] hash_activations timed out")
         return self._conn.recv()["hash_report"]
 
+    def set_corpus_meta(self, total_tokens_per_epoch: int) -> None:
+        """One-shot: tell the child the FT corpus total token count
+        (one full pass = one epoch). Sent once after FinetuningStore.load()
+        completes; the child uses it to render the per-epoch progress meter
+        in its per-cycle ``[backward]`` log. Fire-and-forget — the value is
+        only used cooperatively in logging, so a missed message just prints
+        ``N/?`` until the next backward (and the next backward can't fire
+        before this message lands because the scheduler calls this BEFORE
+        opening FT admission)."""
+        if self._conn is None or self._proc is None or not self._proc.is_alive():
+            return
+        try:
+            self._conn.send({"cmd": "set_corpus_meta",
+                             "total_tokens_per_epoch": int(total_tokens_per_epoch)})
+        except (BrokenPipeError, OSError, EOFError, ValueError) as e:
+            dprint(f"[backward] set_corpus_meta skipped (child gone): {e}")
+
     def notify_buffer_full(self, n: int, sleep_s: float = 2.0,
                            sample_lens: list[int] | None = None,
                            epoch: int = 0) -> None:

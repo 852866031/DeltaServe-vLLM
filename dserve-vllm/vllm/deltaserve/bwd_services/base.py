@@ -18,6 +18,7 @@ the co-serving cycle/timing is preserved. The real LoRA backward + optimizer is
 a later Phase-3 slice.
 """
 
+import math
 import os
 import time
 
@@ -95,6 +96,14 @@ class BackwardService:
         # Tag for the per-cycle one-line log: trainer subclasses set this to
         # "graph" or "eager" depending on which backward path they took.
         self._last_mode: str = "eager"
+        # Per-cycle log progress meter — tokens trained in the CURRENT epoch
+        # (resets to 0 when ``_handle_process_activations`` sees an epoch
+        # higher than the last one). The total is set ONCE by the parent via
+        # the ``set_corpus_meta`` IPC command right after FinetuningStore.load
+        # completes; stays constant for the run's lifetime.
+        self._epoch_processed_tokens: int = 0
+        self._cur_epoch_seen: int = 0
+        self._total_tokens_per_epoch: int = 0
 
     def _maybe_pause(self) -> None:
         """GPU-yield contract: block at a layer boundary while the main process
@@ -260,6 +269,14 @@ class BackwardService:
                     print_hash_report(report, "child")
                     conn.send({"event": "activation_hashes",
                                "hash_report": report})
+                elif cmd == "set_corpus_meta":
+                    # One-shot: corpus total tokens per epoch. Stored on self
+                    # and used by ``_handle_process_activations`` to render
+                    # the per-epoch progress meter. Fire-and-forget — no ack.
+                    self._total_tokens_per_epoch = int(
+                        msg.get("total_tokens_per_epoch", 0))
+                    dprint(f"[backward] corpus meta: "
+                           f"total_tokens_per_epoch={self._total_tokens_per_epoch}")
                 elif cmd == "process_activations":
                     self._handle_process_activations(conn, msg)
                 else:
@@ -306,6 +323,16 @@ class BackwardService:
         sample_lens = msg.get("sample_lens") or []
         epoch = int(msg.get("epoch", 0))
 
+        # Reset the per-epoch processed-tokens counter when the parent reports
+        # a new epoch — must happen BEFORE we add this cycle's ``n``, so the
+        # cycle's training counts toward the new epoch's progress (matches
+        # the parent-side semantics: ``self.current_epoch`` reflects the
+        # store's epoch AT THE TIME OF TRIGGER, so a flush-fired backward
+        # for epoch N+1 carries the N+1 tag).
+        if epoch > self._cur_epoch_seen:
+            self._epoch_processed_tokens = 0
+            self._cur_epoch_seen = epoch
+
         loss = None
         n_valid = 0
         start_evt = end_evt = None
@@ -340,6 +367,10 @@ class BackwardService:
                         self.activations, sample_lens, n, epoch)
                     cpu_elapsed_ms = (time.perf_counter() - t0) * 1000.0
                 self._total_tokens_trained += int(n_valid)
+                # ``n`` is the raw batch-row count (sum of seq_lens in this
+                # cycle), which matches the units of total_tokens_in_memory.
+                # ``n_valid`` would undercount by one per sample (CE shift-by-1).
+                self._epoch_processed_tokens += int(n)
             except Exception as e:  # noqa: BLE001 — keep the cycle alive on error
                 import traceback
                 dprint(f"[backward] backward failed: {e}")
@@ -371,11 +402,41 @@ class BackwardService:
                 total_ms = cpu_elapsed_ms
             else:
                 total_ms = float("nan")
+            # Normalise loss to a float for both the format string and the
+            # non-finite check below — `loss` may be a 0-d tensor or a
+            # Python float depending on the subclass.
+            try:
+                loss_f = loss.item() if hasattr(loss, "item") else float(loss)
+            except Exception:
+                loss_f = float("nan")
+            # Per-epoch progress meter: tokens trained in THIS epoch over the
+            # corpus total. ``?`` when the parent hasn't yet sent ``set_corpus_meta``
+            # (shouldn't happen on the live path — scheduler sends it BEFORE
+            # opening FT admission — but defensive).
+            if self._total_tokens_per_epoch > 0:
+                progress = (f"{self._epoch_processed_tokens}/"
+                            f"{self._total_tokens_per_epoch}")
+            else:
+                progress = f"{self._epoch_processed_tokens}/?"
             dprint(
                 f"[backward] {total_ms:.1f}ms ({self._last_mode}) "
-                f"loss={loss:.6f} "
-                f"total_trained={self._total_tokens_trained}"
+                f"loss={loss_f:.6f} "
+                f"total_trained={self._total_tokens_trained} n={n} "
+                f"epoch={epoch} {progress} tokens"
             )
+            # Loud warning on non-finite loss: training has diverged, the
+            # published LoRA weights are now NaN-tainted, and subsequent
+            # inference through this adapter will produce garbage. The cycle
+            # itself continues so the user can still see follow-up backwards
+            # (and the NaN pattern) — we deliberately do NOT kill the child.
+            if not math.isfinite(loss_f):
+                dprint(
+                    f"[backward] !!! NON-FINITE LOSS ({loss_f}) at "
+                    f"epoch={epoch} n={n} — training diverged; the FT "
+                    f"adapter published to vLLM is now NaN-tainted and "
+                    f"inference through it will return garbage. Lower the "
+                    f"learning rate or disable FT to recover."
+                )
 
         if not self.is_trainer:
             time.sleep(sleep_s)
