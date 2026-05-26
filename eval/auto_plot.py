@@ -31,7 +31,9 @@ Requires matplotlib (pip install matplotlib).
 import argparse
 import csv
 import datetime
+import glob
 import os
+import re
 import subprocess
 import sys
 from typing import Optional
@@ -51,6 +53,44 @@ DEFAULT_SLO_FALLBACK = 1.0
 ALL_MODES = ("loose", "tight", "nutanix")
 MODE_COLORS = {"loose": "tab:blue", "tight": "tab:red", "nutanix": "tab:green"}
 FT_SHADE_COLOR = "tab:orange"
+
+
+def _factor_value(tag: str) -> float:
+    """Map a factor tag to a numeric value for ordering.
+    ``'off'`` (auto_benchmark's encoding of the -1 "disabled" sentinel) sorts
+    as -1.0 — i.e. the smallest. Other tags parse as float."""
+    return -1.0 if tag == "off" else float(tag)
+
+
+def discover_factor_tags(output_dir: str, base_suffix: str) -> list[str]:
+    """Scan ``output_dir`` for ``timeline_results<base_suffix>_factor_<tag>_<mode>.csv``
+    files (the naming auto_benchmark emits on --co runs). Returns the set of
+    distinct ``<tag>`` strings found, sorted ascending by numeric value.
+
+    Used both for ``--factor`` auto-detection (pick smallest) and for user
+    diagnostics when a requested factor isn't present."""
+    pattern = os.path.join(
+        output_dir, f"timeline_results{base_suffix}_factor_*.csv")
+    tags: set[str] = set()
+    # The filename shape is timeline_results<base>_factor_<tag>_<mode>.csv —
+    # split on the LAST underscore before .csv to peel off the mode, then
+    # strip the known prefix to extract the tag. Validates the trailing piece
+    # against the known modes so a stray file with a different naming
+    # convention doesn't pollute the set.
+    name_re = re.compile(
+        r"^timeline_results" + re.escape(base_suffix)
+        + r"_factor_(?P<tag>[^_]+(?:\.[^_]+)?)_(?P<mode>"
+        + "|".join(re.escape(m) for m in ALL_MODES) + r")\.csv$")
+    for path in glob.glob(pattern):
+        m = name_re.match(os.path.basename(path))
+        if m is not None:
+            tags.add(m.group("tag"))
+    try:
+        return sorted(tags, key=_factor_value)
+    except ValueError:
+        # Defensive: if a tag isn't parseable as float/"off", fall back to
+        # lexicographic order so the caller still gets something usable.
+        return sorted(tags)
 
 
 def detect_gpu_subdir() -> str:
@@ -469,8 +509,16 @@ def plot_ttft_satisfaction(ax, res, slo_s, window_s=5.0, avg_tbt_slo=None):
 
 def make_figure_for_mode(mode, base_suffix, output_dir, plots_dir,
                          timeline_csv_dir, out_path, slo_s, window_s,
-                         throughput_window_s=None, avg_tbt_slo=None):
-    full = f"{base_suffix}_{mode}"
+                         throughput_window_s=None, avg_tbt_slo=None,
+                         factor_tag: Optional[str] = None):
+    # When ``factor_tag`` is provided, the on-disk file names carry the factor
+    # in the suffix (``..._factor_<tag>_<mode>.csv``); we extend the base
+    # accordingly so all the read paths line up without callers having to
+    # pre-stitch the string. None / "" → plot legacy files without a factor
+    # suffix (e.g. inference-only runs or pre-naming-change outputs).
+    effective_base = (f"{base_suffix}_factor_{factor_tag}"
+                      if factor_tag else base_suffix)
+    full = f"{effective_base}_{mode}"
     results_csv = os.path.join(output_dir, f"timeline_results{full}.csv")
     bwd_log_csv = os.path.join(output_dir, f"bwd_log{full}.csv")
     meta_json = os.path.join(output_dir, f"bench_meta{full}.json")
@@ -536,7 +584,11 @@ def make_figure_for_mode(mode, base_suffix, output_dir, plots_dir,
                            avg_tbt_slo=avg_tbt_slo)
 
     config_tag = base_suffix.lstrip("_") or "baseline"
-    fig.suptitle(f"{mode}  ({config_tag})")
+    title = f"{mode}  ({config_tag}"
+    if factor_tag:
+        title += f", factor={factor_tag}"
+    title += ")"
+    fig.suptitle(title)
     # constrained_layout handles the partial-row GridSpec; no tight_layout call.
     os.makedirs(plots_dir, exist_ok=True)
     fig.savefig(out_path, dpi=160)
@@ -559,6 +611,13 @@ def main():
     ap.add_argument("--config-yaml", default=CONFIG_YAML)
     ap.add_argument("--window", type=float, default=5.0)
     ap.add_argument("--throughput-window", type=float, default=3)
+    ap.add_argument("--factor", default=None,
+                    help="ft_tokens_admission_constrain_factor tag to plot "
+                         "(matches auto_benchmark's _factor_<X> file suffix). "
+                         "Examples: '1', '0.5', 'off'. Default: auto-detect "
+                         "from files in --output-dir, picking the smallest "
+                         "factor (off = -1 sorts smallest). Pass '' to skip "
+                         "factor entirely (legacy files without _factor_*).")
     args = ap.parse_args()
 
     slo_s = args.slo
@@ -576,10 +635,44 @@ def main():
     if avg_tbt_slo is not None:
         print(f"[auto_plot] avg-TBT SLO = {avg_tbt_slo:.3f}s")
 
+    # Resolve the factor tag. Explicit --factor wins (including '' to mean
+    # "no factor"); otherwise auto-detect by scanning output_dir for any
+    # ``..._factor_<X>_<mode>.csv`` and picking the smallest <X>.
+    factor_tag: Optional[str]
+    if args.factor is None:
+        available = discover_factor_tags(args.output_dir, args.suffix)
+        if available:
+            factor_tag = available[0]
+            other = (f" (also available: {', '.join(available[1:])})"
+                     if len(available) > 1 else "")
+            print(f"[auto_plot] auto-detected factor tag: "
+                  f"'{factor_tag}'{other}")
+        else:
+            factor_tag = None
+            print("[auto_plot] no _factor_* files found; plotting legacy paths "
+                  "(pass --factor explicitly if you have new-format files "
+                  "elsewhere).")
+    else:
+        factor_tag = args.factor or None  # "" → None (skip factor suffix)
+        if factor_tag is not None:
+            print(f"[auto_plot] factor tag from --factor: '{factor_tag}'")
+            # Surface a clear warning if the requested factor has no files —
+            # the file-not-found per-mode error below would otherwise be the
+            # only signal and would conflate with normal "didn't run that
+            # mode" misses.
+            available = discover_factor_tags(args.output_dir, args.suffix)
+            if available and factor_tag not in available:
+                print(f"[auto_plot] WARN: --factor '{factor_tag}' has no "
+                      f"matching files; available: {available}",
+                      file=sys.stderr)
+
     modes = ALL_MODES if args.mode == "all" else (args.mode,)
     skipped, wrote = [], 0
     for mode in modes:
+        # PNG name carries the factor too so A/B runs don't overwrite.
         tag = args.suffix.lstrip("_") or "baseline"
+        if factor_tag:
+            tag = f"{tag}_factor_{factor_tag}"
         out_path = os.path.join(args.plots_dir, f"{mode}_{tag}.png")
         try:
             make_figure_for_mode(
@@ -587,7 +680,7 @@ def main():
                 plots_dir=args.plots_dir, timeline_csv_dir=args.timeline_csv_dir,
                 out_path=out_path, slo_s=slo_s, window_s=args.window,
                 throughput_window_s=args.throughput_window,
-                avg_tbt_slo=avg_tbt_slo)
+                avg_tbt_slo=avg_tbt_slo, factor_tag=factor_tag)
             wrote += 1
         except FileNotFoundError as e:
             skipped.append((mode, str(e)))
