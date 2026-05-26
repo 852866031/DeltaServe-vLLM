@@ -162,6 +162,15 @@ class FinetuneCoordinator:
         # before kernel dispatch in execute_model and cleared in its
         # finally block.
         self.ft_only_in_flight = False
+        # [diag] Wall-clock instant the current pending backward was kicked
+        # off (set by _trigger_backward, cleared in poll_backward on ack).
+        # poll_backward warns once if the gap to "now" exceeds the threshold
+        # below — a backward that takes >> the normal ~100ms almost always
+        # means the child crashed silently (e.g. CUDA OOM, OS-killed) and
+        # the parent will spin forever waiting for an ack that never comes.
+        self._pending_backward_t0: float | None = None
+        self._pending_backward_warned = False
+        self.pending_backward_warn_s = 5.0
 
     def push_sample(self, features, duration, was_graph, predicted) -> None:
         self._completed_samples.append((features, duration, was_graph, predicted))
@@ -321,6 +330,10 @@ class FinetuneCoordinator:
         self.pending_backward = True
         self.epoch_flush_pending = False
         self._cycle += 1
+        # [diag] start a timer so poll_backward can warn if the child never
+        # acks within `pending_backward_warn_s` (dead-child symptom).
+        self._pending_backward_t0 = time.monotonic()
+        self._pending_backward_warned = False
         # dprint(
         #     f"[coord] {reason} ({self.fill_count}/{self.capacity}) -> "
         #     f"signal backward (cycle {self._cycle}); FT admission CLOSED"
@@ -365,25 +378,51 @@ class FinetuneCoordinator:
         if not self.pending_backward or self.backward_process is None:
             return
         resp = self.backward_process.poll_response()
-        if resp is not None:
-            if (self.bwd_log_path and isinstance(resp, dict)
-                    and resp.get("event") == "activations_processed"):
-                self._write_bwd_log_row(
-                    int(resp.get("n", 0)), resp.get("loss"))
-            # Commit the in-buffer claimed samples → trained=True (one-shot
-            # snapshot so the hook can mutate state freely).
-            if self.on_backward_done is not None and self.buffer_samples:
-                trained_now = list(self.buffer_samples)
-                try:
-                    self.on_backward_done(trained_now)
-                except Exception as e:
-                    dprint(f"[coord] on_backward_done hook failed: {e}")
-            self.fill_count = 0
-            self.reserved_fill = 0
-            self.sample_lens = []
-            self.buffer_samples = []
-            self.pending_backward = False
-            self.admission_open = True
+        if resp is None:
+            # [diag] No ack yet. If we've been waiting longer than the
+            # warning threshold, log once — the child has almost certainly
+            # crashed (typical backward takes ~100ms, so >5s means dead).
+            # Also probe the child's exitcode if available so the user
+            # knows whether the OS reaped it.
+            if (not self._pending_backward_warned
+                    and self._pending_backward_t0 is not None
+                    and time.monotonic() - self._pending_backward_t0
+                        > self.pending_backward_warn_s):
+                waited = time.monotonic() - self._pending_backward_t0
+                exitcode = getattr(getattr(self.backward_process, "_proc", None),
+                                   "exitcode", None)
+                alive = getattr(getattr(self.backward_process, "_proc", None),
+                                "is_alive", lambda: None)()
+                dprint(
+                    f"[coord] !!! backward STUCK: no ack in {waited:.1f}s "
+                    f"(threshold {self.pending_backward_warn_s:.1f}s) | "
+                    f"child alive={alive} exitcode={exitcode} | "
+                    f"FT admission stays CLOSED until ack arrives — likely "
+                    f"the backward subprocess died (CUDA OOM / segfault / "
+                    f"OS kill). Check stderr above for [backward] traces."
+                )
+                self._pending_backward_warned = True
+            return
+        if (self.bwd_log_path and isinstance(resp, dict)
+                and resp.get("event") == "activations_processed"):
+            self._write_bwd_log_row(
+                int(resp.get("n", 0)), resp.get("loss"))
+        # Commit the in-buffer claimed samples → trained=True (one-shot
+        # snapshot so the hook can mutate state freely).
+        if self.on_backward_done is not None and self.buffer_samples:
+            trained_now = list(self.buffer_samples)
+            try:
+                self.on_backward_done(trained_now)
+            except Exception as e:
+                dprint(f"[coord] on_backward_done hook failed: {e}")
+        self.fill_count = 0
+        self.reserved_fill = 0
+        self.sample_lens = []
+        self.buffer_samples = []
+        self.pending_backward = False
+        self.admission_open = True
+        self._pending_backward_t0 = None
+        self._pending_backward_warned = False
 
     def _write_bwd_log_row(self, n: int, loss) -> None:
         """Append one finetune-throughput row to bwd_log_path. Timestamp is

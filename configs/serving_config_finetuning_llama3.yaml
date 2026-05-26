@@ -23,7 +23,7 @@ finetune:
   max_saved_finetuning_tokens: 256   # buffer capacity; ~2 inference steps to fill
   backward_sleep_seconds: 2.0        # simulated backward duration (observe inference)
   num_epochs: 20
-  learning_rate: 0.00001
+  learning_rate: 0.000005
   weight_decay: 0.01
   gamma: 0.9
   backward_fp32: false               # bulk backward matmuls: false=bf16 (default), true=fp32

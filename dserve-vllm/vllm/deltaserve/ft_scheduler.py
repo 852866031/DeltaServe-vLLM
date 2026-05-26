@@ -74,6 +74,14 @@ class FinetuneScheduler(AsyncScheduler):
         lengths = self._ft_injector.store.sorted_lengths
         if lengths:
             self._coord.min_sample_len = lengths[0]
+        # One-shot: tell the backward child the FT corpus total token count so
+        # it can render a per-epoch progress meter in its per-cycle log.
+        # ``backward_process`` is injected on the coordinator by the worker at
+        # init_device time (gpu_worker.py); on a no-FT run it's None and we
+        # skip silently.
+        if self._coord.backward_process is not None:
+            self._coord.backward_process.set_corpus_meta(
+                int(self._ft_injector.store.total_tokens_in_memory))
         # [eval] finetune-throughput log path (written per completed backward).
         self._coord.bwd_log_path = getattr(ft_cfg, "bwd_log_path", None)
         # FT admission master switch: when start_on_launch is False, FT stays
@@ -282,7 +290,26 @@ class FinetuneScheduler(AsyncScheduler):
         # keeps the engine busy via super().has_requests()).
         if coord.next_ft_budget() >= max(1, coord.min_sample_len):
             store = self._ft_injector.store
-            return store.has_next() or store.current_epoch < store.total_epochs
+            if store.has_next() or store.current_epoch < store.total_epochs:
+                return True
+        # [diag] FT has nothing left to do — selectable pool drained AND no
+        # epochs remain AND nothing is in-flight. Log once so the user can
+        # distinguish a clean natural end ("ran out of epochs/samples") from
+        # a hang ("backward subprocess died" — see coord.poll_backward's
+        # stuck-backward warning). After this prints, the engine cleanly
+        # idles until the next inference request arrives.
+        if not getattr(self, "_ft_exhausted_logged", False):
+            store = self._ft_injector.store
+            dprint(
+                f"[ft-sched] FT exhausted (no more work): "
+                f"epoch={store.current_epoch}/{store.total_epochs} "
+                f"selectable_lens={len(store.sorted_lengths)} "
+                f"claimed={int(store.has_claimed())} "
+                f"buffer_fill={coord.fill_count}+{coord.reserved_fill}/"
+                f"{coord.capacity} pending_backward={coord.pending_backward} "
+                f"— engine going idle (this is normal end-of-FT, NOT a hang)."
+            )
+            self._ft_exhausted_logged = True
         return False
 
     def would_step_be_ft_only(self) -> bool:
