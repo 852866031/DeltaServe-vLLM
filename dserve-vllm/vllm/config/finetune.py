@@ -101,6 +101,18 @@ class FinetuneConfig:
     final-hidden/targets copies are skipped (the coordinator still advances, so
     the control flow is identical). For A/B benchmarking only."""
 
+    save_attn_qkv: bool = False
+    """Also save the post-RoPE per-layer attention q/k/v tensors during the FT
+    forward (one ``forward_pre_hook`` on each ``self_attn.attn`` module reads
+    its ``(q, k, v)`` args). The backward then SKIPS the per-layer Q/K/V
+    projection + RoPE recompute (the largest chunk of the attention-block
+    recompute on Llama-3-8B — ~13 GFLOPs/layer, ~400-500 GFLOPs / backward at
+    s_max=256). RMSNorm in_ln stays a recompute (cheap, needed for Q/K/V
+    LoRA-A grad). Memory cost: ~99 MB at s_max=256 (qh [s_max, q_size] +
+    kh/vh [s_max, kv_size] bf16 × 32 layers). Best perf/MB candidate of the
+    remaining activation-save optimizations (see ``INTEGRATION_PROGRESS.md``
+    Phase 5 "future activation-save optimization" section). Default off."""
+
     backward_sleep_seconds: float = 2.0
     """How long the (stub) backward process sleeps to simulate a backward pass
     after it consumes + cleans the activation buffer. Larger = easier to observe

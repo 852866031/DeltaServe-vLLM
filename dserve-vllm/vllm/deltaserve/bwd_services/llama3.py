@@ -145,7 +145,7 @@ def _proj_backward(xin, gy, w_base, A, B, scaling, cdt=torch.float32):
 
 
 def layer_forward(x, lw, scaling, cos, sin, seq_lens, b_start, dims, eps,
-                  saved_gate_up=None):
+                  saved_gate_up=None, saved_qh=None, saved_kh=None, saved_vh=None):
     """Rematerialize one Llama decoder layer forward, returning the ``cache`` the
     manual backward needs (attention internals + MLP pre-activations). The frozen
     `down` matmul / layer output are NOT computed — the backward only needs the
@@ -154,6 +154,13 @@ def layer_forward(x, lw, scaling, cos, sin, seq_lens, b_start, dims, eps,
     When ``saved_gate_up`` ([n, 2*intermediate] = gate||up, captured in the forward)
     is given, the MLP `gate_up` matmul is skipped entirely — the biggest recompute in
     the layer. Otherwise gate/up are recomputed (the gradcheck path).
+
+    When ``saved_qh/kh/vh`` are given (each [n, q_size or kv_size] flat,
+    captured by ``self_attn.attn`` forward_pre_hook), we ALSO skip Q/K/V proj
+    + RoPE — the second-biggest recompute. ``x_norm1`` is still computed from
+    ``x`` (cheap; the Q/K/V LoRA-A grad needs it as ``grad_A = grad_Z.t() @
+    x_norm1``). ``cos/sin`` are unused on this fast path. If any of the three
+    saved tensors is absent, the recompute path runs.
 
     ``lw`` is a dict of base weights (q,k,v,o,gate,up,in_ln,post_ln) + LoRA
     (qA,qB,kA,kB,vA,vB,oA,oB). Functional (no in-place) so autograd can differentiate
@@ -165,12 +172,20 @@ def layer_forward(x, lw, scaling, cos, sin, seq_lens, b_start, dims, eps,
     kv_repeat = Hq // Hkv
 
     x_norm1 = rmsnorm(x, lw["in_ln"], eps)
-    q = _proj(x_norm1, lw["q"], lw["qA"], lw["qB"], scaling)        # [n, D]
-    k = _proj(x_norm1, lw["k"], lw["kA"], lw["kB"], scaling)        # [n, kv_size]
-    v = _proj(x_norm1, lw["v"], lw["vA"], lw["vB"], scaling)
-    qh = apply_rope(q.view(n, Hq, Hd), cos, sin)
-    kh = apply_rope(k.view(n, Hkv, Hd), cos, sin)
-    vh = v.view(n, Hkv, Hd)
+    if (saved_qh is not None
+            and saved_kh is not None
+            and saved_vh is not None):
+        # Skip Q/K/V proj + RoPE — use the saved post-RoPE flat tensors.
+        qh = saved_qh.view(n, Hq, Hd)
+        kh = saved_kh.view(n, Hkv, Hd)
+        vh = saved_vh.view(n, Hkv, Hd)
+    else:
+        q = _proj(x_norm1, lw["q"], lw["qA"], lw["qB"], scaling)        # [n, D]
+        k = _proj(x_norm1, lw["k"], lw["kA"], lw["kB"], scaling)        # [n, kv_size]
+        v = _proj(x_norm1, lw["v"], lw["vA"], lw["vB"], scaling)
+        qh = apply_rope(q.view(n, Hq, Hd), cos, sin)
+        kh = apply_rope(k.view(n, Hkv, Hd), cos, sin)
+        vh = v.view(n, Hkv, Hd)
 
     ctx_blocks = []
     for st, ln in zip(b_start, seq_lens):
@@ -435,6 +450,11 @@ class Llama3BackwardService(BackwardService):
         self.scaling = float(meta.get("lora_scaling", 1.0))
         self.vocab = int(meta["vocab_size"])
         self.dims = (self.Hq, self.Hkv, self.Hd, self.kv_size)
+        # Mirror the worker-side ``save_attn_qkv`` flag so the optional
+        # graph runner (constructed below) and the eager per-layer loop both
+        # see it. Drives whether ``layer_forward`` / the captured forward
+        # graph short-circuits Q/K/V proj + RoPE using the saved buffers.
+        self.save_attn_qkv = bool(meta.get("save_attn_qkv", False))
 
         # With enable_lora, vLLM wraps the projections, so the frozen base weight is
         # named e.g. "...qkv_proj.base_layer.weight". Normalize by stripping the
@@ -583,6 +603,12 @@ class Llama3BackwardService(BackwardService):
         # Saved MLP pre-activations (gate||up) per layer, if captured in the forward
         # — lets the remat skip the gate_up matmul (the layer's biggest recompute).
         saved_gu = activations.get("mlp_gate_up")
+        # Saved post-RoPE q/k/v per layer (opt-in via finetune.save_attn_qkv) —
+        # when present, lets the remat skip the second-biggest layer recompute:
+        # Q/K/V projection + RoPE. None when the feature is off.
+        saved_qh_all = activations.get("attn_qh")
+        saved_kh_all = activations.get("attn_kh")
+        saved_vh_all = activations.get("attn_vh")
 
         # If the graphed runner is attached, build per-backward scatter indices
         # + key-pad mask once (re-used across all L layers' padded-attention
@@ -606,18 +632,24 @@ class Llama3BackwardService(BackwardService):
             lw = self._layer_weights(i)
             x = activations["layer_in"][i][:n]
             gu = saved_gu[i][:n] if saved_gu else None
+            qh_i = saved_qh_all[i][:n] if saved_qh_all else None
+            kh_i = saved_kh_all[i][:n] if saved_kh_all else None
+            vh_i = saved_vh_all[i][:n] if saved_vh_all else None
             with torch.no_grad():
                 if (self.graph_runner is not None
                         and self.graph_runner._attn_fit
                         and gu is not None):
                     # Graphed forward: writes cache straight into the
                     # static buffers Graph A / Graph B already read.
-                    cache = self.graph_runner.forward(i, lw, x, gu, n)
+                    cache = self.graph_runner.forward(
+                        i, lw, x, gu, n,
+                        saved_qh=qh_i, saved_kh=kh_i, saved_vh=vh_i)
                 else:
                     cache = layer_forward(
                         x, lw, self.scaling, cos, sin,
                         seq_lens, b_start, self.dims, self.eps,
-                        saved_gate_up=gu)
+                        saved_gate_up=gu,
+                        saved_qh=qh_i, saved_kh=kh_i, saved_vh=vh_i)
                 if self.graph_runner is None:
                     grad_x, grads = layer_backward(
                         g, cache, lw, self.scaling, cos, sin,
