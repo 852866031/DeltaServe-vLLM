@@ -95,12 +95,17 @@ Two mutually exclusive strategies + a global SLO gate underneath both.
   when `> 0` and the step carries prefill, `ft_tokens ≤ inference_prefill_tokens · factor`
   (a `min` on top of the SLO + buffer caps). Direct knob; no effect on prefill-free
   steps (idle / FT-only fills).
-- **`match_with_prefill_workload`** (leaky-bucket, default `False`): scheduler
-  maintains `_unspent_prefill`. On every prefill-carrying step:
-  - if `_unspent_prefill + t_in ≥ peek_next_ft_sample.input_len` → admit that
-    one FT sample, reset counter to 0.
+- **`match_prefill_workload_factor: float`** (leaky-bucket, default `0.0`):
+  scheduler maintains `_unspent_prefill`. On every prefill-carrying step when
+  factor > 0:
+  - if `(_unspent_prefill + t_in) * factor ≥ peek_next_ft_sample.input_len`
+    AND SLO budget > 0 → admit that one FT sample (size capped by SLO
+    budget), reset counter to 0.
   - else → don't admit, accumulate `_unspent_prefill += t_in`.
-  Any successful FT admission resets the counter (atomic, no double-spend).
+  The factor scales how much credit each prefill token earns: `1.0` ≡ the
+  previous `match_with_prefill_workload: True` behaviour; `>1` more
+  aggressive; `<1` more conservative; `0.0` disables (default). Any
+  successful FT admission resets the counter (atomic, no double-spend).
 
 ### SLO gate (always on under both)
 

@@ -120,14 +120,15 @@ class FinetuneScheduler(AsyncScheduler):
         self._async = bool(self.scheduler_config.async_scheduling)
         self._last_step_pred_s = 0.0
 
-        # [match_with_prefill_workload] Leaky-bucket counter of inference
+        # [match_prefill_workload_factor] Leaky-bucket counter of inference
         # prefill tokens we've observed but NOT spent on FT admission. When
-        # the corresponding finetune-config flag is on, this gates each
-        # prefill-step's FT admit: hold off until enough has accumulated to
-        # cover the next FT sample's size, then admit ONE sample + reset.
-        # Set to 0 on every successful FT admission (including FT-only
-        # batches), so credit is consumed atomically per admit. Inert when
-        # the flag is off — the counter just stays at 0.
+        # ``finetune.match_prefill_workload_factor > 0`` this gates each
+        # prefill-step's FT admit: hold off until
+        # ``(counter + t_in) * factor`` covers the next FT sample's size,
+        # then admit ONE sample + reset. Set to 0 on every successful FT
+        # admission (including FT-only batches), so credit is consumed
+        # atomically per admit. Inert when factor=0 — the counter still
+        # increments via the else branch but no trigger ever fires.
         self._unspent_prefill: int = 0
 
         dprint(
@@ -208,6 +209,22 @@ class FinetuneScheduler(AsyncScheduler):
             return coord_budget
         slo_x = min(self._estimator.max_next_ft_tokens(b) for b in budgets_s)
         return max(0, min(coord_budget, slo_x))
+
+    def _initial_ft_budget(self, feats: StepFeatures,
+                           earliest_arrival: float | None) -> int:
+        """Decide the initial FT-token budget for the upcoming step BEFORE
+        match-factor shaping. Default policy is prefill-only: 0 on decode-only
+        steps. Subclasses can relax this gate (e.g. BothPhaseFinetuneScheduler
+        returns the SLO budget unconditionally).
+
+        Decode-only steps are skipped under the default policy because adding
+        FT prefill there would spike the decoders' TBT with no prefill work to
+        amortize against — a conservative DeltaServe-era rule that's
+        independent of what the SLO estimator predicts."""
+        decode_only = feats.b_d > 0 and feats.t_in == 0
+        if decode_only:
+            return 0
+        return self._slo_ft_budget(feats, earliest_arrival)
 
     # ─── SLO estimator: feature extraction + graph predicate ────────────
     def _features_from_output(
@@ -422,47 +439,50 @@ class FinetuneScheduler(AsyncScheduler):
         # turns out to be FT-only and a pre-emption fires before dispatch.
         _admit_snap = self._coord.snapshot_admission()
 
-        # [Phase 4] FT rides along PREFILL steps only. Skip FT on decode-only
-        # steps (decode tokens present, no prefill tokens): adding FT prefill
-        # there would spike the decoders' TBT with no prefill to amortize
-        # against. Computed from the upcoming step's inference composition.
-        # SLO-aware admission then caps the FT tokens so the predicted step time
-        # keeps inference TTFT/TBT within target (fixed coordinator budget while
-        # the estimator is cold).
+        # [Phase 4] SLO-aware FT admission. The default policy is "FT rides
+        # PREFILL steps only" — see ``_initial_ft_budget`` for the gate
+        # (subclasses, e.g. BothPhaseFinetuneScheduler, can relax this so
+        # FT also rides decode-only / mixed steps under the SLO estimator).
+        # SLO-aware admission then caps the FT tokens so the predicted step
+        # time keeps inference TTFT/TBT within target (fixed coordinator
+        # budget while the estimator is cold).
         feats, earliest_arrival = self._current_step_features()
-        decode_only = feats.b_d > 0 and feats.t_in == 0
-        budget = 0 if decode_only else self._slo_ft_budget(
-            feats, earliest_arrival)
+        budget = self._initial_ft_budget(feats, earliest_arrival)
         # Two mutually-exclusive shapers on the SLO/buffer-derived budget for
         # prefill-carrying steps (idle/FT-only and decode-only steps are
         # untouched):
-        #   1. ``match_with_prefill_workload`` (leaky bucket): defer FT admit
-        #      until enough prefill has been observed to "earn" the next FT
+        #   1. ``match_prefill_workload_factor`` (leaky bucket): defer FT
+        #      admit until ``(counter + t_in) * factor`` covers the next FT
         #      sample, then admit exactly that one sample.
         #   2. ``ft_tokens_admission_constrain_factor`` (proportional cap):
         #      admit at most ``t_in * factor`` FT tokens this step.
-        # Flag 1 wins when both are set (factor is ignored — the leaky bucket
-        # already controls FT:prefill ratio).
+        # Shaper 1 wins when set (>0) — the proportional cap is bypassed
+        # since the leaky bucket already controls FT:prefill ratio.
         ft_cfg = self.vllm_config.finetune_config
-        _match_prefill = bool(getattr(ft_cfg, "match_with_prefill_workload",
-                                      False))
+        _match_factor = float(getattr(ft_cfg, "match_prefill_workload_factor",
+                                      0.0))
         _factor = ft_cfg.ft_tokens_admission_constrain_factor
-        if _match_prefill and feats.t_in > 0:
+        if _match_factor > 0 and feats.t_in > 0:
             # Peek the next FT sample we'd admit (smallest untrained in the
             # selectable pool). None → corpus drained, nothing to admit.
             _peek = self._ft_injector.store.pop_next()
             if _peek is None:
                 budget = 0
-            elif self._unspent_prefill + feats.t_in >= _peek.input_len:
+            elif ((self._unspent_prefill + feats.t_in) * _match_factor
+                  >= _peek.input_len):
                 # Triggered: cap budget so we admit exactly this one sample.
                 # ``next_ft_requests`` will pop it via pop_best_under(<=budget)
                 # and claim. The accumulator resets in the post-admit block
-                # below (gated on admitted_now > 0).
+                # below (gated on admitted_now > 0). The min() with the SLO
+                # budget preserves SLO compliance — if SLO predicts no
+                # headroom (budget=0), trigger fires but admit is 0 and the
+                # counter retains its credit for a later step.
                 budget = min(budget, _peek.input_len)
                 dprint(
-                    f"[ft-sched] match_with_prefill: triggered "
+                    f"[ft-sched] match_prefill_workload_factor: triggered "
                     f"(unspent={self._unspent_prefill}+t_in={feats.t_in} "
-                    f">= next_sample={_peek.input_len}), budget={budget}")
+                    f")*factor={_match_factor} >= "
+                    f"next_sample={_peek.input_len}, budget={budget}")
             else:
                 # Not enough credit yet — accumulate and skip FT this step.
                 self._unspent_prefill += int(feats.t_in)
@@ -476,11 +496,12 @@ class FinetuneScheduler(AsyncScheduler):
                 self._enqueue_waiting_request(req)
                 self.requests[req.request_id] = req
             admitted_now = sum(r.num_prompt_tokens for r in reqs)
-        # [match_with_prefill_workload] Any successful FT admission resets the
-        # accumulator — credit is consumed atomically per admit. Done
-        # unconditionally (no gate on ``_match_prefill``) so toggling the flag
-        # mid-run doesn't leave a stale counter; harmless when off (counter
-        # stays at 0 already).
+        # [match_prefill_workload_factor] Any successful FT admission resets
+        # the accumulator — credit is consumed atomically per admit. Done
+        # unconditionally (no gate on ``_match_factor``) so toggling the
+        # factor mid-run doesn't leave a stale counter; harmless when off
+        # (factor=0 ⇒ leaky-bucket branch isn't entered and the counter
+        # stays at 0 anyway).
         if admitted_now > 0:
             self._unspent_prefill = 0
 

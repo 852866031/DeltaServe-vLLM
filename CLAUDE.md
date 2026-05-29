@@ -86,11 +86,14 @@ captured region). Gradcheck + graph parity in `tests/test_llama3_backward{,_grap
 (12 + 21 cases).
 
 **Phase 5.3 — perf polish + admission strategies + bug fixes.** Several shipped:
-- **`match_with_prefill_workload`** — leaky-bucket admission strategy
-  (`config/finetune.py`, default False). Accumulates inference-prefill tokens
-  seen but not yet "spent" on FT; admits ONE FT sample sized exactly to the
-  next-sample's `input_len` when accumulated credit suffices; resets on any FT
-  admit. Mutually exclusive with `ft_tokens_admission_constrain_factor`.
+- **`match_prefill_workload_factor: float`** — leaky-bucket admission
+  strategy (`config/finetune.py`, default 0.0). Accumulates inference-prefill
+  tokens seen but not yet "spent" on FT; admits ONE FT sample sized to the
+  next-sample's `input_len` (capped by SLO budget) when
+  `(counter + t_in) * factor >= next_sample.input_len`. Factor scales how
+  much credit each prefill token earns: `1.0` ≡ the previous boolean-on
+  behaviour, `>1` more aggressive, `<1` more conservative, `0` disables.
+  Mutually exclusive with `ft_tokens_admission_constrain_factor`.
 - **Oversized-sample drop fix** (`finetuning_store.py:load()`): samples with
   `input_len > max_saved_finetuning_tokens` are dropped at load with a warning.
   Previously they sat in the pool forever, deadlocking FT admission once
@@ -122,7 +125,7 @@ trims + summarizes the bwd_log.
 **Current focus:** GPU-validating the `forward_interruptible` pipeline on the existing
 `eval/auto_benchmark.py` replay (P99 TTFT outlier reduction is the headline metric).
 Independent levers (orthogonal to Phase 6):
-- `finetune.match_with_prefill_workload` (new P5.3 leaky-bucket admission) vs
+- `finetune.match_prefill_workload_factor` (P5.3 leaky-bucket admission, float) vs
   `ft_tokens_admission_constrain_factor` (proportional cap) — A/B with
   `auto_benchmark.py --co` and the new `_factor_*` suffix.
 - `finetune.backward_cuda_graph` (P5.2) — compare backward latency in the
@@ -299,8 +302,8 @@ phase's test passes.
      `finetune.backward_cuda_graph`.
    - **5.3 ✅** Perf polish + admission strategies + bug fixes: fused AdamW,
      persistent grad buffers, sync coalescing, one-shot `set_corpus_meta` IPC,
-     restructured per-cycle log, `match_with_prefill_workload` leaky-bucket
-     admission, oversized-sample drop at load (FT deadlock fix), eval-tooling
+     restructured per-cycle log, `match_prefill_workload_factor` leaky-bucket
+     admission (float), oversized-sample drop at load (FT deadlock fix), eval-tooling
      additions (factor suffix, p99 panel, `pure_ft_bench.py`).
    - **(future)** Save post-RoPE qh/kh/vh per layer (best perf/MB remaining
      activation-save candidate); dedicated FT activation pool if vLLM's
