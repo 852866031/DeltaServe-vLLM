@@ -48,6 +48,9 @@ Two kinds of change:
 | P5.2 — CUDA-graph backward (per-layer FFN + padded-attention) | `deltaserve/bwd_services/llama3_graph.py`, `tests/test_llama3_backward_graph.py` | `config/finetune.py`* (`backward_cuda_graph` master switch + `backward_cuda_graph_attn_{bn_max,l_max}` padded-attn bounds), `deltaserve/bwd_services/llama3.py`* (extract `ffn_backward_core` / `attn_backward_core` from `layer_backward`; instantiate `Llama3GraphedBackward` in `_build_state` when flag set; new `_layer_backward_graphed` composes graph-A + eager O-bwd + `_maybe_pause` + graph-B + eager tail; `process_backward` per-layer loop dispatches to graphed runner when present), `v1/worker/gpu_worker.py` (meta dict forwards `backward_cuda_graph` + bn_max/l_max + `max_saved_finetuning_tokens` to the child) |
 | P5.3 — perf polish + admission strategies + bug fixes | `eval/pure_ft_bench.py` | `config/finetune.py`* (new `match_prefill_workload_factor: float` admission strategy), `deltaserve/finetuning_store.py`* (drop samples with `input_len > max_saved_finetuning_tokens` at load — fixes FT-admission deadlock when only oversized samples remain in the pool), `deltaserve/ft_scheduler.py`* (`_unspent_prefill` leaky-bucket counter; admission shaper branches between factor-cap and match-with-prefill-workload; `set_corpus_meta` IPC after `store.load()`), `deltaserve/backward_process.py`* (new `set_corpus_meta(total_tokens_per_epoch)` one-shot IPC method), `deltaserve/bwd_services/base.py`* (per-cycle log line restructured to one line: `[backward] Xms (graph/eager) loss=… total_trained=… n=… epoch=… N/total tokens`; persistent `_grad_qh/kh/vh_buf` allocation; CUDA-event timing replaces wall-clock-after-sync; sync coalesced from 2/cycle → 1/cycle; new `set_corpus_meta` cmd handler), `deltaserve/bwd_services/llama3.py`* (fused AdamW via `torch.optim.AdamW(..., fused=True)`; persistent `grad_qh/kh/vh_buf` plumbed into `attn_backward_core` via opt-in kwargs; `_publish_to_served` docstring expanded with scaling-contract / FT-slot-exclusivity notes), `deltaserve/bwd_services/llama3_graph.py`* (single shared padded-attn graph reused across all L layers — `_attn_graphs` dict collapsed to one `_attn_graph` since the core has no per-layer weights), `eval/auto_benchmark.py` (factor tag `_factor_<X>` appended to output suffix on `--co` runs; `_load_yaml_cfg()` helper shared with `build_server_cmd`), `eval/auto_plot.py` (5-panel layout with new E2E latency percentile panel + p99 highlighted; `--factor` CLI arg with auto-detection of smallest factor; factor in plot title) |
 | Eng obs — per-batch lifecycle trace + ms bwd-log timestamps | — | `config/finetune.py`* (`print_scheduler_add`, `print_engine_batch_exec`, `print_engine_batch_done`, `print_engine_req_recv` — independent gates for the per-batch lifecycle prints; `print_step_mode` becomes a convenience master switch for all four), `deltaserve/coordinator.py`* (`_write_bwd_log_row` uses `isoformat(timespec="milliseconds")`), `v1/engine/core.py`* (`_classify_batch_for_log` decode-only / zero-token gate; `_maybe_log_batch_scheduled` after `schedule()` + `_maybe_log_batch_done` after `future.result()`; engine-recv print gate switched to OR of `print_engine_req_recv | print_step_mode`), `v1/worker/gpu_model_runner.py` (`_log_finetuning_batch` gate switched to OR of `print_engine_batch_exec | print_step_mode`) |
+| P5.4 — forward-recompute CUDA graph (per-layer; 3rd captured region) | — | `deltaserve/bwd_services/llama3_graph.py`* (new `_forward_core` + `_padded_attn_forward_core` + `_capture_forward` + `stage_forward_inputs` + `forward` + `cache_views` methods on `Llama3GraphedBackward`; new static IO `static_layer_in/cos/sin/saved_gate_up/x_norm1/qh_flat/kh_flat/vh_flat/ctx_flat`; `prepare()` pre-captures L=32 forward graphs; `begin_backward()` stages `cos/sin` once per backward; `fwd_failed: set[int]` mirrors `ffn_failed`), `deltaserve/bwd_services/llama3.py`* (`process_backward` per-layer loop routes through `graph_runner.forward(...)` when `_attn_fit` AND `saved_gu` is present; eager `layer_forward(...)` fallback otherwise; layer_forward arg list unchanged in this stage), `config/finetune.py`* (docstring on `backward_cuda_graph` updated to "forward + FFN-bwd + attn-bwd" coverage), `tests/test_llama3_backward_graph.py` (new `test_forward_graph_parity` + `test_forward_overflow_fallback`: 45 new assertions, parity bit-identical to eager `layer_forward`) |
+| P5.5 (F1) — save post-RoPE qh/kh/vh per layer | — | `config/finetune.py`* (new `save_attn_qkv: bool = False` opt-in field), `deltaserve/accumulate.py`* (auto-detect `self_attn.attn` modules per layer; allocate `attn_qh [s_max, q_size]` + `attn_kh/vh [s_max, kv_size]` per layer; new `_make_attn_qkv_pre_hook` reads `args=(q, k, v)` post-RoPE; `zero_offset_range` extended; new `q_size`/`kv_size`/`save_attn_qkv` constructor args), `deltaserve/bwd_services/llama3.py`* (`_build_state` reads `meta["save_attn_qkv"]` → `self.save_attn_qkv`; `layer_forward` accepts `saved_qh/kh/vh` and short-circuits Q/K/V proj + RoPE; `process_backward` extracts saved q/k/v per layer and threads through both paths), `deltaserve/bwd_services/llama3_graph.py`* (`save_attn_qkv` mode flag; new `static_saved_qh/kh/vh` IO; `_forward_core` branches on the mode flag to read from the saved buffers instead of computing Q/K/V/RoPE; `stage_forward_inputs` + `forward` signatures extended with `saved_qh/kh/vh` kwargs), `v1/worker/gpu_worker.py` (derive `q_size = num_heads * head_dim`, `kv_size = num_kv_heads * head_dim`; pass through to `FinetuneAccumulator`; add `save_attn_qkv` to the shared `meta` dict so the backward subprocess knows the mode), `tests/test_llama3_backward_graph.py`* (new `test_layer_forward_saved_qkv_parity` + `test_forward_graph_saved_qkv_parity`: 45 new assertions, parity vs the recompute path) |
+| UnifiedFT — `slo.coserving_admission_phase: both` scheduler | `deltaserve/ft_scheduler_both.py`, `configs/serving_config_finetuning_llama3_both.yaml`, `eval/auto_plot_schedulers.py` | `config/finetune.py`* (new `coserving_admission_phase: str = "prefill"` + `decode_only_ft_safety_margin: float = 0.7` fields under the `slo:` YAML section), `config/vllm.py`* (branch `scheduler_cls` on the phase in `__post_init__`; soft-fall to `"prefill"` with `logger.warning` when `phase=="both"` AND `ft_tokens_admission_constrain_factor != -1`), `deltaserve/ft_scheduler.py`* (extract the FT admission gate to a new `_initial_ft_budget(feats, earliest_arrival)` hook so subclasses can override the `decode_only → 0` short-circuit cleanly), `eval/auto_benchmark.py`* (new `--scheduler {prefill,both}` CLI arg → maps to the corresponding YAML via `_SCHED_CONFIGS`; new `_phase_tag(cfg)` helper reads `slo.coserving_admission_phase` from the loaded YAML; output suffix scheme extended to `_co_factor_<X>_phase_<Y>_<mode>`; `_load_yaml_cfg(config_path)` + `build_server_cmd(..., config_path)` take an explicit path arg), `eval/auto_plot.py`* (drop the E2E latency percentile panel; figure shrinks to a single-row 4-panel layout) |
 
 `*` = same file extended in a later stage.
 
@@ -103,13 +106,11 @@ Two kinds of change:
 > allocated OUTSIDE the shared graph pool — the load-bearing rule for avoiding pool-
 > aliasing NaN traps (DeltaServe reference lines 111–113 vs the `graph_pool_handle()` at
 > 114). LoRA-grad ownership stays with the eager Q/K/V/O proj backwards, so
-> `nn.Parameter.grad` lifecycle is unchanged vs eager. **Layer forward-remat
-> (`layer_forward`) is NOT graphed** — it runs eagerly between layers, matching the
-> reference. Graphing it would require a third per-layer graph with padded-attention
-> forward scaffolding; treated as a follow-up if dispatch overhead in the eager remat
-> becomes the bottleneck. The graphed and eager paths share `ffn_backward_core` /
-> `attn_backward_core`, so gradient values are bit-identical (verified by
-> `tests/test_llama3_backward_graph.py`).
+> `nn.Parameter.grad` lifecycle is unchanged vs eager. The graphed and eager paths
+> share `ffn_backward_core` / `attn_backward_core`, so gradient values are
+> bit-identical (verified by `tests/test_llama3_backward_graph.py`). **P5.4 added a
+> third per-layer graph for the layer forward recompute** — see the P5.4 design
+> note below.
 
 > **P5.3 (perf polish + admission strategies + bug fixes):**
 > • **`match_prefill_workload_factor: float`** — alternate FT admission
@@ -202,6 +203,73 @@ Two kinds of change:
 > is now `deltaserve/accumulate.py` / `FinetuneAccumulator` / `accumulate_final`
 > ("accumulate", to avoid confusion with CUDA-graph capture). Older entries below use
 > the current names.
+
+> **P5.4 (forward-recompute CUDA graph):** extends the P5.2 backend from 2 graphs
+> per layer (FFN-bwd, attn-bwd) to **3 graphs per layer** under the same
+> `finetune.backward_cuda_graph` flag. The new region is the layer-forward
+> rematerialization (RMSNorm in_ln + Q/K/V proj + RoPE + padded-attention forward +
+> O proj + residual add). Same shape-stability strategy as Graphs A/B: capture at
+> fixed `s_max = max_saved_finetuning_tokens` against zero-initialized static
+> buffers, per-layer eager fallback (`fwd_failed`), pre-captured up-front in
+> `prepare()` so the first real backward sees only replay cost. **Key insight that
+> made it tractable**: the forward graph's OUTPUTS are exactly the inputs Graph A /
+> Graph B already read (`static_resid_mid`, `static_gate`, `static_up`,
+> `static_qh_pad/kh_pad/vh_pad`). Writing directly into them eliminates the
+> intermediate copy-in step. Per-sample attention forward is replaced by a
+> captureable padded variant mirroring the existing padded-attn backward
+> (`_padded_attn_forward_core`). Pre-capture cost goes from 33 → 65 graphs at child
+> startup (~few hundred ms). LoRA `.data` storage references are stable across
+> `optimizer.step()` (fused AdamW does in-place updates), so the captured kernels
+> see the up-to-date LoRA values at replay time. The scatter from flat `qh/kh/vh`
+> to padded uses `index_put_(accumulate=True)` (not `accumulate=False`) so the
+> tail-row → (0,0) write inside the captured region adds zero (input tail is
+> zero by construction) instead of clobbering the legit sample-0/pos-0 slot.
+
+> **P5.5 (save post-RoPE qh/kh/vh per layer; a.k.a. F1):** opt-in via
+> `finetune.save_attn_qkv: bool = False`. When ON, three new per-layer buffers
+> (`attn_qh`, `attn_kh`, `attn_vh`) in `FinetuneAccumulator` get populated by a
+> `forward_pre_hook` on each `self_attn.attn` module — the hook sees
+> `args = (q, k, v)` POST-RoPE (vLLM's `LlamaAttention.forward` calls RoPE then
+> `attn(q, k, v)`, so a pre-hook on `attn` is the cleanest hook point). The
+> backward (both eager `layer_forward` and the Phase 5.4 forward graph) reads
+> from these buffers via the new `saved_qh/kh/vh` params and short-circuits the
+> Q/K/V projection + RoPE entirely. RMSNorm in_ln stays a recompute (cheap, ~few
+> MFLOPs; the Q/K/V LoRA-A backward needs `x_norm1` for
+> `grad_A = grad_Z.t() @ x_norm1`). Memory cost: ~96 MB at s_max=256 on
+> Llama-3-8B (qh ~2 MB/layer × 32 = 64 MB; kh/vh ~0.5 MB/layer × 32 each = 32 MB).
+> Compute saved: ~13-16 GFLOPs/layer × 32 ≈ 400-500 GFLOPs per backward, ~5 ms on
+> a 5090. The Phase 5.4 forward graph's `_forward_core` branches on a mode flag
+> set at runner construction (`self.save_attn_qkv`) — the captured graph either
+> reads from the saved buffers (skip Q/K/V/RoPE) or computes them (the
+> recompute path). Mode is fixed per-runner so each capture records the
+> appropriate branch once.
+
+> **UnifiedFT (`coserving_admission_phase: both`):** sibling scheduler that
+> admits FT on any step composition (prefill / decode / mixed / idle) under
+> the SLO estimator's gate, NOT just prefill-carrying steps. Selected at
+> `VllmConfig.__post_init__` based on the new `slo.coserving_admission_phase`
+> field. Soft-fall to `"prefill"` (with `logger.warning` at startup) when
+> `phase == "both"` AND `ft_tokens_admission_constrain_factor != -1` —
+> the proportional cap is prefill-relative and incompatible with decode-only
+> admission. Two overrides vs the parent `FinetuneScheduler`:
+> (1) `_initial_ft_budget` drops the `decode_only → 0` short-circuit (the
+> parent class gets a new hook method that defaults to today's behaviour);
+> (2) `_slo_ft_budget` applies `slo.decode_only_ft_safety_margin` (default
+> 0.7) as a multiplier on `max_tbt_slo` when the upcoming step is decode-only.
+> Justifications for the tighter decode-only margin: the eager penalty from
+> losing the CUDA-graph fast path can dominate sub-5ms decode-only step time;
+> the estimator γ coefficient hasn't seen many decode-only + FT samples until
+> online refit accumulates them. Everything else inherits — same injection,
+> coordinator, backward triggers, async-safety,
+> `match_prefill_workload_factor`. The leaky-bucket counter still self-gates
+> on `feats.t_in > 0`, so long decode-only stretches naturally rate-limit FT
+> once banked credit is consumed (no separate "match decode" knob).
+> Eval tooling: `auto_benchmark.py --scheduler {prefill,both}` picks the
+> corresponding YAML; output suffix extended to
+> `_co_factor_<X>_phase_<Y>_<mode>`. `eval/auto_plot_schedulers.py` emits two
+> A/B PNGs centered on `phase=both`: `both_vs_inf-only` and
+> `both_vs_prefill`. `eval/auto_plot.py` percentile panel dropped (figure
+> now single-row 4-panel).
 
 ---
 
@@ -387,6 +455,28 @@ to drive the flush flag.
 `config/vllm.py.__post_init__` (`scheduler_config.scheduler_cls`) and instantiated by
 `EngineCore` (`v1/engine/core.py:132/145`). Not imported directly anywhere.
 
+**UnifiedFT addition (`_initial_ft_budget` hook):** the FT-admission gate that
+short-circuits `budget=0` on decode-only steps was extracted into a new
+`_initial_ft_budget(feats, earliest_arrival)` method. Default body matches
+today's behaviour; the sibling `BothPhaseFinetuneScheduler` (next entry)
+overrides it to relax the gate. The body of `schedule()` now calls
+`self._initial_ft_budget(...)` instead of inlining the `decode_only` check.
+
+### `vllm/deltaserve/ft_scheduler_both.py` — `BothPhaseFinetuneScheduler`
+**Function:** sibling of `FinetuneScheduler` selected when
+`slo.coserving_admission_phase: both`. Removes the `decode_only → 0`
+short-circuit by overriding `_initial_ft_budget` (always returns the SLO
+budget regardless of step composition) AND `_slo_ft_budget` (applies
+`slo.decode_only_ft_safety_margin` as a multiplier on `max_tbt_slo` when the
+upcoming step is decode-only). Inherits everything else — injection,
+coordinator wiring, backward triggers, async-safety, the
+`match_prefill_workload_factor` leaky-bucket gate (which self-gates on
+`feats.t_in > 0` so long decode-only stretches naturally rate-limit FT).
+**Used by:** the running engine when the phase is `"both"` — selected by
+qualname string in `config/vllm.py.__post_init__`. Soft-fall to
+`FinetuneScheduler` (with `logger.warning`) when
+`ft_tokens_admission_constrain_factor != -1`.
+
 ---
 
 ## MODIFIED upstream files
@@ -495,8 +585,9 @@ arrival at the engine). No other engine-loop changes.
 | `scripts/ft_experiment_{opt,llama3}.py` | co-serving harness: launches a real `vllm serve` HTTP server with finetuning, fires a completion every 1s ×N, then shuts it down (server stdout streams the decision logs) |
 | `scripts/train_opt125m_lora.py` | trains the opt-125m toy LoRA adapters |
 | `scripts/bench_activation_save.py` | microbenchmark: activation-save overhead per FT step |
-| `eval/auto_benchmark.py` | launches `vllm serve` (±`--co`), replays a request timeline, streams `/v1/completions` (ttft = first chunk), writes `timeline_results<suffix>.csv`. P4d/e: `--api-server-count N` (or YAML `server.api_server_count`) shards the frontend; reads `server.api_server_count` from the config. Also writes `bench_meta<suffix>.json` with `t_first_wall_iso` so the plotter can anchor the FT (wall-clock) series at the same t=0 as the inference (monotonic) series — fixes the throughput-panel misalignment where inference and FT peaks appeared in-phase due to the FT log anchoring at first-backward-row instead of benchmark start |
-| `eval/auto_plot.py` | 4-panel per-mode figure. P4d: TTFT panel annotates avg/p90 TTFT + avg TBT (flagged vs `slo.{ttft_slo,avg_tbt_slo}`); E2E-latency panel overlays the inf-only (no-co) curve when its results exist. Loads `bench_meta<suffix>.json` (if present) and passes `t0_wall` to `parse_bwd_log_csv` so the FT series is anchored at benchmark t=0; falls back to legacy first-row anchoring when the meta is missing. `--throughput-window` flag tunes the rolling-mean width on the throughput panel (auto-pick in `[5, 60]` seconds when unset) |
+| `eval/auto_benchmark.py` | launches `vllm serve` (±`--co`), replays a request timeline, streams `/v1/completions` (ttft = first chunk), writes `timeline_results<suffix>.csv`. P4d/e: `--api-server-count N` (or YAML `server.api_server_count`) shards the frontend; reads `server.api_server_count` from the config. Writes `bench_meta<suffix>.json` with `t_first_wall_iso` for the plotter's t=0 anchor. **UnifiedFT**: `--scheduler {prefill,both}` (default `prefill`) selects the corresponding serving YAML via `_SCHED_CONFIGS`; output suffix is `_co_factor_<X>_phase_<Y>_<mode>` so A/B runs don't overwrite |
+| `eval/auto_plot.py` | Single-row 4-panel per-mode figure (request timeline / E2E latency vs time / throughput / TTFT satisfaction). P4d: TTFT panel annotates avg/p90 TTFT + avg TBT (flagged vs `slo.{ttft_slo,avg_tbt_slo}`); E2E-latency panel overlays the inf-only (no-co) curve when its results exist. Loads `bench_meta<suffix>.json` (if present) and passes `t0_wall` to `parse_bwd_log_csv` so the FT series anchors at benchmark t=0. `--throughput-window` flag tunes the rolling-mean width on the throughput panel. (Earlier revision had a 5th E2E-latency-percentile panel; dropped at UnifiedFT — the percentile view lives in `auto_plot_schedulers.py`'s context.) |
+| `eval/auto_plot_schedulers.py` | A/B comparison plotter for the UnifiedFT scheduler. Emits TWO PNGs centered on `phase=both`: `scheduler_compare_<mode>_factor_<tag>_both_vs_inf-only.png` (co-serving overhead vs no-co baseline) and `scheduler_compare_<mode>_factor_<tag>_both_vs_prefill.png` (head-to-head: `both` vs default `prefill` scheduler). Same 4-panel layout as `auto_plot.py`. Reuses `auto_plot.py` helpers (`parse_bwd_log_csv`, `_distribute_to_bins`, `_ft_per_bin`, `_smooth`, `plot_latency_vs_time`, `plot_request_timeline`, `read_slo`). Multi-series throughput panel uses per-run filled inference bands + hatched FT bands (cycling hatch patterns so overlaps stay readable) + per-run total dashed line, matching `auto_plot.plot_throughput_curves`'s visual identity. Multi-series TTFT-satisfaction panel folds per-run avg/p90 stats into a single combined text box. Prints every input file path as it resolves them so the user can see which runs landed on disk. Graceful degradation when a file is missing (`[plot] skip both_vs_X: phase=Y run not found`) |
 | `adapters/{opt125m,llama3}-toy-lora{,-ft}/` | the inference + FT adapters |
 | `alpaca_1000.txt` | FT corpus |
 | `tests/test_config_loader.py`, `test_finetuning_store.py`, `test_phase1_step2.py`, `test_phase1_step3.py`, `test_phase1_m1.py`, `test_phase1_m2.py`, `test_merged_estimator.py`, `test_profiling_shapes.py` | CPU/GPU verification |
