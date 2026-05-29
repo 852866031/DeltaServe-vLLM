@@ -871,11 +871,14 @@ bytes either way; saves one CUDA kernel + one allocation per hook firing
   `down`/`out` recompute.)
 - **Phase 5.3 — perf polish + admission strategies + bug fixes. ✅ SHIPPED.** Bundled set
   documented in detail in `VLLM_FORK_CHANGES.md` (P5.3 stage row + design note):
-  - `match_with_prefill_workload` — leaky-bucket FT admission strategy. Accumulates
-    inference-prefill tokens seen but not yet "spent" on FT; admits ONE FT sample
-    sized to the next sample's `input_len` when accumulated credit suffices; resets on
-    any FT admit. Mutually exclusive with `ft_tokens_admission_constrain_factor`.
-    Config: `finetune.match_with_prefill_workload: true`. Default False.
+  - `match_prefill_workload_factor: float` — leaky-bucket FT admission strategy.
+    Accumulates inference-prefill tokens seen but not yet "spent" on FT; admits ONE
+    FT sample sized to the next sample's `input_len` (capped by SLO budget) when
+    `(counter + t_in) * factor >= next_sample.input_len`. Factor scales how much
+    credit each prefill token earns: `1.0` ≡ the original boolean-on behaviour,
+    `>1` more aggressive, `<1` more conservative. Mutually exclusive with
+    `ft_tokens_admission_constrain_factor`. Config:
+    `finetune.match_prefill_workload_factor: <float>`. Default 0.0 (disabled).
   - **Oversized-sample drop at load** (`finetuning_store.py:load()`) — fixes a real
     deadlock when only samples with `input_len > max_saved_finetuning_tokens` remain
     in the pool. Surfaced by `pure_ft_bench.py` on `alpaca_1000.txt`.

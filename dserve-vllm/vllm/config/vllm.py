@@ -827,9 +827,35 @@ class VllmConfig:
         # explicit user override (True/False) is respected.
         if self.finetune_config.enable_finetuning:
             if self.scheduler_config.scheduler_cls is None:
-                self.scheduler_config.scheduler_cls = (
-                    "vllm.deltaserve.ft_scheduler.FinetuneScheduler"
-                )
+                # Phase-aware scheduler choice. ``coserving_admission_phase``
+                # = "prefill" (default) keeps today's prefill-only FT
+                # admission; "both" picks the sibling scheduler that allows
+                # FT on any step (prefill / decode / mixed / idle) under
+                # the SLO estimator's gate. The proportional cap
+                # ft_tokens_admission_constrain_factor is defined relative
+                # to prefill tokens, so it's incompatible with decode-only
+                # admission — soft-fall to "prefill" with a warning if both
+                # are set.
+                phase = getattr(self.finetune_config,
+                                "coserving_admission_phase", "prefill")
+                cap_factor = float(getattr(
+                    self.finetune_config,
+                    "ft_tokens_admission_constrain_factor", -1.0))
+                if phase == "both" and cap_factor != -1.0:
+                    logger.warning(
+                        "[deltaserve] coserving_admission_phase='both' is "
+                        "incompatible with ft_tokens_admission_constrain_factor"
+                        "=%s (must be -1); forcing 'prefill'.", cap_factor)
+                    phase = "prefill"
+                if phase == "both":
+                    self.scheduler_config.scheduler_cls = (
+                        "vllm.deltaserve.ft_scheduler_both."
+                        "BothPhaseFinetuneScheduler"
+                    )
+                else:
+                    self.scheduler_config.scheduler_cls = (
+                        "vllm.deltaserve.ft_scheduler.FinetuneScheduler"
+                    )
             if self.scheduler_config.async_scheduling is None:
                 self.scheduler_config.async_scheduling = True
 
