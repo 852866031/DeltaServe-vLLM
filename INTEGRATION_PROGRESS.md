@@ -80,11 +80,14 @@ under co-serving should drop from "~80 ms (one full FT-only forward)" toward
 the YAML. See the new **Phase 6** section below for the full design + verification
 plan.
 
-Phase 5.2 (backward CUDA graphs) and 5.3 (perf polish + admission strategies + bug
-fixes) have shipped — see the bottom of the **Phase 5** section for what landed and
-what's next (save post-RoPE qh/kh/vh per layer is the next FT-throughput candidate,
-documented as future work). From here on we **prioritize Llama-3**; opt-125m stays at
-its current stage (loss-only) as a reference path and is not developed further.
+Phases 5.2 (backward CUDA graphs), 5.3 (perf polish + admission strategies + bug
+fixes), 5.4 (forward-recompute CUDA graph), and 5.5 (save post-RoPE qh/kh/vh per
+layer) have shipped — see the **Phase 5** section for what landed. The
+unified-phase scheduler (`coserving_admission_phase: both`) has shipped as code;
+GPU A/B vs the default prefill-only scheduler is pending — see the
+**"Unified-phase FT scheduler"** section for the verification path. From here on
+we **prioritize Llama-3**; opt-125m stays at its current stage (loss-only) as a
+reference path and is not developed further.
 
 ---
 
@@ -834,6 +837,93 @@ the next FT batch reuses the same offset and overwrites any stale bytes that wou
 have been there. InputBatch state cleans up on the NEXT step's `_update_states` via
 the existing "unscheduled" path (same mechanism that handles the normal FT retire).
 
+## Unified-phase FT scheduler — `slo.coserving_admission_phase: both` 🟡 (code; GPU A/B pending)
+
+Opt-in alternative to the default prefill-only FT admission. New scheduler
+class `BothPhaseFinetuneScheduler` (`deltaserve/ft_scheduler_both.py`) is a
+sibling of `FinetuneScheduler` — selected when
+`slo.coserving_admission_phase: both` is set in the YAML (with a startup
+soft-fall back to `"prefill"` if `ft_tokens_admission_constrain_factor != -1`,
+since the proportional cap is prefill-relative).
+
+**Rationale.** Today's rule "FT only rides prefill-carrying steps" is
+DeltaServe-era conservatism — the SLO estimator already predicts decode +
+graph/eager regimes, so it can decide per-step whether adding FT fits the
+TBT/TTFT budget. An FT sample is structurally just "an inference req with 1
+token to generate" (that's literally what `FinetuneInjector` produces). The
+load-bearing cost to price in: any batch carrying FT forces eager
+(`force_eager=self._ft_has`), so admitting FT onto a CUDA-graphed decode-only
+batch pays the eager penalty. The estimator's `will_use_graph` regime split
+already models this.
+
+**Implementation.** Two overrides vs the parent `FinetuneScheduler`:
+- `_initial_ft_budget(feats, earliest_arrival)` — drops the
+  `decode_only → 0` short-circuit. Every step composition runs through the
+  SLO budget computation. (The parent class gets a new hook method that
+  defaults to today's behaviour, so this is a clean one-line override.)
+- `_slo_ft_budget(feats, earliest_arrival)` — when the upcoming step is
+  decode-only, scales `max_tbt_slo` by `decode_only_ft_safety_margin`
+  (default 0.7) before computing the TBT-derived FT-token cap. Conservative
+  margin justified by: (a) eager penalty from losing the CUDA-graph fast
+  path can dominate sub-5ms decode-only step time; (b) γ coefficient hasn't
+  seen many decode-only + FT samples until online refit accumulates them.
+
+Everything else inherits from `FinetuneScheduler`: injection, coordinator,
+backward triggers, async-safety (reserve-at-inject), the
+`match_prefill_workload_factor` leaky-bucket gate, the `_unspent_prefill`
+counter. The leaky-bucket counter still self-gates on `feats.t_in > 0`, so
+long decode-only stretches naturally rate-limit FT (no new credit accrues)
+once banked credit is consumed.
+
+**Config.** Two new fields under `slo:` in `FinetuneConfig`:
+- `coserving_admission_phase: str = "prefill"` — selects the scheduler.
+- `decode_only_ft_safety_margin: float = 0.7` — TBT-budget multiplier on
+  decode-only steps.
+
+New YAML: `configs/serving_config_finetuning_llama3_both.yaml` (copy of the
+existing llama3 YAML with `slo.coserving_admission_phase: both` +
+`slo.decode_only_ft_safety_margin: 0.7`).
+
+**Eval tooling.**
+- `eval/auto_benchmark.py` gains `--scheduler {prefill,both}` (default
+  `prefill`); the flag picks the corresponding YAML and the output suffix is
+  extended to `_co_factor_<X>_phase_<Y>_<mode>` so A/B runs across schedulers
+  don't overwrite.
+- `eval/auto_plot_schedulers.py` (new) emits two A/B PNGs centered on
+  `phase=both`: `both_vs_inf-only` (co-serving overhead vs no-co baseline)
+  and `both_vs_prefill` (head-to-head scheduler comparison). Same 4-panel
+  layout as `auto_plot.py` (timeline / E2E latency / throughput / TTFT
+  satisfaction). Reuses `auto_plot.py` helpers (`parse_bwd_log_csv`,
+  `_distribute_to_bins`, etc.). Auto-detects factor + phases from disk.
+- `eval/auto_plot.py`: percentile panel dropped (figure now single-row
+  4-panel; percentile view lives in `auto_plot_schedulers.py`'s context).
+
+**Verification path (pending GPU validation).**
+1. Smoke: launch with the new YAML, confirm log line
+   `BothPhaseFinetuneScheduler active | decode_only_safety=0.7 | ...`.
+2. Confirm `[batch]` logs eventually show FT tokens admitted on decode-only
+   steps (`decode=[...] | ft=N` with `t_in=0`).
+3. A/B: run `auto_benchmark.py --co --loose` three times (no-co baseline /
+   `--scheduler prefill` / `--scheduler both`), then
+   `python eval/auto_plot_schedulers.py --mode loose`. Read the two output
+   PNGs for: TTFT SLO satisfaction held, E2E latency curves comparable,
+   `phase=both` FT throughput ≥ `phase=prefill` FT throughput (the win
+   condition).
+
+**Known follow-ups (documented, not blocking).**
+- Profiling pass extension: `profiling_batch_generator.py` shape sweeps
+  don't cover `(B_d, K, T_in=0, T_ft>0)` and mixed shapes. γ converges via
+  online refit (every 256 steps) but slower than profiling-seeded.
+- Eager-penalty differential modeling: today's TBT check uses
+  `t_current = predict(..., will_use_graph=False)` for the eager-with-FT
+  prediction. A future refinement could compare against `predict(...,
+  will_use_graph=True)` (no-FT graph time) to explicitly fight the
+  graph-loss tax.
+- `match_prefill_workload_factor` on decode-only: counter accumulates only
+  on prefill-carrying steps. A future `match_any_workload_factor` could
+  count decode tokens too. Out of scope per the "keep
+  match_prefill_workload_factor" requirement.
+
 ## Phase 6.1 — Slice-based FT activation save ✅ (code)
 
 Per-layer hooks (`input_layernorm`, `model.norm`, `mlp.gate_up_proj`) now use a slice
@@ -847,7 +937,7 @@ freed inference slot mid-batch — common is contiguous, but not guaranteed). Sa
 bytes either way; saves one CUDA kernel + one allocation per hook firing
 (~33 per Llama-3 FT forward).
 
-## Phase 5 — Optimizations & assets 🟡 (5.1, 5.2, 5.3 shipped; multi-TP + dedicated FT pool open)
+## Phase 5 — Optimizations & assets 🟡 (5.1, 5.2, 5.3, 5.4, 5.5 shipped; multi-TP + dedicated FT pool open)
 
 - **Pause/resume `_maybe_pause` — the GPU-yielding co-serving contract. ✅ IMPLEMENTED (prefill-gated).**
   An `mp.Event` GPU-grant (SET = backward may run; CLEARED = yield) is created in
@@ -895,40 +985,49 @@ bytes either way; saves one CUDA kernel + one allocation per hook firing
     `-1`); `eval/auto_plot` 5-panel layout with E2E latency percentile + p99
     highlighted + `--factor X` (auto-detects smallest) + factor in plot title;
     **`eval/pure_ft_bench.py`** new pure-FT (no inference traffic) benchmark.
+- **Phase 5.4 — Forward-recompute CUDA graph (per layer). ✅ SHIPPED.** Captures the
+  full per-layer forward rematerialization (RMSNorm in_ln + Q/K/V proj + RoPE +
+  padded-attention forward + O proj + residual add) as one CUDA graph per layer,
+  extending the Phase 5.2 backend from 2 captured regions to **3 per layer** under
+  the same `finetune.backward_cuda_graph` flag. The forward graph's outputs ARE the
+  FFN-bwd / padded-attn-bwd graphs' input buffers (writes directly to
+  `static_resid_mid`, `static_gate`, `static_up`, `static_qh_pad/kh_pad/vh_pad`) —
+  eliminates intermediate copy-in steps. Per-sample attention forward is replaced
+  by a captureable padded variant mirroring `_padded_attn_core`. Pre-capture cost
+  goes from 33 → 65 graphs at child startup (~few hundred ms; one-time). Per-layer
+  silent eager fallback on capture/replay failure (`fwd_failed`) or when
+  `_attn_fit=False`. Gradcheck parity 111/111 in
+  `tests/test_llama3_backward_graph.py` (45 new assertions).
+- **Phase 5.5 (a.k.a. F1) — save post-RoPE qh/kh/vh per layer. ✅ SHIPPED.** Opt-in
+  via `finetune.save_attn_qkv: bool = False`. When ON, a `forward_pre_hook` on each
+  `self_attn.attn` module captures the FT rows of post-RoPE q, k, v (vLLM's
+  `self_attn.attn(q, k, v)` call site, args ≡ post-RoPE q, k, v). New per-layer
+  buffers `attn_qh/kh/vh[i]` in `FinetuneAccumulator`, threaded through CUDA-IPC
+  `share_activations`. The backward (both eager `layer_forward` and the Phase 5.4
+  forward graph) short-circuits Q/K/V proj + RoPE entirely, only recomputing
+  RMSNorm in_ln (cheap; the Q/K/V LoRA-A backward needs `x_norm1`).
+  - **Cost:** +~96 MB at `max_saved_finetuning_tokens=256` on Llama-3-8B
+    (`qh [s_max, q_size=4096]` bf16 ≈ 2 MB/layer × 32 = 64 MB; `kh/vh [s_max, kv_size=1024]`
+    bf16 ≈ 0.5 MB/layer × 32 each = 16 MB each).
+  - **Recovery:** ~13-16 GFLOPs/layer × 32 = ~400-500 GFLOPs eliminated per
+    backward — ~5 ms on a 5090.
+  - Per-layer silent eager fallback when `saved_gu` is absent for that layer.
+    Forward graph variant captured at runner construction based on the
+    `save_attn_qkv` flag (mode is fixed per-runner — graph captures the
+    appropriate branch once).
+  - Parity verified vs the recompute path in `test_layer_forward_saved_qkv_parity`
+    + `test_forward_graph_saved_qkv_parity`.
+  - **Trade-offs ranked** (`backward-review-issues.md` §F):
+    | candidate | GFLOPs saved/layer | +MB | ratio (GFLOPs/MB) |
+    |---|---|---|---|
+    | **qh/kh/vh post-RoPE (shipped)** | 13-16 | 96 | **5.2** |
+    | `mlp_gate_up` (already shipped) | 30 | 469 | 2.0 |
+    | `ctx_flat` | 0.7 | 67 | 0.33 |
+    | `x_norm1` alone | 0.005 | 67 | 0.002 |
 - A dedicated FT activation pool only if vLLM's allocator gets in the way; multi-TP
-  correctness (backward per-rank). (eval/analysis tooling port: ✅ done in P5.3 above.)
-
-### Future activation-save optimization — save post-RoPE `qh, kh, vh` per layer
-
-Currently the backward re-derives `qh, kh, vh` from `layer_in[i]` via
-RMSNorm-in_ln + Q/K/V proj + RoPE each backward (~16 GFLOPs/layer on
-Llama-3-8B at n=256). Saving these directly in the forward (mirroring the
-existing `mlp_gate_up` pattern in `FinetuneAccumulator`) would eliminate that
-recompute.
-
-- **Cost:** +99 MB at `max_saved_finetuning_tokens=256` (~18% buffer growth):
-  `qh` `[s_max, Hq=32, Hd=128]` bf16 ≈ 2.1 MB/layer × 32 = 67 MB;
-  `kh`/`vh` `[s_max, Hkv=8, Hd=128]` bf16 ≈ 0.5 MB/layer × 32 each = 32 MB total.
-- **Recovery:** ~16 GFLOPs/layer × 32 = ~500 GFLOPs eliminated per backward
-  — roughly 5 ms on a 5090. Best perf/memory ratio of any save candidate
-  (5.2 GFLOPs/MB; `mlp_gate_up` is 2.0; `ctx_flat` would be 0.33).
-- **Implementation sketch:**
-  - Post-hooks on `self_attn.{q,k,v}_proj` applying RoPE in-hook
-    (positions = `arange(0, seq_len)` per FT sample — already known to the
-    accumulator via the per-sample length list).
-  - Three new buffers in `FinetuneAccumulator`, threaded through CUDA-IPC
-    `share_activations`.
-  - A `saved_qh/kh/vh` parameter on `layer_forward` that short-circuits the
-    Q/K/V/RoPE path when populated. The Q/K/V LoRA-A backward still needs
-    `x_norm1` for `grad_A = grad_Z.t() @ x_norm1` — recompute RMSNorm in the
-    backward (~5 MFLOPs, free) rather than also saving it.
-- **Trade-offs ranked** (see `backward-review-issues.md` §F):
-  | candidate | GFLOPs saved/layer | +MB | ratio (GFLOPs/MB) |
-  |---|---|---|---|
-  | qh/kh/vh post-RoPE | 16 | 99 | **5.2** |
-  | mlp_gate_up (existing) | 30 | 469 | 2.0 |
-  | ctx_flat | 0.7 | 67 | 0.33 |
-  | x_norm1 alone | 0.005 | 67 | 0.002 |
+  correctness (backward per-rank). Profiling pass extension to cover `decode + FT`
+  and `decode-only + FT` shapes (currently online-refit only). (eval/analysis
+  tooling port: ✅ done in P5.3 above.)
 
 ## Top risks
 

@@ -87,7 +87,29 @@ forward gives us nothing useful for FT loss.
 
 ## 4. FT admission rules
 
-Two mutually exclusive strategies + a global SLO gate underneath both.
+Three orthogonal axes: **which steps are eligible** (phase) × **how to shape FT
+within an eligible step** (strategy) × **the SLO ceiling** (always-on gate).
+
+### Scheduler phase — which steps are eligible (UnifiedFT)
+
+- **`coserving_admission_phase: "prefill"` (default)** — FT only admits to
+  prefill-carrying steps. Decode-only steps short-circuit to budget=0 in
+  `FinetuneScheduler._initial_ft_budget` (the hook that subclasses override).
+  Today's behaviour; selects the original `FinetuneScheduler`.
+- **`coserving_admission_phase: "both"`** — FT admits to any step composition
+  (prefill / decode / mixed / idle) under the SLO estimator's gate. Selects
+  `BothPhaseFinetuneScheduler` (`deltaserve/ft_scheduler_both.py`), which
+  drops the decode-only short-circuit AND applies an extra safety margin on
+  decode-only:
+  - **`decode_only_ft_safety_margin: float = 0.7`** scales `max_tbt_slo` on
+    decode-only steps. Tighter because (a) the eager penalty from losing the
+    CUDA-graph fast path can dominate sub-5ms decode-only step time, (b) the
+    estimator's γ coefficient hasn't seen many decode-only + FT samples until
+    online refit accumulates them.
+- **Soft-fall** to `"prefill"` (with `logger.warning` at startup) when
+  `coserving_admission_phase == "both"` AND
+  `ft_tokens_admission_constrain_factor != -1` — the proportional cap is
+  prefill-relative and incompatible with decode-only admission.
 
 ### Per-step admission strategies (mutually exclusive)
 
@@ -305,11 +327,23 @@ anything in the engine:
 
 - `eval/auto_benchmark.py` replays request timelines from
   `eval/timelines/5090/`, streams `/v1/completions`. Outputs tagged
-  `_factor_<X>` (or `_factor_off` for `-1`) so A/B runs don't overwrite.
-- `eval/auto_plot.py` — 5-panel layout (timeline / E2E latency /
-  throughput bands / TTFT-SLO satisfaction / **E2E latency percentile
-  with p99 highlighted**). `--factor X` arg with smallest-factor
-  autodetect; factor appears in plot title.
+  `_factor_<X>_phase_<Y>` (or `_factor_off` for `-1`; phase = `prefill` |
+  `both`) so A/B runs across the FT admission factor AND the scheduler
+  variant land in distinct files. `--scheduler {prefill,both}` picks the
+  corresponding YAML (`configs/serving_config_finetuning_llama3{,_both}.yaml`).
+- `eval/auto_plot.py` — single-row 4-panel layout (timeline / E2E latency
+  vs time / throughput bands / TTFT-SLO satisfaction). `--factor X` arg
+  with smallest-factor autodetect; factor + phase appear in plot title.
+  (Earlier revision had a 5th E2E-latency percentile panel; dropped at
+  UnifiedFT.)
+- `eval/auto_plot_schedulers.py` — A/B comparison plotter. Emits **two**
+  PNGs centered on the `both` scheduler variant: `both_vs_inf-only` (the
+  co-serving overhead vs the no-co baseline) and `both_vs_prefill`
+  (head-to-head: unified-phase scheduler vs prefill-only). Same 4-panel
+  layout as `auto_plot.py`; reuses its helpers. Multi-series throughput
+  panel uses per-run filled inference bands + hatched FT bands (cycling
+  hatch patterns so overlaps stay readable). Prints every input file path
+  as it resolves them.
 - `eval/pure_ft_bench.py` — pure-FT (no inference traffic) benchmark.
   Launches the server, POSTs `/start_finetuning`, idles for `--duration`,
   trims + summarizes the bwd_log. Isolated backward-throughput
@@ -332,8 +366,10 @@ behaviour:
    bound inference latency during the backward.
 5. **Async + reserve-at-inject** lets the inference batch queue pipeline
    through co-serving.
-6. **SLO-aware admission** + the two strategy knobs decide how much FT
-   to admit per step.
+6. **SLO-aware admission** + the two strategy knobs (`*_admission_constrain_factor`,
+   `match_prefill_workload_factor`) decide **how much** FT to admit per step;
+   the `coserving_admission_phase` (`prefill` vs `both`) decides **which step
+   compositions are eligible** at all.
 7. **`forward_interruptible`** catches late inference arrivals at three
    points to pre-empt FT-only steps.
 8. **Control plane + frontend fixes** (`disable_log_stats`,
