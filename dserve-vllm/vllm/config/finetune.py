@@ -140,6 +140,11 @@ class FinetuneConfig:
     estimator and buffer space allow. No effect on prefill-free steps (idle /
     FT-only fills), where prefill is zero.
 
+    Three-regime estimator interaction: under the iterative
+    ``admit_ft_to_step`` algorithm, this factor is a hard upper bound on
+    ``T_ft`` per step. The loop's break condition becomes
+    ``tentative.T_ft + candidate.input_len > min(buffer_cap, t_in * factor)``.
+
     Mutually exclusive with ``match_prefill_workload_factor`` — when the
     latter is > 0, this factor is ignored (the leaky-bucket strategy fully
     replaces the per-step proportional cap)."""
@@ -184,7 +189,15 @@ class FinetuneConfig:
     Replaces ``ft_tokens_admission_constrain_factor`` when ``> 0`` — the
     proportional factor cap is bypassed since this gate controls the
     FT-per-prefill ratio directly. Default 0.0 keeps the previous
-    factor-based behaviour."""
+    factor-based behaviour.
+
+    Three-regime estimator interaction: under the iterative
+    ``admit_ft_to_step`` algorithm, the leaky bucket gates entry to the
+    per-sample loop. If the trigger condition holds, the loop is capped at
+    a single iteration (admit exactly one sample sized to the SLO budget).
+    If the trigger condition fails, the loop is skipped entirely and
+    ``_unspent_prefill`` accumulates by ``t_in``. The counter resets on
+    any successful admit."""
 
     coserving_admission_phase: str = "prefill"
     """Which step compositions are eligible for FT admission. Two values:
@@ -205,17 +218,26 @@ class FinetuneConfig:
     admission. Set the factor to ``-1`` to use ``"both"``."""
 
     decode_only_ft_safety_margin: float = 0.7
-    """[both mode only] Multiplier applied to ``max_tbt_slo`` when computing
-    the FT budget on DECODE-ONLY steps. Tighter than the prefill-carrying
-    path because: (a) the eager penalty from losing the CUDA-graph fast path
-    can dominate the sub-5ms decode-only step time, (b) the SLO estimator's
-    γ coefficient hasn't seen many decode-only + FT samples until the online
-    refit accumulates them. 0.7 (default) = the FT budget on a decode-only
-    step is computed against 70% of the configured ``max_tbt_slo``. Set to
-    1.0 to disable the extra margin (use the same TBT budget as prefill-
-    carrying steps). Has no effect when ``coserving_admission_phase ==
-    "prefill"`` (today's behaviour). Independent of the standard
-    0.9 × ttft_slo TTFT margin, which still applies everywhere."""
+    """[both mode only] Multiplier applied to ``max_tbt_slo`` when the
+    iterative ``admit_ft_to_step`` evaluates a per-sample candidate on a
+    DECODE-ONLY step. The per-sample SLO check uses ``max_tbt_slo * margin``
+    instead of ``max_tbt_slo`` for that step's acceptance gate.
+
+    Cold-start conservatism: the three-regime EAGER coefficient set predicts
+    the FULL→eager transition cost more accurately than the previous
+    closed-form solve (it sees the full step-with-FT directly), but the margin
+    gives a safety buffer while the EAGER regime accumulates records for the
+    ``(T_in=0, T_ft>0, B_d>0)`` shape. The offline profiling pass now sweeps
+    this shape (see ``_ft_on_decode_shapes`` in
+    ``profiling_batch_generator.py``), so the margin can be tuned toward 1.0
+    once GPU A/B runs validate the estimator's per-regime RMSE on this shape.
+
+    0.7 (default) = the FT budget on a decode-only step is computed against
+    70% of the configured ``max_tbt_slo``. Set to 1.0 to disable the extra
+    margin entirely. Has no effect when ``coserving_admission_phase ==
+    "prefill"`` (decode-only steps short-circuit to no FT regardless).
+    Independent of the standard 0.9 × ttft_slo TTFT margin, which still
+    applies everywhere."""
 
     profile_on_launch: bool = True
     """Run the offline execution-time profiling pass at launch (before serving)

@@ -39,10 +39,12 @@ slo:
   # prefill-carrying). The SLO estimator + the decode-only safety margin
   # below are the only gates. Picks `BothPhaseFinetuneScheduler` at startup.
   coserving_admission_phase: both
-  # On decode-only steps, scale max_tbt_slo by this factor before computing
-  # the FT budget. Tighter (0.7) than prefill-carrying because the eager
-  # penalty + estimator cold-start can dominate sub-5ms decode-only steps.
-  # Set to 1.0 to use the same TBT budget as prefill.
+  # On decode-only steps, scale max_tbt_slo by this factor when the iterative
+  # admission's per-sample SLO check runs. Cold-start buffer for the new
+  # three-regime EAGER coefficient set — the offline profiling pass now
+  # sweeps the (T_in=0, B_d>0, T_ft>0) shape so γ converges within ~few
+  # hundred steps; after that, this margin can be tuned toward 1.0 without
+  # losing SLO compliance. Set to 1.0 to disable the extra margin entirely.
   decode_only_ft_safety_margin: 0.7
   # MUST stay -1 in "both" mode — the proportional cap is prefill-relative.
   # If you set this > 0, the scheduler falls back to prefill-only with a
