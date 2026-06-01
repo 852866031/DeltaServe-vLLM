@@ -20,7 +20,7 @@ finetune:
   # Finetuning corpus: one tokenizable sample per non-empty line.
   # data_path: ../test_dataset.txt
   data_path: ../alpaca_1000.txt
-  max_saved_finetuning_tokens: 256   # buffer capacity; ~2 inference steps to fill
+  max_saved_finetuning_tokens: 512   # buffer capacity; ~2 inference steps to fill
   backward_sleep_seconds: 2.0        # simulated backward duration (observe inference)
   num_epochs: 20
   learning_rate: 0.000005
@@ -52,7 +52,7 @@ slo:
   # next_sample.input_len AND SLO allows. 0.0 disables (default);
   # 1.0 reproduces the old `match_with_prefill_workload: true` behaviour;
   # >1 admits more aggressively; <1 more conservatively.
-  match_prefill_workload_factor: 0.0
+  match_prefill_workload_factor: 0.5
   # [unified-phase only] TBT-budget multiplier on decode-only steps when FT
   # is being considered for admission. Inert in this (prefill-only) config —
   # decode-only steps short-circuit to no FT regardless. Exposed here for

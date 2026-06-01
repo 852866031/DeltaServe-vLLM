@@ -7,16 +7,22 @@ server:
 - Launches `dserve-vllm serve` (Llama-3-8B + the inference LoRA adapter,
   finetuning enabled when --co) in its own process group; streams server logs
   live.
-- Waits for /health, then runs a warmup phase (first N timeline rows, replayed
-  on the timeline schedule, NOT recorded), an optional rest, then the full
-  timeline (recorded).
+- Waits for /health, then (under --co) POSTs /start_finetuning so the
+  backward warms up alongside inference, then runs a warmup phase (first
+  N timeline rows, replayed on the timeline schedule, NOT recorded), an
+  optional rest, then the full timeline (recorded).
 - Each request is a STREAMING /v1/completions call: ttft_s = time from send to
   the first streamed chunk; latency_s = time to the last chunk; avg/worst tbt
   from inter-chunk gaps.
 - Writes per-request metrics to output/timeline_results<suffix>.csv (same
   columns as the DeltaServe harness). When --co, the server writes a
-  finetune-throughput log (bwd_log<suffix>.csv) which is trimmed to the
-  timeline window afterwards.
+  finetune-throughput log (bwd_log<suffix>.csv) which is trimmed at the
+  end of the run to drop any backward rows that fall outside the
+  inference timeline window. The cutoff accounts for timelines whose
+  first row starts at a non-zero timestamp (e.g. loose's first request
+  sits at timestamp 5) — the kept window starts ``base_ts`` seconds
+  BEFORE the first request was sent, so the published log spans the
+  same coordinate range as the timeline.
 
 Hardcoded (per the eval setup): base model Llama-3-8B, FT adapter
 adapters/llama3-toy-lora-ft (via the finetuning YAML), inference adapter
@@ -25,6 +31,13 @@ adapters/llama3-toy-lora, port/rank matching ft_experiment_llama3.py.
 Usage (dserve-vllm env, CUDA env per README.md):
     python eval/auto_benchmark.py --co --loose
     python eval/auto_benchmark.py --tight        # inference-only (no FT)
+
+Pass --publish to write the output files under the canonical names that
+the top-level ``evaluation/process_results.py`` reads (no scheduler-
+``_phase_<p>`` tag for any mode; no FT-``_factor_<f>`` tag for
+loose / tight; factor tag kept for nutanix):
+    python eval/auto_benchmark.py --co --loose   --publish
+    python eval/auto_benchmark.py --co --nutanix --publish
 """
 
 import argparse
@@ -211,8 +224,11 @@ def build_server_cmd(co: bool, bwd_log_path: Optional[str],
         if bwd_log_path:
             cmd.append(f"--finetune-config.bwd_log_path={bwd_log_path}")
         # Hold FT admission closed at launch; the benchmark opens it via
-        # POST /start_finetuning after warmup. (Profiling at launch is
-        # unaffected — it injects FT directly.)
+        # POST /start_finetuning right before warmup so FT and inference
+        # share warmup. (Profiling at launch is unaffected — it injects
+        # FT directly.) The bwd_log trim at end-of-run drops any backward
+        # rows that fired during warmup so the published log still
+        # matches the recorded inference timeline.
         cmd.append("--finetune-config.start_on_launch=false")
     # else: finetune sections omitted -> enable_finetuning defaults False.
     cmd += ["--host", "127.0.0.1", "--port", str(_PORT),
@@ -245,7 +261,8 @@ def make_prompt_from_length(prompt_length: int) -> str:
 
 
 async def start_finetuning(server: str) -> bool:
-    """POST /start_finetuning to open FT admission (after warmup)."""
+    """POST /start_finetuning to open FT admission (called right BEFORE
+    warmup so the backward warms up alongside inference)."""
     try:
         async with aiohttp.ClientSession() as s:
             async with s.post(f"{server}/start_finetuning", timeout=10) as r:
@@ -378,20 +395,31 @@ def write_results_csv(path: str, rows) -> None:
 
 
 def trim_bwd_log_before(path: str, cutoff: datetime.datetime) -> None:
-    """Drop bwd_log rows whose ISO-second `timestamp` is strictly before
-    `cutoff` (the timeline-start wall clock), keeping only timeline-phase
-    backward rows. Same-second rows are kept."""
+    """Drop bwd_log rows whose ``timestamp`` is strictly before
+    ``cutoff``. Compares at full microsecond precision so the row in
+    the same second as the cutoff is dropped if it sits a few hundred
+    ms earlier — the previous second-truncation pass leaked that row,
+    which then landed in a negative full-timeline bucket downstream
+    and got silently dropped by ``_bucketize`` in process_results.py."""
     if not os.path.exists(path):
         print(f"[bench] no bwd_log to trim at {path}", flush=True)
         return
-    cutoff_iso = cutoff.replace(microsecond=0).isoformat(timespec="seconds")
+    # Parse each row's timestamp to a datetime instead of relying on
+    # lexicographic ISO comparison; that way ``cutoff=03:05:30.908``
+    # correctly rejects ``timestamp=03:05:30.068``.
     with open(path, "r", newline="") as f:
         reader = csv.DictReader(f)
         fieldnames = reader.fieldnames
         all_rows = list(reader)
     if not fieldnames or "timestamp" not in fieldnames:
         return
-    kept = [r for r in all_rows if (r.get("timestamp") or "") >= cutoff_iso]
+    def _parse(ts: str) -> Optional[datetime.datetime]:
+        try:
+            return datetime.datetime.fromisoformat(ts.strip())
+        except (ValueError, TypeError):
+            return None
+    kept = [r for r in all_rows
+            if (_parse(r.get("timestamp") or "") or cutoff) >= cutoff]
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
@@ -496,7 +524,7 @@ async def main() -> None:
                     help="Enable finetuning (co-serving). Off => inference only.")
     ap.add_argument("--warmup_count", type=int, default=1000)
     ap.add_argument("--warmup_duration_s", type=float, default=10.0)
-    ap.add_argument("--warmup_rest_s", type=float, default=0.0)
+    ap.add_argument("--warmup_rest_s", type=float, default=5.0)
     ap.add_argument("--startup-timeout", type=float, default=600.0)
     ap.add_argument("--api-server-count", type=int, default=None,
                     help="Number of frontend API server processes (shared "
@@ -535,6 +563,19 @@ async def main() -> None:
                          "eval/output/server<suffix>.log instead of streaming "
                          "to this terminal. Off by default (logs print live so "
                          "you can see startup banners and any crash trace).")
+    ap.add_argument("--publish", action="store_true",
+                    help="Write the output files (timeline_results, bwd_log, "
+                         "bench_meta) under the canonical names that the "
+                         "top-level evaluation/process_results.py reads. "
+                         "Specifically: drops the scheduler `_phase_<phase>` "
+                         "tag for every mode, AND drops the FT-admission "
+                         "`_factor_<X>` tag for loose / tight only (nutanix "
+                         "keeps the factor tag because process_results.py "
+                         "distinguishes nutanix runs by their factor). With "
+                         "--publish a non-default factor will OVERWRITE the "
+                         "matching canonical file — A/B factor sweeps should "
+                         "skip this flag and let the tagged suffix split the "
+                         "output files apart.")
     args = ap.parse_args()
 
     if sum(bool(x) for x in (args.loose, args.tight, args.nutanix)) > 1:
@@ -562,22 +603,42 @@ async def main() -> None:
     print(f"[bench] --scheduler={args.scheduler} → "
           f"{Path(config_path).relative_to(_ROOT)}", flush=True)
 
-    # Output suffix: <co?>_factor_<f>_phase_<p>_<mode>. Tags (only on --co
-    # runs) let A/B comparisons across ``ft_tokens_admission_constrain_factor``
-    # values AND scheduler ``coserving_admission_phase`` land in distinct
-    # files. ``-1`` (disabled) renders as ``off``; default phase is
-    # ``prefill``. Mirrors the plotter's {base}_{mode} scheme
-    # (base = '_co_factor_X_phase_Y' or '').
+    # Output suffix. Two layouts:
+    #
+    # Default (tagged):  <co?>_factor_<f>_phase_<p>_<mode>. Tags (only on
+    # --co runs) let A/B comparisons across
+    # ``ft_tokens_admission_constrain_factor`` values AND scheduler
+    # ``coserving_admission_phase`` land in distinct files. ``-1``
+    # (disabled) renders as ``off``; default phase is ``prefill``.
+    # Mirrors the plotter's {base}_{mode} scheme.
+    #
+    # With --publish:    canonical names that the top-level
+    # evaluation/process_results.py reads —
+    #   loose / tight:   "_co" + "_<mode>"          (no factor, no phase)
+    #   nutanix:         "_co_factor_<f>" + "_nutanix" (factor tag kept)
+    # The phase tag is always dropped.
     base = "_co" if args.co else ""
+    factor_tag = phase_tag = None
     if args.co:
         cfg = _load_yaml_cfg(config_path)
         factor_tag = _ft_factor_tag(cfg)
         phase_tag = _phase_tag(cfg)
-        base = f"{base}_factor_{factor_tag}_phase_{phase_tag}"
         print(f"[bench] ft_tokens_admission_constrain_factor tag: "
               f"_factor_{factor_tag} | "
               f"coserving_admission_phase tag: _phase_{phase_tag}",
               flush=True)
+        if args.publish:
+            # process_results.py expects bare _co_<mode> for loose/tight
+            # and _co_factor_<f>_<mode> for nutanix.
+            if mode == "nutanix":
+                base = f"_co_factor_{factor_tag}"
+            # else: leave base as "_co" — drops both tags.
+            print(f"[bench] --publish: writing canonical names "
+                  f"(base='{base}', phase tag dropped"
+                  + ("" if mode == "nutanix" else ", factor tag dropped")
+                  + ")", flush=True)
+        else:
+            base = f"{base}_factor_{factor_tag}_phase_{phase_tag}"
     suffix = base + (f"_{mode}" if mode else "")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_csv = str(OUTPUT_DIR / f"timeline_results{suffix}.csv")
@@ -681,6 +742,14 @@ async def main() -> None:
 
         model = _INFER_LORA_NAME  # inference requests target the inference LoRA
 
+        # Open FT admission BEFORE warmup so the backward pass warms up
+        # together with inference. The end-of-run trim_bwd_log_before
+        # pass drops any backward rows that fired before the recorded
+        # timeline started (t_first_wall), so the published bwd_log
+        # still matches the inference window written to disk.
+        if args.co:
+            await start_finetuning(server)
+
         if warmup_rows:
             await _run_rows(server, warmup_rows, stop, model,
                             record=False, label="warmup")
@@ -692,11 +761,6 @@ async def main() -> None:
                     return
                 except asyncio.TimeoutError:
                     pass
-
-        # Start finetuning AFTER warmup (server launched with FT admission held
-        # via start_on_launch=false). FT then co-serves the recorded timeline.
-        if args.co:
-            await start_finetuning(server)
 
         results, t_first_wall = await _run_rows(
             server, timeline_rows, stop, model, record=True, label="timeline")
@@ -715,11 +779,29 @@ async def main() -> None:
             with open(meta_path, "w") as f:
                 _json.dump({"t_first_wall_iso": t_first_wall.isoformat()}, f)
 
-        # Give the server a moment to flush any in-flight backward row, then
-        # trim the bwd_log to the timeline window.
+        # Give the server a moment to flush any in-flight backward row,
+        # then trim the bwd_log to the timeline window. The cutoff
+        # accounts for the timeline's base offset: a timeline whose
+        # first request sits at ``timestamp_s = base_ts`` (e.g.
+        # base_ts=5 for loose) lines that request up with
+        # ``t_first_wall`` — meaning timeline coordinate 0 corresponds
+        # to wall clock ``t_first_wall - base_ts``. We keep bwd_log
+        # entries from that earlier instant onward so the published log
+        # spans the same window as the inference timeline (instead of
+        # dropping the first ``base_ts`` seconds of finetune activity).
         if args.co and bwd_log and t_first_wall is not None:
             await asyncio.sleep(1.0)
-            trim_bwd_log_before(bwd_log, t_first_wall)
+            # Pull base_ts straight from the loaded timeline so the
+            # cutoff adapts to whatever CSV was passed in (loose: 5.0,
+            # tight: 3.0, nutanix: 0.6, future timelines: whatever
+            # their first row says). ``timeline_rows`` is sorted
+            # ascending by ``load_timeline_csv``, so [0] is the min.
+            base_ts = timeline_rows[0].timestamp_s if timeline_rows else 0.0
+            cutoff = t_first_wall - datetime.timedelta(seconds=base_ts)
+            print(f"[bench] trimming bwd_log to >= {cutoff.isoformat(timespec='milliseconds')} "
+                  f"(t_first_wall − base_ts={base_ts:g}s, "
+                  f"from {Path(args.timeline_csv).name})", flush=True)
+            trim_bwd_log_before(bwd_log, cutoff)
     finally:
         stop.set()
         print("[bench] shutting down server", flush=True)
