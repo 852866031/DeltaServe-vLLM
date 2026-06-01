@@ -37,7 +37,7 @@ finetune:
 # and refit online; FT tokens are admitted only while the predicted step time
 # keeps inference TTFT/TBT within these targets.
 slo:
-  ttft_slo: 0.2                      # time-to-first-token target (seconds)
+  ttft_slo: 0.3                      # time-to-first-token target (seconds)
   avg_tbt_slo: 0.02                   # avg time-between-tokens target (seconds)
   max_tbt_slo: 0.1                   # max single-step time while admitting FT (seconds)
   profile_on_launch: true            # offline profiling pass before serving
@@ -46,7 +46,7 @@ slo:
   # when >0 and prefill is present, admit at most prefill_tokens * factor FT
   # tokens (on top of the SLO + buffer caps). -1 disables (fill up to whatever
   # the SLO estimator and buffer allow). No effect on idle/FT-only steps.
-  ft_tokens_admission_constrain_factor: 1
+  ft_tokens_admission_constrain_factor: -1
   # batch_prediction_stats_path: output/scheduler/batch_prediction_stats.csv
   match_with_prefill_workload: false            
 
