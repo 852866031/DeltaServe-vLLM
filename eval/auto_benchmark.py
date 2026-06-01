@@ -383,15 +383,37 @@ def load_timeline_csv(path: str) -> List[TimelineRow]:
     return rows
 
 
-def write_results_csv(path: str, rows) -> None:
+def write_results_csv(path: str, rows, t_first_wall=None,
+                      real_timestamp: bool = False) -> None:
+    """Write per-request metrics. When ``real_timestamp`` is set (and a
+    ``t_first_wall`` recording origin is available), prepend an absolute
+    wall-clock ``timestamp`` column in the SAME ISO-millisecond format the
+    bwd_log uses, derived as ``t_first_wall + t_rel_s`` (the request's send
+    time on the shared wall clock). ``t_rel_s`` is always kept."""
+    emit_ts = bool(real_timestamp) and t_first_wall is not None
+    if real_timestamp and t_first_wall is None:
+        print("[bench] --real-timestamp requested but no recording origin "
+              "(t_first_wall) is available; writing relative-only CSV.",
+              flush=True)
+    base_cols = ["idx", "t_rel_s", "latency_s", "status",
+                 "ttft_s", "avg_tbt_s", "worst_tbt_s"]
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["idx", "t_rel_s", "latency_s", "status",
-                    "ttft_s", "avg_tbt_s", "worst_tbt_s"])
+        w.writerow((["timestamp"] if emit_ts else []) + base_cols)
         for idx, t_rel, latency, status, ttft, avg_tbt, worst_tbt in rows:
-            w.writerow([idx, t_rel, latency, status, ttft, avg_tbt, worst_tbt])
-    print(f"[bench] wrote results CSV: {path}", flush=True)
+            base = [idx, t_rel, latency, status, ttft, avg_tbt, worst_tbt]
+            if emit_ts:
+                # Same format as coordinator._write_bwd_log_row so the two
+                # logs land on a single wall clock.
+                ts = (t_first_wall + datetime.timedelta(seconds=float(t_rel))
+                      ).isoformat(timespec="milliseconds")
+                w.writerow([ts] + base)
+            else:
+                w.writerow(base)
+    print(f"[bench] wrote results CSV: {path}"
+          f"{' (with wall-clock timestamp column)' if emit_ts else ''}",
+          flush=True)
 
 
 def trim_bwd_log_before(path: str, cutoff: datetime.datetime) -> None:
@@ -576,6 +598,15 @@ async def main() -> None:
                          "matching canonical file — A/B factor sweeps should "
                          "skip this flag and let the tagged suffix split the "
                          "output files apart.")
+    ap.add_argument("--real-timestamp", action="store_true",
+                    help="Add an absolute wall-clock 'timestamp' column to the "
+                         "results CSV, in the SAME format as bwd_log "
+                         "(ISO-8601, millisecond precision, e.g. "
+                         "2026-06-01T16:33:48.117). It records each request's "
+                         "send time on the same wall clock the bwd_log uses, so "
+                         "inference and finetune throughput can be aligned "
+                         "directly without the bench_meta anchor. The relative "
+                         "t_rel_s column is preserved. Off by default.")
     args = ap.parse_args()
 
     if sum(bool(x) for x in (args.loose, args.tight, args.nutanix)) > 1:
@@ -764,7 +795,8 @@ async def main() -> None:
 
         results, t_first_wall = await _run_rows(
             server, timeline_rows, stop, model, record=True, label="timeline")
-        write_results_csv(out_csv, results)
+        write_results_csv(out_csv, results, t_first_wall=t_first_wall,
+                          real_timestamp=args.real_timestamp)
 
         # Persist the benchmark wall-clock t0 so the plotter can anchor the
         # finetune log (which has wall-clock timestamps) to the same origin
