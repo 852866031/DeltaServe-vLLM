@@ -366,10 +366,14 @@ class BackwardService:
                     loss, n_valid = self.process_backward(
                         self.activations, sample_lens, n, epoch)
                     cpu_elapsed_ms = (time.perf_counter() - t0) * 1000.0
-                self._total_tokens_trained += int(n_valid)
+                # FT throughput metric: total FT token-rows PROCESSED (raw
+                # ``n`` = sum of this cycle's sample lengths), NOT the CE-valid
+                # target count (``n_valid`` = n − num_samples from the
+                # shift-by-1). ``n`` is the activation rows actually forwarded +
+                # backpropped, which is the throughput number we report.
+                self._total_tokens_trained += int(n)
                 # ``n`` is the raw batch-row count (sum of seq_lens in this
                 # cycle), which matches the units of total_tokens_in_memory.
-                # ``n_valid`` would undercount by one per sample (CE shift-by-1).
                 self._epoch_processed_tokens += int(n)
             except Exception as e:  # noqa: BLE001 — keep the cycle alive on error
                 import traceback

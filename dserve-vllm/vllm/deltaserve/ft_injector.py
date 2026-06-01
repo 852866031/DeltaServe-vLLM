@@ -84,13 +84,25 @@ class FinetuneInjector:
 
     def _make_request(self, sample) -> Request:
         self._counter += 1
+        req_id = f"__ft__{self._counter}"
         req = Request(
-            request_id=f"__ft__{self._counter}",
+            request_id=req_id,
             prompt_token_ids=list(sample.prompt_ids),
             sampling_params=SamplingParams(max_tokens=1, temperature=0.0),
             pooling_params=None,
             lora_request=self.ft_lora,
             block_hasher=self.block_hasher,
+            # [DeltaServe] Unique per-request cache salt so this FT prompt can
+            # NEVER get a prefix-cache hit — not against sibling FT samples that
+            # share the corpus template prefix (e.g. "### Instruction:"), nor
+            # against an earlier-epoch repeat of the same sample. A cache hit
+            # would skip re-forwarding the cached prefix tokens, so their
+            # activations would never be saved and the backward would train on a
+            # truncated sample (only the uncached suffix). The unique salt makes
+            # every block-hash unique → the FULL prompt is always forwarded →
+            # all per-token activations are captured. No effect when prefix
+            # caching is off; inference requests are unaffected.
+            cache_salt=req_id,
         )
         req.is_finetuning = True
         # Source sample reference for the store's commit/release routing.
