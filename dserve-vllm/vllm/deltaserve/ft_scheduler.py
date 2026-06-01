@@ -120,14 +120,15 @@ class FinetuneScheduler(AsyncScheduler):
         self._async = bool(self.scheduler_config.async_scheduling)
         self._last_step_pred_s = 0.0
 
-        # [match_with_prefill_workload] Leaky-bucket counter of inference
+        # [match_prefill_workload_factor] Leaky-bucket counter of inference
         # prefill tokens we've observed but NOT spent on FT admission. When
-        # the corresponding finetune-config flag is on, this gates each
-        # prefill-step's FT admit: hold off until enough has accumulated to
-        # cover the next FT sample's size, then admit ONE sample + reset.
-        # Set to 0 on every successful FT admission (including FT-only
-        # batches), so credit is consumed atomically per admit. Inert when
-        # the flag is off — the counter just stays at 0.
+        # ``finetune.match_prefill_workload_factor > 0`` this gates each
+        # prefill-step's FT admit: hold off until
+        # ``(counter + t_in) * factor`` covers the next FT sample's size,
+        # then admit ONE sample + reset. Set to 0 on every successful FT
+        # admission (including FT-only batches), so credit is consumed
+        # atomically per admit. Inert when factor=0 — the counter still
+        # increments via the else branch but no trigger ever fires.
         self._unspent_prefill: int = 0
 
         dprint(
@@ -176,38 +177,211 @@ class FinetuneScheduler(AsyncScheduler):
                              b_d=b_d, k=k, prefill_lens=prefill_lens or None)
         return feats, earliest_arrival
 
-    def _slo_ft_budget(self, feats: StepFeatures,
-                       earliest_arrival: float | None) -> int:
-        """FT token budget for this step: the min of the SLO-derived headroom
-        and the coordinator's buffer-space cap. Falls back to the fixed
-        coordinator budget while the estimator is still cold. `feats` is the
-        upcoming step's inference composition (before FT is added)."""
-        coord_budget = self._coord.next_ft_budget()
-        if coord_budget <= 0 or not self._estimator.is_ready:
-            return coord_budget
-        # Baseline step time WITHOUT the new FT (eager: adding FT forces eager).
-        t_current = self._estimator.predict(feats, will_use_graph=False)
+    def admit_ft_to_step(self) -> tuple[int, list]:
+        """Three-regime SLO-aware FT admission. Replaces the previous
+        closed-form quadratic ``_slo_ft_budget`` + ``next_ft_requests`` chain.
+
+        Implements the 5-stage iterative algorithm from
+        ``SLO_ESTIMATOR_REDESIGN.md`` §2.4:
+
+          0. Hard preconditions (FT started, no backward in flight, buffer has
+             space, store has work).
+          1. Extract upcoming-step features (no FT yet).
+          2. Phase gate — ``coserving_admission_phase: prefill`` denies FT on
+             decode-only steps; ``both`` lets the SLO estimator decide.
+          3. Baseline-without-FT prediction + headroom check. Picks the regime
+             matching the step's actual CUDA-graph mode: ``DECODE_ONLY`` for
+             decode-only, ``INF_PREFILL`` for prefill-carrying.
+          4. Iterative greedy admission — try samples smallest-first; each
+             iteration predicts using the ``EAGER`` regime (FT forces eager
+             regardless of baseline regime). Shapers
+             (``match_prefill_workload_factor``,
+             ``ft_tokens_admission_constrain_factor``) layer on top as outer
+             pre-filters with unchanged semantics.
+          5. Commit — claim samples in the store, build Request objects.
+
+        The regime transition cost (e.g. FULL graph → eager when FT is admitted
+        onto a decode-only step) is implicit in the difference between the
+        baseline regime's prediction and the EAGER regime's per-sample
+        prediction — no separate eager-penalty term needed.
+
+        Returns ``(admitted_tokens, ft_requests)`` — admitted token count for
+        the coordinator's bookkeeping, and the new Request objects to enqueue.
+        """
+        from vllm.deltaserve.estimator import (
+            REGIME_DECODE_ONLY,
+            REGIME_EAGER,
+            REGIME_INF_PREFILL,
+        )
+
+        # ─── Stage 0: hard preconditions ────────────────────────────────
+        if self._profiling_mode:
+            return 0, []
+        if self._coord.next_ft_budget() <= 0:
+            # ft_started False / pending_backward True / admission_open False /
+            # buffer full — coordinator already encodes all the precondition
+            # checks; honor its verdict.
+            return 0, []
+        store = self._ft_injector.store
+        if not store.has_next() and store.current_epoch >= store.total_epochs - 1:
+            # Pool exhausted across remaining epochs — nothing to admit.
+            return 0, []
+
+        # ─── Stage 1: features for the upcoming step (no FT yet) ────────
+        feats, earliest_arrival = self._current_step_features()
+        is_decode_only = (feats.t_in == 0 and feats.b_d > 0)
+        is_idle = (feats.t_in == 0 and feats.b_d == 0)
+        has_prefill = (feats.t_in > 0)
+
+        # ─── Stage 2: phase gate ────────────────────────────────────────
+        ft_cfg = self.vllm_config.finetune_config
+        phase = getattr(ft_cfg, "coserving_admission_phase", "prefill")
+        if phase == "prefill" and is_decode_only:
+            return 0, []
+
+        # Decode-only safety margin only applies in "both" mode on decode-only
+        # steps. Cold-start conservatism while the EAGER regime accumulates
+        # records for the (T_in=0, T_ft>0, B_d>0) shape.
+        decode_only_margin = (
+            float(getattr(ft_cfg, "decode_only_ft_safety_margin", 0.7))
+            if (phase == "both" and is_decode_only) else 1.0)
+
+        # ─── Stage 3: baseline prediction + SLO headroom check ──────────
+        # Use the regime matching the step's actual CUDA-graph mode if NO FT
+        # were added (which gives the honest baseline before FT forces eager).
+        if not self._estimator.is_ready:
+            # Cold-start: fall back to coordinator's buffer-cap budget,
+            # no SLO gating (matches pre-redesign cold-start behavior).
+            t_baseline = 0.0
+        elif is_decode_only:
+            t_baseline = self._estimator.predict(
+                feats, regime=REGIME_DECODE_ONLY)
+        elif is_idle:
+            t_baseline = 0.0   # no inference cost; only FT will run
+        else:
+            t_baseline = self._estimator.predict(
+                feats, regime=REGIME_INF_PREFILL)
+
         now = time.time()
-        # Under async, the step we're building queues behind the in-flight
-        # forward, so the waiting request can't start prefilling until that
-        # finishes. Charge that wait against the TTFT budget (pessimistic: the
-        # full predicted time of the previously scheduled step).
         queue_wait = self._last_step_pred_s if self._async else 0.0
-        budgets_s: list[float] = []
-        if earliest_arrival is not None and feats.t_in > 0:
-            # TTFT: now + (in-flight queue wait) + (this step) must beat the
-            # deadline for the earliest waiting request.
-            budgets_s.append(
-                earliest_arrival + 0.9 * self._ttft_slo
-                - now - queue_wait - t_current)
-        if feats.b_d > 0:
-            # max-TBT: this step's time is the inter-token interval for decodes.
-            budgets_s.append(self._max_tbt_slo - t_current)
-        if not budgets_s:
-            # No inference constraint this step (idle but for FT) → buffer cap.
-            return coord_budget
-        slo_x = min(self._estimator.max_next_ft_tokens(b) for b in budgets_s)
-        return max(0, min(coord_budget, slo_x))
+        ttft_deadline = (
+            (earliest_arrival + 0.9 * self._ttft_slo)
+            if (has_prefill and earliest_arrival is not None) else None)
+
+        # Headroom checks against the BASELINE — if the step is already over
+        # SLO without FT, no point even trying to admit.
+        if feats.b_d > 0 and self._estimator.is_ready:
+            effective_tbt = self._max_tbt_slo * decode_only_margin
+            if t_baseline >= effective_tbt:
+                return 0, []
+        if ttft_deadline is not None and self._estimator.is_ready:
+            if (ttft_deadline - now - queue_wait - t_baseline) <= 0:
+                return 0, []
+
+        # ─── Stage 4: admission shapers (outer pre-filters) + iterative loop ─
+        _match_factor = float(getattr(
+            ft_cfg, "match_prefill_workload_factor", 0.0))
+        _prop_factor = float(getattr(
+            ft_cfg, "ft_tokens_admission_constrain_factor", -1.0))
+
+        max_iterations: int | None = None
+        leaky_bucket_triggered = False
+
+        # Leaky bucket: gate iteration entry on accumulated credit covering
+        # the next sample. When triggered, admit exactly one sample.
+        if _match_factor > 0 and has_prefill:
+            _peek = store.pop_next()
+            if _peek is None:
+                return 0, []
+            credit = (self._unspent_prefill + feats.t_in) * _match_factor
+            if credit >= _peek.input_len:
+                leaky_bucket_triggered = True
+                max_iterations = 1
+                dprint(
+                    f"[ft-sched] match_prefill_workload_factor triggered "
+                    f"(unspent={self._unspent_prefill}+t_in={feats.t_in})"
+                    f"*factor={_match_factor} >= "
+                    f"next_sample={_peek.input_len}")
+            else:
+                # Not enough credit yet — accumulate and skip FT this step.
+                self._unspent_prefill += int(feats.t_in)
+                return 0, []
+
+        # Buffer-space cap (always applies). Proportional cap layers on top
+        # when set (mutually exclusive with leaky-bucket; matches existing
+        # semantics — leaky-bucket wins when both > 0 since its branch
+        # returns above).
+        buffer_cap = self._coord.space_remaining()
+        token_cap = buffer_cap
+        if not leaky_bucket_triggered and _prop_factor != -1 and has_prefill:
+            token_cap = min(buffer_cap, int(feats.t_in * _prop_factor))
+        if token_cap <= 0:
+            return 0, []
+
+        # Iterative greedy admission. Smallest-first via pop_next; each
+        # iteration predicts with EAGER regime (FT forces eager) and checks
+        # SLOs against the hypothetical-with-FT cost.
+        admitted: list = []
+        cur_t_in = float(feats.t_in)
+        cur_t_ft = 0.0
+        cur_p = int(feats.p)
+        cur_prefill_lens = list(feats.prefill_lens) if feats.prefill_lens \
+            else []
+
+        while True:
+            if max_iterations is not None and len(admitted) >= max_iterations:
+                break
+            if cur_t_ft >= token_cap:
+                break
+            # Advance epoch if the current epoch's pool is exhausted.
+            if not store.has_next() and not store.advance_epoch():
+                break
+            candidate = store.pop_next(exclude=admitted)
+            if candidate is None:
+                break
+            if cur_t_ft + candidate.input_len > token_cap:
+                break
+
+            # Hypothetical features with this sample added. Subset convention:
+            # T_in += input_len AND T_ft += input_len (FT prefill is prefill).
+            new_prefill_lens = cur_prefill_lens + [candidate.input_len]
+            hypothetical = StepFeatures(
+                t_in=cur_t_in + candidate.input_len,
+                p=cur_p + 1,
+                t_ft=cur_t_ft + candidate.input_len,
+                b_d=feats.b_d,
+                k=feats.k,
+                prefill_lens=new_prefill_lens,
+            )
+
+            # Predict the step cost if this sample were admitted (forces eager).
+            if self._estimator.is_ready:
+                t_with_ft = self._estimator.predict(
+                    hypothetical, regime=REGIME_EAGER)
+                # SLO checks on the hypothetical-with-FT prediction.
+                if feats.b_d > 0:
+                    effective_tbt = self._max_tbt_slo * decode_only_margin
+                    if t_with_ft > effective_tbt:
+                        break
+                if ttft_deadline is not None:
+                    if (ttft_deadline - now - queue_wait - t_with_ft) <= 0:
+                        break
+            # (Cold-start: estimator not ready; admit up to token_cap unchecked.
+            # Matches the pre-redesign cold-start behavior where the coord
+            # buffer budget was the only cap.)
+
+            admitted.append(candidate)
+            cur_t_in += candidate.input_len
+            cur_t_ft += candidate.input_len
+            cur_p += 1
+            cur_prefill_lens = new_prefill_lens
+
+        # ─── Stage 5: commit ────────────────────────────────────────────
+        if not admitted:
+            return 0, []
+        store.claim(admitted)
+        reqs = [self._ft_injector._make_request(s) for s in admitted]
+        return int(cur_t_ft), reqs
 
     # ─── SLO estimator: feature extraction + graph predicate ────────────
     def _features_from_output(
@@ -422,65 +596,23 @@ class FinetuneScheduler(AsyncScheduler):
         # turns out to be FT-only and a pre-emption fires before dispatch.
         _admit_snap = self._coord.snapshot_admission()
 
-        # [Phase 4] FT rides along PREFILL steps only. Skip FT on decode-only
-        # steps (decode tokens present, no prefill tokens): adding FT prefill
-        # there would spike the decoders' TBT with no prefill to amortize
-        # against. Computed from the upcoming step's inference composition.
-        # SLO-aware admission then caps the FT tokens so the predicted step time
-        # keeps inference TTFT/TBT within target (fixed coordinator budget while
-        # the estimator is cold).
-        feats, earliest_arrival = self._current_step_features()
-        decode_only = feats.b_d > 0 and feats.t_in == 0
-        budget = 0 if decode_only else self._slo_ft_budget(
-            feats, earliest_arrival)
-        # Two mutually-exclusive shapers on the SLO/buffer-derived budget for
-        # prefill-carrying steps (idle/FT-only and decode-only steps are
-        # untouched):
-        #   1. ``match_with_prefill_workload`` (leaky bucket): defer FT admit
-        #      until enough prefill has been observed to "earn" the next FT
-        #      sample, then admit exactly that one sample.
-        #   2. ``ft_tokens_admission_constrain_factor`` (proportional cap):
-        #      admit at most ``t_in * factor`` FT tokens this step.
-        # Flag 1 wins when both are set (factor is ignored — the leaky bucket
-        # already controls FT:prefill ratio).
-        ft_cfg = self.vllm_config.finetune_config
-        _match_prefill = bool(getattr(ft_cfg, "match_with_prefill_workload",
-                                      False))
-        _factor = ft_cfg.ft_tokens_admission_constrain_factor
-        if _match_prefill and feats.t_in > 0:
-            # Peek the next FT sample we'd admit (smallest untrained in the
-            # selectable pool). None → corpus drained, nothing to admit.
-            _peek = self._ft_injector.store.pop_next()
-            if _peek is None:
-                budget = 0
-            elif self._unspent_prefill + feats.t_in >= _peek.input_len:
-                # Triggered: cap budget so we admit exactly this one sample.
-                # ``next_ft_requests`` will pop it via pop_best_under(<=budget)
-                # and claim. The accumulator resets in the post-admit block
-                # below (gated on admitted_now > 0).
-                budget = min(budget, _peek.input_len)
-                dprint(
-                    f"[ft-sched] match_with_prefill: triggered "
-                    f"(unspent={self._unspent_prefill}+t_in={feats.t_in} "
-                    f">= next_sample={_peek.input_len}), budget={budget}")
-            else:
-                # Not enough credit yet — accumulate and skip FT this step.
-                self._unspent_prefill += int(feats.t_in)
-                budget = 0
-        elif _factor != -1 and feats.t_in > 0:
-            budget = min(budget, int(feats.t_in * _factor))
-        admitted_now = 0
-        if not self._profiling_mode and budget > 0:
-            reqs = self._ft_injector.next_ft_requests(budget)
-            for req in reqs:
-                self._enqueue_waiting_request(req)
-                self.requests[req.request_id] = req
-            admitted_now = sum(r.num_prompt_tokens for r in reqs)
-        # [match_with_prefill_workload] Any successful FT admission resets the
-        # accumulator — credit is consumed atomically per admit. Done
-        # unconditionally (no gate on ``_match_prefill``) so toggling the flag
-        # mid-run doesn't leave a stale counter; harmless when off (counter
-        # stays at 0 already).
+        # [Phase 4 — three-regime redesign] SLO-aware iterative FT admission.
+        # ``admit_ft_to_step`` runs the full 5-stage algorithm internally:
+        # preconditions, features, phase gate, per-regime baseline + headroom
+        # check, per-sample iterative loop with EAGER predictions, commit.
+        # The existing admission shapers (match_prefill_workload_factor +
+        # ft_tokens_admission_constrain_factor) are layered inside as outer
+        # pre-filters with unchanged semantics — leaky-bucket gates entry to
+        # the loop and caps iterations to 1; proportional cap is a hard
+        # upper bound on T_ft. Both still mutually exclusive (leaky wins).
+        admitted_now, ft_reqs = self.admit_ft_to_step()
+        for req in ft_reqs:
+            self._enqueue_waiting_request(req)
+            self.requests[req.request_id] = req
+        # Reset the leaky-bucket accumulator on any successful admit. Done
+        # unconditionally (no gate on ``_match_factor``) so toggling the
+        # factor mid-run doesn't leave a stale counter; harmless when off
+        # (factor=0 leaves the counter at 0 anyway).
         if admitted_now > 0:
             self._unspent_prefill = 0
 
@@ -571,7 +703,9 @@ class FinetuneScheduler(AsyncScheduler):
             feats, lora_ids = self._features_from_output(output)
             was_graph = self._will_use_graph(
                 feats, lora_ids, output.total_num_scheduled_tokens)
-            predicted = (self._estimator.predict(feats, was_graph)
+            # Composition-derived regime selection (was_graph stays as an
+            # observability stamp on the tracker record).
+            predicted = (self._estimator.predict(feats)
                          if self._estimator.is_ready else None)
             output._ft_step_features = feats
             output._ft_step_was_graph = was_graph

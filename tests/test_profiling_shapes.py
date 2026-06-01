@@ -49,14 +49,21 @@ def run_case(batch_max, ft_cap, max_req):
     ok_ft = True
     ok_decomp = False
     prefill_totals = {}
+    # Tally the new EAGER-regime shape categories. Each is identified by
+    # composition, not by a distinct `kind` string (they reuse the existing
+    # decode / mixed / coserve kinds with extra ft_lens or empty inf_lens).
+    has_ft_on_decode = False    # decode shape with ft_lens > 0
+    has_ft_on_mixed = False     # mixed shape with ft_lens > 0
+    has_ft_only_idle = False    # coserve shape with no inf
     for s in recorded:
         inf = sum(s.inf_lens)
         ft = sum(s.ft_lens)
         mix = sum(s.mix_lens)
-        # per-step prefill token budget (inf+ft together for coserve)
+        # per-step prefill token budget (inf+ft together for coserve;
+        # for decode/mixed the FT rides the wave-2 step alongside decode).
         if inf + ft > batch_max:
             ok_batch = False
-        if mix > batch_max:
+        if mix + ft > batch_max:
             ok_batch = False
         for L in list(s.inf_lens) + list(s.ft_lens) + list(s.mix_lens):
             if L > eff_max_req:
@@ -67,6 +74,13 @@ def run_case(batch_max, ft_cap, max_req):
             ok_ft = False
         if s.kind == "prefill":
             prefill_totals.setdefault(inf, set()).add(len(s.inf_lens))
+        # New EAGER-regime shape categories.
+        if s.kind == "decode" and ft > 0:
+            has_ft_on_decode = True
+        if s.kind == "mixed" and ft > 0:
+            has_ft_on_mixed = True
+        if s.kind == "coserve" and inf == 0 and ft > 0:
+            has_ft_only_idle = True
     # decomposition: at least one prefill total appears with >1 distinct P
     for total, ps in prefill_totals.items():
         if len(ps) > 1:
@@ -75,6 +89,14 @@ def run_case(batch_max, ft_cap, max_req):
     check("all requests within max_req_len", ok_req)
     check("FT tokens within ft_cap", ok_ft)
     check("has decomposition variants (same total, different P)", ok_decomp)
+    # New EAGER-regime coverage. Tiny configs (ft_cap=64, batch=512) may drop
+    # some of these if the cap math excludes them — the new sweeps respect
+    # the same caps as the existing ones.
+    check("has FT-on-decode shapes (or caps too tight)",
+          has_ft_on_decode or batch_max < 256)
+    check("has FT-on-mixed shapes (or caps too tight)",
+          has_ft_on_mixed or batch_max < 512)
+    check("has FT-only-idle shape", has_ft_only_idle)
 
 
 def main():

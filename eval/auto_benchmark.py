@@ -45,7 +45,14 @@ import aiohttp
 
 _HERE = Path(__file__).resolve().parent          # eval/
 _ROOT = _HERE.parent                             # repo root
-_CONFIG = _ROOT / "configs" / "serving_config_finetuning_llama3.yaml"
+# Map ``--scheduler`` → the serving YAML that selects that scheduler at
+# engine init (via ``slo.coserving_admission_phase``). Keep both YAMLs in
+# sync EXCEPT for the phase + decode_only_ft_safety_margin knobs.
+_SCHED_CONFIGS = {
+    "prefill": _ROOT / "configs" / "serving_config_finetuning_llama3.yaml",
+    "both": _ROOT / "configs" / "serving_config_finetuning_llama3_both.yaml",
+}
+_CONFIG_DEFAULT = _SCHED_CONFIGS["prefill"]
 
 # Per-GPU base model + HF cache root. Both boxes resolve via the HF cache
 # machinery (offline), so we pass HF repo ids (not direct paths). HF looks
@@ -124,16 +131,34 @@ def _finetune_cli_args(section: dict) -> list[str]:
     return args
 
 
-def _load_yaml_cfg() -> dict:
+def _load_yaml_cfg(config_path: Optional[str] = None) -> dict:
     """Load the finetuning YAML once, with the repo root stripped from
     ``sys.path`` so ``vllm`` resolves to the installed package (not any
     source-tree copy). Same trick used by ``build_server_cmd``; factored out
     so ``main()`` can read knobs (e.g. the FT admission factor) for the
-    output-file suffix without re-implementing the path dance."""
+    output-file suffix without re-implementing the path dance.
+
+    ``config_path`` overrides the default
+    ``configs/serving_config_finetuning_llama3.yaml`` — used by the
+    ``--config`` CLI arg to A/B different scheduler variants."""
     sys.path[:] = [p for p in sys.path
                    if os.path.abspath(p or ".") not in {str(_HERE), str(_ROOT)}]
     from vllm.deltaserve.config_loader import load_yaml_config
-    return load_yaml_config(str(_CONFIG))
+    return load_yaml_config(str(config_path or _CONFIG_DEFAULT))
+
+
+def _phase_tag(cfg: dict) -> str:
+    """Render ``slo.coserving_admission_phase`` as a filesystem-safe suffix
+    tag. Default ``"prefill"`` (today's behaviour); ``"both"`` selects the
+    BothPhaseFinetuneScheduler that admits FT on any step composition.
+    Unrecognized values are stringified verbatim — the scheduler-selection
+    layer is authoritative on what's actually valid."""
+    phase = ((cfg.get("slo") or {})
+             .get("coserving_admission_phase"))
+    if phase is None:
+        phase = ((cfg.get("finetune") or {})
+                 .get("coserving_admission_phase"))
+    return str(phase or "prefill")
 
 
 def _ft_factor_tag(cfg: dict) -> str:
@@ -159,11 +184,15 @@ def _ft_factor_tag(cfg: dict) -> str:
 
 def build_server_cmd(co: bool, bwd_log_path: Optional[str],
                      api_server_count: Optional[int] = None,
-                     base_model: str = _BASE_MODEL_DEFAULT) -> list[str]:
+                     base_model: str = _BASE_MODEL_DEFAULT,
+                     config_path: Optional[str] = None) -> list[str]:
     """Build the `dserve-vllm serve` command. Imports config_loader with the
     repo root stripped from sys.path so `vllm` resolves to the installed
-    package, not any source-tree copy."""
-    cfg = _load_yaml_cfg()
+    package, not any source-tree copy.
+
+    ``config_path`` overrides the default YAML — passed through from
+    ``--config`` so the server gets the right finetune/slo knobs."""
+    cfg = _load_yaml_cfg(config_path)
     from vllm.deltaserve.config_loader import split_config
     engine_kwargs, _, _ = split_config(cfg)
     engine_kwargs.pop("model", None)  # positional to `dserve-vllm serve`
@@ -473,6 +502,16 @@ async def main() -> None:
                     help="Number of frontend API server processes (shared "
                          "single EngineCore). >1 shards output processing. "
                          "Overrides server.api_server_count in the YAML.")
+    ap.add_argument("--scheduler", choices=sorted(_SCHED_CONFIGS.keys()),
+                    default="prefill",
+                    help="Which co-serving scheduler to load. 'prefill' "
+                         "(default) uses the original FT-rides-prefill "
+                         "scheduler; 'both' uses BothPhaseFinetuneScheduler "
+                         "(FT admits to any step composition under SLO). Maps "
+                         "to the corresponding serving YAML "
+                         "(serving_config_finetuning_llama3{,_both}.yaml). "
+                         "The loaded phase is appended to the output suffix "
+                         "as _phase_<phase>.")
     ap.add_argument("--model", default=None,
                     help="Base model id (HF) or local path. Default is "
                          "per-GPU: " + ", ".join(
@@ -515,16 +554,30 @@ async def main() -> None:
     timeline_rows = load_timeline_csv(args.timeline_csv)
     print(f"[bench] loaded {len(timeline_rows)} rows from {args.timeline_csv}", flush=True)
 
-    # Output suffix: <co?>_factor_<f>_<mode>. The factor tag (only on --co
-    # runs) lets A/B comparisons across ``ft_tokens_admission_constrain_factor``
-    # values land in distinct files; -1 / disabled is shown as "off".
-    # Mirrors the plotter's {base}_{mode} scheme (base = '_co_factor_X' or '').
+    # Resolve the serving YAML path from --scheduler. The actual phase tag
+    # in the output suffix is read from the LOADED YAML's
+    # ``slo.coserving_admission_phase`` (not just args.scheduler) so a typo
+    # in the YAML doesn't silently disagree with the output file name.
+    config_path = str(_SCHED_CONFIGS[args.scheduler])
+    print(f"[bench] --scheduler={args.scheduler} → "
+          f"{Path(config_path).relative_to(_ROOT)}", flush=True)
+
+    # Output suffix: <co?>_factor_<f>_phase_<p>_<mode>. Tags (only on --co
+    # runs) let A/B comparisons across ``ft_tokens_admission_constrain_factor``
+    # values AND scheduler ``coserving_admission_phase`` land in distinct
+    # files. ``-1`` (disabled) renders as ``off``; default phase is
+    # ``prefill``. Mirrors the plotter's {base}_{mode} scheme
+    # (base = '_co_factor_X_phase_Y' or '').
     base = "_co" if args.co else ""
     if args.co:
-        factor_tag = _ft_factor_tag(_load_yaml_cfg())
-        base = f"{base}_factor_{factor_tag}"
+        cfg = _load_yaml_cfg(config_path)
+        factor_tag = _ft_factor_tag(cfg)
+        phase_tag = _phase_tag(cfg)
+        base = f"{base}_factor_{factor_tag}_phase_{phase_tag}"
         print(f"[bench] ft_tokens_admission_constrain_factor tag: "
-              f"_factor_{factor_tag}", flush=True)
+              f"_factor_{factor_tag} | "
+              f"coserving_admission_phase tag: _phase_{phase_tag}",
+              flush=True)
     suffix = base + (f"_{mode}" if mode else "")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_csv = str(OUTPUT_DIR / f"timeline_results{suffix}.csv")
@@ -548,7 +601,7 @@ async def main() -> None:
 
     server = f"http://127.0.0.1:{_PORT}"
     cmd = build_server_cmd(args.co, bwd_log, args.api_server_count,
-                           base_model=base_model)
+                           base_model=base_model, config_path=config_path)
     print("[bench] launching:", " ".join(cmd), flush=True)
     print(f"[bench] results -> {out_csv}"
           + (f" | bwd_log -> {bwd_log}" if bwd_log else ""), flush=True)

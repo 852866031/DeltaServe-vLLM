@@ -1,0 +1,98 @@
+# DeltaServe-on-vLLM serving config — finetuning (co-serving) enabled, Llama-3.
+# BOTH-PHASE variant: FT admits on any step composition (prefill, decode,
+# mixed, idle) under the SLO estimator's gate. See
+# `slo.coserving_admission_phase` + `slo.decode_only_ft_safety_margin` below.
+# All other knobs match `serving_config_finetuning_llama3.yaml`; A/B against
+# that file via `eval/auto_benchmark.py --config <this-file> --co --loose`.
+
+finetune:
+  enable_finetuning: true
+  backward_mps_percentage: 10        # CUDA MPS % granted to the backward process
+  # The FT adapter is the one the backward process trains; its weights are
+  # loaded fp32 and shared with the subprocess. Relative paths are resolved
+  # against THIS file's directory (configs/), so ../adapters points at the
+  # repo-root adapters.
+  finetuning_lora_path: ../adapters/llama3-toy-lora-ft
+  # Finetuning corpus: one tokenizable sample per non-empty line.
+  data_path: ../alpaca_1000.txt
+  max_saved_finetuning_tokens: 256   # buffer capacity; ~2 inference steps to fill
+  backward_sleep_seconds: 2.0        # simulated backward duration (observe inference)
+  num_epochs: 20
+  learning_rate: 0.000005
+  weight_decay: 0.01
+  gamma: 0.9
+  backward_fp32: false               # bulk backward matmuls: false=bf16 (default), true=fp32
+  forward_interruptible: true
+  ft_only_admission_grace_ms: 0      # ms, tunable; 0 disables tier A
+  backward_cuda_graph: true
+  save_attn_qkv: true
+
+# SLO-aware FT admission + execution-time estimator (Phase 4).
+slo:
+  ttft_slo: 0.2                      # time-to-first-token target (seconds)
+  avg_tbt_slo: 0.02                  # avg time-between-tokens target (seconds)
+  max_tbt_slo: 0.1                   # max single-step time while admitting FT (seconds)
+  profile_on_launch: true
+  profile_num_repeats: 2
+  # --- BOTH-PHASE knobs ---
+  # "both" lets FT admit to decode-only / mixed / idle steps too (not just
+  # prefill-carrying). The SLO estimator + the decode-only safety margin
+  # below are the only gates. Picks `BothPhaseFinetuneScheduler` at startup.
+  coserving_admission_phase: both
+  # On decode-only steps, scale max_tbt_slo by this factor when the iterative
+  # admission's per-sample SLO check runs. Cold-start buffer for the new
+  # three-regime EAGER coefficient set — the offline profiling pass now
+  # sweeps the (T_in=0, B_d>0, T_ft>0) shape so γ converges within ~few
+  # hundred steps; after that, this margin can be tuned toward 1.0 without
+  # losing SLO compliance. Set to 1.0 to disable the extra margin entirely.
+  decode_only_ft_safety_margin: 0.7
+  # MUST stay -1 in "both" mode — the proportional cap is prefill-relative.
+  # If you set this > 0, the scheduler falls back to prefill-only with a
+  # warning at startup.
+  ft_tokens_admission_constrain_factor: -1
+  # Leaky-bucket admission: trigger when (counter + t_in) * factor >=
+  # next_sample.input_len AND SLO allows. 0.0 disables (default). In
+  # "both" mode the counter still only accumulates on prefill-carrying
+  # steps (so long decode-only stretches naturally rate-limit FT once
+  # banked credit is consumed).
+  match_prefill_workload_factor: 0.0
+
+# Observability knobs (folded into FinetuneConfig by the loader).
+debug:
+  print_weight_hash: false
+  print_activation_hash: false
+  print_scheduler_add: true
+  print_engine_batch_exec: true
+  print_engine_batch_done: false
+  print_engine_req_recv: false
+
+# Inference LoRA adapter(s) served on vLLM's normal multi-LoRA path.
+adapters:
+  lora_path_0: ../adapters/llama3-toy-lora
+
+# vLLM LoRA enablement.
+lora:
+  enable_lora: true
+  max_loras: 2
+  max_lora_rank: 16
+
+server:
+  host: 127.0.0.1
+  port: 8000
+  rank_id: 0
+  api_server_count: 4
+
+model:
+  model: meta-llama/Meta-Llama-3-8B
+  tokenizer_mode: auto
+  trust_remote_code: false
+  dtype: auto
+  max_model_len: 2048
+
+engine:
+  gpu_memory_utilization: 0.75
+  enforce_eager: false
+  disable_log_stats: true
+
+parallel:
+  tensor_parallel_size: 1
