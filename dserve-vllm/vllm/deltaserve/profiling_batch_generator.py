@@ -147,6 +147,77 @@ class ProfilingShapeGenerator:
                 n_decode=1))
         return out
 
+    # ─── EAGER regime coverage (three-regime estimator redesign) ──────
+    # The three composition-based regimes are:
+    #   INF_PREFILL (T_ft=0, T_in>0) — covered by _prefill_shapes + _mixed_shapes
+    #   DECODE_ONLY (T_in=T_ft=0)    — covered by _decode_shapes
+    #   EAGER       (T_ft>0)         — covered by _coserve_shapes ((T_in>0, B_d=0))
+    #                                  + the three sweeps below (B_d>0 cases
+    #                                  + pure FT-only)
+    # Required to seed the EAGER regime across all shapes the live unified-
+    # phase scheduler may encounter.
+
+    def _ft_on_decode_shapes(self) -> list[ProfileShape]:
+        """EAGER regime, ``(T_in=0, B_d>0, K>0, T_ft>0)`` — FT admitted onto a
+        decode-only step (unified-phase scheduler's new admission case).
+        Uses the existing ``decode`` kind extended with ``ft_lens``: the
+        driver prefills the inf reqs (wave 1), then injects FT alongside the
+        first decode step."""
+        out: list[ProfileShape] = []
+        # Single-sample FT injection — the typical unified-phase admission
+        # pattern (admit one FT sample per decode-only step). Reserve room
+        # for FT in the batch budget when sizing per-decode KV.
+        ft_size = max(8, min(self.ft_cap, 64))
+        budget_for_decode = self.batch_max_tokens - ft_size
+        if budget_for_decode < 16:
+            return []
+        for b in (1, 2, 4, 8):
+            # Size per-decode KV to fit alongside ft_size in the batch.
+            per = min(self.max_req_len, max(16, budget_for_decode // b))
+            if b * per > budget_for_decode:
+                per = max(16, budget_for_decode // b)
+            # Final cap check (should always hold after the sizing above).
+            if b * per + ft_size > self.batch_max_tokens:
+                continue
+            out.append(ProfileShape(
+                "decode",
+                inf_lens=[per] * b,
+                ft_lens=[ft_size],
+                n_decode=2))
+        return out
+
+    def _ft_on_mixed_shapes(self) -> list[ProfileShape]:
+        """EAGER regime, ``(T_in>0, B_d>0, K>0, T_ft>0)`` — FT admitted onto
+        a mixed prefill+decode step (the typical default-scheduler admission
+        case under steady-state). Uses the existing ``mixed`` kind extended
+        with ``ft_lens``: the driver injects FT alongside wave-2 prefill."""
+        out: list[ProfileShape] = []
+        for inf, mix, ft in ((256, 128, 64), (512, 256, 128), (1024, 256, 64)):
+            if inf > self.inf_cap or mix > self.inf_cap or ft > self.ft_cap:
+                continue
+            if mix + ft > self.batch_max_tokens:
+                continue
+            out.append(ProfileShape(
+                "mixed",
+                inf_lens=self._partition(inf, max(1, inf // 256)),
+                mix_lens=self._partition(mix, max(1, mix // 128)),
+                ft_lens=self._partition(ft, max(1, ft // 64)),
+                n_decode=1))
+        return out
+
+    def _ft_only_idle_shapes(self) -> list[ProfileShape]:
+        """EAGER regime, ``(T_in=0, B_d=0, K=0, T_ft>0)`` — pure FT-fill on
+        idle inference (the buffer-fill case during quiet inference windows).
+        Uses the existing ``coserve`` kind with empty ``inf_lens`` — the
+        driver's coserve branch already iterates inf_lens (no-op when empty)
+        and then ft_lens. Single representative shape; cheap to record."""
+        if self.ft_cap <= 0:
+            return []
+        return [ProfileShape(
+            "coserve",
+            inf_lens=[],
+            ft_lens=self._partition(self.ft_cap, max(1, self.ft_cap // 64)))]
+
     def prepare(self) -> tuple[list[ProfileShape], list[ProfileShape]]:
         """Return (warmup_shapes, recorded_shapes).
 
@@ -154,9 +225,15 @@ class ProfilingShapeGenerator:
         FlashInfer JIT / autotune). Recorded shapes are the full sweep; the
         driver repeats them `num_repeats` times.
         """
-        recorded = (self._prefill_shapes() + self._decode_shapes()
-                    + self._coserve_shapes() + self._mixed_shapes())
-        # Warmup: one representative of each kind.
+        recorded = (self._prefill_shapes()
+                    + self._decode_shapes()
+                    + self._coserve_shapes()
+                    + self._mixed_shapes()
+                    + self._ft_on_decode_shapes()
+                    + self._ft_on_mixed_shapes()
+                    + self._ft_only_idle_shapes())
+        # Warmup: one representative of each kind so JIT/autotune covers the
+        # eager-with-FT-decode path too.
         warmup = [
             ProfileShape("prefill", inf_lens=[256, 256]),
             ProfileShape("decode", inf_lens=[128, 128], n_decode=1),
@@ -164,4 +241,10 @@ class ProfilingShapeGenerator:
         if 128 + min(self.ft_cap, 64) <= self.batch_max_tokens:
             warmup.append(ProfileShape("coserve", inf_lens=[128],
                                        ft_lens=[min(self.ft_cap, 64)]))
+        # FT-on-decode warmup (primes the new shape's kernels).
+        ft_warm = min(self.ft_cap, 32)
+        if 2 * 64 + ft_warm <= self.batch_max_tokens:
+            warmup.append(ProfileShape(
+                "decode", inf_lens=[64, 64],
+                ft_lens=[ft_warm], n_decode=1))
         return warmup, recorded

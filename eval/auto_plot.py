@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""auto_plot.py — 5-panel per-mode plots for DeltaServe-on-vLLM benchmarks.
+"""auto_plot.py — 4-panel per-mode plots for DeltaServe-on-vLLM benchmarks.
 
 Self-contained port of DeltaServe/eval/llama3/auto_plot.py (helpers inlined,
 csv+numpy only — no pandas). For each workload-shape mode it builds one
-5-subplot PNG (4 in the first row, 1 in the second row):
+4-subplot PNG (single row):
 
   1. Scheduled request timeline (req/s bars + output tok/s line) from
      timelines/<gpu>/timeline_<mode>.csv
@@ -11,9 +11,11 @@ csv+numpy only — no pandas). For each workload-shape mode it builds one
   3. Throughput tok/s: inference contribution + finetune contribution bands
      (FT band from bwd_log<suffix>.csv)
   4. TTFT SLO satisfaction rate vs the 95% target
-  5. E2E latency percentile curve (empirical CDF; x = percentile 0–100,
-     y = latency at that percentile). Shows the tail shape that panel 2's
-     time-series scatter hides.
+
+(The E2E latency percentile CDF panel previously occupied a partial second
+row; dropped to keep the figure readable. See
+``eval/auto_plot_schedulers.py`` for cross-scheduler A/B comparisons that
+include a percentile view.)
 
 Inputs (under eval/output/, suffix = '<base>_<mode>' from auto_benchmark.py):
   timeline_results<base>_<mode>.csv
@@ -546,26 +548,23 @@ def make_figure_for_mode(mode, base_suffix, output_dir, plots_dir,
     bwd_log = parse_bwd_log_csv(bwd_log_csv, t0_wall=t0_wall)
     color = MODE_COLORS.get(mode, "tab:gray")
 
-    # 2-row layout: 4 panels in row 1 (timeline / E2E vs time / throughput /
-    # TTFT satisfaction), 1 panel in row 2 (E2E latency percentile curve).
-    # Row-2 columns 1-3 are intentionally left blank — matplotlib doesn't
-    # render an axis we don't add. ``constrained_layout`` handles the partial
-    # second row cleanly (``tight_layout`` warns on incomplete rows).
-    fig = plt.figure(figsize=(24, 10), constrained_layout=True)
-    gs = fig.add_gridspec(2, 4)
+    # Single-row 4-panel layout: timeline / E2E vs time / throughput /
+    # TTFT satisfaction. (A previous revision had a 5th panel — E2E latency
+    # percentile CDF — in a partial second row; dropped to keep the figure
+    # readable. The percentile view lives separately, see
+    # eval/auto_plot_schedulers.py for the cross-scheduler comparison.)
+    fig = plt.figure(figsize=(24, 5), constrained_layout=True)
+    gs = fig.add_gridspec(1, 4)
     ax_timeline = fig.add_subplot(gs[0, 0])
     ax_latency = fig.add_subplot(gs[0, 1])
     ax_throughput = fig.add_subplot(gs[0, 2])
     ax_ttft = fig.add_subplot(gs[0, 3])
-    ax_latency_pct = fig.add_subplot(gs[1, 0])
 
     plot_request_timeline(ax_timeline, tl)
     plot_latency_vs_time(ax_latency, res, label=mode, color=color)
-    plot_latency_percentile(ax_latency_pct, res, label=mode, color=color)
     # If this is a co-serving run, overlay the inference-only (no-co) E2E
-    # latency for the same mode when its results exist — on BOTH the E2E
-    # time-series panel and the percentile panel, so the co-serving overhead
-    # is visible both as a function of time AND in the tail distribution.
+    # latency for the same mode when its results exist — co-serving overhead
+    # becomes visible as a function of time.
     if base_suffix:
         infonly_csv = os.path.join(output_dir, f"timeline_results_{mode}.csv")
         if (os.path.exists(infonly_csv)
@@ -574,8 +573,6 @@ def make_figure_for_mode(mode, base_suffix, output_dir, plots_dir,
                 infonly_res = load_results(infonly_csv)
                 plot_latency_vs_time(ax_latency, infonly_res,
                                      label="inf-only", color="tab:gray")
-                plot_latency_percentile(ax_latency_pct, infonly_res,
-                                        label="inf-only", color="tab:gray")
             except Exception as e:
                 print(f"[auto_plot] skip inf-only overlay for {mode}: {e}")
     plot_throughput_curves(ax_throughput, res, tl, bwd_log, color_inf=color,

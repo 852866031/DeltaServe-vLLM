@@ -654,8 +654,23 @@ class EngineCore:
                     sched.enqueue_profiling_request(
                         sched.new_profiling_request(
                             rand_ids(L), 1 + shape.n_decode, is_ft=False))
-                for _ in range(1 + shape.n_decode):
-                    self._profiling_step()
+                if shape.ft_lens:
+                    # FT-on-decode: prefill inf reqs (wave 1), then inject FT
+                    # alongside the first decode step → the recorded step
+                    # carries (T_in=0, B_d>0, K>0, T_ft>0) — the EAGER regime
+                    # shape required by the unified-phase scheduler.
+                    self._profiling_step()  # wave-1 prefill
+                    for L in shape.ft_lens:
+                        sched.enqueue_profiling_request(
+                            sched.new_profiling_request(
+                                rand_ids(L), 1, is_ft=True))
+                    self._profiling_step()  # wave-1 decode + FT (recorded shape)
+                    # Drain remaining decode steps (one already consumed above).
+                    for _ in range(max(0, shape.n_decode - 1)):
+                        self._profiling_step()
+                else:
+                    for _ in range(1 + shape.n_decode):
+                        self._profiling_step()
             elif shape.kind == "mixed":
                 for L in shape.inf_lens:
                     sched.enqueue_profiling_request(
@@ -665,7 +680,13 @@ class EngineCore:
                 for L in shape.mix_lens:
                     sched.enqueue_profiling_request(
                         sched.new_profiling_request(rand_ids(L), 1, is_ft=False))
-                self._profiling_step()  # wave-1 decode + wave-2 prefill (mixed)
+                # Optional FT alongside wave-2 prefill — gives the EAGER
+                # regime ``(T_in>0, B_d>0, K>0, T_ft>0)`` shape data.
+                for L in shape.ft_lens:
+                    sched.enqueue_profiling_request(
+                        sched.new_profiling_request(
+                            rand_ids(L), 1, is_ft=True))
+                self._profiling_step()  # wave-1 decode + wave-2 prefill (mixed) [+ FT]
                 # drain the rest
                 for _ in range(shape.n_decode):
                     self._profiling_step()

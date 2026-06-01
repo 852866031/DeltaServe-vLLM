@@ -48,7 +48,17 @@ slo:
   # the SLO estimator and buffer allow). No effect on idle/FT-only steps.
   ft_tokens_admission_constrain_factor: -1
   # batch_prediction_stats_path: output/scheduler/batch_prediction_stats.csv
-  match_with_prefill_workload: false            
+  # Leaky-bucket admission: trigger when (counter + t_in) * factor >=
+  # next_sample.input_len AND SLO allows. 0.0 disables (default);
+  # 1.0 reproduces the old `match_with_prefill_workload: true` behaviour;
+  # >1 admits more aggressively; <1 more conservatively.
+  match_prefill_workload_factor: 0.0
+  # [unified-phase only] TBT-budget multiplier on decode-only steps when FT
+  # is being considered for admission. Inert in this (prefill-only) config —
+  # decode-only steps short-circuit to no FT regardless. Exposed here for
+  # visibility; takes effect when the scheduler is switched to "both" via the
+  # _both.yaml variant. See FinetuneConfig docstring for cold-start tuning.
+  decode_only_ft_safety_margin: 0.7
 
 # Observability knobs (folded into FinetuneConfig by the loader).
 debug:
