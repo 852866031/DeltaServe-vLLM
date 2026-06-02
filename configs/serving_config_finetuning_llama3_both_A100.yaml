@@ -15,7 +15,7 @@ finetune:
   finetuning_lora_path: ../adapters/llama3-toy-lora-ft
   # Finetuning corpus: one tokenizable sample per non-empty line.
   data_path: ../alpaca_1000.txt
-  max_saved_finetuning_tokens: 512   # buffer capacity; ~2 inference steps to fill
+  max_saved_finetuning_tokens: 256   # buffer capacity; ~2 inference steps to fill
   backward_sleep_seconds: 2.0        # simulated backward duration (observe inference)
   num_epochs: 20
   learning_rate: 0.000005
@@ -29,9 +29,9 @@ finetune:
 
 # SLO-aware FT admission + execution-time estimator (Phase 4).
 slo:
-  ttft_slo: 0.3                      # time-to-first-token target (seconds)
-  avg_tbt_slo: 0.05                          # avg time-between-tokens target (seconds)
-  max_tbt_slo: 0.2                   # max single-step time while admitting FT (seconds)
+  ttft_slo: 0.2                      # time-to-first-token target (seconds)
+  avg_tbt_slo: 0.02                          # avg time-between-tokens target (seconds)
+  max_tbt_slo: 0.1                   # max single-step time while admitting FT (seconds)
   profile_on_launch: true
   profile_num_repeats: 2
   # --- BOTH-PHASE knobs ---
@@ -49,13 +49,13 @@ slo:
   # MUST stay -1 in "both" mode — the proportional cap is prefill-relative.
   # If you set this > 0, the scheduler falls back to prefill-only with a
   # warning at startup.
-  ft_tokens_admission_constrain_factor: 0
+  ft_tokens_admission_constrain_factor: -1
   # Leaky-bucket admission: trigger when (counter + t_in) * factor >=
   # next_sample.input_len AND SLO allows. 0.0 disables (default). In
   # "both" mode the counter still only accumulates on prefill-carrying
   # steps (so long decode-only stretches naturally rate-limit FT once
   # banked credit is consumed).
-  match_prefill_workload_factor: 0.0
+  match_prefill_workload_factor: 2
 
 # Observability knobs (folded into FinetuneConfig by the loader).
 debug:
