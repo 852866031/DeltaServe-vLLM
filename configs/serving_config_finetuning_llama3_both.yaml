@@ -15,7 +15,7 @@ finetune:
   finetuning_lora_path: ../adapters/llama3-toy-lora-ft
   # Finetuning corpus: one tokenizable sample per non-empty line.
   data_path: ../alpaca_1000.txt
-  max_saved_finetuning_tokens: 512   # buffer capacity; ~2 inference steps to fill
+  max_saved_finetuning_tokens: 256   # buffer capacity; ~2 inference steps to fill
   backward_sleep_seconds: 2.0        # simulated backward duration (observe inference)
   num_epochs: 20
   learning_rate: 0.000005
