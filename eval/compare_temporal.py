@@ -59,6 +59,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
+from matplotlib.lines import Line2D
 
 # Reuse auto_plot.py's helpers verbatim (same dir). Insert _HERE so the import
 # resolves regardless of the caller's CWD.
@@ -77,8 +78,58 @@ from auto_plot import (  # noqa: E402
 DEFAULT_INPUT_DIR = os.path.join(_HERE, "temporal_share_output")
 GPUS = ("5090", "A100")
 
+# ============================================================================
+# Settings — edit here to retitle / resize / restyle.
+# ============================================================================
+
+# ---- Output ----
+GENERATE_PDF = True               # write a .pdf next to the .png
+PNG_DPI = 130
+
+# ---- Figure ----
+FIGSIZE = (14, 13)                # overall figure size in inches
+HEIGHT_RATIOS = (0.8, 1.0, 1.0)   # gridspec row heights: timeline / GPU1 / GPU2
+SUPTITLE = None                   # None disables the figure-level title
+
+# ---- Per-panel titles ----
+# Set to None to drop the panel header above each GPU subplot. Use
+# ``{gpu_name}`` placeholder for substitution.
+PANEL_TITLE_TEMPLATE = "{gpu_name} — E2E latency & FT throughput"
+
+# ---- Axis labels ----
+XLABEL = "Time (s)"
+YLABEL_LATENCY = "E2E latency (s)"
+YLABEL_FT = "FT throughput (tok/s)"
+
+# ---- Y-axis headroom (per-GPU panels only) ----
+# Cap both the left (latency) and right (FT throughput) y-axes at
+# ``peak × YMAX_HEADROOM``. Keeps the legend / annotation box from
+# overlapping the highest data points.
+YMAX_HEADROOM = 1.3
+
+# ---- Display names (replace internal series ids in the legend) ----
+DISPLAY_NAME_INF = "vLLM"
+DISPLAY_NAME_CO = "DeltaServe-vLLM-Temp"
+DISPLAY_NAME_TAIL_OVERHEAD = "Lowest 1% overhead"
+
+# ---- Font sizes ----
+FONTSIZE_PANEL_TITLE = 12
+FONTSIZE_AXIS_LABEL = 11
+FONTSIZE_TICK = 10
+FONTSIZE_LEGEND = 9
+
+# ---- Colors ----
 INF_COLOR = "tab:blue"
 CO_COLOR = "tab:red"
+# FT_SHADE_COLOR comes from auto_plot.py (orange).
+
+# ---- Scatter style ----
+SCATTER_SIZE = 10
+SCATTER_ALPHA = 0.7
+MEAN_LINE_ALPHA = 0.5
+MEAN_LINE_WIDTH = 1.0
+
+# ============================================================================
 
 
 def _load_or_none(loader, path: str):
@@ -180,18 +231,21 @@ def _overhead_pct(a: float, b: float) -> float:
     return float("nan")
 
 
-def _scatter_latency(ax, res, label: str, color: str, x_offset: float = 0.0,
+def _scatter_latency(ax, res, color: str, x_offset: float = 0.0,
                      mean_line: float = None) -> None:
     """Scatter E2E latency vs time on ``ax`` (x shifted by ``x_offset`` into
-    timeline coords), with ``label`` as the legend entry and an optional dashed
-    line at ``mean_line``."""
+    timeline coords), plus an optional dashed line at ``mean_line``. The
+    legend entry is built by the caller (so we can rename series and add
+    overhead annotations) — this function deliberately does NOT push a
+    label into the auto-legend handles."""
     ok = res["ok"]
     t = res["t_rel_s"][ok] + x_offset
     lat = res["latency_s"][ok]
-    ax.scatter(t, lat, s=10, color=color, alpha=0.7, label=label, zorder=3)
+    ax.scatter(t, lat, s=SCATTER_SIZE, color=color, alpha=SCATTER_ALPHA,
+               zorder=3)
     if mean_line is not None and np.isfinite(mean_line):
-        ax.axhline(mean_line, color=color, linestyle="--", linewidth=1,
-                   alpha=0.5, zorder=2)
+        ax.axhline(mean_line, color=color, linestyle="--",
+                   linewidth=MEAN_LINE_WIDTH, alpha=MEAN_LINE_ALPHA, zorder=2)
 
 
 def _ft_throughput_curve(bwd_path: str, anchor_wall, tl_base: float,
@@ -257,12 +311,13 @@ def _ft_throughput_curve(bwd_path: str, anchor_wall, tl_base: float,
 def plot_gpu_panel(ax, gpu_dir: str, gpu_name: str, mode: str, factor: float,
                    tl_base: float = 0.0, ft_offset: float = 0.0,
                    window_s=None) -> float:
-    """E2E latency (co vs inf-only, left axis) + co FT throughput (right axis)
-    for one GPU, all on the timeline file's clock. Inference is shifted by
-    ``tl_base`` (so the first request lands at the timeline's first timestamp,
-    e.g. 15s); FT is anchored at the timeline origin + ``ft_offset``. Blank
-    labeled panel when neither result file exists. Returns the panel's right-
-    most x (0 if blank) so the caller can set a shared x-limit."""
+    """E2E latency (vLLM vs DeltaServe-vLLM-Temp, left axis) + co FT
+    throughput (right axis) for one GPU, all on the timeline file's clock.
+    Inference is shifted by ``tl_base`` (so the first request lands at the
+    timeline's first timestamp); FT is anchored at the timeline origin +
+    ``ft_offset``. Blank labeled panel when neither result file exists.
+    Returns the panel's right-most x (0 if blank) so the caller can set a
+    shared x-limit."""
     fsuf = f"_co_factor_{factor:g}"
     co_path = os.path.join(gpu_dir, f"timeline_results{fsuf}_{mode}.csv")
     inf_path = os.path.join(gpu_dir, f"timeline_results_{mode}.csv")
@@ -272,59 +327,43 @@ def plot_gpu_panel(ax, gpu_dir: str, gpu_name: str, mode: str, factor: float,
     co = _load_or_none(load_results, co_path)
     inf = _load_or_none(load_results, inf_path)
 
+    def _set_panel_title():
+        if PANEL_TITLE_TEMPLATE:
+            ax.set_title(PANEL_TITLE_TEMPLATE.format(gpu_name=gpu_name),
+                         fontsize=FONTSIZE_PANEL_TITLE)
+
     if co is None and inf is None:
         ax.text(0.5, 0.5, f"{gpu_name}\n(no data)", ha="center", va="center",
                 transform=ax.transAxes, fontsize=13, color="0.55")
         ax.set_xticks([])
         ax.set_yticks([])
-        ax.set_title(f"{gpu_name} — E2E latency & FT throughput")
+        _set_panel_title()
         return 0.0
 
-    co_name = f"co_factor_{factor:g}"
-
     # ---- left axis: E2E latency vs time (timeline coords), both runs ----
-    # Reported metrics: full mean (overhead vs the inf full mean) and the
-    # slowest-1% tail (overhead vs the inf slowest-1%).
     t_ends = []
     inf_avg = inf_slow1 = float("nan")
+    co_avg = co_slow1 = float("nan")
     if inf is not None:
         inf_avg, _, _, inf_slow1, _ = _latency_stats(inf)
-        _scatter_latency(ax, inf, f"inf-only (avg {inf_avg:.3f}s)", INF_COLOR,
-                         x_offset=tl_base, mean_line=inf_avg)
+        _scatter_latency(ax, inf, INF_COLOR, x_offset=tl_base,
+                         mean_line=inf_avg)
         m = inf["ok"]
         t_ends.append(inf["t_rel_s"][m] + inf["latency_s"][m] + tl_base)
     if co is not None:
         co_avg, _, _, co_slow1, _ = _latency_stats(co)
-        # Both overheads folded into the scatter legend entry (no extra lines):
-        # full mean vs inf full mean, and the slowest-1% tail (mean of the worst
-        # 1%, latencies >= p99) vs inf's slowest-1%.
-        co_label = f"{co_name} (avg {co_avg:.3f}s"
-        if np.isfinite(inf_avg):
-            co_label += f", {_overhead_pct(co_avg, inf_avg):+.1f}% vs inf"
-        if np.isfinite(co_slow1):
-            co_label += f"; slowest-1% {co_slow1:.3f}s"
-            if np.isfinite(inf_slow1):
-                co_label += f", {_overhead_pct(co_slow1, inf_slow1):+.1f}% vs inf"
-        co_label += ")"
-        _scatter_latency(ax, co, co_label, CO_COLOR, x_offset=tl_base,
-                         mean_line=co_avg)
+        _scatter_latency(ax, co, CO_COLOR, x_offset=tl_base, mean_line=co_avg)
         m = co["ok"]
         t_ends.append(co["t_rel_s"][m] + co["latency_s"][m] + tl_base)
 
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("E2E latency (s)")
+    ax.set_xlabel(XLABEL, fontsize=FONTSIZE_AXIS_LABEL)
+    ax.set_ylabel(YLABEL_LATENCY, fontsize=FONTSIZE_AXIS_LABEL)
+    ax.tick_params(axis="both", labelsize=FONTSIZE_TICK)
     ax.set_ylim(bottom=0)
-    ax.set_title(f"{gpu_name} — E2E latency & FT throughput")
+    _set_panel_title()
     ax.grid(True, alpha=0.25)
 
     # ---- right axis: co_factor FT throughput, aligned via real timestamps ----
-    # The co results CSV (auto_benchmark --real-timestamp) and the bwd_log share
-    # one wall clock, so we anchor the FT curve to the co run's first-request
-    # wall clock (T_first_co): coord = tl_base + (completion_wall − T_first_co).
-    # FT that completed BEFORE the first request lands in [0, tl_base) and is
-    # KEPT — finetune runs during warmup, before inference starts, so that
-    # pre-inference activity is shown rather than trimmed. Falls back to
-    # bench_meta, then first-backward anchoring, for pre-real-timestamp runs.
     co_first_wall = _results_first_wall(co_path) if co is not None else None
     anchor_wall = co_first_wall or _read_t0_wall(meta_path)
     if os.path.exists(bwd_path):
@@ -339,30 +378,74 @@ def plot_gpu_panel(ax, gpu_dir: str, gpu_name: str, mode: str, factor: float,
             t_max = max(t_max, float(np.nanmax(arr)))
 
     ax_r = ax.twinx()
-    ax_r.set_ylabel("FT throughput (tok/s)", color=FT_SHADE_COLOR)
-    ax_r.tick_params(axis="y", labelcolor=FT_SHADE_COLOR)
+    ax_r.set_ylabel(YLABEL_FT, color=FT_SHADE_COLOR,
+                    fontsize=FONTSIZE_AXIS_LABEL)
+    ax_r.tick_params(axis="y", labelcolor=FT_SHADE_COLOR,
+                     labelsize=FONTSIZE_TICK)
     ft = _ft_throughput_curve(bwd_path, anchor_wall, tl_base,
                               ft_offset=ft_offset, window_s=window_s)
+    ft_peak = 0.0
     if ft is None:
         # No FT data: hide the empty twin so it doesn't draw a stray 0..1 axis.
         ax_r.set_yticks([])
     else:
-        # FT curve is identified by the right-axis label, so no legend entry.
         centers, tok_per_s, ft_last = ft
         ax_r.fill_between(centers, 0, tok_per_s, color=FT_SHADE_COLOR,
                           alpha=0.18, linewidth=0, zorder=1)
         ax_r.plot(centers, tok_per_s, color=FT_SHADE_COLOR, linewidth=1.7,
                   zorder=2)
-        # Pin the bottom AFTER plotting so the top still autoscales to the data.
-        ax_r.set_ylim(bottom=0)
+        ft_peak = float(np.nanmax(tok_per_s)) if tok_per_s.size else 0.0
         t_max = max(t_max, ft_last)
 
-    # ---- combined legend (both axes) ----
-    h1, l1 = ax.get_legend_handles_labels()
-    h2, l2 = ax_r.get_legend_handles_labels()
-    if h1 or h2:
-        ax.legend(h1 + h2, l1 + l2, loc="upper right", fontsize=8)
+    # ---- apply 1.3× headroom to BOTH y-axes ----
+    lat_peaks = []
+    if inf is not None:
+        m = inf["ok"]
+        if m.any():
+            lat_peaks.append(float(np.nanmax(inf["latency_s"][m])))
+    if co is not None:
+        m = co["ok"]
+        if m.any():
+            lat_peaks.append(float(np.nanmax(co["latency_s"][m])))
+    lat_peak = max((p for p in lat_peaks if np.isfinite(p) and p > 0),
+                   default=0.0)
+    if lat_peak > 0:
+        ax.set_ylim(0, lat_peak * YMAX_HEADROOM)
+    if ft_peak > 0:
+        ax_r.set_ylim(0, ft_peak * YMAX_HEADROOM)
+    else:
+        ax_r.set_ylim(bottom=0)
+
+    # ---- legend: three explicit entries (no auto-built scatter labels) ----
+    #   1) vLLM (avg latency)
+    #   2) DeltaServe-vLLM-Temp (avg latency, % overhead vs vLLM)
+    #   3) Lowest 1% overhead: +/- X% — text-only entry, no marker
+    handles, labels = [], []
+    if inf is not None and np.isfinite(inf_avg):
+        handles.append(_dot_handle(INF_COLOR))
+        labels.append(f"{DISPLAY_NAME_INF} (avg {inf_avg:.3f}s)")
+    if co is not None and np.isfinite(co_avg):
+        avg_oh = _overhead_pct(co_avg, inf_avg)
+        oh_str = (f", {avg_oh:+.1f}% vs {DISPLAY_NAME_INF}"
+                  if np.isfinite(avg_oh) else "")
+        handles.append(_dot_handle(CO_COLOR))
+        labels.append(f"{DISPLAY_NAME_CO} (avg {co_avg:.3f}s{oh_str})")
+    if (co is not None and inf is not None
+            and np.isfinite(co_slow1) and np.isfinite(inf_slow1)):
+        tail_oh = _overhead_pct(co_slow1, inf_slow1)
+        if np.isfinite(tail_oh):
+            handles.append(Line2D([0], [0], linestyle="none", marker=""))
+            labels.append(f"{DISPLAY_NAME_TAIL_OVERHEAD}: {tail_oh:+.1f}%")
+    if handles:
+        ax.legend(handles, labels, loc="upper right",
+                  fontsize=FONTSIZE_LEGEND)
     return t_max
+
+
+def _dot_handle(color: str) -> Line2D:
+    """Coloured-dot legend handle that matches the scatter style."""
+    return Line2D([0], [0], marker="o", color="w",
+                  markerfacecolor=color, markersize=8)
 
 
 def build_figure(input_dir: str, mode: str, factor: float,
@@ -370,8 +453,8 @@ def build_figure(input_dir: str, mode: str, factor: float,
     # constrained_layout (not tight_layout) so the per-panel twinx right axes
     # don't trip the "Axes not compatible with tight_layout" warning. Three
     # full-width rows: timeline, then one row per GPU.
-    fig = plt.figure(figsize=(14, 13), constrained_layout=True)
-    gs = GridSpec(3, 1, figure=fig, height_ratios=[0.8, 1.0, 1.0])
+    fig = plt.figure(figsize=FIGSIZE, constrained_layout=True)
+    gs = GridSpec(3, 1, figure=fig, height_ratios=list(HEIGHT_RATIOS))
 
     # Row 0: scheduled request timeline (full width). The timeline file is the
     # x-axis reference: keep its native timestamps (first inference at e.g. 15s)
@@ -413,10 +496,8 @@ def build_figure(input_dir: str, mode: str, factor: float,
             if ax.has_data():
                 ax.set_xlim(*xlim)
 
-    fig.suptitle(
-        f"Temporal sharing — E2E latency (co_factor_{factor:g} vs inf-only) "
-        f"+ FT throughput · {mode}",
-        fontsize=14)
+    if SUPTITLE:
+        fig.suptitle(SUPTITLE, fontsize=14)
     return fig
 
 
@@ -454,9 +535,16 @@ def main() -> None:
     fig = build_figure(args.input_dir, args.mode, args.factor,
                        ft_offset=args.ft_offset, window_s=args.window)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    fig.savefig(out_path, dpi=130)
-    plt.close(fig)
+    fig.savefig(out_path, dpi=PNG_DPI)
     print(f"[compare_temporal] wrote figure → {out_path}")
+    if GENERATE_PDF:
+        # Mirror plot_multi_result / plot_full_timelines: no surrounding
+        # margin so the PDF drops into a paper/poster context cleanly.
+        pdf_path = os.path.splitext(out_path)[0] + ".pdf"
+        fig.savefig(pdf_path, format="pdf",
+                    bbox_inches="tight", pad_inches=0)
+        print(f"[compare_temporal] wrote figure → {pdf_path}  (no-margin)")
+    plt.close(fig)
 
 
 if __name__ == "__main__":
