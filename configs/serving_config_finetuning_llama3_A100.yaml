@@ -38,15 +38,15 @@ finetune:
 # keeps inference TTFT/TBT within these targets.
 slo:
   ttft_slo: 0.3                      # time-to-first-token target (seconds)
-  avg_tbt_slo: 0.02                   # avg time-between-tokens target (seconds)
-  max_tbt_slo: 0.1                   # max single-step time while admitting FT (seconds)
+  avg_tbt_slo: 0.05                   # avg time-between-tokens target (seconds)
+  max_tbt_slo: 0.15                   # max single-step time while admitting FT (seconds)
   profile_on_launch: true            # offline profiling pass before serving
   profile_num_repeats: 2             # recorded passes per profiling shape
   # Cap FT tokens per step relative to that step's inference prefill tokens:
   # when >0 and prefill is present, admit at most prefill_tokens * factor FT
   # tokens (on top of the SLO + buffer caps). -1 disables (fill up to whatever
   # the SLO estimator and buffer allow). No effect on idle/FT-only steps.
-  ft_tokens_admission_constrain_factor: -1
+  ft_tokens_admission_constrain_factor: 0
   # batch_prediction_stats_path: output/scheduler/batch_prediction_stats.csv
   # Leaky-bucket admission: trigger when (counter + t_in) * factor >=
   # next_sample.input_len AND SLO allows. 0.0 disables (default);
