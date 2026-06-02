@@ -46,13 +46,13 @@ slo:
   # when >0 and prefill is present, admit at most prefill_tokens * factor FT
   # tokens (on top of the SLO + buffer caps). -1 disables (fill up to whatever
   # the SLO estimator and buffer allow). No effect on idle/FT-only steps.
-  ft_tokens_admission_constrain_factor: 0
+  ft_tokens_admission_constrain_factor: -1
   # batch_prediction_stats_path: output/scheduler/batch_prediction_stats.csv
   # Leaky-bucket admission: trigger when (counter + t_in) * factor >=
   # next_sample.input_len AND SLO allows. 0.0 disables (default);
   # 1.0 reproduces the old `match_with_prefill_workload: true` behaviour;
   # >1 admits more aggressively; <1 more conservatively.
-  match_prefill_workload_factor: 0
+  match_prefill_workload_factor: 0.5
   # [unified-phase only] TBT-budget multiplier on decode-only steps when FT
   # is being considered for admission. Inert in this (prefill-only) config —
   # decode-only steps short-circuit to no FT regardless. Exposed here for

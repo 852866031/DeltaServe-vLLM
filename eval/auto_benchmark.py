@@ -58,14 +58,35 @@ import aiohttp
 
 _HERE = Path(__file__).resolve().parent          # eval/
 _ROOT = _HERE.parent                             # repo root
-# Map ``--scheduler`` → the serving YAML that selects that scheduler at
-# engine init (via ``slo.coserving_admission_phase``). Keep both YAMLs in
-# sync EXCEPT for the phase + decode_only_ft_safety_margin knobs.
+# Map ``(--timeline-gpu, --scheduler)`` → the serving YAML that selects
+# that scheduler at engine init (via ``slo.coserving_admission_phase``).
+# The 5090 uses the original YAMLs; the A100 has its own copies with
+# board-specific tunings (estimator seed, ``decode_only_ft_safety_margin``,
+# etc.). Keep the YAMLs within each board pair in sync EXCEPT for the
+# phase + decode_only_ft_safety_margin knobs.
 _SCHED_CONFIGS = {
-    "prefill": _ROOT / "configs" / "serving_config_finetuning_llama3.yaml",
-    "both": _ROOT / "configs" / "serving_config_finetuning_llama3_both.yaml",
+    "5090": {
+        "prefill": _ROOT / "configs" / "serving_config_finetuning_llama3.yaml",
+        "both":    _ROOT / "configs" / "serving_config_finetuning_llama3_both.yaml",
+    },
+    "A100": {
+        "prefill": _ROOT / "configs" / "serving_config_finetuning_llama3_A100.yaml",
+        "both":    _ROOT / "configs" / "serving_config_finetuning_llama3_both_A100.yaml",
+    },
 }
-_CONFIG_DEFAULT = _SCHED_CONFIGS["prefill"]
+# Schedulers are the same set across boards; flatten for argparse choices
+# and for the legacy ``_CONFIG_DEFAULT`` (kept as a 5090 default so the
+# ``_load_yaml_cfg`` fallback path stays well-defined).
+_SCHED_CHOICES = sorted(_SCHED_CONFIGS["5090"].keys())
+_CONFIG_DEFAULT = _SCHED_CONFIGS["5090"]["prefill"]
+
+
+def _resolve_sched_config(gpu: str, scheduler: str) -> Path:
+    """Pick the YAML for (gpu, scheduler). Falls back to the 5090 entry
+    if a board we don't have a per-GPU YAML for is requested — keeps the
+    benchmark runnable on future hardware until the config is added."""
+    by_sched = _SCHED_CONFIGS.get(gpu) or _SCHED_CONFIGS["5090"]
+    return by_sched[scheduler]
 
 # Per-GPU base model + HF cache root. Both boxes resolve via the HF cache
 # machinery (offline), so we pass HF repo ids (not direct paths). HF looks
@@ -552,7 +573,7 @@ async def main() -> None:
                     help="Number of frontend API server processes (shared "
                          "single EngineCore). >1 shards output processing. "
                          "Overrides server.api_server_count in the YAML.")
-    ap.add_argument("--scheduler", choices=sorted(_SCHED_CONFIGS.keys()),
+    ap.add_argument("--scheduler", choices=_SCHED_CHOICES,
                     default="prefill",
                     help="Which co-serving scheduler to load. 'prefill' "
                          "(default) uses the original FT-rides-prefill "
@@ -626,12 +647,16 @@ async def main() -> None:
     timeline_rows = load_timeline_csv(args.timeline_csv)
     print(f"[bench] loaded {len(timeline_rows)} rows from {args.timeline_csv}", flush=True)
 
-    # Resolve the serving YAML path from --scheduler. The actual phase tag
-    # in the output suffix is read from the LOADED YAML's
-    # ``slo.coserving_admission_phase`` (not just args.scheduler) so a typo
-    # in the YAML doesn't silently disagree with the output file name.
-    config_path = str(_SCHED_CONFIGS[args.scheduler])
-    print(f"[bench] --scheduler={args.scheduler} → "
+    # Resolve the serving YAML path from (--timeline-gpu, --scheduler).
+    # The 5090 and A100 boards have separate YAMLs because the estimator
+    # seed, decode_only_ft_safety_margin, and similar tunings are board-
+    # specific. The actual phase tag in the output suffix is read from
+    # the LOADED YAML's ``slo.coserving_admission_phase`` (not just
+    # args.scheduler) so a typo in the YAML doesn't silently disagree
+    # with the output file name.
+    config_path = str(_resolve_sched_config(args.timeline_gpu, args.scheduler))
+    print(f"[bench] --timeline-gpu={args.timeline_gpu} "
+          f"--scheduler={args.scheduler} → "
           f"{Path(config_path).relative_to(_ROOT)}", flush=True)
 
     # Output suffix. Two layouts:
