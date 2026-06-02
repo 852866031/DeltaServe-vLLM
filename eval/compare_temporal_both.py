@@ -33,8 +33,14 @@ Time alignment, the bwd_log anchor source, and the warmup-phase FT
 handling are identical to ``compare_temporal.py`` — see that file's
 header for the full reasoning. The only change here is the third trace.
 
+By default both GPU panels are drawn (timeline + 5090 + A100 = 3 rows). Pass
+``--5090`` or ``--A100`` to render only that GPU (timeline + one panel = 2
+rows), dropping the other.
+
 Usage:
-  python eval/compare_temporal_both.py                                # nutanix, factor 0 / off
+  python eval/compare_temporal_both.py                                # both GPUs (3 rows)
+  python eval/compare_temporal_both.py --5090                         # 5090 only (2 rows)
+  python eval/compare_temporal_both.py --A100                         # A100 only (2 rows)
   python eval/compare_temporal_both.py --factor 0 --factor-full -1    # bundle uses _factor_-1
   python eval/compare_temporal_both.py --mode nutanix --factor 0
 """
@@ -386,9 +392,17 @@ def plot_gpu_panel(ax, gpu_dir: str, gpu_name: str, mode: str,
 
 def build_figure(input_dir: str, mode: str,
                  factor_temp: str, factor_full: str,
-                 ft_offset: float = 0.0, window_s=None) -> plt.Figure:
-    fig = plt.figure(figsize=FIGSIZE, constrained_layout=True)
-    gs = GridSpec(3, 1, figure=fig, height_ratios=list(HEIGHT_RATIOS))
+                 ft_offset: float = 0.0, window_s=None,
+                 gpus=GPUS) -> plt.Figure:
+    # Rows: timeline (HEIGHT_RATIOS[0]) + 1.0 per GPU in ``gpus``. Scale the
+    # figure height so each row keeps its default per-row height regardless of
+    # how many GPUs are shown (one GPU => 2 rows, both => 3).
+    gpus = tuple(gpus)
+    height_ratios = [HEIGHT_RATIOS[0]] + [1.0] * len(gpus)
+    row_unit = FIGSIZE[1] / sum(HEIGHT_RATIOS)
+    fig = plt.figure(figsize=(FIGSIZE[0], row_unit * sum(height_ratios)),
+                     constrained_layout=True)
+    gs = GridSpec(1 + len(gpus), 1, figure=fig, height_ratios=height_ratios)
 
     # Row 0: scheduled request timeline (full width). The timeline file
     # is the x-axis reference: keep its native timestamps (first inference
@@ -409,10 +423,10 @@ def build_figure(input_dir: str, mode: str,
         ax_tl.set_yticks([])
         ax_tl.set_title("Scheduled Request Timeline (missing)")
 
-    # Rows 1+2: one GPU per full-width row.
+    # Rows 1..N: one GPU per full-width row (whichever GPUs are in ``gpus``).
     gpu_axes = []
     t_max = float(tl["t_rel_s"].max()) if tl is not None and len(tl["t_rel_s"]) else 0.0
-    for row, gpu in enumerate(GPUS, start=1):
+    for row, gpu in enumerate(gpus, start=1):
         ax = fig.add_subplot(gs[row, 0])
         gpu_axes.append(ax)
         panel_tmax = plot_gpu_panel(
@@ -459,19 +473,32 @@ def main() -> None:
                          "on top of the real-timestamp anchor. Default 0.")
     ap.add_argument("--output", default=None,
                     help="Output PNG path. Default: "
-                         "<input-dir>/compare_temporal_both_<mode>.png.")
+                         "<input-dir>/compare_temporal_both[_<gpu>]_<mode>.png.")
+    # GPU selection: with --5090 or --A100 the figure shows ONLY that GPU
+    # (timeline + one panel = 2 rows), dropping the other. With neither, both
+    # GPUs are shown (timeline + 2 panels = 3 rows), as before.
+    gpu_sel = ap.add_mutually_exclusive_group()
+    gpu_sel.add_argument("--5090", dest="gpu", action="store_const",
+                         const="5090",
+                         help="Plot only the 5090 panel (drop A100).")
+    gpu_sel.add_argument("--A100", dest="gpu", action="store_const",
+                         const="A100",
+                         help="Plot only the A100 panel (drop 5090).")
     args = ap.parse_args()
 
     if not os.path.isdir(args.input_dir):
         sys.exit(f"[compare_temporal_both] input dir not found: {args.input_dir}")
 
+    gpus = (args.gpu,) if args.gpu else GPUS
+    gpu_tag = f"_{args.gpu}" if args.gpu else ""
     out_path = args.output or os.path.join(
-        args.input_dir, f"compare_temporal_both_{args.mode}.png")
+        args.input_dir, f"compare_temporal_both{gpu_tag}_{args.mode}.png")
 
     fig = build_figure(args.input_dir, args.mode,
                        factor_temp=args.factor,
                        factor_full=args.factor_full,
-                       ft_offset=args.ft_offset, window_s=args.window)
+                       ft_offset=args.ft_offset, window_s=args.window,
+                       gpus=gpus)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     fig.savefig(out_path, dpi=PNG_DPI)
     print(f"[compare_temporal_both] wrote figure → {out_path}")
