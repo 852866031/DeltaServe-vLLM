@@ -97,12 +97,27 @@ GENERATE_PDF = True
 PNG_DPI = 130
 
 # ---- Figure ----
-FIGSIZE = (14, 13)
-HEIGHT_RATIOS = (0.8, 1.0, 1.0)
+FIGSIZE = (15, 13)
+HEIGHT_RATIOS = (1.0, 1.0, 1.0)
 SUPTITLE = None                   # None disables the figure-level title
+
+# Vertical gap between adjacent figure rows as a fraction of an average
+# row height (matplotlib ``GridSpec.hspace``). Larger → bigger gap
+# between the timeline panel and the first GPU panel (and between the
+# two GPU panels when both are drawn). ``None`` lets constrained_layout
+# auto-pick.
+ROW_HSPACE = 0.05
 
 # ---- Per-panel titles ----
 PANEL_TITLE_TEMPLATE = "{gpu_name} — E2E latency & FT throughput"
+# Display-name map for the panel title only. Keys are the directory
+# names under ``input_dir/`` ("5090", "A100"); values are how the GPU
+# is shown in the title text. Unknown keys fall through to the raw
+# directory name.
+GPU_DISPLAY_NAME = {
+    "5090": "RTX 5090",
+    "A100": "NVIDIA A100",
+}
 
 # ---- Axis labels ----
 XLABEL = "Time (s)"
@@ -110,7 +125,7 @@ YLABEL_LATENCY = "E2E latency (s)"
 YLABEL_FT = "FT throughput (tok/s)"
 
 # ---- Y-axis headroom (per-GPU panels only) ----
-YMAX_HEADROOM = 1.4
+YMAX_HEADROOM = 1.55
 
 # ---- Display names (replace internal series ids in the legend) ----
 DISPLAY_NAME_INF = "vLLM"
@@ -119,19 +134,33 @@ DISPLAY_NAME_CO_FULL = "DeltaServe-vLLM"        # UNthrottled (new) run
 DISPLAY_NAME_TAIL_OVERHEAD = "Lowest 1% overhead"
 
 # ---- Font sizes ----
-FONTSIZE_PANEL_TITLE = 12
-FONTSIZE_AXIS_LABEL = 11
+FONTSIZE_PANEL_TITLE = 16
+FONTSIZE_AXIS_LABEL = 14
 FONTSIZE_TICK = 10
-FONTSIZE_LEGEND = 9
+FONTSIZE_LEGEND = 13
+
+# ---- Font weights — matplotlib accepts "normal", "bold", "light", or a
+# numeric value 0–1000. Drop these to "normal" to revert. ----
+FONTWEIGHT_TITLE = "bold"
+FONTWEIGHT_AXIS_LABEL = "bold"
 
 # ---- Legend placement (per-GPU panels) ----
-# ``LEGEND_LOC`` is matplotlib's anchor (``"upper center"``,
-# ``"upper right"``, ``"center"``, …). ``LEGEND_BBOX_TO_ANCHOR`` is an
-# optional (x, y) override in axes-fraction coordinates; ``None`` lets
-# matplotlib pick from ``loc`` alone. Default places the box at the
-# top-middle so the YMAX_HEADROOM band above the data peaks holds it.
+# Three-row layout: ``ncol = 2`` with a hidden spacer between the
+# latency block and the FT-throughput block lays the entries out as::
+#
+#   Row 1: vLLM                 | DeltaServe-vLLM-Temp
+#   Row 2: DeltaServe-vLLM      | (empty — spacer)
+#   Row 3: Temp FT Throughput   | DeltaServe-vLLM FT Throughput
+#
+# i.e. the unthrottled DeltaServe-vLLM latency entry sits alone on
+# row 2, separating the throttled / unthrottled latency lines from the
+# FT-throughput comparison underneath. Drop ``LEGEND_NCOL`` back to 3
+# (and remove the spacer in ``plot_gpu_panel``) to revert to the older
+# 2-row layout. Matplotlib fills the legend column-major; the natural
+# row-major handle order is fixed up via ``_row_major_reorder``.
 LEGEND_LOC = "upper center"
-LEGEND_BBOX_TO_ANCHOR = None
+LEGEND_BBOX_TO_ANCHOR = (0.5, 1.0)
+LEGEND_NCOL = 2
 
 # ---- Colors ----
 INF_COLOR = "tab:blue"
@@ -149,6 +178,10 @@ FT_LINE_WIDTH = 1.7
 # ---- Scatter style ----
 SCATTER_SIZE = 10
 SCATTER_ALPHA = 0.7
+# Set ``SHOW_MEAN_LINE = True`` to overlay a dashed per-series mean
+# (full-mean latency) on each scatter — disabled by default to keep the
+# panel clean; the mean values still appear in the legend annotations.
+SHOW_MEAN_LINE = False
 MEAN_LINE_ALPHA = 0.5
 MEAN_LINE_WIDTH = 1.0
 
@@ -179,7 +212,8 @@ def _scatter_latency(ax, res, color: str, x_offset: float = 0.0,
     lat = res["latency_s"][ok]
     ax.scatter(t, lat, s=SCATTER_SIZE, color=color, alpha=SCATTER_ALPHA,
                zorder=3)
-    if mean_line is not None and np.isfinite(mean_line):
+    if (SHOW_MEAN_LINE and mean_line is not None
+            and np.isfinite(mean_line)):
         ax.axhline(mean_line, color=color, linestyle="--",
                    linewidth=MEAN_LINE_WIDTH, alpha=MEAN_LINE_ALPHA, zorder=2)
 
@@ -188,6 +222,39 @@ def _dot_handle(color: str) -> Line2D:
     """Coloured-dot legend handle that matches the scatter style."""
     return Line2D([0], [0], marker="o", color="w",
                   markerfacecolor=color, markersize=8)
+
+
+def _row_major_reorder(items, ncol):
+    """Reorder ``items`` so matplotlib's column-major legend fill
+    DISPLAYS them in row-major order.
+
+    matplotlib fills ``ncol`` columns top-to-bottom (col 1 first, then
+    col 2, …). With ``ncol = 3`` and 5 items the natural input
+    ``[A, B, C, D, E]`` therefore renders as::
+
+        A C E
+        B D
+
+    Re-permuting the input by column-then-row pulls the row-major
+    visual back::
+
+        A B C
+        D E
+
+    The transform is: for each column ``c`` walk down its rows ``r`` and
+    pull ``items[r*ncol + c]``. Items shorter than ``nrow*ncol`` just
+    leave the trailing slots empty (matplotlib renders them blank)."""
+    n = len(items)
+    if n == 0 or ncol <= 1:
+        return list(items)
+    nrow = (n + ncol - 1) // ncol
+    out = []
+    for c in range(ncol):
+        for r in range(nrow):
+            idx = r * ncol + c
+            if idx < n:
+                out.append(items[idx])
+    return out
 
 
 def _draw_ft_curve(ax_r, bwd_path: str, anchor_wall, tl_base: float,
@@ -242,8 +309,10 @@ def plot_gpu_panel(ax, gpu_dir: str, gpu_name: str, mode: str,
 
     def _set_panel_title():
         if PANEL_TITLE_TEMPLATE:
-            ax.set_title(PANEL_TITLE_TEMPLATE.format(gpu_name=gpu_name),
-                         fontsize=FONTSIZE_PANEL_TITLE)
+            ax.set_title(PANEL_TITLE_TEMPLATE.format(
+                gpu_name=GPU_DISPLAY_NAME.get(gpu_name, gpu_name)),
+                         fontsize=FONTSIZE_PANEL_TITLE,
+                         fontweight=FONTWEIGHT_TITLE)
 
     if inf is None and co_temp is None and co_full is None:
         ax.text(0.5, 0.5, f"{gpu_name}\n(no data)", ha="center", va="center",
@@ -278,8 +347,10 @@ def plot_gpu_panel(ax, gpu_dir: str, gpu_name: str, mode: str,
         m = co_full["ok"]
         t_ends.append(co_full["t_rel_s"][m] + co_full["latency_s"][m] + tl_base)
 
-    ax.set_xlabel(XLABEL, fontsize=FONTSIZE_AXIS_LABEL)
-    ax.set_ylabel(YLABEL_LATENCY, fontsize=FONTSIZE_AXIS_LABEL)
+    ax.set_xlabel(XLABEL, fontsize=FONTSIZE_AXIS_LABEL,
+                  fontweight=FONTWEIGHT_AXIS_LABEL)
+    ax.set_ylabel(YLABEL_LATENCY, fontsize=FONTSIZE_AXIS_LABEL,
+                  fontweight=FONTWEIGHT_AXIS_LABEL)
     ax.tick_params(axis="both", labelsize=FONTSIZE_TICK)
     ax.set_ylim(bottom=0)
     _set_panel_title()
@@ -296,7 +367,8 @@ def plot_gpu_panel(ax, gpu_dir: str, gpu_name: str, mode: str,
 
     ax_r = ax.twinx()
     ax_r.set_ylabel(YLABEL_FT, color=FT_TEMP_COLOR,
-                    fontsize=FONTSIZE_AXIS_LABEL)
+                    fontsize=FONTSIZE_AXIS_LABEL,
+                    fontweight=FONTWEIGHT_AXIS_LABEL)
     ax_r.tick_params(axis="y", labelcolor=FT_TEMP_COLOR,
                      labelsize=FONTSIZE_TICK)
 
@@ -363,6 +435,17 @@ def plot_gpu_panel(ax, gpu_dir: str, gpu_name: str, mode: str,
             parts.append(f"{avg_oh:+.1f}%")
         handles.append(_dot_handle(CO_FULL_COLOR))
         labels.append(f"{DISPLAY_NAME_CO_FULL} ({', '.join(parts)})")
+    # Three-row layout: drop a hidden spacer between the latency block
+    # and the FT-throughput block so ncol=2 lays out as
+    #   row 1: vLLM | Temp
+    #   row 2: full | <spacer>
+    #   row 3: Temp FT | full FT
+    # i.e. the unthrottled DeltaServe-vLLM latency entry sits alone on
+    # row 2. Drop the spacer (and set LEGEND_NCOL back to 3) to revert
+    # to the older 2-row layout.
+    if LEGEND_NCOL == 2 and len(handles) == 3:
+        handles.append(Line2D([0], [0], linestyle="none", marker=""))
+        labels.append("")
     # Dedicated FT-throughput entries — coloured patches match the
     # filled bands on the right axis so the legend doubles as a curve
     # key. The relative comparison (full vs Temp) lives on the
@@ -383,9 +466,16 @@ def plot_gpu_panel(ax, gpu_dir: str, gpu_name: str, mode: str,
                              edgecolor=FT_FULL_COLOR))
         labels.append(label)
     if handles:
-        legend_kwargs = dict(loc=LEGEND_LOC, fontsize=FONTSIZE_LEGEND)
+        legend_kwargs = dict(loc=LEGEND_LOC, fontsize=FONTSIZE_LEGEND,
+                             ncol=LEGEND_NCOL)
         if LEGEND_BBOX_TO_ANCHOR is not None:
             legend_kwargs["bbox_to_anchor"] = LEGEND_BBOX_TO_ANCHOR
+        # matplotlib fills the legend column-major; permute so the
+        # visual ends up row-major. For LEGEND_NCOL=2 (3-row layout) a
+        # hidden spacer above pads the latency block to 4 entries so
+        # the FT-throughput pair lands cleanly on row 3.
+        handles = _row_major_reorder(handles, LEGEND_NCOL)
+        labels = _row_major_reorder(labels, LEGEND_NCOL)
         ax.legend(handles, labels, **legend_kwargs)
     return t_max
 
@@ -402,7 +492,10 @@ def build_figure(input_dir: str, mode: str,
     row_unit = FIGSIZE[1] / sum(HEIGHT_RATIOS)
     fig = plt.figure(figsize=(FIGSIZE[0], row_unit * sum(height_ratios)),
                      constrained_layout=True)
-    gs = GridSpec(1 + len(gpus), 1, figure=fig, height_ratios=height_ratios)
+    gs_kwargs = dict(figure=fig, height_ratios=height_ratios)
+    if ROW_HSPACE is not None:
+        gs_kwargs["hspace"] = ROW_HSPACE
+    gs = GridSpec(1 + len(gpus), 1, **gs_kwargs)
 
     # Row 0: scheduled request timeline (full width). The timeline file
     # is the x-axis reference: keep its native timestamps (first inference
@@ -415,13 +508,36 @@ def build_figure(input_dir: str, mode: str,
     if tl is not None:
         tl["t_rel_s"] = tl["t_rel_s"] + tl_base
         plot_request_timeline(ax_tl, tl)
+        # auto_plot.plot_request_timeline sets the title + axis labels
+        # with matplotlib's defaults — re-style each artist in place so
+        # this panel matches the per-GPU panels below (bold + tuned size).
+        if ax_tl.get_title():
+            ax_tl.title.set_fontsize(FONTSIZE_PANEL_TITLE)
+            ax_tl.title.set_fontweight(FONTWEIGHT_TITLE)
+        ax_tl.xaxis.label.set_fontsize(FONTSIZE_AXIS_LABEL)
+        ax_tl.xaxis.label.set_fontweight(FONTWEIGHT_AXIS_LABEL)
+        ax_tl.yaxis.label.set_fontsize(FONTSIZE_AXIS_LABEL)
+        ax_tl.yaxis.label.set_fontweight(FONTWEIGHT_AXIS_LABEL)
+        # plot_request_timeline draws a tokens/s twin axis (right side)
+        # — find it on the figure and bold its y label too. Twin axes
+        # share the parent's x range, which is the cheapest way to
+        # match them without auto_plot exposing the handle.
+        for child in ax_tl.figure.axes:
+            if child is ax_tl:
+                continue
+            if (child.get_position().bounds == ax_tl.get_position().bounds
+                    and child.yaxis.label.get_text()):
+                child.yaxis.label.set_fontsize(FONTSIZE_AXIS_LABEL)
+                child.yaxis.label.set_fontweight(FONTWEIGHT_AXIS_LABEL)
     else:
         ax_tl.text(0.5, 0.5, f"timeline_{mode}.csv\n(not found)",
                    ha="center", va="center", transform=ax_tl.transAxes,
                    fontsize=12, color="0.55")
         ax_tl.set_xticks([])
         ax_tl.set_yticks([])
-        ax_tl.set_title("Scheduled Request Timeline (missing)")
+        ax_tl.set_title("Scheduled Request Timeline (missing)",
+                        fontsize=FONTSIZE_PANEL_TITLE,
+                        fontweight=FONTWEIGHT_TITLE)
 
     # Rows 1..N: one GPU per full-width row (whichever GPUs are in ``gpus``).
     gpu_axes = []
