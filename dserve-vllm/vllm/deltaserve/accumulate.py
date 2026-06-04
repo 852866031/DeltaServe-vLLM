@@ -56,7 +56,8 @@ class FinetuneAccumulator:
                  dtype, intermediate_size: int | None = None,
                  q_size: int | None = None,
                  kv_size: int | None = None,
-                 save_attn_qkv: bool = False) -> None:
+                 save_attn_qkv: bool = False,
+                 save_attn_ctx: bool = False) -> None:
         self.max_saved = int(max_saved)
         self.hidden_size = int(hidden_size)
         self.intermediate_size = int(intermediate_size) if intermediate_size else 0
@@ -70,6 +71,11 @@ class FinetuneAccumulator:
         # is model-specific and we don't infer it without dims).
         self._save_attn_qkv = (bool(save_attn_qkv)
                                and self.q_size > 0 and self.kv_size > 0)
+        # Opt-in: save the attention context output (= o_proj input) per layer
+        # to skip the attention-forward recompute in the backward. Same
+        # ``self_attn.attn`` module as the qkv save, but a POST hook reading the
+        # output; width = q_size (= num_heads · head_dim).
+        self._save_attn_ctx = bool(save_attn_ctx) and self.q_size > 0
 
         # Per-step state (set by begin_step, read by hooks).
         self._active = False
@@ -127,6 +133,9 @@ class FinetuneAccumulator:
         # Save post-RoPE q/k/v only if requested, dims known, AND modules found.
         self._save_attn_qkv = (self._save_attn_qkv
                                and bool(self._self_attn_attn_modules))
+        # Save attention context (o_proj input) only if requested AND modules found.
+        self._save_attn_ctx = (self._save_attn_ctx
+                               and bool(self._self_attn_attn_modules))
 
         # Pre-allocated buffers (plain torch.zeros — outside any CUDA-graph pool).
         def _buf(width=None):
@@ -154,6 +163,12 @@ class FinetuneAccumulator:
         self.attn_vh = ([_buf(self.kv_size)
                          for _ in range(self.num_layers)]
                         if self._save_attn_qkv else [])
+        # Per-layer attention context output (= o_proj input). Flat
+        # [s_max, q_size] — same row order as the rest of the batch. Only
+        # allocated when save_attn_ctx is on.
+        self.attn_ctx = ([_buf(self.q_size)
+                          for _ in range(self.num_layers)]
+                         if self._save_attn_ctx else [])
         self.buffers = {
             "final_hidden": self.final_hidden,
             "concat_input_ids": self.concat_input_ids,
@@ -168,6 +183,8 @@ class FinetuneAccumulator:
             self.buffers["attn_qh"] = self.attn_qh
             self.buffers["attn_kh"] = self.attn_kh
             self.buffers["attn_vh"] = self.attn_vh
+        if self.attn_ctx:
+            self.buffers["attn_ctx"] = self.attn_ctx
 
     def register_hooks(self) -> None:
         for layer, mod in self._layer_in_modules.items():
@@ -191,16 +208,23 @@ class FinetuneAccumulator:
                             self.attn_qh[layer],
                             self.attn_kh[layer],
                             self.attn_vh[layer])))
+        if self._save_attn_ctx:
+            for layer, mod in self._self_attn_attn_modules.items():
+                self._handles.append(
+                    mod.register_forward_hook(
+                        self._make_attn_ctx_out_hook(self.attn_ctx[layer])))
         dprint(
             f"[accumulate] residual-stream pre-hooks on "
             f"{len(self._layer_in_modules)} input_layernorm + "
             f"{int(self._final_norm_module is not None)} final norm; "
             f"gate_up post-hooks on {len(self._gate_up_modules) if self._save_gate_up else 0}; "
-            f"attn-qkv pre-hooks on {len(self._self_attn_attn_modules) if self._save_attn_qkv else 0}"
+            f"attn-qkv pre-hooks on {len(self._self_attn_attn_modules) if self._save_attn_qkv else 0}; "
+            f"attn-ctx post-hooks on {len(self._self_attn_attn_modules) if self._save_attn_ctx else 0}"
             f"; buffers [{self.max_saved}, {self.hidden_size}] x {self.num_layers} "
             f"layers (+ final_in/final_hidden"
             f"{'/mlp_gate_up' if self._save_gate_up else ''}"
-            f"{'/attn_qh+kh+vh' if self._save_attn_qkv else ''})"
+            f"{'/attn_qh+kh+vh' if self._save_attn_qkv else ''}"
+            f"{'/attn_ctx' if self._save_attn_ctx else ''})"
         )
 
     def _make_pre_hook(self, buf):
@@ -268,6 +292,32 @@ class FinetuneAccumulator:
                 raise FTAborted()
 
         return pre_hook
+
+    def _make_attn_ctx_out_hook(self, ctx_buf):
+        """Hook fires AFTER ``self_attn.attn(q, k, v)`` — its output is the
+        attention context (the o_proj input), flat ``[n_total, q_size]`` in
+        batch-row order. Saved so the backward can skip the attention-forward
+        recompute. Flattened defensively in case the op returns [n, H, Hd]."""
+        def out_hook(module, inputs, output):
+            if not self._active or self._cur_n == 0:
+                return
+            out = output[0] if isinstance(output, tuple) else output
+            if self._cur_contiguous:
+                rows = out[self._cur_start:self._cur_start + self._cur_n]
+            else:
+                rows = out[self._cur_mask]
+            off = self._cur_offset
+            n = min(rows.shape[0], self.max_saved - off)
+            if n > 0:
+                ctx_buf[off:off + n].copy_(
+                    rows[:n].reshape(n, -1).to(self.dtype))
+            # tier-C abort (same idiom as the other hooks).
+            _evt = self._abort_event
+            if _evt is not None and _evt.is_set():
+                from vllm.deltaserve.coordinator import FTAborted
+                raise FTAborted()
+
+        return out_hook
 
     def _make_out_hook(self, buf):
         def out_hook(module, inputs, output):
@@ -371,4 +421,6 @@ class FinetuneAccumulator:
         for buf in self.attn_kh:
             buf[off:off + n].zero_()
         for buf in self.attn_vh:
+            buf[off:off + n].zero_()
+        for buf in self.attn_ctx:
             buf[off:off + n].zero_()

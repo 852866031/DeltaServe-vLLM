@@ -28,6 +28,7 @@ finetune:
   ft_only_admission_grace_ms: 0
   backward_cuda_graph: true
   save_attn_qkv: true
+  save_attn_ctx: true               # save attn ctx (o_proj input); skip attention-forward recompute in backward
   # --- Estimator-accuracy validation ---
   validate_estimator: true             # forces async OFF + per-batch CSV append
   # Path is resolved relative to THIS file's dir (configs/), so this lands at

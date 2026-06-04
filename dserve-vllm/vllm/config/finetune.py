@@ -113,6 +113,19 @@ class FinetuneConfig:
     remaining activation-save optimizations (see ``INTEGRATION_PROGRESS.md``
     Phase 5 "future activation-save optimization" section). Default off."""
 
+    save_attn_ctx: bool = False
+    """Also save the per-layer attention CONTEXT output (the input to
+    ``o_proj``, i.e. the result of ``self_attn.attn(q, k, v)``) during the FT
+    forward — one ``forward_hook`` on each ``self_attn.attn`` module reads its
+    output. The backward then SKIPS the attention-forward recompute (the
+    per-sample scores/softmax/AV loop, or the captured padded-attention forward
+    in Graph C) and reads the saved ``ctx`` directly as the O-projection
+    backward input. The Q/K/V tensors are still needed by the attention
+    BACKWARD, so this composes with ``save_attn_qkv``: with both on, the
+    per-layer forward recompute collapses to RMSNorm in_ln + O-proj + residual
+    (everything else is read from saved buffers). Memory cost: ~33 MB at
+    s_max=256 (ctx [s_max, q_size] bf16 × 32 layers). Default off."""
+
     backward_sleep_seconds: float = 2.0
     """How long the (stub) backward process sleeps to simulate a backward pass
     after it consumes + cleans the activation buffer. Larger = easier to observe

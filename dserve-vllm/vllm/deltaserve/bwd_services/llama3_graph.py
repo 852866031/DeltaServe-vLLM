@@ -90,6 +90,13 @@ class Llama3GraphedBackward:
         # Mode is fixed at construction; affects which capture branch
         # ``_forward_core`` takes.
         self.save_attn_qkv = bool(getattr(svc, "save_attn_qkv", False))
+        # When True, the captured forward graph SKIPS the padded-attention
+        # forward (scores/softmax/AV) and reads ctx from ``static_saved_ctx``
+        # (staged from ``activations["attn_ctx"]`` per layer). The q/k/v scatter
+        # into ``static_*_pad`` still runs (Graph B / attn-bwd needs it). Mode
+        # is fixed at construction; affects which capture branch
+        # ``_forward_core`` takes.
+        self.save_attn_ctx = bool(getattr(svc, "save_attn_ctx", False))
 
         # Per-layer FFN graphs (each binds layer-specific frozen weights:
         # lw["down"], lw["gate"], lw["up"], lw["post_ln"]). Capture/replay
@@ -230,6 +237,11 @@ class Llama3GraphedBackward:
         self.static_saved_qh = torch.zeros((s, q_size), dtype=mdt, device=dev)
         self.static_saved_kh = torch.zeros((s, kv_size), dtype=mdt, device=dev)
         self.static_saved_vh = torch.zeros((s, kv_size), dtype=mdt, device=dev)
+        # Saved attention context (o_proj input) captured in the forward (only
+        # used when ``save_attn_ctx`` is on). Staged per layer in
+        # ``stage_forward_inputs``; consumed inside ``_forward_core`` to skip
+        # the padded-attention forward. q_size == D for Llama.
+        self.static_saved_ctx = torch.zeros((s, q_size), dtype=mdt, device=dev)
         # Outputs (flat, model dtype): the rest of the cache the eager tail
         # consumes. qh/kh/vh flat are written alongside the padded scatter.
         self.static_x_norm1 = torch.zeros((s, D), dtype=mdt, device=dev)
@@ -737,8 +749,14 @@ class Llama3GraphedBackward:
         self.static_vh_pad.index_put_(
             (self.static_bn_idx, self.static_pos_idx), vh, accumulate=True)
 
-        # 4) Padded-attention forward → static_ctx_flat.
-        self._padded_attn_forward_core()
+        # 4) Attention forward → static_ctx_flat. In save_attn_ctx mode the
+        #    forward attention (scores/softmax/AV) is skipped — ctx was captured
+        #    in the FT forward and staged into static_saved_ctx. The q/k/v
+        #    padded scatter above still ran (Graph B / attn-bwd reads it).
+        if self.save_attn_ctx:
+            self.static_ctx_flat.copy_(self.static_saved_ctx)
+        else:
+            self._padded_attn_forward_core()
 
         # 5) O projection (base + LoRA) → resid_mid = layer_in + o.
         o = _proj(self.static_ctx_flat, lw["o"], lw["oA"], lw["oB"], scaling)
@@ -766,14 +784,17 @@ class Llama3GraphedBackward:
                              saved_gate_up: torch.Tensor, n: int,
                              saved_qh: torch.Tensor | None = None,
                              saved_kh: torch.Tensor | None = None,
-                             saved_vh: torch.Tensor | None = None) -> None:
+                             saved_vh: torch.Tensor | None = None,
+                             saved_ctx: torch.Tensor | None = None) -> None:
         """Copy this layer's inputs into the static slabs (zero the tail).
         ``cos/sin`` are staged once per backward in ``begin_backward``; the
         ``static_*_pad`` buffers are zeroed here so the in-graph scatter
         produces zero rows at the tail.
 
         ``saved_qh/kh/vh`` are the per-layer post-RoPE captures (when
-        ``save_attn_qkv`` is on); ignored in the recompute mode."""
+        ``save_attn_qkv`` is on); ``saved_ctx`` is the per-layer attention
+        context (when ``save_attn_ctx`` is on). Both ignored in their
+        respective recompute modes."""
         s = self.s_max
         if layer_in.dtype != self.model_dtype:
             layer_in = layer_in.to(self.model_dtype)
@@ -798,6 +819,13 @@ class Llama3GraphedBackward:
                 self.static_saved_qh[n:].zero_()
                 self.static_saved_kh[n:].zero_()
                 self.static_saved_vh[n:].zero_()
+        # Stage the saved attention context only in save_attn_ctx mode.
+        if self.save_attn_ctx and saved_ctx is not None:
+            if saved_ctx.dtype != self.model_dtype:
+                saved_ctx = saved_ctx.to(self.model_dtype)
+            self.static_saved_ctx[:n].copy_(saved_ctx.reshape(n, -1))
+            if n < s:
+                self.static_saved_ctx[n:].zero_()
         # Zero the padded q/k/v staging targets before the scatter so tail
         # writes (to slot (0,0)) don't leave stale data from a prior layer.
         self.static_qh_pad.zero_()
@@ -808,7 +836,8 @@ class Llama3GraphedBackward:
                 saved_gate_up: torch.Tensor, n: int,
                 saved_qh: torch.Tensor | None = None,
                 saved_kh: torch.Tensor | None = None,
-                saved_vh: torch.Tensor | None = None) -> dict:
+                saved_vh: torch.Tensor | None = None,
+                saved_ctx: torch.Tensor | None = None) -> dict:
         """Graphed layer forward-recompute. Returns the cache dict of static
         views the downstream backward consumes — same shape contract as the
         eager ``layer_forward``.
@@ -825,6 +854,7 @@ class Llama3GraphedBackward:
         eager_kwargs = dict(
             saved_gate_up=saved_gate_up,
             saved_qh=saved_qh, saved_kh=saved_kh, saved_vh=saved_vh,
+            saved_ctx=saved_ctx,
         )
         dims = (self.Hq, self.Hkv, self.Hd, self.Hkv * self.Hd)
 
@@ -836,7 +866,7 @@ class Llama3GraphedBackward:
 
         self.stage_forward_inputs(layer_in, saved_gate_up, n,
                                   saved_qh=saved_qh, saved_kh=saved_kh,
-                                  saved_vh=saved_vh)
+                                  saved_vh=saved_vh, saved_ctx=saved_ctx)
 
         if layer_id not in self._fwd_graphs:
             try:

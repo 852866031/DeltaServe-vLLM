@@ -488,6 +488,10 @@ class Worker(WorkerBase):
             # short-circuits the Q/K/V proj + RoPE recompute (RMSNorm
             # in_ln stays — cheap and needed for Q/K/V LoRA-A grad).
             "save_attn_qkv": bool(ft_cfg.save_attn_qkv),
+            # When True, the forward saves the attention context (o_proj input)
+            # per layer to ``activations["attn_ctx"]``. The backward skips the
+            # attention-forward recompute and reads ctx directly.
+            "save_attn_ctx": bool(ft_cfg.save_attn_ctx),
         }
 
         dprint(
@@ -552,6 +556,7 @@ class Worker(WorkerBase):
             q_size=q_size,
             kv_size=kv_size,
             save_attn_qkv=bool(ft_cfg.save_attn_qkv),
+            save_attn_ctx=bool(ft_cfg.save_attn_ctx),
         )
         accumulator.register_hooks()
         ack = backward_process.share_activations(
