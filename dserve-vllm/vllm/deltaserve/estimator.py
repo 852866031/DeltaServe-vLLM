@@ -298,11 +298,17 @@ class MergedExecutionEstimator:
         return regime, p  # still unfitted; predict returns 0
 
     def predict(self, features: StepFeatures,
-                regime: str | None = None) -> float:
+                regime: str | None = None,
+                apply_margin: bool = True) -> float:
         """Predict step time. ``regime`` overrides composition-derived
         selection — used by the iterative admission loop, which forces
         ``regime="eager"`` for hypothetical-with-FT predictions (because
-        adding FT always forces eager)."""
+        adding FT always forces eager).
+
+        ``apply_margin`` (default True) adds the pessimistic ×(1 + 1.5·RMSE)
+        safety margin used for conservative SLO admission. Pass False to get
+        the RAW model prediction (no margin) — used by estimator-accuracy
+        validation, which scores the model itself against the measured time."""
         if not self.is_ready:
             if not self._warned_unfitted:
                 dprint("[estimator] predict() called before any fit; "
@@ -312,7 +318,7 @@ class MergedExecutionEstimator:
         selected_regime, p = self._select(features, regime=regime)
         pred = p.eval(features)
         rmse = self._rmse[selected_regime]
-        if rmse:
+        if apply_margin and rmse:
             pred *= 1.0 + 1.5 * rmse   # pessimistic safety margin (DeltaServe)
         return max(0.0, float(pred))
 

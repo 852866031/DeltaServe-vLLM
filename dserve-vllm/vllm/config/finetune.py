@@ -258,6 +258,28 @@ class FinetuneConfig:
     """If set, dump per-step predicted-vs-actual execution times to this CSV on
     FT exit (for offline estimator analysis). None disables."""
 
+    validate_estimator: bool = False
+    """Estimator-accuracy validation mode. When True: (1) forces async
+    scheduling OFF (so the deferred CUDA-event ring's prior slot is always
+    settled → accurate per-batch actuals), and (2) appends one
+    (predicted, actual, features) row per scheduled batch to
+    ``estimator_validation_path`` as the drain loop pairs each step's features
+    with its measured GPU time. The mode-"w" end-dump to
+    ``batch_prediction_stats_path`` is SKIPPED in this mode (it would clobber
+    the appended file). The logged ``predicted_duration`` is the RAW model
+    prediction — the ×(1 + 1.5·RMSE) safety margin is NOT applied (admission
+    still uses the margined value); this scores the model itself. Zero added
+    runtime cost when False (a single bool check on the drain path). Requires
+    ``enable_finetuning=True``. Note: the last ~RING (=4) batches of a run are
+    never drained, so they're absent from the CSV — a sub-1% tail with no
+    effect on accuracy stats."""
+
+    estimator_validation_path: str | None = None
+    """Output CSV for ``validate_estimator`` — per-batch rows appended (header
+    on first write). Falls back to ``batch_prediction_stats_path`` when None;
+    if both are None, validation rows are dropped (warned once). Intended
+    location: eval/estimator/."""
+
     bwd_log_path: str | None = None
     """If set, append one row per completed backward to this CSV (timestamp,
     epoch, batch_idx, batch_tokens, batch_loss, total_processed_tokens) — the

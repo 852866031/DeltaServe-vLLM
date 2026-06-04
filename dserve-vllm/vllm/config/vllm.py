@@ -856,7 +856,18 @@ class VllmConfig:
                     self.scheduler_config.scheduler_cls = (
                         "vllm.deltaserve.ft_scheduler.FinetuneScheduler"
                     )
-            if self.scheduler_config.async_scheduling is None:
+            if getattr(self.finetune_config, "validate_estimator", False):
+                # Estimator-validation mode needs deterministic per-batch
+                # actuals: under async, schedule(N+1) runs before forward(N)
+                # completes, so the deferred CUDA-event ring's "previous slot"
+                # may not be settled. Force sync (override an explicit True).
+                if self.scheduler_config.async_scheduling:
+                    logger.info(
+                        "[deltaserve] validate_estimator=True — forcing "
+                        "async_scheduling OFF for accurate per-batch "
+                        "estimator validation.")
+                self.scheduler_config.async_scheduling = False
+            elif self.scheduler_config.async_scheduling is None:
                 self.scheduler_config.async_scheduling = True
 
         if self.performance_mode != "balanced":

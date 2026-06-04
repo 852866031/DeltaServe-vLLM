@@ -583,6 +583,12 @@ async def main() -> None:
                          "(serving_config_finetuning_llama3{,_both}.yaml). "
                          "The loaded phase is appended to the output suffix "
                          "as _phase_<phase>.")
+    ap.add_argument("--config", default=None,
+                    help="Path to a serving YAML to use verbatim, overriding "
+                         "the --scheduler/--timeline-gpu auto-resolution. Use "
+                         "for one-off configs (e.g. the estimator-validation "
+                         "YAML, configs/serving_config_finetuning_llama3_"
+                         "validate.yaml).")
     ap.add_argument("--model", default=None,
                     help="Base model id (HF) or local path. Default is "
                          "per-GPU: " + ", ".join(
@@ -654,10 +660,14 @@ async def main() -> None:
     # the LOADED YAML's ``slo.coserving_admission_phase`` (not just
     # args.scheduler) so a typo in the YAML doesn't silently disagree
     # with the output file name.
-    config_path = str(_resolve_sched_config(args.timeline_gpu, args.scheduler))
-    print(f"[bench] --timeline-gpu={args.timeline_gpu} "
-          f"--scheduler={args.scheduler} → "
-          f"{Path(config_path).relative_to(_ROOT)}", flush=True)
+    if args.config:
+        config_path = str(Path(args.config).expanduser().resolve())
+        print(f"[bench] --config → {config_path}", flush=True)
+    else:
+        config_path = str(_resolve_sched_config(args.timeline_gpu, args.scheduler))
+        print(f"[bench] --timeline-gpu={args.timeline_gpu} "
+              f"--scheduler={args.scheduler} → "
+              f"{Path(config_path).relative_to(_ROOT)}", flush=True)
 
     # Output suffix. Two layouts:
     #
