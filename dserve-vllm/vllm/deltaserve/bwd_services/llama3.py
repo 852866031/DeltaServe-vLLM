@@ -145,7 +145,8 @@ def _proj_backward(xin, gy, w_base, A, B, scaling, cdt=torch.float32):
 
 
 def layer_forward(x, lw, scaling, cos, sin, seq_lens, b_start, dims, eps,
-                  saved_gate_up=None, saved_qh=None, saved_kh=None, saved_vh=None):
+                  saved_gate_up=None, saved_qh=None, saved_kh=None,
+                  saved_vh=None, saved_ctx=None):
     """Rematerialize one Llama decoder layer forward, returning the ``cache`` the
     manual backward needs (attention internals + MLP pre-activations). The frozen
     `down` matmul / layer output are NOT computed — the backward only needs the
@@ -161,6 +162,14 @@ def layer_forward(x, lw, scaling, cos, sin, seq_lens, b_start, dims, eps,
     ``x`` (cheap; the Q/K/V LoRA-A grad needs it as ``grad_A = grad_Z.t() @
     x_norm1``). ``cos/sin`` are unused on this fast path. If any of the three
     saved tensors is absent, the recompute path runs.
+
+    When ``saved_ctx`` ([n, D] = the attention context / o_proj input, captured
+    by a ``self_attn.attn`` forward_hook) is given, the attention forward (the
+    per-sample scores/softmax/AV loop) is SKIPPED — ``ctx_flat`` is read from
+    the saved tensor. ``qh/kh/vh`` are still produced (saved or recomputed)
+    because the attention BACKWARD consumes them. Composes with
+    ``saved_qh/kh/vh``: with both, only RMSNorm in_ln + O-proj + residual are
+    recomputed.
 
     ``lw`` is a dict of base weights (q,k,v,o,gate,up,in_ln,post_ln) + LoRA
     (qA,qB,kA,kB,vA,vB,oA,oB). Functional (no in-place) so autograd can differentiate
@@ -187,23 +196,28 @@ def layer_forward(x, lw, scaling, cos, sin, seq_lens, b_start, dims, eps,
         kh = apply_rope(k.view(n, Hkv, Hd), cos, sin)
         vh = v.view(n, Hkv, Hd)
 
-    ctx_blocks = []
-    for st, ln in zip(b_start, seq_lens):
-        q_blk = qh[st:st + ln].transpose(0, 1)      # [Hq, L, Hd]
-        k_blk = kh[st:st + ln].transpose(0, 1)      # [Hkv, L, Hd]
-        v_blk = vh[st:st + ln].transpose(0, 1)
-        if kv_repeat != 1:
-            k_rep = k_blk.repeat_interleave(kv_repeat, 0)
-            v_rep = v_blk.repeat_interleave(kv_repeat, 0)
-        else:
-            k_rep, v_rep = k_blk, v_blk
-        scores = (q_blk.float() @ k_rep.float().transpose(-1, -2)) * scale
-        mask = torch.triu(torch.ones(ln, ln, dtype=torch.bool, device=x.device), 1)
-        scores = scores.masked_fill(mask, -1e9)
-        att = torch.softmax(scores, dim=-1)         # [Hq, L, L] fp32
-        ctx_blk = (att @ v_rep.float()).to(x.dtype).transpose(0, 1)  # [L, Hq, Hd]
-        ctx_blocks.append(ctx_blk)
-    ctx_flat = torch.cat(ctx_blocks, 0).reshape(n, D)
+    if saved_ctx is not None:
+        # Skip the attention forward (scores/softmax/AV) — use the saved ctx.
+        ctx_flat = saved_ctx.reshape(n, D)
+    else:
+        ctx_blocks = []
+        for st, ln in zip(b_start, seq_lens):
+            q_blk = qh[st:st + ln].transpose(0, 1)      # [Hq, L, Hd]
+            k_blk = kh[st:st + ln].transpose(0, 1)      # [Hkv, L, Hd]
+            v_blk = vh[st:st + ln].transpose(0, 1)
+            if kv_repeat != 1:
+                k_rep = k_blk.repeat_interleave(kv_repeat, 0)
+                v_rep = v_blk.repeat_interleave(kv_repeat, 0)
+            else:
+                k_rep, v_rep = k_blk, v_blk
+            scores = (q_blk.float() @ k_rep.float().transpose(-1, -2)) * scale
+            mask = torch.triu(
+                torch.ones(ln, ln, dtype=torch.bool, device=x.device), 1)
+            scores = scores.masked_fill(mask, -1e9)
+            att = torch.softmax(scores, dim=-1)         # [Hq, L, L] fp32
+            ctx_blk = (att @ v_rep.float()).to(x.dtype).transpose(0, 1)  # [L, Hq, Hd]
+            ctx_blocks.append(ctx_blk)
+        ctx_flat = torch.cat(ctx_blocks, 0).reshape(n, D)
 
     o = _proj(ctx_flat, lw["o"], lw["oA"], lw["oB"], scaling)       # [n, D]
     resid_mid = x + o
@@ -455,6 +469,10 @@ class Llama3BackwardService(BackwardService):
         # see it. Drives whether ``layer_forward`` / the captured forward
         # graph short-circuits Q/K/V proj + RoPE using the saved buffers.
         self.save_attn_qkv = bool(meta.get("save_attn_qkv", False))
+        # Mirror the worker-side ``save_attn_ctx`` flag — drives whether
+        # ``layer_forward`` / the captured forward graph skips the attention
+        # forward (scores/softmax/AV) using the saved ctx buffer.
+        self.save_attn_ctx = bool(meta.get("save_attn_ctx", False))
 
         # With enable_lora, vLLM wraps the projections, so the frozen base weight is
         # named e.g. "...qkv_proj.base_layer.weight". Normalize by stripping the
@@ -609,6 +627,10 @@ class Llama3BackwardService(BackwardService):
         saved_qh_all = activations.get("attn_qh")
         saved_kh_all = activations.get("attn_kh")
         saved_vh_all = activations.get("attn_vh")
+        # Saved attention context (o_proj input) per layer (opt-in via
+        # finetune.save_attn_ctx) — lets the remat skip the attention forward
+        # (scores/softmax/AV). None when the feature is off.
+        saved_ctx_all = activations.get("attn_ctx")
 
         # If the graphed runner is attached, build per-backward scatter indices
         # + key-pad mask once (re-used across all L layers' padded-attention
@@ -635,6 +657,7 @@ class Llama3BackwardService(BackwardService):
             qh_i = saved_qh_all[i][:n] if saved_qh_all else None
             kh_i = saved_kh_all[i][:n] if saved_kh_all else None
             vh_i = saved_vh_all[i][:n] if saved_vh_all else None
+            ctx_i = saved_ctx_all[i][:n] if saved_ctx_all else None
             with torch.no_grad():
                 if (self.graph_runner is not None
                         and self.graph_runner._attn_fit
@@ -643,13 +666,15 @@ class Llama3BackwardService(BackwardService):
                     # static buffers Graph A / Graph B already read.
                     cache = self.graph_runner.forward(
                         i, lw, x, gu, n,
-                        saved_qh=qh_i, saved_kh=kh_i, saved_vh=vh_i)
+                        saved_qh=qh_i, saved_kh=kh_i, saved_vh=vh_i,
+                        saved_ctx=ctx_i)
                 else:
                     cache = layer_forward(
                         x, lw, self.scaling, cos, sin,
                         seq_lens, b_start, self.dims, self.eps,
                         saved_gate_up=gu,
-                        saved_qh=qh_i, saved_kh=kh_i, saved_vh=vh_i)
+                        saved_qh=qh_i, saved_kh=kh_i, saved_vh=vh_i,
+                        saved_ctx=ctx_i)
                 if self.graph_runner is None:
                     grad_x, grads = layer_backward(
                         g, cache, lw, self.scaling, cos, sin,
