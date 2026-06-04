@@ -57,7 +57,29 @@ from typing import List, Optional, Tuple
 import aiohttp
 
 _HERE = Path(__file__).resolve().parent          # eval/
-_ROOT = _HERE.parent                             # repo root
+_ROOT = _HERE.parent                             # repo root (DeltaServe-vLLM/)
+# Per-GPU timelines/ root. The 5090 keeps its local in-repo timelines
+# (``eval/timelines/5090/``) — they were generated against that board's
+# request-rate envelope. The A100 board reuses the *shared* base
+# timelines that live at the evaluation project root
+# (``<eval>/timelines/base/``), which is the single source of truth used
+# by the cross-system pipeline (process_results.py + the comparison
+# plots). Keeps A100 runs joinable with the lms / vllm+torchtune
+# baselines without re-generating per-board copies. To add a third
+# board, drop a new entry here.
+_EVAL_ROOT = _ROOT.parent                        # <…>/evaluation/
+_TIMELINES_DIRS = {
+    "5090": _HERE / "timelines" / "5090",
+    "A100": _EVAL_ROOT / "timelines" / "base",
+}
+
+
+def resolve_timelines_dir(gpu: str) -> Path:
+    """Pick the timelines/ subdir for ``gpu``. Falls back to the
+    in-repo ``eval/timelines/<gpu>/`` layout for unknown boards so a
+    future hardware addition doesn't crash at parse-time."""
+    return _TIMELINES_DIRS.get(gpu, _HERE / "timelines" / gpu)
+
 # Map ``(--timeline-gpu, --scheduler)`` → the serving YAML that selects
 # that scheduler at engine init (via ``slo.coserving_admission_phase``).
 # The 5090 uses the original YAMLs; the A100 has its own copies with
@@ -557,17 +579,22 @@ async def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--timeline_csv", default=None,
-                    help="Schedule CSV. Default: timelines/<gpu>/timeline_live.csv")
+                    help="Schedule CSV. Default per --timeline-gpu: "
+                         "5090 → eval/timelines/5090/timeline_live.csv, "
+                         "A100 → <eval>/timelines/base/timeline_live.csv "
+                         "(shared with the cross-system pipeline).")
     ap.add_argument("--timeline-gpu", default=gpu_default, choices=["5090", "A100"],
-                    help=f"timelines/<gpu>/ subdir. Default auto-detected ({gpu_default}).")
+                    help=f"Selects the timelines/ root (see "
+                         f"resolve_timelines_dir). Default auto-detected "
+                         f"({gpu_default}).")
     ap.add_argument("--loose", action="store_true")
     ap.add_argument("--tight", action="store_true")
     ap.add_argument("--nutanix", action="store_true")
     ap.add_argument("--co", action="store_true",
                     help="Enable finetuning (co-serving). Off => inference only.")
     ap.add_argument("--warmup_count", type=int, default=1000)
-    ap.add_argument("--warmup_duration_s", type=float, default=10.0)
-    ap.add_argument("--warmup_rest_s", type=float, default=5.0)
+    ap.add_argument("--warmup_duration_s", type=float, default=20.0)
+    ap.add_argument("--warmup_rest_s", type=float, default=8.0)
     ap.add_argument("--startup-timeout", type=float, default=600.0)
     ap.add_argument("--api-server-count", type=int, default=None,
                     help="Number of frontend API server processes (shared "
@@ -634,12 +661,25 @@ async def main() -> None:
                          "inference and finetune throughput can be aligned "
                          "directly without the bench_meta anchor. The relative "
                          "t_rel_s column is preserved. Off by default.")
+    ap.add_argument("--no-trim", action="store_true",
+                    help="Skip the end-of-run bwd_log trim. By default the "
+                         "bwd_log is trimmed to the timeline window starting "
+                         "``base_ts`` seconds before the first request "
+                         "(see the run docs for the cutoff math). The trim "
+                         "drops the backward cycle that straddles the "
+                         "timeline-start boundary, which makes the FT "
+                         "throughput at timeline second 0 read as zero. "
+                         "Pass --no-trim to keep every row the backward "
+                         "process wrote, so downstream tools "
+                         "(process_results.py) can include the boundary "
+                         "cycle when binning FT throughput at the start "
+                         "of the window.")
     args = ap.parse_args()
 
     if sum(bool(x) for x in (args.loose, args.tight, args.nutanix)) > 1:
         ap.error("--loose, --tight, --nutanix are mutually exclusive")
 
-    timelines_dir = _HERE / "timelines" / args.timeline_gpu
+    timelines_dir = resolve_timelines_dir(args.timeline_gpu)
     mode: Optional[str] = None
     if args.loose:
         mode, args.timeline_csv = "loose", str(timelines_dir / "timeline_loose.csv")
@@ -858,18 +898,35 @@ async def main() -> None:
         # dropping the first ``base_ts`` seconds of finetune activity).
         if args.co and bwd_log and t_first_wall is not None:
             await asyncio.sleep(1.0)
-            # Pull base_ts straight from the loaded timeline so the
-            # cutoff adapts to whatever CSV was passed in (loose: 5.0,
-            # tight: 3.0, nutanix: 0.6, future timelines: whatever
-            # their first row says). ``timeline_rows`` is sorted
-            # ascending by ``load_timeline_csv``, so [0] is the min.
-            base_ts = timeline_rows[0].timestamp_s if timeline_rows else 0.0
-            cutoff = t_first_wall - datetime.timedelta(seconds=base_ts)
-            print(f"[bench] trimming bwd_log to >= {cutoff.isoformat(timespec='milliseconds')} "
-                  f"(t_first_wall − base_ts={base_ts:g}s, "
-                  f"from {Path(args.timeline_csv).name})", flush=True)
-            trim_bwd_log_before(bwd_log, cutoff)
+            if args.no_trim:
+                # --no-trim: keep every bwd row, including the cycle
+                # that straddles the timeline-start boundary, so
+                # downstream binning can attribute its tokens to the
+                # first window second instead of reading zero there.
+                print(f"[bench] --no-trim: keeping bwd_log as-is "
+                      f"({bwd_log})", flush=True)
+            else:
+                # Pull base_ts straight from the loaded timeline so the
+                # cutoff adapts to whatever CSV was passed in (loose: 5.0,
+                # tight: 3.0, nutanix: 0.6, future timelines: whatever
+                # their first row says). ``timeline_rows`` is sorted
+                # ascending by ``load_timeline_csv``, so [0] is the min.
+                base_ts = timeline_rows[0].timestamp_s if timeline_rows else 0.0
+                cutoff = t_first_wall - datetime.timedelta(seconds=base_ts)
+                print(f"[bench] trimming bwd_log to >= {cutoff.isoformat(timespec='milliseconds')} "
+                      f"(t_first_wall − base_ts={base_ts:g}s, "
+                      f"from {Path(args.timeline_csv).name})", flush=True)
+                trim_bwd_log_before(bwd_log, cutoff)
     finally:
+        # Give the server a 1s breather before tearing it down so the
+        # backward process can flush any in-flight bwd_log row + close
+        # files cleanly. Without this the last row(s) sometimes don't
+        # make it to disk before SIGINT propagates and the file is
+        # truncated mid-line.
+        # try:
+        #     await asyncio.sleep(1.0)
+        # except Exception:
+        #     pass
         stop.set()
         print("[bench] shutting down server", flush=True)
         terminate(proc)
