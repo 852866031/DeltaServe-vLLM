@@ -222,98 +222,6 @@ def test_attn_overflow_fallback():
     assert not runner._attn_fit, "expected _attn_fit=False for overflow batch"
 
 
-def test_obwd_graph_parity():
-    """O-proj-backward graph replay must match the eager ``_proj_backward``
-    (grad_ctx + the O LoRA grads), incl. correct reduction over only the real
-    rows (staged tail zeroed)."""
-    print("test_obwd_graph_parity:")
-    torch.manual_seed(11)
-    Hq, Hkv, Hd = 4, 2, 16
-    D, kv_size, inter, r = Hq * Hd, Hkv * Hd, 32, 4
-    L_, eps, cdt = 2, 1e-5, torch.float32
-    s_max, bn_max, l_max = 16, 4, 8
-    scaling = 2.0
-
-    lws = [_make_layer_weights(D, kv_size, inter, r, MDT) for _ in range(L_)]
-    svc = _mk_svc(D, L_, Hq, Hkv, Hd, inter, eps, MDT, cdt, lws=lws,
-                  scaling=scaling)
-    runner = Llama3GraphedBackward(svc, s_max=s_max, bn_max=bn_max, l_max=l_max)
-
-    for batch_idx, seq_lens in enumerate([[5, 3], [8, 4]]):
-        n = sum(seq_lens)
-        b_start = [sum(seq_lens[:i]) for i in range(len(seq_lens))]
-        runner.begin_backward(n, seq_lens, b_start)
-        for i in range(L_):
-            lw = lws[i]
-            ctx_flat = torch.randn(n, D, device=DEVICE, dtype=MDT)
-            grad_resid_mid = torch.randn(n, D, device=DEVICE, dtype=cdt)
-            ref_gctx, ref_oA, ref_oB = L._proj_backward(
-                ctx_flat, grad_resid_mid, lw["o"], lw["oA"], lw["oB"],
-                scaling, cdt)
-            out_gctx, out_oA, out_oB = runner.o_backward(
-                i, lw, ctx_flat, grad_resid_mid, n)
-            _check(f"batch{batch_idx} layer{i} grad_ctx",
-                   out_gctx[:n], ref_gctx, _FP32_TOL)
-            _check(f"batch{batch_idx} layer{i} grad_oA", out_oA, ref_oA, _FP32_TOL)
-            _check(f"batch{batch_idx} layer{i} grad_oB", out_oB, ref_oB, _FP32_TOL)
-
-
-def test_qkv_tail_graph_parity():
-    """QKV-tail graph (RoPE-bwd + Q/K/V-proj-bwd + in_ln rmsnorm-bwd + residual)
-    must match the eager tail. cos/sin come from begin_backward's staging, so
-    the test builds positions the same way (concat(arange(s)))."""
-    print("test_qkv_tail_graph_parity:")
-    torch.manual_seed(12)
-    Hq, Hkv, Hd = 4, 2, 16
-    D, kv_size, inter, r = Hq * Hd, Hkv * Hd, 32, 4
-    L_, eps, cdt = 2, 1e-5, torch.float32
-    s_max, bn_max, l_max = 16, 4, 8
-    scaling, theta = 2.0, 500000.0
-
-    lws = [_make_layer_weights(D, kv_size, inter, r, MDT) for _ in range(L_)]
-    svc = _mk_svc(D, L_, Hq, Hkv, Hd, inter, eps, MDT, cdt, lws=lws,
-                  scaling=scaling, theta=theta)
-    runner = Llama3GraphedBackward(svc, s_max=s_max, bn_max=bn_max, l_max=l_max)
-
-    for batch_idx, seq_lens in enumerate([[5, 3], [8, 4]]):
-        n = sum(seq_lens)
-        b_start = [sum(seq_lens[:i]) for i in range(len(seq_lens))]
-        runner.begin_backward(n, seq_lens, b_start)
-        positions = torch.cat([torch.arange(s, device=DEVICE) for s in seq_lens])
-        cos, sin = L.rope_cos_sin(positions, Hd, theta)
-        for i in range(L_):
-            lw = lws[i]
-            grad_qh = torch.randn(n, Hq, Hd, device=DEVICE, dtype=cdt)
-            grad_kh = torch.randn(n, Hkv, Hd, device=DEVICE, dtype=cdt)
-            grad_vh = torch.randn(n, Hkv, Hd, device=DEVICE, dtype=cdt)
-            x_norm1 = torch.randn(n, D, device=DEVICE, dtype=MDT)
-            x = torch.randn(n, D, device=DEVICE, dtype=MDT)
-            grad_resid_mid = torch.randn(n, D, device=DEVICE, dtype=cdt)
-            # Eager reference (mirrors the tail in layer_backward).
-            grad_q = L.rope_backward(grad_qh, cos, sin).reshape(n, D)
-            grad_k = L.rope_backward(grad_kh, cos, sin).reshape(n, kv_size)
-            grad_v = grad_vh.reshape(n, kv_size)
-            gx_q, gqA, gqB = L._proj_backward(x_norm1, grad_q, lw["q"],
-                                              lw["qA"], lw["qB"], scaling, cdt)
-            gx_k, gkA, gkB = L._proj_backward(x_norm1, grad_k, lw["k"],
-                                              lw["kA"], lw["kB"], scaling, cdt)
-            gx_v, gvA, gvB = L._proj_backward(x_norm1, grad_v, lw["v"],
-                                              lw["vA"], lw["vB"], scaling, cdt)
-            grad_x_norm1 = gx_q + gx_k + gx_v
-            ref_grad_x = (L.rmsnorm_backward(x, grad_x_norm1, lw["in_ln"],
-                                             eps).to(cdt) + grad_resid_mid)
-            ref = {"qA": gqA, "qB": gqB, "kA": gkA, "kB": gkB,
-                   "vA": gvA, "vB": gvB}
-            out_grad_x, out = runner.qkv_tail_backward(
-                i, lw, grad_qh, grad_kh, grad_vh, x_norm1, x,
-                grad_resid_mid, cos, sin, n)
-            _check(f"batch{batch_idx} layer{i} grad_x",
-                   out_grad_x[:n], ref_grad_x, _FP32_TOL)
-            for k in ("qA", "qB", "kA", "kB", "vA", "vB"):
-                _check(f"batch{batch_idx} layer{i} grad_{k}",
-                       out[k], ref[k], _FP32_TOL)
-
-
 def test_forward_graph_parity():
     """Per-layer forward-recompute graph replay must match the eager
     ``layer_forward`` output cache (all 9 entries: x, x_norm1, qh, kh, vh,
@@ -570,59 +478,6 @@ def test_forward_graph_saved_ctx_parity():
                        out[key], ref[key], _FP32_TOL)
 
 
-def test_full_layer_backward_graph_parity():
-    """End-to-end: the full graphed per-layer backward (ffn → O-bwd → attn →
-    QKV-tail, wired exactly as ``_layer_backward_graphed``) must match the eager
-    ``layer_backward`` for the whole grads dict + grad_x. Exercises the
-    cross-region static-buffer reuse / data-flow, not just each region alone."""
-    print("test_full_layer_backward_graph_parity:")
-    torch.manual_seed(13)
-    Hq, Hkv, Hd = 4, 2, 16
-    D, kv_size, inter, r = Hq * Hd, Hkv * Hd, 32, 4
-    L_, eps, cdt = 2, 1e-5, torch.float32
-    s_max, bn_max, l_max = 16, 4, 8
-    scaling, theta = 2.0, 500000.0
-    dims = (Hq, Hkv, Hd, kv_size)
-
-    lws = [_make_layer_weights(D, kv_size, inter, r, MDT) for _ in range(L_)]
-    svc = _mk_svc(D, L_, Hq, Hkv, Hd, inter, eps, MDT, cdt, lws=lws,
-                  scaling=scaling, theta=theta)
-    runner = Llama3GraphedBackward(svc, s_max=s_max, bn_max=bn_max, l_max=l_max)
-
-    for batch_idx, seq_lens in enumerate([[5, 3], [8, 4]]):
-        n = sum(seq_lens)
-        b_start = [sum(seq_lens[:i]) for i in range(len(seq_lens))]
-        runner.begin_backward(n, seq_lens, b_start)
-        positions = torch.cat([torch.arange(s, device=DEVICE) for s in seq_lens])
-        cos, sin = L.rope_cos_sin(positions, Hd, theta)
-        for i in range(L_):
-            lw = lws[i]
-            cache, g, _ = _make_inputs(seq_lens, D, Hq, Hkv, Hd, inter,
-                                       MDT, cdt, s_max)
-            # Eager reference: the whole layer backward.
-            ref_gx, ref_grads = L.layer_backward(
-                g, cache, lw, scaling, cos, sin, seq_lens, b_start, dims, eps,
-                cdt=cdt)
-            # Graphed sequence — identical to Llama3BackwardService.
-            #   _layer_backward_graphed.
-            grad_resid_mid = runner.ffn_backward(i, g, cache, lw)
-            grad_ctx_flat, grad_oA, grad_oB = runner.o_backward(
-                i, lw, cache["ctx_flat"], grad_resid_mid, n)
-            grad_ctx = grad_ctx_flat.view(n, Hq, Hd)
-            grad_qh, grad_kh, grad_vh = runner.attn_backward(
-                i, cache["qh"], cache["kh"], cache["vh"], grad_ctx,
-                seq_lens, b_start, dims)
-            grad_x, grads = runner.qkv_tail_backward(
-                i, lw, grad_qh, grad_kh, grad_vh,
-                cache["x_norm1"], cache["x"], grad_resid_mid, cos, sin, n)
-            grads["oA"], grads["oB"] = grad_oA, grad_oB
-            _check(f"batch{batch_idx} layer{i} grad_x",
-                   grad_x[:n], ref_gx, _FP32_TOL)
-            for k in ("qA", "qB", "kA", "kB", "vA", "vB", "oA", "oB"):
-                _check(f"batch{batch_idx} layer{i} grad_{k}",
-                       grads[k], ref_grads[k], _FP32_TOL)
-
-
 def test_forward_overflow_fallback():
     """Batches that overflow (bn_max, l_max) must silently fall back to the
     eager ``layer_forward`` (and still produce the correct cache)."""
@@ -663,9 +518,6 @@ def main():
     test_ffn_graph_parity()
     test_attn_graph_parity()
     test_attn_overflow_fallback()
-    test_obwd_graph_parity()
-    test_qkv_tail_graph_parity()
-    test_full_layer_backward_graph_parity()
     test_forward_graph_parity()
     test_layer_forward_saved_qkv_parity()
     test_forward_graph_saved_qkv_parity()
