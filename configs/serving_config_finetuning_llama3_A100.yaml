@@ -53,7 +53,7 @@ slo:
   # next_sample.input_len AND SLO allows. 0.0 disables (default);
   # 1.0 reproduces the old `match_with_prefill_workload: true` behaviour;
   # >1 admits more aggressively; <1 more conservatively.
-  match_prefill_workload_factor: 1.2
+  match_prefill_workload_factor: 0
   # [unified-phase only] TBT-budget multiplier on decode-only steps when FT
   # is being considered for admission. Inert in this (prefill-only) config —
   # decode-only steps short-circuit to no FT regardless. Exposed here for
