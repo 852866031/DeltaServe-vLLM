@@ -693,15 +693,8 @@ class Llama3BackwardService(BackwardService):
             for proj in _PROJ:
                 pa, pb = ld.get(proj, {}).get("A"), ld.get(proj, {}).get("B")
                 if pa is not None:
-                    # copy=True is load-bearing: the graphed backward returns
-                    # VIEWS into reused static LoRA-grad buffers, so .grad must
-                    # be a private copy (else the next layer's replay clobbers
-                    # it, and the per-layer clip would scale the static buffer).
-                    # No-op-cheap for the eager path (fresh tensors). Forces a
-                    # copy even when bwd_dtype is already fp32 (where a plain
-                    # .float() would alias).
-                    pa.grad = grads[proj + "A"].to(torch.float32, copy=True)
-                    pb.grad = grads[proj + "B"].to(torch.float32, copy=True)
+                    pa.grad = grads[proj + "A"].float()
+                    pb.grad = grads[proj + "B"].float()
                     layer_params += [pa, pb]
             if layer_params:
                 torch.nn.utils.clip_grad_norm_(layer_params, max_norm=1.0)
@@ -722,25 +715,27 @@ class Llama3BackwardService(BackwardService):
     @torch.no_grad()
     def _layer_backward_graphed(self, i, g, cache, lw, cos, sin,
                                 seq_lens, b_start):
-        """Fully-graphed per-layer backward: Graph A (FFN-bwd) → Graph O
-        (O-proj-bwd) → pause (yield GPU to inference) → Graph B (padded-attn-bwd)
-        → Graph D (RoPE / Q-K-V proj / in_ln rmsnorm tail). Same gradient values
-        as the eager ``layer_backward``; differs only in *when* host dispatch
-        happens. Each region silently falls back to its eager helper on
-        capture/replay failure or padded-budget overflow.
+        """Graphed per-layer backward: Graph A (FFN-bwd) → eager O-bwd → pause
+        (yield GPU to inference) → Graph B (padded-attn-bwd) → eager tail
+        (RoPE / Q-K-V proj / in_ln rmsnorm). Same gradient values as the eager
+        ``layer_backward``; differs only in *when* host dispatch happens.
 
-        Pause cadence: once per layer, between the O-bwd and attn graphs — the
-        eager path's once-per-layer pause is preserved (the captured region
-        can't host an mp.Event.wait anyway)."""
-        Hq, _, Hd, _ = self.dims
+        Pause cadence: once per layer, between the two graphs — the eager
+        path's once-per-layer pause-at-start is preserved, just relocated to
+        the mid-layer point so each graph runs without yielding (the captured
+        region can't host an mp.Event.wait anyway)."""
+        cdt = self.bwd_dtype
+        Hq, _, Hd, kv_size = self.dims
         n = g.shape[0]
+        D = Hq * Hd
 
         # --- Graph A: FFN-bwd (frozen MLP, with residual) ---
         grad_resid_mid = self.graph_runner.ffn_backward(i, g, cache, lw)
 
-        # --- Graph O: O-projection backward (LoRA grad lives here) ---
-        grad_ctx_flat, grad_oA, grad_oB = self.graph_runner.o_backward(
-            i, lw, cache["ctx_flat"], grad_resid_mid, n)
+        # --- Eager: O-projection backward (LoRA grad lives here) ---
+        grad_ctx_flat, grad_oA, grad_oB = _proj_backward(
+            cache["ctx_flat"], grad_resid_mid, lw["o"],
+            lw["oA"], lw["oB"], self.scaling, cdt)
 
         # --- Yield GPU to inference between graphs (preserves the load-bearing
         # per-layer pause cadence; mp.Event.wait can't run inside a graph). ---
@@ -752,11 +747,23 @@ class Llama3BackwardService(BackwardService):
             i, cache["qh"], cache["kh"], cache["vh"], grad_ctx,
             seq_lens, b_start, self.dims)
 
-        # --- Graph D: RoPE bwd → Q/K/V proj bwd → in_ln rmsnorm bwd tail ---
-        grad_x, grads = self.graph_runner.qkv_tail_backward(
-            i, lw, grad_qh, grad_kh, grad_vh,
-            cache["x_norm1"], cache["x"], grad_resid_mid, cos, sin, n)
-        grads["oA"], grads["oB"] = grad_oA, grad_oB
+        # --- Eager tail: RoPE bwd → Q/K/V proj bwd → in_ln rmsnorm bwd ---
+        grad_q = rope_backward(grad_qh, cos, sin).reshape(n, D)
+        grad_k = rope_backward(grad_kh, cos, sin).reshape(n, kv_size)
+        grad_v = grad_vh.reshape(n, kv_size)
+        xn1 = cache["x_norm1"]
+        gx_q, grad_qA, grad_qB = _proj_backward(
+            xn1, grad_q, lw["q"], lw["qA"], lw["qB"], self.scaling, cdt)
+        gx_k, grad_kA, grad_kB = _proj_backward(
+            xn1, grad_k, lw["k"], lw["kA"], lw["kB"], self.scaling, cdt)
+        gx_v, grad_vA, grad_vB = _proj_backward(
+            xn1, grad_v, lw["v"], lw["vA"], lw["vB"], self.scaling, cdt)
+        grad_x_norm1 = gx_q + gx_k + gx_v
+        grad_x = rmsnorm_backward(
+            cache["x"], grad_x_norm1, lw["in_ln"], self.eps).to(cdt) + grad_resid_mid
+
+        grads = {"qA": grad_qA, "qB": grad_qB, "kA": grad_kA, "kB": grad_kB,
+                 "vA": grad_vA, "vB": grad_vB, "oA": grad_oA, "oB": grad_oB}
         return grad_x, grads
 
     @torch.no_grad()
