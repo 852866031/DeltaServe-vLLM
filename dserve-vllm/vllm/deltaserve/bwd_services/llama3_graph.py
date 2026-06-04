@@ -14,23 +14,34 @@ service. Two graphs per layer:
     cached qh/kh/vh + grad_ctx (scatter in, compute, gather out). Bounds come
     from ``finetune.backward_cuda_graph_attn_{bn_max,l_max}``.
 
-Everything outside these two regions stays eager (forward remat, O-proj bwd,
-RoPE bwd, Q/K/V-proj bwd, in_ln rmsnorm bwd, optimizer/publish). ``_maybe_pause``
-is the caller's responsibility — they invoke it BETWEEN our two replays each
-layer so the GPU-yield contract is preserved at the same per-layer cadence as
-the all-eager path.
+Plus (item-1 / "graph the eager tail") two more per-layer regions so the whole
+per-layer backward is captured:
 
-Capture-failure / shape-fit-failure handling per layer is silent eager fallback:
-the runner adds the layer id to ``ffn_failed`` / ``attn_failed`` and forwards
-to ``ffn_backward_core`` / ``attn_backward_core`` from ``llama3.py`` for the
-rest of the run. Gradient values are bit-identical to eager (same math, just
-replayed under fixed shapes).
+  * **O-proj-backward graph** — ``_proj_backward`` for the O projection (LoRA
+    grad + grad_ctx), run between the FFN and attention graphs.
+  * **QKV-tail graph** — RoPE-bwd + Q/K/V-proj-bwd (LoRA grad) + in_ln
+    rmsnorm-bwd + the residual add, run after the attention graph.
+
+So per layer: forward-remat → FFN-bwd → O-bwd → [pause] → attn-bwd → QKV-tail.
+``_maybe_pause`` is still the caller's responsibility, invoked BETWEEN the
+O-bwd and attn-bwd replays so the GPU-yield contract keeps its per-layer cadence.
+
+These two new regions write LoRA grads (``grad_qA/qB/kA/kB/vA/vB/oA/oB``) into
+persistent static buffers; the caller copies them to the fp32 master ``.grad``
+after replay. Because the LoRA grads are reduced (summed) over the token
+dimension, the padded tail rows of every staged input MUST be zeroed (else they
+contaminate the reduction) — ``_stage_*`` does this.
+
+Capture-failure / shape-fit-failure handling per region is silent eager
+fallback: the runner records the layer id in ``ffn_failed`` / ``attn_failed`` /
+``obwd_failed`` / ``tail_failed`` (or the per-backward ``_attn_fit`` gate) and
+forwards to the eager ``llama3.py`` helpers for the rest of the run. Gradient
+values are bit-identical to eager (same math, just replayed under fixed shapes).
 
 Persistent static IO buffers live OUTSIDE the shared graph pool — the
 DeltaServe reference's load-bearing rule (``SFT_service_graph.py`` lines
 111–113 vs ``graph_pool_handle()`` at line 114) for avoiding pool-aliasing
-NaN traps. We don't capture LoRA-grad writes here (Q/K/V/O proj backwards stay
-eager, so ``nn.Parameter.grad`` ownership doesn't change vs the eager path).
+NaN traps. This includes the LoRA-grad output buffers.
 """
 
 from __future__ import annotations
@@ -43,11 +54,14 @@ import torch
 from vllm.deltaserve import dprint
 from vllm.deltaserve.bwd_services.llama3 import (
     _proj,
+    _proj_backward,
     apply_rope,
     attn_backward_core,
     ffn_backward_core,
     layer_forward,
     rmsnorm,
+    rmsnorm_backward,
+    rope_backward,
     rope_cos_sin,
 )
 
@@ -121,6 +135,17 @@ class Llama3GraphedBackward:
         # eager backward tail. Per-layer eager fallback (``fwd_failed``).
         self._fwd_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.fwd_failed: set[int] = set()
+        # Per-layer O-projection-backward graphs + the QKV-tail (RoPE-bwd +
+        # Q/K/V-proj-bwd + in_ln rmsnorm-bwd + residual) graphs. Per-layer
+        # because Q/K/V/O base + LoRA weights are layer-specific. Both write
+        # LoRA grads into persistent static buffers. Per-layer eager fallback.
+        self._obwd_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self.obwd_failed: set[int] = set()
+        self._tail_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self.tail_failed: set[int] = set()
+        # LoRA-grad output buffers are allocated lazily on first capture (their
+        # shape needs the LoRA rank ``r`` read off the layer weights).
+        self._lora_grad_bufs_ready = False
 
         # Single graph pool for both regions. Static IO is allocated BEFORE
         # any capture call so it lives in the default caching allocator, not
@@ -250,6 +275,30 @@ class Llama3GraphedBackward:
         self.static_vh_flat = torch.zeros((s, Hkv, Hd), dtype=mdt, device=dev)
         self.static_ctx_flat = torch.zeros((s, D), dtype=mdt, device=dev)
 
+        # ---- O-bwd / QKV-tail graph outputs (cdt) ----
+        # grad to ctx (O-bwd output → scattered into the attn graph's grad_ctx),
+        # and grad_x (QKV-tail output → chained to the next layer down).
+        self.static_grad_ctx_flat = torch.zeros((s, D), dtype=cdt, device=dev)
+        self.static_grad_x = torch.zeros((s, D), dtype=cdt, device=dev)
+        # LoRA grad output buffers (static_grad_qA/qB/...) are allocated lazily
+        # in ``_ensure_lora_grad_bufs`` once the LoRA rank is known.
+
+    def _ensure_lora_grad_bufs(self, lw: dict) -> None:
+        """Allocate the 8 persistent LoRA-grad output buffers (q/k/v/o × A/B),
+        sized from the layer's LoRA weights. Idempotent. Allocated OUTSIDE any
+        graph pool (called before the capture context)."""
+        if self._lora_grad_bufs_ready:
+            return
+        dev, cdt = self.device, self.cdt
+        # A: [r, in]; B: [out, r]. Same rank across projections.
+        def z(t):
+            return torch.zeros(tuple(t.shape), dtype=cdt, device=dev)
+        self.static_grad_qA = z(lw["qA"]); self.static_grad_qB = z(lw["qB"])
+        self.static_grad_kA = z(lw["kA"]); self.static_grad_kB = z(lw["kB"])
+        self.static_grad_vA = z(lw["vA"]); self.static_grad_vB = z(lw["vB"])
+        self.static_grad_oA = z(lw["oA"]); self.static_grad_oB = z(lw["oB"])
+        self._lora_grad_bufs_ready = True
+
     # ---------------------------------------------------------------- prepare
 
     def prepare(self) -> None:
@@ -301,6 +350,23 @@ class Llama3GraphedBackward:
                 dprint(f"[bwd-graph] forward layer {i} startup capture failed: "
                        f"{e}; will fall back to eager at runtime")
 
+        # O-proj-bwd + QKV-tail: one graph per layer each (Q/K/V/O LoRA
+        # addresses vary). Static cos/sin already staged by begin_backward.
+        for i in range(L):
+            try:
+                self._capture_obwd(i, self.svc._layer_weights(i))
+            except Exception as e:  # noqa: BLE001
+                self.obwd_failed.add(i)
+                dprint(f"[bwd-graph] O-bwd layer {i} startup capture failed: "
+                       f"{e}; will fall back to eager at runtime")
+        for i in range(L):
+            try:
+                self._capture_qkv_tail(i, self.svc._layer_weights(i))
+            except Exception as e:  # noqa: BLE001
+                self.tail_failed.add(i)
+                dprint(f"[bwd-graph] QKV-tail layer {i} startup capture failed: "
+                       f"{e}; will fall back to eager at runtime")
+
         # Reset per-backward state — the real first backward calls
         # begin_backward again with its own seq_lens.
         self._cur_n = 0
@@ -313,11 +379,15 @@ class Llama3GraphedBackward:
 
         captured_ffn = L - len(self.ffn_failed)
         captured_fwd = L - len(self.fwd_failed)
+        captured_obwd = L - len(self.obwd_failed)
+        captured_tail = L - len(self.tail_failed)
         attn_status = "0/1" if self.attn_failed else "1/1"
         elapsed = (time.perf_counter() - t0) * 1000.0
         dprint(
             f"[bwd-graph] pre-captured forward {captured_fwd}/{L} + "
-            f"FFN {captured_ffn}/{L} + attn {attn_status} in {elapsed:.0f}ms")
+            f"FFN {captured_ffn}/{L} + attn {attn_status} + "
+            f"O-bwd {captured_obwd}/{L} + QKV-tail {captured_tail}/{L} "
+            f"in {elapsed:.0f}ms")
 
     # ----------------------------------------------------------- per-backward
 
@@ -476,6 +546,193 @@ class Llama3GraphedBackward:
         self.static_up[:n].copy_(cache["up"])
         if n < s:
             self.static_up[n:].zero_()
+
+    # ----------------------------------------------------- O-proj backward
+
+    def _obwd_core(self, lw: dict) -> None:
+        """Captureable O-projection backward. Reads ``static_ctx_flat`` (o_proj
+        input) + ``static_grad_resid_mid`` (FFN-bwd output); writes
+        ``static_grad_ctx_flat`` + the O LoRA grads. The tail of
+        ``static_grad_resid_mid`` is zeroed by ``_stage_obwd_inputs`` so the
+        reduced LoRA grads aren't contaminated by padded rows."""
+        gctx, goA, goB = _proj_backward(
+            self.static_ctx_flat, self.static_grad_resid_mid,
+            lw["o"], lw["oA"], lw["oB"], self.svc.scaling, self.cdt)
+        self.static_grad_ctx_flat.copy_(gctx)
+        self.static_grad_oA.copy_(goA)
+        self.static_grad_oB.copy_(goB)
+
+    def _stage_obwd_inputs(self, ctx_flat: torch.Tensor,
+                           grad_resid_mid: torch.Tensor, n: int) -> None:
+        s = self.s_max
+        self.static_ctx_flat[:n].copy_(ctx_flat)
+        if n < s:
+            self.static_ctx_flat[n:].zero_()
+        gr = grad_resid_mid
+        if gr.dtype != self.cdt:
+            gr = gr.to(self.cdt)
+        self.static_grad_resid_mid[:n].copy_(gr)
+        if n < s:
+            self.static_grad_resid_mid[n:].zero_()
+
+    def _capture_obwd(self, layer_id: int, lw: dict) -> None:
+        self._ensure_lora_grad_bufs(lw)
+        for _ in range(self._N_WARMUP):
+            self._obwd_core(lw)
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, pool=self._graph_pool, stream=self._stream):
+            self._obwd_core(lw)
+        self._obwd_graphs[layer_id] = g
+
+    def o_backward(self, layer_id: int, lw: dict, ctx_flat: torch.Tensor,
+                   grad_resid_mid: torch.Tensor, n: int):
+        """Graphed O-proj backward. Returns (grad_ctx_flat_view, grad_oA,
+        grad_oB). Silent eager fallback when the batch overflowed the padded
+        budget (``_attn_fit`` False) or this layer's capture/replay raised."""
+        if not self._attn_fit or layer_id in self.obwd_failed:
+            return _proj_backward(ctx_flat, grad_resid_mid, lw["o"],
+                                  lw["oA"], lw["oB"], self.svc.scaling, self.cdt)
+        self._stage_obwd_inputs(ctx_flat, grad_resid_mid, n)
+        if layer_id not in self._obwd_graphs:
+            try:
+                self._capture_obwd(layer_id, lw)
+            except Exception as e:  # noqa: BLE001
+                self.obwd_failed.add(layer_id)
+                dprint(f"[bwd-graph] O-bwd capture failed for layer {layer_id}: "
+                       f"{e}; falling back to eager for this layer")
+                return _proj_backward(ctx_flat, grad_resid_mid, lw["o"],
+                                      lw["oA"], lw["oB"], self.svc.scaling,
+                                      self.cdt)
+        try:
+            self._obwd_graphs[layer_id].replay()
+        except Exception as e:  # noqa: BLE001
+            self.obwd_failed.add(layer_id)
+            dprint(f"[bwd-graph] O-bwd replay failed for layer {layer_id}: "
+                   f"{e}; falling back to eager for this layer")
+            return _proj_backward(ctx_flat, grad_resid_mid, lw["o"],
+                                  lw["oA"], lw["oB"], self.svc.scaling, self.cdt)
+        return (self.static_grad_ctx_flat[:n],
+                self.static_grad_oA, self.static_grad_oB)
+
+    # ------------------------------------- QKV-tail (RoPE + Q/K/V-proj + in_ln)
+
+    def _qkv_tail_core(self, lw: dict) -> None:
+        """Captureable backward tail: RoPE-bwd → Q/K/V-proj-bwd (LoRA grad) →
+        in_ln rmsnorm-bwd + residual. Reads ``static_grad_{qh,kh,vh}`` (attn-bwd
+        output, flat), ``static_x_norm1`` (Q/K/V LoRA-A input), ``static_cos/sin``,
+        ``static_layer_in`` (= x, for in_ln rmsnorm-bwd), ``static_grad_resid_mid``
+        (residual add). Writes ``static_grad_x`` + the Q/K/V LoRA grads. Tails of
+        ``static_grad_{qh,kh,vh}`` are zeroed in ``_stage_tail_inputs`` so the
+        reduced LoRA grads aren't contaminated."""
+        s, D = self.s_max, self.D
+        Hq, Hkv, Hd = self.Hq, self.Hkv, self.Hd
+        kv_size = Hkv * Hd
+        scaling, cdt, eps = self.svc.scaling, self.cdt, self.eps
+        grad_q = rope_backward(self.static_grad_qh,
+                               self.static_cos, self.static_sin).reshape(s, D)
+        grad_k = rope_backward(self.static_grad_kh,
+                               self.static_cos, self.static_sin).reshape(s, kv_size)
+        grad_v = self.static_grad_vh.reshape(s, kv_size)
+        xn1 = self.static_x_norm1
+        gx_q, gqA, gqB = _proj_backward(xn1, grad_q, lw["q"], lw["qA"], lw["qB"],
+                                        scaling, cdt)
+        gx_k, gkA, gkB = _proj_backward(xn1, grad_k, lw["k"], lw["kA"], lw["kB"],
+                                        scaling, cdt)
+        gx_v, gvA, gvB = _proj_backward(xn1, grad_v, lw["v"], lw["vA"], lw["vB"],
+                                        scaling, cdt)
+        grad_x_norm1 = gx_q + gx_k + gx_v
+        grad_x = (rmsnorm_backward(self.static_layer_in, grad_x_norm1,
+                                   lw["in_ln"], eps).to(cdt)
+                  + self.static_grad_resid_mid)
+        self.static_grad_x.copy_(grad_x)
+        self.static_grad_qA.copy_(gqA); self.static_grad_qB.copy_(gqB)
+        self.static_grad_kA.copy_(gkA); self.static_grad_kB.copy_(gkB)
+        self.static_grad_vA.copy_(gvA); self.static_grad_vB.copy_(gvB)
+
+    def _stage_tail_inputs(self, grad_qh: torch.Tensor, grad_kh: torch.Tensor,
+                           grad_vh: torch.Tensor, x_norm1: torch.Tensor,
+                           x: torch.Tensor, grad_resid_mid: torch.Tensor,
+                           n: int) -> None:
+        s = self.s_max
+        def _stage(dst, src, to_cdt=False):
+            if to_cdt and src.dtype != self.cdt:
+                src = src.to(self.cdt)
+            dst[:n].copy_(src)
+            if n < s:
+                dst[n:].zero_()
+        # grad_qh/kh/vh tails MUST be zero (they drive the reduced LoRA grads).
+        _stage(self.static_grad_qh, grad_qh)
+        _stage(self.static_grad_kh, grad_kh)
+        _stage(self.static_grad_vh, grad_vh)
+        _stage(self.static_x_norm1, x_norm1)
+        _stage(self.static_layer_in, x)
+        _stage(self.static_grad_resid_mid, grad_resid_mid, to_cdt=True)
+
+    def _capture_qkv_tail(self, layer_id: int, lw: dict) -> None:
+        self._ensure_lora_grad_bufs(lw)
+        for _ in range(self._N_WARMUP):
+            self._qkv_tail_core(lw)
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, pool=self._graph_pool, stream=self._stream):
+            self._qkv_tail_core(lw)
+        self._tail_graphs[layer_id] = g
+
+    def qkv_tail_backward(self, layer_id: int, lw: dict,
+                          grad_qh: torch.Tensor, grad_kh: torch.Tensor,
+                          grad_vh: torch.Tensor, x_norm1: torch.Tensor,
+                          x: torch.Tensor, grad_resid_mid: torch.Tensor,
+                          cos: torch.Tensor, sin: torch.Tensor, n: int):
+        """Graphed RoPE + Q/K/V-proj + in_ln rmsnorm backward. Returns
+        (grad_x_view, grads_dict with qA/qB/kA/kB/vA/vB). Silent eager fallback
+        when the batch overflowed (``_attn_fit`` False) or capture/replay
+        raised."""
+        Hq, Hd = self.Hq, self.Hd
+        D = Hq * Hd
+        kv_size = self.Hkv * Hd
+        cdt, scaling, eps = self.cdt, self.svc.scaling, self.eps
+
+        def _eager():
+            grad_q = rope_backward(grad_qh, cos, sin).reshape(n, D)
+            grad_k = rope_backward(grad_kh, cos, sin).reshape(n, kv_size)
+            grad_v = grad_vh.reshape(n, kv_size)
+            gx_q, gqA, gqB = _proj_backward(x_norm1, grad_q, lw["q"], lw["qA"],
+                                            lw["qB"], scaling, cdt)
+            gx_k, gkA, gkB = _proj_backward(x_norm1, grad_k, lw["k"], lw["kA"],
+                                            lw["kB"], scaling, cdt)
+            gx_v, gvA, gvB = _proj_backward(x_norm1, grad_v, lw["v"], lw["vA"],
+                                            lw["vB"], scaling, cdt)
+            grad_x_norm1 = gx_q + gx_k + gx_v
+            grad_x = (rmsnorm_backward(x, grad_x_norm1, lw["in_ln"], eps).to(cdt)
+                      + grad_resid_mid)
+            grads = {"qA": gqA, "qB": gqB, "kA": gkA, "kB": gkB,
+                     "vA": gvA, "vB": gvB}
+            return grad_x, grads
+
+        if not self._attn_fit or layer_id in self.tail_failed:
+            return _eager()
+        self._stage_tail_inputs(grad_qh, grad_kh, grad_vh, x_norm1, x,
+                                grad_resid_mid, n)
+        if layer_id not in self._tail_graphs:
+            try:
+                self._capture_qkv_tail(layer_id, lw)
+            except Exception as e:  # noqa: BLE001
+                self.tail_failed.add(layer_id)
+                dprint(f"[bwd-graph] QKV-tail capture failed for layer "
+                       f"{layer_id}: {e}; falling back to eager for this layer")
+                return _eager()
+        try:
+            self._tail_graphs[layer_id].replay()
+        except Exception as e:  # noqa: BLE001
+            self.tail_failed.add(layer_id)
+            dprint(f"[bwd-graph] QKV-tail replay failed for layer {layer_id}: "
+                   f"{e}; falling back to eager for this layer")
+            return _eager()
+        grads = {"qA": self.static_grad_qA, "qB": self.static_grad_qB,
+                 "kA": self.static_grad_kA, "kB": self.static_grad_kB,
+                 "vA": self.static_grad_vA, "vB": self.static_grad_vB}
+        return self.static_grad_x[:n], grads
 
     # ----------------------------------------------------- padded-attention
 
