@@ -56,7 +56,7 @@ slo:
   # "both" mode the counter still only accumulates on prefill-carrying
   # steps (so long decode-only stretches naturally rate-limit FT once
   # banked credit is consumed).
-  match_prefill_workload_factor: 0.0
+  match_prefill_workload_factor: 2
 
 # Observability knobs (folded into FinetuneConfig by the loader).
 debug:

@@ -50,6 +50,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import random
+import string
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -291,7 +293,7 @@ def build_server_cmd(co: bool, bwd_log_path: Optional[str],
 # ----------------------------------------------------------------------
 # Request helpers
 # ----------------------------------------------------------------------
-def make_prompt_from_length(prompt_length: int) -> str:
+def make_prompt_from_length_1(prompt_length: int) -> str:
     """Deterministic char-length prompt (matches the DeltaServe harness)."""
     base = "Instruction:\n"
     tail = "\n### Response: "
@@ -302,6 +304,13 @@ def make_prompt_from_length(prompt_length: int) -> str:
         prompt += "x" * (prompt_length - len(prompt))
     return prompt[:prompt_length]
 
+
+def make_prompt_from_length(length: int) -> str:
+    words = []
+    for _ in range(max(1, length)):
+        word = "".join(random.choices(string.ascii_lowercase, k=random.randint(3, 5)))
+        words.append(word)
+    return " ".join(words).capitalize() + "."
 
 async def start_finetuning(server: str) -> bool:
     """POST /start_finetuning to open FT admission (called right BEFORE
