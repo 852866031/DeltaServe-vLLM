@@ -13,6 +13,9 @@ Selected via scheduler_config.scheduler_cls when finetune.enable_finetuning is
 set (wired in VllmConfig.__post_init__).
 """
 
+import csv
+import datetime
+import os
 import time
 
 from vllm.config import CUDAGraphMode
@@ -107,6 +110,13 @@ class FinetuneScheduler(AsyncScheduler):
         self._tracker = StepExecutionTracker()
         self._stats_csv_path = getattr(
             ft_cfg, "batch_prediction_stats_path", None)
+        # [validate_estimator] Per-batch predicted-vs-actual append mode.
+        self._validate_estimator = bool(
+            getattr(ft_cfg, "validate_estimator", False))
+        self._validation_path = (
+            getattr(ft_cfg, "estimator_validation_path", None)
+            or self._stats_csv_path)
+        self._validation_header_written = False
         # SLO targets (seconds) for the admission gate.
         self._ttft_slo = float(ft_cfg.ttft_slo)
         self._max_tbt_slo = float(ft_cfg.max_tbt_slo)
@@ -406,16 +416,30 @@ class FinetuneScheduler(AsyncScheduler):
                 continue
             if req.lora_request and req.lora_request.lora_int_id > 0:
                 lora_ids.add(req.lora_request.lora_int_id)
+            # NB: `super().schedule()` has already run `_update_after_schedule`
+            # (base Scheduler), which advanced `req.num_computed_tokens` by the
+            # tokens scheduled THIS step. Reconstruct the pre-step computed
+            # count so a request that finishes its prefill in a single step —
+            # and every prefill-only FT sample — is still classified as prefill.
+            # Reading the post-step value made every single-step prefill (and
+            # every FT sample, which is always single-step) look like a decode
+            # with t_in=t_ft=0, silently starving the inf_prefill / eager regime
+            # fits of the online refit (they would only ever see the rare
+            # multi-chunk prefill's non-final chunks).
+            n_sched = int(n)
+            pre_computed = req.num_computed_tokens - n_sched
             # Prefill iff this step is still consuming prompt tokens; otherwise
             # the request is generating (decode). FT reqs are prefill-only.
-            if req.num_computed_tokens < req.num_prompt_tokens:
-                prefill_lens.append(int(n))
-                t_in += n
+            if pre_computed < req.num_prompt_tokens:
+                prefill_lens.append(n_sched)
+                t_in += n_sched
                 if getattr(req, "is_finetuning", False):
-                    t_ft += n
+                    t_ft += n_sched
             else:
                 b_d += 1
-                k += req.num_computed_tokens
+                # Pre-step context length — matches `_current_step_features`,
+                # which sums running reqs' `num_computed_tokens` BEFORE schedule.
+                k += pre_computed
         feats = StepFeatures(
             t_in=t_in, p=len(prefill_lens), t_ft=t_ft, b_d=b_d, k=k,
             prefill_lens=prefill_lens or None)
@@ -518,10 +542,50 @@ class FinetuneScheduler(AsyncScheduler):
         """Dump predicted-vs-actual step stats (called on FT exit)."""
         self._tracker.write_prediction_stats_csv(self._stats_csv_path)
 
+    def _append_validation_row(self, feats, dur, was_graph, predicted) -> None:
+        """[validate_estimator] Append one (predicted, actual, features) row for
+        a just-completed step to ``self._validation_path``. Header on first
+        write (in-process guard, no per-row stat()). Mirrors the coordinator's
+        ``_write_bwd_log_row`` append pattern. Only called when
+        ``self._validate_estimator``. ``predicted`` is blank during estimator
+        cold-start (before the first fit)."""
+        path = self._validation_path
+        if path is None:
+            if not self._validation_header_written:
+                dprint("[ft-sched] validate_estimator=True but no output path "
+                       "(set estimator_validation_path or "
+                       "batch_prediction_stats_path) — dropping validation rows.")
+                self._validation_header_written = True  # warn once
+            return
+        try:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            new_file = not os.path.exists(path)
+            with open(path, "a", newline="") as f:
+                w = csv.writer(f)
+                if new_file or not self._validation_header_written:
+                    w.writerow([
+                        "timestamp", "regime", "was_graph",
+                        "t_in", "p", "t_ft", "b_d", "k", "s",
+                        "execution_duration", "predicted_duration"])
+                    self._validation_header_written = True
+                w.writerow([
+                    datetime.datetime.now().isoformat(timespec="milliseconds"),
+                    feats.regime(), was_graph,
+                    feats.t_in, feats.p, feats.t_ft, feats.b_d, feats.k,
+                    feats.s, dur,
+                    "" if predicted is None else predicted,
+                ])
+        except Exception as e:
+            dprint(f"[ft-sched] validation row append failed: {e}")
+
     def shutdown(self) -> None:
         # [Phase 4] Dump the predicted-vs-actual estimator stats before teardown.
+        # Skipped in validate_estimator mode: the mode-"w" dump would clobber the
+        # per-batch-appended estimator_validation CSV (which is a superset).
         try:
-            if self._stats_csv_path:
+            if self._stats_csv_path and not self._validate_estimator:
                 self.write_estimator_stats()
         except Exception as e:
             dprint(f"[ft-sched] estimator stats dump failed: {e}")
@@ -577,6 +641,9 @@ class FinetuneScheduler(AsyncScheduler):
             if dur > 0:
                 self._tracker.add(feats, dur, predicted=predicted,
                                   was_graph=was_graph)
+                if self._validate_estimator:
+                    self._append_validation_row(
+                        feats, dur, was_graph, predicted)
 
         # Live refit of the SLO estimator every REFIT_EVERY steps. Skipped during
         # offline profiling (one fit at the end of the pass).
@@ -704,9 +771,15 @@ class FinetuneScheduler(AsyncScheduler):
             was_graph = self._will_use_graph(
                 feats, lora_ids, output.total_num_scheduled_tokens)
             # Composition-derived regime selection (was_graph stays as an
-            # observability stamp on the tracker record).
-            predicted = (self._estimator.predict(feats)
-                         if self._estimator.is_ready else None)
+            # observability stamp on the tracker record). In validate_estimator
+            # mode log the RAW model prediction (no safety margin) so the CSV
+            # scores the model itself; the admission gate's own predict() calls
+            # keep the margin (conservative). Safe because validate_estimator
+            # forces async OFF → _last_step_pred_s (queue-wait) is unused.
+            predicted = (
+                self._estimator.predict(
+                    feats, apply_margin=not self._validate_estimator)
+                if self._estimator.is_ready else None)
             output._ft_step_features = feats
             output._ft_step_was_graph = was_graph
             output._ft_step_predicted = predicted

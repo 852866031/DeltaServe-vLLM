@@ -1,0 +1,82 @@
+# DeltaServe-on-vLLM serving config — ESTIMATOR-VALIDATION variant (Llama-3).
+#
+# Same as serving_config_finetuning_llama3.yaml, but runs the SLO
+# execution-time estimator in validation mode: validate_estimator forces async
+# scheduling OFF and appends one (predicted, actual, features) row per
+# scheduled batch to estimator_validation_path. Drive it with co-serving on:
+#   python eval/auto_benchmark.py --co \
+#       --config configs/serving_config_finetuning_llama3_validate.yaml \
+#       --timeline_csv eval/estimator/timeline_nutanix.csv
+# then analyze with eval/estimator/plot_estimator_accuracy.py.
+
+finetune:
+  enable_finetuning: true
+  backward_mps_percentage: 10
+  finetuning_lora_path: ../adapters/llama3-toy-lora-ft
+  data_path: ../alpaca_1000.txt
+  max_saved_finetuning_tokens: 256
+  backward_sleep_seconds: 2.0
+  num_epochs: 20
+  learning_rate: 0.000005
+  weight_decay: 0.01
+  gamma: 0.9
+  backward_fp32: false
+  # Estimator does not model mid-forward aborts; keep steps running to
+  # completion so each measured "actual" is a full step (clean predicted-vs-
+  # actual pairs). Flip to true only to validate under the pre-emption pipeline.
+  forward_interruptible: true
+  ft_only_admission_grace_ms: 0
+  backward_cuda_graph: true
+  save_attn_qkv: true
+  # --- Estimator-accuracy validation ---
+  validate_estimator: true             # forces async OFF + per-batch CSV append
+  # Path is resolved relative to THIS file's dir (configs/), so this lands at
+  # repo-root/eval/estimator/. (Path resolution applies to the finetune section.)
+  estimator_validation_path: ../eval/estimator/estimator_validation_nutanix.csv
+
+slo:
+  ttft_slo: 0.3
+  avg_tbt_slo: 0.02
+  max_tbt_slo: 0.1
+  profile_on_launch: true              # seeds the estimator so predicted is non-null from step 1
+  profile_num_repeats: 2
+  ft_tokens_admission_constrain_factor: -1
+  match_prefill_workload_factor: 0.5
+  decode_only_ft_safety_margin: 0.7
+
+debug:
+  print_weight_hash: false
+  print_activation_hash: false
+  print_scheduler_add: true
+  print_engine_batch_exec: true
+  print_engine_batch_done: false
+  print_engine_req_recv: false
+
+adapters:
+  lora_path_0: ../adapters/llama3-toy-lora
+
+lora:
+  enable_lora: true
+  max_loras: 2
+  max_lora_rank: 16
+
+server:
+  host: 127.0.0.1
+  port: 8000
+  rank_id: 0
+  api_server_count: 4
+
+model:
+  model: meta-llama/Meta-Llama-3-8B
+  tokenizer_mode: auto
+  trust_remote_code: false
+  dtype: auto
+  max_model_len: 2048
+
+engine:
+  gpu_memory_utilization: 0.85
+  enforce_eager: false
+  disable_log_stats: true
+
+parallel:
+  tensor_parallel_size: 1

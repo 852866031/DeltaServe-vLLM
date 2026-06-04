@@ -122,7 +122,7 @@ FILE_NOINT_BWD = "bwd_log_co_factor_interrupt_false_{mode}.csv"
 FILE_NOINT_META = "bench_meta_co_factor_interrupt_false_{mode}.json"
 
 # ---- Font sizes ----
-FONTSIZE_PANEL_TITLE = 16
+FONTSIZE_PANEL_TITLE = 20
 FONTSIZE_AXIS_LABEL = 14
 FONTSIZE_TICK = 10
 FONTSIZE_LEGEND = 13
