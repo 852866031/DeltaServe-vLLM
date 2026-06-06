@@ -8,6 +8,11 @@ finetune.start_on_launch=false). It runs `deltaserve_start_finetuning` on the
 worker via collective_rpc; under single-GPU/uniproc the worker shares the
 process with the scheduler + coordinator, so the flag flip is seen immediately.
 
+POST /stop_finetuning closes FT admission again — a stop / start cycle resumes
+from the same buffer + counter state (the coordinator's ``stop_finetuning``
+intentionally preserves in-flight work). Useful for pausing FT during a
+benchmark phase or to bracket a deliberate idle window.
+
 Only attached when finetuning is enabled.
 """
 
@@ -39,6 +44,24 @@ async def start_finetuning(raw_request: Request):
     logger.info("Finetuning %s.", "started" if ok else "NOT started")
     return JSONResponse(status_code=200 if ok else 409,
                         content={"started": ok})
+
+
+@router.post("/stop_finetuning")
+async def stop_finetuning(raw_request: Request):
+    """Close FT admission. Idempotent — a stop on an already-stopped
+    session returns ok=True. Buffer state and in-flight backwards are
+    preserved so a follow-up POST /start_finetuning resumes cleanly."""
+    logger.info("Stopping finetuning (closing FT admission)...")
+    try:
+        results = await engine_client(raw_request).collective_rpc(
+            method="deltaserve_stop_finetuning")
+    except Exception as e:
+        logger.exception("stop_finetuning failed")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    ok = bool(results and all(results))
+    logger.info("Finetuning %s.", "stopped" if ok else "NOT stopped")
+    return JSONResponse(status_code=200 if ok else 409,
+                        content={"stopped": ok})
 
 
 def attach_router(app: FastAPI):

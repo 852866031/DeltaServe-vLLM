@@ -20,7 +20,7 @@ finetune:
   # Finetuning corpus: one tokenizable sample per non-empty line.
   # data_path: ../test_dataset.txt
   data_path: ../alpaca_1000.txt
-  max_saved_finetuning_tokens: 512   # buffer capacity; ~2 inference steps to fill
+  max_saved_finetuning_tokens: 600   # buffer capacity; ~2 inference steps to fill
   backward_sleep_seconds: 2.0        # simulated backward duration (observe inference)
   num_epochs: 20
   learning_rate: 0.000005
@@ -29,7 +29,19 @@ finetune:
   backward_fp32: false               # bulk backward matmuls: false=bf16 (default), true=fp32
   forward_interruptible: true
   ft_only_admission_grace_ms: 0  #  ms, tunable; 0 disables tier A
+  # Pause backward when an inference batch's total tokens
+  # (prefill + ft + decode-count, the (total=N) field of the
+  # [deltaserve] [batch …] log) exceed the threshold. _enable
+  # is the master switch so the threshold value can stay in
   backward_cuda_graph: true
+  # the YAML across A/B runs.
+  fwd_token_throttle_enable: true
+  fwd_token_throttle: 200
+  rps_throttle_enable: true
+  rps_throttle_close_rps: 20      # tune
+  rps_throttle_open_rps: 19      # must be < close
+  rps_throttle_window_s: 0.75      # 1-2s recommended
+  rps_throttle_close_time: 0.5
   save_attn_qkv: true
   save_attn_ctx: true               # save attn ctx (o_proj input); skip attention-forward recompute in backward
 
@@ -38,16 +50,16 @@ finetune:
 # and refit online; FT tokens are admitted only while the predicted step time
 # keeps inference TTFT/TBT within these targets.
 slo:
-  ttft_slo: 0.35                      # time-to-first-token target (seconds)
+  ttft_slo: 0.25                      # time-to-first-token target (seconds)
   avg_tbt_slo: 0.1                   # avg time-between-tokens target (seconds)
-  max_tbt_slo: 0.15                   # max single-step time while admitting FT (seconds)
+  max_tbt_slo: 0.12                   # max single-step time while admitting FT (seconds)
   profile_on_launch: true            # offline profiling pass before serving
   profile_num_repeats: 2             # recorded passes per profiling shape
   # Cap FT tokens per step relative to that step's inference prefill tokens:
   # when >0 and prefill is present, admit at most prefill_tokens * factor FT
   # tokens (on top of the SLO + buffer caps). -1 disables (fill up to whatever
   # the SLO estimator and buffer allow). No effect on idle/FT-only steps.
-  ft_tokens_admission_constrain_factor: 0.1
+  ft_tokens_admission_constrain_factor: 0.5
   # batch_prediction_stats_path: output/scheduler/batch_prediction_stats.csv
   # Leaky-bucket admission: trigger when (counter + t_in) * factor >=
   # next_sample.input_len AND SLO allows. 0.0 disables (default);

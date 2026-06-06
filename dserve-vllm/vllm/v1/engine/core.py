@@ -1721,6 +1721,17 @@ class EngineCoreProc(EngineCore):
             if self._reject_add_in_shutdown(req):
                 return
             _ftc = getattr(self.vllm_config, "finetune_config", None)
+            # [rps_throttle] Stamp the arrival on the coordinator's
+            # sliding-window tracker so the FT scheduler's per-step
+            # check_rps_throttle() sees a current rate. Cheap (single
+            # deque.append); always safe to call — the tracker exists
+            # from coordinator-init time. Gated on the enable flag so
+            # disabled runs pay nothing beyond one bool check.
+            if _ftc is not None and _ftc.rps_throttle_enable:
+                _coord = getattr(self.scheduler, "_coord", None)
+                if _coord is not None:
+                    import time as _t
+                    _coord.rps_tracker.note_arrival(_t.monotonic())
             if _ftc is not None and (
                     _ftc.print_engine_req_recv or _ftc.print_step_mode):
                 # Scheduler-side request counter (shared via the coordinator

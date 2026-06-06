@@ -33,9 +33,13 @@ Usage (dserve-vllm env, CUDA env per README.md):
     python eval/auto_benchmark.py --tight        # inference-only (no FT)
 
 Pass --publish to write the output files under the canonical names that
-the top-level ``evaluation/process_results.py`` reads (no scheduler-
-``_phase_<p>`` tag for any mode; no FT-``_factor_<f>`` tag for
-loose / tight; factor tag kept for nutanix):
+the top-level ``evaluation/process_results.py`` reads — bare
+``_co_<mode>`` for every mode (loose, tight, AND nutanix), no
+``_factor_<f>`` and no ``_phase_<p>`` tag. To A/B-sweep over factor
+or scheduler-phase values, run WITHOUT ``--publish`` so the tagged
+names are kept and the runs don't overwrite each other; then re-run
+the chosen "good" configuration once with ``--publish`` to land its
+files at the canonical paths process_results picks up:
     python eval/auto_benchmark.py --co --loose   --publish
     python eval/auto_benchmark.py --co --nutanix --publish
 """
@@ -508,23 +512,59 @@ WARMUP_START_OFFSET_S = 1.0
 async def _run_rows(server: str, rows: List[TimelineRow], stop: asyncio.Event,
                     model: str, record: bool, label: str,
                     request_timeout_s: float = 600.0):
-    """Replay `rows` on their (normalized) timeline schedule. Returns
-    (recorded result tuples, timeline-start wall clock)."""
+    """Replay `rows` on their timeline schedule.
+
+    - **Record phase** (``record=True``) honours each row's absolute
+      ``timestamp_s`` as the wall offset from scheduling start, so a
+      timeline that begins with a leading valley (e.g. tight: first
+      request at t=6s) actually waits 6s before firing the first
+      request. The bench's wall-clock duration matches the
+      timeline's full span (60s for tight) and ``t_first_wall`` is
+      the wall clock of the first request (= scheduling start + base_ts).
+    - **Warmup phase** (``record=False``) keeps the pre-existing
+      normalized behaviour (``- base_ts``) so warmup dispatches
+      immediately and doesn't waste time on a synthetic leading
+      valley before the FT subprocess gets a chance to spin up.
+
+    The recorded ``t_rel_s`` column always means "seconds since the
+    first request fires" — same semantics for both phases, so
+    downstream consumers (process_results, the trim cutoff math) are
+    unchanged regardless of which phase produced the CSV."""
     results = []
     if not rows:
         return results, None
     base_ts = min(r.timestamp_s for r in rows)
     offset = 0.0 if record else WARMUP_START_OFFSET_S
+    # ``schedule_shift`` is what we subtract from each row's
+    # timestamp when computing its target. Warmup normalizes
+    # (subtract base_ts → first row fires at t0); record honours the
+    # leading valley (subtract 0 → first row fires at t0 + base_ts).
+    schedule_shift = base_ts if not record else 0.0
     connector = aiohttp.TCPConnector(limit=0)
     timeout = aiohttp.ClientTimeout(total=request_timeout_s)
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         t0 = time.monotonic()
-        t_first_wall = datetime.datetime.now()
-        total = max(r.timestamp_s for r in rows) - base_ts
-        print(f"[bench] {label}: {len(rows)} requests, span {total:.1f}s", flush=True)
+        # ``t_first_wall`` always means "wall clock at which the FIRST
+        # request fires" — downstream consumers (process_results,
+        # trim_bwd_log_before, --real-timestamp column) depend on this
+        # semantic. With the record-phase pre-roll, the first request
+        # fires at t0 + base_ts wall-time, so push t_first_wall forward
+        # by base_ts. Warmup (schedule_shift=base_ts) keeps the
+        # first-fires-at-t0 behaviour, so its t_first_wall is "now".
+        first_offset = base_ts - schedule_shift   # = base_ts (record), 0 (warmup)
+        t_first_wall = datetime.datetime.now() + datetime.timedelta(
+            seconds=first_offset)
+        total = max(r.timestamp_s for r in rows) - schedule_shift
+        if first_offset > 0:
+            print(f"[bench] {label}: {len(rows)} requests, span {total:.1f}s "
+                  f"(includes {first_offset:.1f}s leading wait before "
+                  f"first request fires)", flush=True)
+        else:
+            print(f"[bench] {label}: {len(rows)} requests, span {total:.1f}s",
+                  flush=True)
 
         async def _one(row: TimelineRow):
-            target = t0 + (row.timestamp_s - base_ts) + offset
+            target = t0 + (row.timestamp_s - schedule_shift) + offset
             delay = target - time.monotonic()
             if delay > 0:
                 try:
@@ -534,7 +574,12 @@ async def _run_rows(server: str, rows: List[TimelineRow], stop: asyncio.Event,
                     pass
             if stop.is_set():
                 return
-            t_rel = time.monotonic() - t0
+            # ``t_rel`` = seconds since the FIRST request fired. With
+            # the record-phase pre-roll, monotonic time at the first
+            # request is ``t0 + base_ts`` (assuming offset=0 for
+            # record), so subtract first_offset so t_rel of the first
+            # request is 0 — matches the historical CSV semantic.
+            t_rel = time.monotonic() - t0 - first_offset
             prompt = make_prompt_from_length(row.prompt_length)
             res = await send_one_request(
                 session, server, row.row_id, t_rel, prompt,
@@ -603,7 +648,7 @@ async def main() -> None:
                     help="Enable finetuning (co-serving). Off => inference only.")
     ap.add_argument("--warmup_count", type=int, default=1000)
     ap.add_argument("--warmup_duration_s", type=float, default=20.0)
-    ap.add_argument("--warmup_rest_s", type=float, default=8.0)
+    ap.add_argument("--warmup_rest_s", type=float, default=7.0)
     ap.add_argument("--startup-timeout", type=float, default=600.0)
     ap.add_argument("--api-server-count", type=int, default=None,
                     help="Number of frontend API server processes (shared "
@@ -652,15 +697,16 @@ async def main() -> None:
                     help="Write the output files (timeline_results, bwd_log, "
                          "bench_meta) under the canonical names that the "
                          "top-level evaluation/process_results.py reads. "
-                         "Specifically: drops the scheduler `_phase_<phase>` "
-                         "tag for every mode, AND drops the FT-admission "
-                         "`_factor_<X>` tag for loose / tight only (nutanix "
-                         "keeps the factor tag because process_results.py "
-                         "distinguishes nutanix runs by their factor). With "
-                         "--publish a non-default factor will OVERWRITE the "
-                         "matching canonical file — A/B factor sweeps should "
-                         "skip this flag and let the tagged suffix split the "
-                         "output files apart.")
+                         "Drops BOTH the scheduler `_phase_<phase>` tag and "
+                         "the FT-admission `_factor_<X>` tag for every mode "
+                         "(loose / tight / nutanix), so every published run "
+                         "lands at the same canonical path. Two different "
+                         "factor or phase values run with --publish will "
+                         "OVERWRITE each other — A/B sweeps should skip "
+                         "this flag and let the tagged suffix split the "
+                         "output files apart, then run the chosen 'good' "
+                         "configuration once more with --publish to land "
+                         "the final files at the canonical paths.")
     ap.add_argument("--real-timestamp", action="store_true",
                     help="Add an absolute wall-clock 'timestamp' column to the "
                          "results CSV, in the SAME format as bwd_log "
@@ -729,9 +775,9 @@ async def main() -> None:
     #
     # With --publish:    canonical names that the top-level
     # evaluation/process_results.py reads —
-    #   loose / tight:   "_co" + "_<mode>"          (no factor, no phase)
-    #   nutanix:         "_co_factor_<f>" + "_nutanix" (factor tag kept)
-    # The phase tag is always dropped.
+    #   all modes (loose / tight / nutanix): "_co" + "_<mode>"
+    #   (no factor tag, no phase tag — those are A/B-sweep variants
+    #   that --publish collapses to the single "shipped" file path).
     base = "_co" if args.co else ""
     factor_tag = phase_tag = None
     if args.co:
@@ -743,15 +789,15 @@ async def main() -> None:
               f"coserving_admission_phase tag: _phase_{phase_tag}",
               flush=True)
         if args.publish:
-            # process_results.py expects bare _co_<mode> for loose/tight
-            # and _co_factor_<f>_<mode> for nutanix.
-            if mode == "nutanix":
-                base = f"_co_factor_{factor_tag}"
-            # else: leave base as "_co" — drops both tags.
+            # process_results.py reads bare _co_<mode> for every mode.
+            # ``base`` is already "_co"; nothing extra to append. The
+            # nutanix case used to keep the factor tag here for
+            # historical A/B reasons — see the file header for the
+            # new recommendation: sweep without --publish, then
+            # re-publish the chosen run.
             print(f"[bench] --publish: writing canonical names "
-                  f"(base='{base}', phase tag dropped"
-                  + ("" if mode == "nutanix" else ", factor tag dropped")
-                  + ")", flush=True)
+                  f"(base='{base}', both factor + phase tags dropped)",
+                  flush=True)
         else:
             base = f"{base}_factor_{factor_tag}_phase_{phase_tag}"
     suffix = base + (f"_{mode}" if mode else "")

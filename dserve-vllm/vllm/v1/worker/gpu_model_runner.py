@@ -4055,10 +4055,27 @@ class GPUModelRunner(
         # Elapsed since FT admission opened (POST /start_finetuning); t=0 until set.
         ft_t0 = getattr(coord, "ft_start_time", None) if coord is not None else None
         elapsed = (_time.monotonic() - ft_t0) if ft_t0 is not None else 0.0
+        # Surface the fwd-token-throttle state in the batch log when the
+        # feature is enabled: makes "bwd looks stalled" easy to diagnose.
+        # The HIT decision uses INFERENCE-ONLY tokens (prefill + decode,
+        # excluding FT) — matching the actual throttle in execute_model
+        # — because an FT-only batch has no inference work to protect
+        # the bwd from, so the throttle shouldn't fire for it. The
+        # displayed ``(total=N)`` field above still shows the full
+        # batch count for context; the throttle line shows the
+        # inf-only total it compared against.
+        throttle_part = ""
+        if _ftc.fwd_token_throttle_enable:
+            _thr = int(_ftc.fwd_token_throttle)
+            _inf_total = prefill + len(decode_kv)
+            _hit = _inf_total > _thr if _thr > 0 else False
+            throttle_part = (f" | fwd_throttle={_thr} "
+                             f"inf_total={_inf_total} "
+                             f"({'HIT' if _hit else 'ok'})")
         dprint(
             f"[batch {ts} t={elapsed:+.3f}s] prefill={prefill} ft={ft} "
             f"decode={decode_kv} (total={total}) | {mode} | running={run} "
-            f"(inf={run_inf}) waiting={wait}{admit_str}"
+            f"(inf={run_inf}) waiting={wait}{admit_str}{throttle_part}"
         )
 
     def _maybe_verify_ft_accumulation(self) -> None:
@@ -4102,6 +4119,48 @@ class GPUModelRunner(
 
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
+
+        # [fwd_token_throttle] Idle-release safety net. ``execute_model``
+        # early-returns ~40 lines down when num_scheduled_tokens == 0
+        # (no inference in queue, no FT admitted), which is *exactly*
+        # the state we reach after a workload burst ends with the
+        # throttle still holding the bwd paused. Without releasing
+        # here, the cross-step release block further down never runs,
+        # the bwd cycle stays mid-pause, ``pending_backward`` stays
+        # True, the engine keeps stepping into the same 0-token early
+        # return, and the FT deadlocks. Fires only when the throttle
+        # is currently holding the pause — no-op for every other
+        # configuration, so the early-return path is unchanged in the
+        # common case.
+        if getattr(self, "_throttle_held", False):
+            _idle_coord = getattr(self, "_ft_coordinator", None)
+            _idle_feats = getattr(
+                scheduler_output, "_ft_step_features", None)
+            _idle_cfg = self.vllm_config.finetune_config
+            # Re-evaluate the throttle condition for THIS step. The
+            # release condition mirrors the in-step cross-step block:
+            # release whenever the throttle isn't (re-)engaged. An
+            # empty/no-feats step trivially satisfies that — there's
+            # nothing inference-side to protect from.
+            _idle_release = True
+            if (_idle_feats is not None
+                    and _idle_cfg.fwd_token_throttle_enable):
+                _idle_thr = int(_idle_cfg.fwd_token_throttle)
+                if _idle_thr > 0:
+                    # INFERENCE-only total (mirrors the engage-side
+                    # decision a few hundred lines below): inf_prefill
+                    # + decode_count. FT tokens excluded so an FT-only
+                    # step doesn't keep the bwd paused.
+                    _idle_inf_prefill = (int(_idle_feats.t_in)
+                                         - int(_idle_feats.t_ft))
+                    _idle_total = _idle_inf_prefill + int(_idle_feats.b_d)
+                    _idle_release = _idle_total <= _idle_thr
+            if _idle_release and _idle_coord is not None:
+                _idle_coord.gpu_resume_backward()
+                self._throttle_held = False
+                # Mirror to coord for the scheduler's pre-pause check
+                # in ``_trigger_backward``.
+                _idle_coord.fwd_throttle_active = False
 
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
@@ -4376,6 +4435,7 @@ class GPUModelRunner(
         # (a per-step synchronize would serialize the forward and defeat it).
         _ft_time_step = coord is not None
         _pause_bwd = False
+        _pause_throttle = False
         _ft_slot = -1
         if _ft_time_step:
             if getattr(self, "_ft_timing_events", None) is None:
@@ -4416,10 +4476,55 @@ class GPUModelRunner(
             # nothing — that was the cause of the ~1.7s TTFT stall at the start
             # of an inference burst.
             _feats = getattr(scheduler_output, "_ft_step_features", None)
-            _pause_bwd = (_feats is not None and _feats.t_in > 0
-                          and coord.pending_backward)
+            # Pause reasons (OR-merged; same single set_pause caller so
+            # there is no two-source race — see the design discussion in
+            # the project history):
+            #   (1) prefill present (today's rule, TTFT-critical)
+            #   (2) fwd-token throttle: this step's total tokens
+            #       exceed the configured threshold. ``total`` here
+            #       matches the ``(total=N)`` field of the
+            #       ``[deltaserve] [batch …]`` log:
+            #           total = t_in (prefill incl. ft) + b_d (decode count)
+            if _feats is not None and coord.pending_backward:
+                _pause_prefill = _feats.t_in > 0
+                _ft_cfg = self.vllm_config.finetune_config
+                if _ft_cfg.fwd_token_throttle_enable:
+                    _throttle = int(_ft_cfg.fwd_token_throttle)
+                    if _throttle > 0:
+                        # INFERENCE-only total = inf_prefill + decode count.
+                        # ``t_in`` includes the FT subset, so subtract
+                        # ``t_ft`` to isolate the inference prefill. FT
+                        # tokens are NOT counted: an FT-only batch has
+                        # zero inference work competing for the GPU, so
+                        # the throttle (which exists to protect inference
+                        # from bwd contention) shouldn't fire for it.
+                        _inf_prefill = int(_feats.t_in) - int(_feats.t_ft)
+                        _total = _inf_prefill + int(_feats.b_d)
+                        _pause_throttle = _total > _throttle
+                _pause_bwd = _pause_prefill or _pause_throttle
+            # Cross-step throttle release: if a previous step left the
+            # bwd paused for throttle reasons and this step's total has
+            # dropped back at-or-below the threshold (so _pause_throttle
+            # is False), release the held pause now. Tracked via
+            # ``self._throttle_held``; prefill releases itself via the
+            # after-forward path below, so this flag only follows the
+            # throttle source.
+            if getattr(self, "_throttle_held", False) and not _pause_throttle:
+                coord.gpu_resume_backward()
+                self._throttle_held = False
+                # Mirror to coord for the scheduler's pre-pause check
+                # in ``_trigger_backward``.
+                coord.fwd_throttle_active = False
             if _pause_bwd:
                 coord.gpu_pause_backward()
+                # Remember whether the THROTTLE is the reason we're
+                # paused so the after-forward gate below can skip the
+                # resume (sticky pause across consecutive heavy steps).
+                self._throttle_held = _pause_throttle
+                # Mirror to coord. The scheduler reads this in
+                # _trigger_backward to decide whether to pre-pause
+                # the bwd before signaling it to start.
+                coord.fwd_throttle_active = _pause_throttle
             _start_evt.record()
         # [forward_interruptible / tier C] Arm the per-layer abort path if
         # this is a pure FT-only forward (any inference present would suffer
@@ -4510,7 +4615,14 @@ class GPUModelRunner(
             # (MPS time-slices anyway), which is fine and far cheaper than
             # blocking the engine loop on the forward's completion. In `finally`
             # so a failed forward can't leave the backward stalled.
-            if _pause_bwd:
+            # Skip the resume when the throttle is the reason for pause
+            # (or one of the reasons): the throttle is "sticky" — it
+            # holds the bwd paused across consecutive heavy steps and
+            # is released only by the cross-step block above, on the
+            # first step whose total dropped at-or-below the threshold.
+            # Releasing here would let the bwd briefly run between
+            # heavy steps, defeating the throttle's intent.
+            if _pause_bwd and not _pause_throttle:
                 coord.gpu_resume_backward()
             # [forward_interruptible / tier C] Always clear the live-FT-only
             # marker — even on aborted / failed forwards — so the input
