@@ -20,6 +20,7 @@ FinetuneScheduler and the GPUModelRunner since single-GPU runs both in-process):
 All decisions are printed via ``dprint`` (green, main process).
 """
 
+import collections
 import csv
 import datetime
 import os
@@ -29,6 +30,35 @@ import time
 import torch
 
 from vllm.deltaserve import dprint
+
+
+class RpsTracker:
+    """Sliding-window inference-arrival rate tracker for the
+    ``finetune.rps_throttle_*`` knobs.
+
+    Hooked from ``v1/engine/core.py``'s input-queue drain — every
+    request that lands in the engine's input_queue calls
+    ``note_arrival(time.monotonic())``. ``rps(now)`` returns the count
+    of arrivals in the last ``window_s`` seconds, divided by
+    ``window_s``. Old timestamps are pruned lazily on access. Single-
+    threaded inside EngineCore so no lock is needed."""
+
+    __slots__ = ("_window_s", "_arrivals")
+
+    def __init__(self, window_s: float) -> None:
+        self._window_s = float(window_s)
+        self._arrivals: "collections.deque[float]" = collections.deque()
+
+    def note_arrival(self, ts: float) -> None:
+        self._arrivals.append(ts)
+
+    def rps(self, now: float) -> float:
+        cutoff = now - self._window_s
+        while self._arrivals and self._arrivals[0] < cutoff:
+            self._arrivals.popleft()
+        if self._window_s <= 0:
+            return 0.0
+        return len(self._arrivals) / self._window_s
 
 
 class FTAborted(Exception):
@@ -86,6 +116,34 @@ class FinetuneCoordinator:
         self.on_backward_done = None
         self.admission_open = True
         self.pending_backward = False
+        # [rps_throttle] Sliding-window arrival-rate tracker. Created
+        # eagerly with a 1.0s default window so ``note_arrival`` from
+        # the engine input-queue drain is always safe to call; the
+        # scheduler resizes the window at startup once it has read
+        # the FinetuneConfig knob ``rps_throttle_window_s``.
+        self.rps_tracker = RpsTracker(window_s=1.0)
+        # Hysteresis latch for the rps_throttle gate. True once the
+        # close threshold has been crossed and admission was closed
+        # by the throttle; flipped back to False once RPS drops below
+        # the open threshold and admission is re-opened by the
+        # throttle. ``admission_open`` is what's actually consulted by
+        # ``next_ft_budget`` — this flag only exists so the throttle
+        # knows whether IT was the reason the gate is closed (we don't
+        # want to spuriously re-open over a buffer-full close).
+        self.rps_throttle_active = False
+        # Wall-clock instant (monotonic seconds) at which the throttle
+        # most recently engaged. Used by ``check_rps_throttle`` to
+        # enforce ``rps_throttle_close_time`` — the temporal-hysteresis
+        # minimum hold. ``None`` while disengaged.
+        self.rps_throttle_engaged_at: float | None = None
+        # Mirror of the runner's ``_throttle_held`` flag — True while
+        # the fwd_token_throttle is keeping the backward paused. The
+        # runner writes it from its per-step pause-decision block
+        # (gpu_model_runner.py). Read by ``_trigger_backward`` so the
+        # scheduler can pre-pause the bwd when the last step's
+        # throttle was HIT, avoiding wasted setup work in the bwd
+        # subprocess before it blocks at its first ``_maybe_pause``.
+        self.fwd_throttle_active = False
         # [async] An epoch boundary was reached (set by the scheduler when the
         # corpus epoch drains). The flush fires from record_capture once the
         # buffer's in-flight saves settle (reserved_fill == 0), so it can't race
@@ -190,6 +248,104 @@ class FinetuneCoordinator:
             return 0
         return min(self.per_step_budget, self.space_remaining())
 
+    def check_rps_throttle(self, now: float, close_rps: float,
+                           open_rps: float, window_s: float,
+                           close_time: float = 0.0) -> None:
+        """[rps_throttle] Per-step decision: close ``admission_open``
+        when the inference arrival rate crosses ``close_rps``; reopen
+        when it drops below ``open_rps``. The gap between the two
+        thresholds is the spatial hysteresis band — RPS sitting
+        inside it leaves the gate in its current state, preventing
+        flapping at the boundary.
+
+        ``close_time`` adds TEMPORAL hysteresis on top: once the
+        throttle engages, the release check is deferred until at
+        least ``close_time`` seconds have elapsed since the engage
+        moment. A transient sub-second dip below ``open_rps`` no
+        longer flaps the gate — useful when bursts are short but
+        you want the FT pause to be sticky for a while.
+
+        Option B (overload ``admission_open``): the throttle uses the
+        existing admission flag rather than a separate gate, so
+        ``next_ft_budget`` doesn't need a new AND clause. The
+        coordinator's other writers of ``admission_open`` (buffer
+        fill in ``note_injection``, backward start in
+        ``_trigger_backward``, backward done in ``poll_backward``)
+        still operate; the throttle interleaves with them under the
+        single-threaded EngineCore. ``space_remaining()`` /
+        ``pending_backward`` checks in ``next_ft_budget`` protect
+        against any spurious "open" the throttle issues over a
+        buffer-full state.
+
+        ``self.rps_throttle_active`` is the throttle's internal
+        latch so it knows whether to flip on the next transition;
+        it's not consulted by anything else.
+        ``self.rps_throttle_engaged_at`` is the engage timestamp
+        used to enforce ``close_time``."""
+        if close_rps <= 0:
+            return
+        # Allow the scheduler to resize the window at startup; cheap
+        # if it didn't change.
+        if abs(self.rps_tracker._window_s - float(window_s)) > 1e-9:
+            self.rps_tracker._window_s = float(window_s)
+        cur_rps = self.rps_tracker.rps(now)
+        if self.rps_throttle_active:
+            # Engaged → release when load drops back below open_rps
+            # AND the minimum-hold ``close_time`` has elapsed since
+            # the engage moment. The held_for / remaining bookkeeping
+            # in the dprint makes it obvious from the log why a
+            # release was deferred when one would otherwise fire.
+            _engaged_at = self.rps_throttle_engaged_at or now
+            _held_for = max(0.0, now - _engaged_at)
+            if cur_rps < open_rps:
+                # Idle bypass: a fully-zero RPS reading means
+                # ``rps_tracker`` saw NO arrivals in the last
+                # ``window_s`` seconds — there's no inference work
+                # to protect from, so skip the close_time hold and
+                # release immediately. ``cur_rps`` is an exact
+                # ``count / window_s`` so ``== 0.0`` is reliable
+                # (no float fuzz); ``count == 0`` ⇔ ``rps == 0``.
+                _idle_bypass = (cur_rps == 0.0)
+                if (close_time > 0 and _held_for < close_time
+                        and not _idle_bypass):
+                    _remaining = close_time - _held_for
+                    # Quiet log — fires every step the release is
+                    # deferred; only print at >=1% remaining so a
+                    # near-zero residual doesn't spam the trace.
+                    if _remaining > 0.01 * close_time:
+                        dprint(
+                            f"[rps_throttle] release deferred: "
+                            f"rps={cur_rps:.1f} < "
+                            f"open_rps={open_rps:g} but held only "
+                            f"{_held_for:.2f}s / {close_time:g}s "
+                            f"(remaining {_remaining:.2f}s)")
+                else:
+                    self.rps_throttle_active = False
+                    self.rps_throttle_engaged_at = None
+                    self.admission_open = True
+                    _reason = ("idle-bypass: rps=0 for the last "
+                               f"{self.rps_tracker._window_s:g}s"
+                               if _idle_bypass and close_time > 0
+                                   and _held_for < close_time
+                               else f"rps={cur_rps:.1f} < "
+                                    f"open_rps={open_rps:g}")
+                    dprint(
+                        f"[rps_throttle] release: {_reason} → "
+                        f"admission_open=True "
+                        f"(held for {_held_for:.2f}s)")
+        else:
+            # Idle → engage when load crosses close_rps.
+            if cur_rps > close_rps:
+                self.rps_throttle_active = True
+                self.rps_throttle_engaged_at = now
+                self.admission_open = False
+                _ct = (f" min_hold={close_time:g}s"
+                       if close_time > 0 else "")
+                dprint(
+                    f"[rps_throttle] engage: rps={cur_rps:.1f} > "
+                    f"close_rps={close_rps:g} → "
+                    f"admission_open=False{_ct}")
+
     def start_finetuning(self) -> None:
         """Open FT admission (POST /start_finetuning). Idempotent."""
         if self.ft_start_time is None:
@@ -197,6 +353,35 @@ class FinetuneCoordinator:
         if not self.ft_started:
             self.ft_started = True
             dprint("[coord] finetuning STARTED (admission opened by HTTP)")
+
+    def stop_finetuning(self) -> None:
+        """Close FT admission (POST /stop_finetuning). Idempotent.
+
+        Flips ``ft_started`` back to False — the master gate in
+        ``next_ft_budget`` that keeps FT samples out of the batch.
+        Other coordinator state (``admission_open``, ``fill_count``,
+        ``pending_backward``, throttle latches, …) is intentionally
+        left alone:
+
+          * Any in-flight backward continues to completion — stopping
+            doesn't abort a cycle, it just denies NEW admissions.
+          * Buffer space + counts are preserved, so a later
+            ``start_finetuning`` resumes from exactly where we left
+            off (the next FT step will find the same partially-filled
+            buffer, the same per-epoch processed-token count, etc.).
+          * ``ft_start_time`` is preserved on purpose — it anchors the
+            runner's ``[batch ...] t=+Ns`` log line and would jump
+            backwards on a re-start if we reset it.
+
+        Cycle: ``start`` → run for a while → ``stop`` → idle (no new
+        FT, in-flight bwd drains) → ``start`` → resume."""
+        if self.ft_started:
+            self.ft_started = False
+            dprint(
+                "[coord] finetuning STOPPED (admission closed by HTTP) "
+                f"| fill_count={self.fill_count} "
+                f"reserved_fill={self.reserved_fill} "
+                f"pending_backward={self.pending_backward}")
 
     def current_offset(self) -> int:
         # Next free write position = committed + reserved-in-flight. (Fallback;
@@ -339,6 +524,21 @@ class FinetuneCoordinator:
         #     f"signal backward (cycle {self._cycle}); FT admission CLOSED"
         # )
         if self.backward_process is not None:
+            # [fwd_token_throttle] If the last step's throttle decision
+            # was HIT, the inference side is still busy — proactively
+            # pause the backward BEFORE sending the work signal so it
+            # lands in a known-paused state. Without this, the
+            # backward subprocess receives the signal, sets up its
+            # cycle, and only blocks at the first ``_maybe_pause``
+            # layer boundary — wasted setup work the throttle would
+            # have otherwise prevented. ``fwd_throttle_active`` is
+            # mirrored from the runner's ``_throttle_held`` flag every
+            # time the per-step pause decision flips, so this read is
+            # the same answer as "was the most recent batch a HIT?".
+            if self.fwd_throttle_active:
+                self.gpu_pause_backward()
+                dprint(f"[coord] {reason} but fwd_throttle is HIT → "
+                       f"pre-paused backward (cycle {self._cycle})")
             # Make sure the capture writes are visible to the backward process
             # before it reads/cleans the shared buffer. Wait only on the FT
             # capture-completion event (recorded by the runner right after the

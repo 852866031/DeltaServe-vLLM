@@ -595,6 +595,7 @@ class Llama3BackwardService(BackwardService):
     # -- the real backward (overrides base.process_backward) ------------------
 
     def process_backward(self, activations, sample_lens, n, epoch):
+        self._maybe_pause()
         if not self._built:
             raise RuntimeError("llama3 backward state not built (weights not shared)")
         # Mode tag for the one-line cycle log (set in BackwardService dispatcher).

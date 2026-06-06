@@ -158,9 +158,16 @@ class FinetuneConfig:
     ``T_ft`` per step. The loop's break condition becomes
     ``tentative.T_ft + candidate.input_len > min(buffer_cap, t_in * factor)``.
 
-    Mutually exclusive with ``match_prefill_workload_factor`` — when the
-    latter is > 0, this factor is ignored (the leaky-bucket strategy fully
-    replaces the per-step proportional cap)."""
+    Composes with ``match_prefill_workload_factor``. When both shapers
+    are enabled (factor here > 0 AND match factor > 0), the leaky
+    bucket decides WHEN to admit (a triggered step admits exactly one
+    sample) and this proportional factor decides WHETHER the chosen
+    sample's ``input_len`` fits under ``t_in * factor`` BEFORE it
+    actually lands in the batch. If it doesn't fit, the leaky-bucket
+    trigger fires but admission is 0 for the step; credit isn't
+    consumed (the counter resets only on a *successful* admit), so a
+    later step with a larger ``t_in`` cap can carry the sample
+    through."""
 
     match_prefill_workload_factor: float = 0.0
     """Alternate FT admission strategy: a leaky-bucket gate that defers FT
@@ -199,10 +206,17 @@ class FinetuneConfig:
     headroom (budget=0), the trigger fires but admission is 0; the
     counter retains its credit for a later step.
 
-    Replaces ``ft_tokens_admission_constrain_factor`` when ``> 0`` — the
-    proportional factor cap is bypassed since this gate controls the
-    FT-per-prefill ratio directly. Default 0.0 keeps the previous
-    factor-based behaviour.
+    Composes with ``ft_tokens_admission_constrain_factor``. When both
+    are enabled the leaky bucket fires the WHEN (trigger when credit
+    is enough) and the proportional factor fires the WHETHER (the
+    triggered sample must fit under ``t_in * factor``). Earlier
+    versions made these mutually exclusive — the proportional cap
+    was bypassed when the leaky bucket triggered — which let a
+    triggered sample that was much larger than the step's prefill
+    inflate the batch beyond the proportional rule. The current
+    behaviour gates the triggered sample on the proportional cap
+    too; if it doesn't fit, the step admits 0 and the bucket
+    retains its credit for a later (larger-prefill) step.
 
     Three-regime estimator interaction: under the iterative
     ``admit_ft_to_step`` algorithm, the leaky bucket gates entry to the
@@ -321,6 +335,104 @@ class FinetuneConfig:
     previous busy-loop drain and the upcoming schedule call. Cost is roughly
     ``ms / ft_forward_ms`` of FT throughput during idle; benefit scales with
     inference QPS. Set 0 to disable A while keeping B and C."""
+
+    # --- fwd-token throttle (extends the prefill-gated pause) ---
+    fwd_token_throttle_enable: bool = False
+    """Master switch for the fwd-token-throttle pause source. When False
+    (default), pause decisions stay prefill-only (today's behaviour:
+    pause when ``feats.t_in > 0`` and a backward is pending). When True,
+    the pause condition is extended to ALSO fire when the current
+    inference batch's total token count exceeds ``fwd_token_throttle``
+    — see that field for the math. The threshold is read every step,
+    so toggling the bool at runtime takes effect on the next batch."""
+
+    fwd_token_throttle: int = 1024
+    """[fwd_token_throttle_enable] Token-count threshold for the new
+    pause source. The pause decision becomes::
+
+        pause = pending_backward and (
+            feats.t_in > 0                           # today's rule
+            or (enable and total > fwd_token_throttle)   # new rule
+        )
+
+    where ``total = prefill + ft + len(decode_kv)`` — the same value
+    the engine's ``[batch …] (total=N)`` log line shows for each
+    step. Resume happens for free as soon as both conditions go
+    False (no prefill AND total at-or-below the threshold), so a
+    transient burst un-pauses backward within microseconds of the
+    next step that drops back under the bound. Ignored when
+    ``fwd_token_throttle_enable`` is False; the field is still read
+    so the value can sit in a YAML and be flipped on/off via the
+    bool without editing the number."""
+
+    # --- rps-throttle (closes FT admission under bursts) ---
+    rps_throttle_enable: bool = False
+    """Master switch for the inference-RPS-based admission gate.
+    When True, the FT scheduler closes ``coord.admission_open`` once
+    the inference arrival rate (sliding window) crosses
+    ``rps_throttle_close_rps``, and re-opens it once the rate drops
+    below ``rps_throttle_open_rps``. Distinct from
+    ``fwd_token_throttle_enable``: that one pauses the running
+    backward; this one denies NEW FT samples from entering the
+    activation buffer. The two stack — together they form 'back off
+    FT in all directions during bursts'."""
+
+    rps_throttle_close_rps: float = 50.0
+    """[rps_throttle_enable] Inference arrival RPS above which the
+    throttle ENGAGES (sets ``admission_open = False``). Measured as
+    the count of requests entering the engine's input_queue in the
+    last ``rps_throttle_window_s`` seconds, divided by the window
+    width."""
+
+    rps_throttle_open_rps: float = 30.0
+    """[rps_throttle_enable] Inference arrival RPS below which a
+    currently-engaged throttle RELEASES (sets ``admission_open =
+    True``). Must be strictly less than ``rps_throttle_close_rps``
+    so the gap acts as hysteresis — RPS sitting between the two
+    thresholds leaves the gate in its current state, which avoids
+    flapping at the boundary."""
+
+    rps_throttle_window_s: float = 1.0
+    """[rps_throttle_enable] Sliding-window width for the arrival-
+    rate measurement. Too short (e.g. 0.1s) = noisy: a single-burst
+    spike could flap the throttle. Too long (e.g. 10s) = laggy:
+    the throttle stays engaged seconds after the burst is over.
+    1-2s is the sensible range for typical workloads."""
+
+    rps_throttle_close_time: float = 0.0
+    """[rps_throttle_enable] Minimum duration (seconds) the throttle
+    must stay engaged once it has closed admission, even if the
+    arrival rate immediately drops below ``rps_throttle_open_rps``.
+    The release check is deferred until ``close_time`` seconds have
+    elapsed since the engage moment.
+
+    Acts as TEMPORAL hysteresis layered on top of the existing
+    SPATIAL hysteresis (the ``close_rps``/``open_rps`` gap):
+
+      * Spatial hysteresis stops flapping at the rate boundary —
+        the RPS must drop noticeably below the close threshold to
+        re-open.
+      * Temporal hysteresis (this knob) stops flapping in time —
+        even if the RPS briefly dips, the throttle stays engaged
+        for at least ``close_time`` seconds. Useful when bursts
+        are short (sub-second) but you want the FT pause to be
+        sticky for longer so the backward isn't dragged through
+        a flapping pause/resume cycle.
+
+    Default ``0.0`` disables — the throttle releases the moment
+    the RPS drops below ``open_rps`` (today's behaviour). Set to
+    e.g. ``2.0`` to require the throttle to stay engaged for at
+    least 2 seconds after each engage.
+
+    Idle bypass: when the sliding-window RPS reads EXACTLY 0
+    (no arrivals in the last ``rps_throttle_window_s`` seconds),
+    the close_time hold is short-circuited and the throttle
+    releases immediately. Rationale: a fully-quiet inference
+    window means there is no inference work to protect from, so
+    holding the bwd paused any longer just wastes FT progress.
+    Pick ``rps_throttle_window_s`` to define the "for a window"
+    duration the idle bypass requires (e.g. ``window_s = 1.0``
+    means rps=0 must hold for at least 1s before bypass fires)."""
 
     # --- debug / observability ---
     print_weight_hash: bool = False

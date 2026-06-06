@@ -26,6 +26,13 @@ finetune:
   # actual pairs). Flip to true only to validate under the pre-emption pipeline.
   forward_interruptible: true
   ft_only_admission_grace_ms: 0
+  # Pause backward when an inference batch's total tokens
+  # (prefill + ft + decode-count, the (total=N) field of the
+  # [deltaserve] [batch …] log) exceed the threshold. _enable
+  # is the master switch so the threshold value can stay in
+  # the YAML across A/B runs.
+  fwd_token_throttle_enable: false
+  fwd_token_throttle: 200
   backward_cuda_graph: true
   save_attn_qkv: true
   save_attn_ctx: true               # save attn ctx (o_proj input); skip attention-forward recompute in backward

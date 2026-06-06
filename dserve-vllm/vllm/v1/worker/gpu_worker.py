@@ -839,6 +839,20 @@ class Worker(WorkerBase):
         coord.start_finetuning()
         return True
 
+    def deltaserve_stop_finetuning(self) -> bool:
+        """[DeltaServe] Close FT admission. Invoked via collective_rpc from the
+        POST /stop_finetuning HTTP route. Mirror of
+        ``deltaserve_start_finetuning``. Idempotent: a stop on an already-
+        stopped session is a no-op. After a stop, a follow-up start resumes
+        from the same buffer / counter state — see ``Coordinator.stop_finetuning``
+        for the preservation contract."""
+        from vllm.deltaserve.coordinator import get_coordinator
+        coord = get_coordinator()
+        if coord is None:
+            return False
+        coord.stop_finetuning()
+        return True
+
     def update_max_model_len(self, max_model_len: int) -> None:
         """Update max_model_len after auto-fit to GPU memory.
         This is called when max_model_len=-1 is used and the engine

@@ -113,7 +113,9 @@ class BackwardService:
         hang the backward forever."""
         g = self._gpu_grant
         if g is not None and not g.is_set():
+            print(f"[backward] GPU grant cleared — yielding to inference prefill; ")
             g.wait(timeout=5.0)
+            print(f"[backward] GPU grant re-set — resuming backward")
 
     # -- per-model hooks ---------------------------------------------------
 
@@ -322,6 +324,25 @@ class BackwardService:
         sleep_s = float(msg.get("sleep_s", 2.0))
         sample_lens = msg.get("sample_lens") or []
         epoch = int(msg.get("epoch", 0))
+        # Announce the start of a backward cycle. Reports the per-cycle
+        # token count + sample count + epoch, plus the current pause-
+        # gate state (``gpu_grant`` SET = bwd can run; CLEAR = paused,
+        # the first ``_maybe_pause`` boundary inside ``process_backward``
+        # will block until something flips the event). When the trace
+        # shows a long gap between this "start" line and the next
+        # [backward] line, the gate state here tells you whether the
+        # gap is a real backward (gate=SET) or just waiting for an
+        # inference pause / throttle to release (gate=CLEAR).
+        _grant_set = (self._gpu_grant.is_set()
+                      if self._gpu_grant is not None else None)
+        _gate = ("SET" if _grant_set
+                 else ("CLEAR" if _grant_set is False else "n/a"))
+        dprint(
+            f"[backward] start: n={n} samples={len(sample_lens)} "
+            f"epoch={epoch} gpu_grant={_gate}"
+            + ("  (will block until released)"
+               if _grant_set is False else "")
+        )
 
         # Reset the per-epoch processed-tokens counter when the parent reports
         # a new epoch — must happen BEFORE we add this cycle's ``n``, so the

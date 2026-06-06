@@ -25,6 +25,13 @@ finetune:
   # learning_rate: 0.00001
   # weight_decay: 0.01
   # gamma: 0.9
+  # Pause backward when an inference batch's total tokens
+  # (prefill + ft + decode-count, the (total=N) field of the
+  # [deltaserve] [batch …] log) exceed the threshold. _enable
+  # is the master switch so the threshold value can stay in
+  # the YAML across A/B runs.
+  fwd_token_throttle_enable: false
+  fwd_token_throttle: 200
 
 # SLO-aware FT admission + execution-time estimator (Phase 4).
 slo:

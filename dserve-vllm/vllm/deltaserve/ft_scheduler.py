@@ -317,13 +317,21 @@ class FinetuneScheduler(AsyncScheduler):
                 self._unspent_prefill += int(feats.t_in)
                 return 0, []
 
-        # Buffer-space cap (always applies). Proportional cap layers on top
-        # when set (mutually exclusive with leaky-bucket; matches existing
-        # semantics — leaky-bucket wins when both > 0 since its branch
-        # returns above).
+        # Buffer-space cap (always applies). Proportional cap layers on
+        # top whenever ``ft_tokens_admission_constrain_factor != -1``
+        # AND the step carries prefill — INCLUDING when the leaky
+        # bucket has already fired. Composition rule (per spec): when
+        # both shapers are enabled, the leaky bucket decides WHEN to
+        # admit (credit-gated trigger) and the proportional factor
+        # decides HOW MUCH can be admitted (per-step cap). If the
+        # leaky bucket fires but the next sample's input_len doesn't
+        # fit under ``t_in * prop_factor`` the iterative loop simply
+        # admits nothing, leaving the leaky-bucket credit intact so a
+        # later step (with more prefill, hence a larger cap) can
+        # admit the sample.
         buffer_cap = self._coord.space_remaining()
         token_cap = buffer_cap
-        if not leaky_bucket_triggered and _prop_factor != -1 and has_prefill:
+        if _prop_factor != -1 and has_prefill:
             token_cap = min(buffer_cap, int(feats.t_in * _prop_factor))
         if token_cap <= 0:
             return 0, []
@@ -657,6 +665,24 @@ class FinetuneScheduler(AsyncScheduler):
         # will carry the flush.
         self._coord.try_epoch_flush()
 
+        # [rps_throttle] Per-step gate: close admission_open when the
+        # inference arrival rate sliding-window exceeds the close
+        # threshold, reopen when it drops below the open threshold.
+        # See FinetuneCoordinator.check_rps_throttle for the design
+        # choice (Option B: overload admission_open, no separate
+        # gate). No-op when rps_throttle_enable is False.
+        _ft_cfg = self.vllm_config.finetune_config
+        if _ft_cfg.rps_throttle_enable:
+            import time as _t
+            self._coord.check_rps_throttle(
+                _t.monotonic(),
+                close_rps=_ft_cfg.rps_throttle_close_rps,
+                open_rps=_ft_cfg.rps_throttle_open_rps,
+                window_s=_ft_cfg.rps_throttle_window_s,
+                close_time=float(getattr(
+                    _ft_cfg, "rps_throttle_close_time", 0.0)),
+            )
+
         # [forward_interruptible] Snapshot admission state before any FT
         # injection / note_injection / reserve mutates it. Stashed on the
         # output so _rollback_ft_step can restore it verbatim if this batch
@@ -669,9 +695,12 @@ class FinetuneScheduler(AsyncScheduler):
         # check, per-sample iterative loop with EAGER predictions, commit.
         # The existing admission shapers (match_prefill_workload_factor +
         # ft_tokens_admission_constrain_factor) are layered inside as outer
-        # pre-filters with unchanged semantics — leaky-bucket gates entry to
-        # the loop and caps iterations to 1; proportional cap is a hard
-        # upper bound on T_ft. Both still mutually exclusive (leaky wins).
+        # pre-filters. Leaky-bucket gates entry to the loop and caps
+        # iterations to 1; proportional cap is a hard upper bound on
+        # T_ft. The two now COMPOSE — when both enabled, the
+        # triggered sample must also satisfy the proportional cap or
+        # admission is 0 (credit retained for a later step). See
+        # admit_ft_to_step() Stage 4 for the actual logic.
         admitted_now, ft_reqs = self.admit_ft_to_step()
         for req in ft_reqs:
             self._enqueue_waiting_request(req)
