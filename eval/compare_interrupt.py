@@ -53,6 +53,7 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
+from matplotlib.ticker import MultipleLocator
 
 # Reuse auto_plot.py helpers + compare_temporal.py + compare_temporal_both.py.
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -92,6 +93,8 @@ PNG_DPI = 130
 # ---- Figure ----
 FIGSIZE = (15, 4.5)              # single panel; height is enough for legend + data
 SUPTITLE = None                  # None disables the figure-level title
+XMAX = 40.0                      # x-axis upper limit (s); None = full timeline span
+                                 # (overridable with --xmax)
 
 # ---- Per-panel title ----
 PANEL_TITLE = f"{GPU_DISPLAY_NAME} — E2E latency & FT throughput"
@@ -104,6 +107,10 @@ YLABEL_FT = "FT throughput (tok/s)"
 
 # ---- Y-axis headroom ----
 YMAX_HEADROOM = 1.55
+
+# ---- Y-axis tick spacing (None = matplotlib auto) ----
+YTICK_LATENCY = 0.4       # left axis (E2E latency, s): a tick every 0.4
+YTICK_FT = 500            # right axis (FT throughput, tok/s): a tick every 500
 
 # ---- Display names (replace internal series ids in the legend) ----
 DISPLAY_NAME_INF = "vLLM"
@@ -124,7 +131,7 @@ FILE_NOINT_META = "bench_meta_co_factor_interrupt_false_{mode}.json"
 # ---- Font sizes ----
 FONTSIZE_PANEL_TITLE = 20
 FONTSIZE_AXIS_LABEL = 14
-FONTSIZE_TICK = 10
+FONTSIZE_TICK = 14
 FONTSIZE_LEGEND = 13
 
 # ---- Font weights ----
@@ -325,6 +332,12 @@ def plot_panel(ax, gpu_dir: str, mode: str,
     else:
         ax_r.set_ylim(bottom=0)
 
+    # ---- y-axis tick spacing ----
+    if YTICK_LATENCY:
+        ax.yaxis.set_major_locator(MultipleLocator(YTICK_LATENCY))
+    if YTICK_FT and ft_peak > 0:
+        ax_r.yaxis.set_major_locator(MultipleLocator(YTICK_FT))
+
     # ---- legends ----
     # Top box (3 rows x 2 cols, ROW-major intent):
     #   Row 1: vLLM                            | (blank spacer)
@@ -432,7 +445,7 @@ def plot_panel(ax, gpu_dir: str, mode: str,
 
 
 def build_figure(input_dir: str, mode: str,
-                 ft_offset: float = 0.0, window_s=None) -> plt.Figure:
+                 ft_offset: float = 0.0, window_s=None, xmax=XMAX) -> plt.Figure:
     fig = plt.figure(figsize=FIGSIZE, constrained_layout=True)
     gs = GridSpec(1, 1, figure=fig)
     ax = fig.add_subplot(gs[0, 0])
@@ -446,7 +459,9 @@ def build_figure(input_dir: str, mode: str,
     t_max = plot_panel(ax, os.path.join(input_dir, GPU), mode,
                        tl_base=tl_base,
                        ft_offset=ft_offset, window_s=window_s)
-    if t_max > 0:
+    if xmax is not None:
+        ax.set_xlim(0, xmax)
+    elif t_max > 0:
         ax.set_xlim(0, t_max * 1.01)
     if SUPTITLE:
         fig.suptitle(SUPTITLE, fontsize=14)
@@ -467,6 +482,9 @@ def main() -> None:
     ap.add_argument("--ft-offset", type=float, default=0.0,
                     help="Extra manual shift (s) of the FT-throughput curves "
                          "on top of the real-timestamp anchor. Default 0.")
+    ap.add_argument("--xmax", type=float, default=XMAX,
+                    help=f"x-axis upper limit in seconds (default {XMAX}); "
+                         "pass a negative value for the full timeline span.")
     ap.add_argument("--output", default=None,
                     help="Output PNG path. Default: "
                          "<input-dir>/compare_interrupt_<mode>.png.")
@@ -478,8 +496,10 @@ def main() -> None:
     out_path = args.output or os.path.join(
         args.input_dir, f"compare_interrupt_{args.mode}.png")
 
+    # Negative --xmax means "full span" (xmax=None).
+    xmax = None if (args.xmax is not None and args.xmax < 0) else args.xmax
     fig = build_figure(args.input_dir, args.mode,
-                       ft_offset=args.ft_offset, window_s=args.window)
+                       ft_offset=args.ft_offset, window_s=args.window, xmax=xmax)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     fig.savefig(out_path, dpi=PNG_DPI)
     print(f"[compare_interrupt] wrote figure → {out_path}")

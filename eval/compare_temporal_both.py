@@ -136,7 +136,7 @@ DISPLAY_NAME_TAIL_OVERHEAD = "Lowest 1% overhead"
 # ---- Font sizes ----
 FONTSIZE_PANEL_TITLE = 20
 FONTSIZE_AXIS_LABEL = 14
-FONTSIZE_TICK = 10
+FONTSIZE_TICK = 14
 FONTSIZE_LEGEND = 13
 
 # ---- Font weights — matplotlib accepts "normal", "bold", "light", or a
@@ -161,6 +161,10 @@ FONTWEIGHT_AXIS_LABEL = "bold"
 LEGEND_LOC = "upper center"
 LEGEND_BBOX_TO_ANCHOR = (0.5, 1.0)
 LEGEND_NCOL = 2
+
+# ---- Timeline panel (row 0) ----
+# auto_plot.plot_request_timeline adds its own legend; set False to drop it.
+SHOW_TIMELINE_LEGEND = False
 
 # ---- Colors ----
 INF_COLOR = "tab:blue"
@@ -508,6 +512,11 @@ def build_figure(input_dir: str, mode: str,
     if tl is not None:
         tl["t_rel_s"] = tl["t_rel_s"] + tl_base
         plot_request_timeline(ax_tl, tl)
+        # Drop the timeline panel's auto-legend (auto_plot adds one on ax_tl).
+        if not SHOW_TIMELINE_LEGEND:
+            leg = ax_tl.get_legend()
+            if leg is not None:
+                leg.remove()
         # auto_plot.plot_request_timeline sets the title + axis labels
         # with matplotlib's defaults — re-style each artist in place so
         # this panel matches the per-GPU panels below (bold + tuned size).
@@ -518,9 +527,12 @@ def build_figure(input_dir: str, mode: str,
         ax_tl.xaxis.label.set_fontweight(FONTWEIGHT_AXIS_LABEL)
         ax_tl.yaxis.label.set_fontsize(FONTSIZE_AXIS_LABEL)
         ax_tl.yaxis.label.set_fontweight(FONTWEIGHT_AXIS_LABEL)
+        # auto_plot uses matplotlib default tick sizes — match the per-GPU
+        # panels' FONTSIZE_TICK on the timeline panel too.
+        ax_tl.tick_params(axis="both", labelsize=FONTSIZE_TICK)
         # plot_request_timeline draws a tokens/s twin axis (right side)
-        # — find it on the figure and bold its y label too. Twin axes
-        # share the parent's x range, which is the cheapest way to
+        # — find it on the figure and bold its y label + size its ticks too.
+        # Twin axes share the parent's x range, which is the cheapest way to
         # match them without auto_plot exposing the handle.
         for child in ax_tl.figure.axes:
             if child is ax_tl:
@@ -529,6 +541,7 @@ def build_figure(input_dir: str, mode: str,
                     and child.yaxis.label.get_text()):
                 child.yaxis.label.set_fontsize(FONTSIZE_AXIS_LABEL)
                 child.yaxis.label.set_fontweight(FONTWEIGHT_AXIS_LABEL)
+                child.tick_params(axis="y", labelsize=FONTSIZE_TICK)
     else:
         ax_tl.text(0.5, 0.5, f"timeline_{mode}.csv\n(not found)",
                    ha="center", va="center", transform=ax_tl.transAxes,
