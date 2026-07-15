@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
-"""compare_temporal_both.py — temporal-sharing comparison figure with the
-unthrottled DeltaServe-vLLM run added.
+"""compare_temporal_5090.py — two-panel temporal-sharing figure, 5090 only.
 
-Three-way version of ``compare_temporal.py``. Each per-GPU panel overlays
-THREE inference E2E latency traces (plus two FT throughput traces) on a
-shared time axis::
+A trimmed version of ``compare_temporal_both.py``: exactly TWO rows —
+the scheduled-request timeline on top, and the 5090 E2E-latency / FT-
+throughput panel below. The 5090 panel overlays three inference E2E
+latency traces (left axis) + two FT-throughput curves (right axis):
 
   * vLLM                  — inference-only baseline      (no co-serving)
   * DeltaServe-vLLM-Temp  — co_factor_<F> run            (throttled / temporal)
-  * DeltaServe-vLLM       — co_factor_<F_full> run       (UNTHROTTLED, new)
+  * DeltaServe-vLLM       — co_factor_<F_full> run       (unthrottled)
 
-For each co-serving series, the corresponding finetune-throughput curve
-is also drawn on the right y-axis (orange for the throttled run, purple
-for the unthrottled run by default).
+Differences from ``compare_temporal_both.py``: no A100 panel / multi-GPU
+machinery, no per-panel title on the 5090 panel, and ONE names-only
+legend (no numbers) placed in the gap BETWEEN the timeline and the 5090
+panel — latency series on the first row, FT-throughput on the second.
 
-Expected files per GPU subdir (``<mode>`` defaults to ``nutanix``,
-``F`` from ``--factor 0`` → ``co_factor_0``, ``F_full`` from
-``--factor-full off`` → ``co_factor_off`` by default — this matches the
-``_factor_off`` naming convention auto_benchmark uses for the
-unthrottled / "constraint disabled" run; pass ``--factor-full -1`` (or
-any other value) if your bundle uses a different tag):
+Expected files under ``eval/temporal_share_output/5090/`` (``<mode>``
+defaults to ``nutanix``):
 
   timeline_results_<mode>.csv                    (vLLM, inf-only)
   timeline_results_co_factor_<F>_<mode>.csv      (Temp / throttled)
@@ -27,22 +24,11 @@ any other value) if your bundle uses a different tag):
   bwd_log_co_factor_<F>_<mode>.csv               (Temp FT throughput)
   bwd_log_co_factor_<F_full>_<mode>.csv          (full FT throughput)
   bench_meta_co_factor_<F>_<mode>.json           (optional anchors)
-  bench_meta_co_factor_<F_full>_<mode>.json
-
-Time alignment, the bwd_log anchor source, and the warmup-phase FT
-handling are identical to ``compare_temporal.py`` — see that file's
-header for the full reasoning. The only change here is the third trace.
-
-By default both GPU panels are drawn (timeline + 5090 + A100 = 3 rows). Pass
-``--5090`` or ``--A100`` to render only that GPU (timeline + one panel = 2
-rows), dropping the other.
 
 Usage:
-  python eval/compare_temporal_both.py                                # both GPUs (3 rows)
-  python eval/compare_temporal_both.py --5090                         # 5090 only (2 rows)
-  python eval/compare_temporal_both.py --A100                         # A100 only (2 rows)
-  python eval/compare_temporal_both.py --factor 0 --factor-full -1    # bundle uses _factor_-1
-  python eval/compare_temporal_both.py --mode nutanix --factor 0
+  python eval/compare_temporal_5090.py
+  python eval/compare_temporal_5090.py --factor 0 --factor-full off
+  python eval/compare_temporal_5090.py --mode nutanix
 """
 import argparse
 import csv
@@ -55,6 +41,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.patheffects as pe
 from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
@@ -86,7 +73,7 @@ from compare_temporal import (  # noqa: E402
 )
 
 DEFAULT_INPUT_DIR = os.path.join(_HERE, "temporal_share_output")
-GPUS = ("5090", "A100")
+GPU = "5090"                      # this script plots ONLY the 5090 panel
 
 # ============================================================================
 # Settings — edit here to retitle / resize / restyle.
@@ -97,27 +84,17 @@ GENERATE_PDF = True
 PNG_DPI = 130
 
 # ---- Figure ----
-FIGSIZE = (14, 13)
-HEIGHT_RATIOS = (0.8, 1.0, 1.0)
+FIGSIZE = (14, 8.5)               # two rows: timeline + 5090 panel
+HEIGHT_RATIOS = (1.0, 1.0)        # timeline row : 5090 row
 SUPTITLE = None                   # None disables the figure-level title
 
-# Vertical gap between adjacent figure rows as a fraction of an average
-# row height (matplotlib ``GridSpec.hspace``). Larger → bigger gap
-# between the timeline panel and the first GPU panel (and between the
-# two GPU panels when both are drawn). ``None`` lets constrained_layout
-# auto-pick.
+# Vertical gap between the timeline panel and the 5090 panel as a
+# fraction of an average row height (matplotlib ``GridSpec.hspace``).
+# Larger → bigger gap (the between-panel legend lives in it).
 ROW_HSPACE = 0.05
 
-# ---- Per-panel titles ----
-PANEL_TITLE_TEMPLATE = "{gpu_name} — E2E latency & FT throughput"
-# Display-name map for the panel title only. Keys are the directory
-# names under ``input_dir/`` ("5090", "A100"); values are how the GPU
-# is shown in the title text. Unknown keys fall through to the raw
-# directory name.
-GPU_DISPLAY_NAME = {
-    "5090": "RTX 5090",
-    "A100": "NVIDIA A100",
-}
+# ---- Per-panel title ----
+PANEL_TITLE_TEMPLATE = None       # None = no title on the 5090 panel
 
 # ---- Axis labels ----
 XLABEL = "Time (s)"
@@ -125,7 +102,7 @@ YLABEL_LATENCY = "E2E latency (s)"
 YLABEL_FT = "FT throughput (tok/s)"
 
 # ---- Y-axis headroom (per-GPU panels only) ----
-YMAX_HEADROOM = 1.55
+YMAX_HEADROOM = 1.3
 
 # ---- Display names (replace internal series ids in the legend) ----
 DISPLAY_NAME_INF = "vLLM"
@@ -134,33 +111,33 @@ DISPLAY_NAME_CO_FULL = "DeltaServe-vLLM"        # UNthrottled (new) run
 DISPLAY_NAME_TAIL_OVERHEAD = "Lowest 1% overhead"
 
 # ---- Font sizes ----
-FONTSIZE_PANEL_TITLE = 22
-FONTSIZE_AXIS_LABEL = 16
-FONTSIZE_TICK = 14
-FONTSIZE_LEGEND = 14.5
+FONTSIZE_PANEL_TITLE = 25
+FONTSIZE_AXIS_LABEL = 19
+FONTSIZE_TICK = 18
+FONTSIZE_LEGEND = 20
 
 # ---- Font weights — matplotlib accepts "normal", "bold", "light", or a
 # numeric value 0–1000. Drop these to "normal" to revert. ----
 FONTWEIGHT_TITLE = "bold"
 FONTWEIGHT_AXIS_LABEL = "bold"
 
-# ---- Legend placement (per-GPU panels) ----
-# Three-row layout: ``ncol = 2`` with a hidden spacer between the
-# latency block and the FT-throughput block lays the entries out as::
-#
-#   Row 1: vLLM                 | DeltaServe-vLLM-Temp
-#   Row 2: DeltaServe-vLLM      | (empty — spacer)
-#   Row 3: Temp FT Throughput   | DeltaServe-vLLM FT Throughput
-#
-# i.e. the unthrottled DeltaServe-vLLM latency entry sits alone on
-# row 2, separating the throttled / unthrottled latency lines from the
-# FT-throughput comparison underneath. Drop ``LEGEND_NCOL`` back to 3
-# (and remove the spacer in ``plot_gpu_panel``) to revert to the older
-# 2-row layout. Matplotlib fills the legend column-major; the natural
-# row-major handle order is fixed up via ``_row_major_reorder``.
-LEGEND_LOC = "upper center"
-LEGEND_BBOX_TO_ANCHOR = (0.5, 1.0)
-LEGEND_NCOL = 2
+# ---- Legend (between the timeline and the 5090 panel) ----
+# One names-only legend (NO numbers) in two rows, each centered, anchored
+# ABOVE the 5090 panel so it lands in the gap below the timeline:
+#   Row 1 (higher): vLLM | DeltaServe-vLLM-Temp | DeltaServe-vLLM
+#   Row 2 (lower):  Temp FT Throughput | DeltaServe-vLLM FT Throughput
+# Tune the y-coords (5090-axes fraction, >1.0 = above the panel) to set
+# the gap; constrained_layout reserves the room between the two panels.
+LEGEND_LAT_BBOX_TO_ANCHOR = (0.5, 1.16)   # latency row (top)
+LEGEND_FT_BBOX_TO_ANCHOR = (0.5, 1.02)    # FT row (just above the panel)
+LEGEND_COLUMNSPACING = 1.4
+LEGEND_HANDLETEXTPAD = 0.4
+SHOW_FT_LEGEND = True                      # include the two FT-throughput entries
+# Apparent legend weight WITHOUT a real bold font (DejaVu Sans has only
+# normal/bold): a thin same-colour stroke on normal-weight text. Tune the
+# point width for a weight "between" normal and bold — 0 = plain normal,
+# ~0.5 ≈ semibold, ~0.8 ≈ near-bold.
+LEGEND_WEIGHT_STROKE = 0.5
 
 # ---- Timeline panel (row 0) ----
 # auto_plot.plot_request_timeline adds its own legend; set False to drop it.
@@ -228,6 +205,17 @@ def _dot_handle(color: str) -> Line2D:
                   markerfacecolor=color, markersize=8)
 
 
+def _faux_weight(legend, stroke_pt: float) -> None:
+    """Give ``legend``'s text a weight 'between' normal and bold without a
+    real semibold font: outline each glyph with a thin same-colour stroke
+    (``stroke_pt`` points). 0 → leave as plain normal weight."""
+    if not stroke_pt or stroke_pt <= 0:
+        return
+    for t in legend.get_texts():
+        t.set_path_effects([
+            pe.withStroke(linewidth=stroke_pt, foreground=t.get_color())])
+
+
 def _row_major_reorder(items, ncol):
     """Reorder ``items`` so matplotlib's column-major legend fill
     DISPLAYS them in row-major order.
@@ -282,7 +270,7 @@ def _draw_ft_curve(ax_r, bwd_path: str, anchor_wall, tl_base: float,
               zorder=2)
     peak = float(np.nanmax(tok_per_s)) if tok_per_s.size else 0.0
     mean = float(np.mean(tok_per_s)) if tok_per_s.size else 0.0
-    print(f"[compare_temporal_both] {gpu_name}: FT {series_name}: "
+    print(f"[compare_temporal_5090] {gpu_name}: FT {series_name}: "
           f"peak={peak:.0f} tok/s, mean={mean:.0f} tok/s, "
           f"t_last={_ft_last:.1f}s")
     return peak, mean
@@ -313,8 +301,7 @@ def plot_gpu_panel(ax, gpu_dir: str, gpu_name: str, mode: str,
 
     def _set_panel_title():
         if PANEL_TITLE_TEMPLATE:
-            ax.set_title(PANEL_TITLE_TEMPLATE.format(
-                gpu_name=GPU_DISPLAY_NAME.get(gpu_name, gpu_name)),
+            ax.set_title(PANEL_TITLE_TEMPLATE.format(gpu_name=gpu_name),
                          fontsize=FONTSIZE_PANEL_TITLE,
                          fontweight=FONTWEIGHT_TITLE)
 
@@ -413,93 +400,60 @@ def plot_gpu_panel(ax, gpu_dir: str, gpu_name: str, mode: str,
     else:
         ax_r.set_ylim(bottom=0)
 
-    # ---- legend: up to five entries ----
-    #   1) vLLM                                 (avg latency)
-    #   2) DeltaServe-vLLM-Temp                 (avg latency, % vs vLLM)
-    #   3) DeltaServe-vLLM                      (avg latency, % vs vLLM)
-    #   4) FT throughput (DeltaServe-vLLM-Temp) (mean tok/s, % vs full)
-    #   5) FT throughput (DeltaServe-vLLM)      (mean tok/s)
-    handles, labels = [], []
+    # ---- legend (names only) BETWEEN the timeline and this panel ----
+    # Row 1: the three latency series (dots). Row 2: the two FT bands
+    # (patches). No numbers — and rendered as two stacked, frame-less,
+    # individually-centered legends anchored ABOVE this panel, so they
+    # land in the gap below the timeline.
+    lat_handles, lat_labels = [], []
     if inf is not None and np.isfinite(inf_avg):
-        handles.append(_dot_handle(INF_COLOR))
-        labels.append(f"{DISPLAY_NAME_INF} (avg {inf_avg:.3f}s)")
+        lat_handles.append(_dot_handle(INF_COLOR))
+        lat_labels.append(DISPLAY_NAME_INF)
     if co_temp is not None and np.isfinite(co_temp_avg):
-        parts = [f"avg {co_temp_avg:.3f}s"]
-        avg_oh = _overhead_pct(co_temp_avg, inf_avg)
-        if np.isfinite(avg_oh):
-            # Drop the explicit "vs <baseline>" — vLLM is the obvious
-            # reference and trimming the suffix tightens the legend.
-            parts.append(f"{avg_oh:+.1f}%")
-        handles.append(_dot_handle(CO_TEMP_COLOR))
-        labels.append(f"{DISPLAY_NAME_CO_TEMP} ({', '.join(parts)})")
+        lat_handles.append(_dot_handle(CO_TEMP_COLOR))
+        lat_labels.append(DISPLAY_NAME_CO_TEMP)
     if co_full is not None and np.isfinite(co_full_avg):
-        parts = [f"avg {co_full_avg:.3f}s"]
-        avg_oh = _overhead_pct(co_full_avg, inf_avg)
-        if np.isfinite(avg_oh):
-            parts.append(f"{avg_oh:+.1f}%")
-        handles.append(_dot_handle(CO_FULL_COLOR))
-        labels.append(f"{DISPLAY_NAME_CO_FULL} ({', '.join(parts)})")
-    # Three-row layout: drop a hidden spacer between the latency block
-    # and the FT-throughput block so ncol=2 lays out as
-    #   row 1: vLLM | Temp
-    #   row 2: full | <spacer>
-    #   row 3: Temp FT | full FT
-    # i.e. the unthrottled DeltaServe-vLLM latency entry sits alone on
-    # row 2. Drop the spacer (and set LEGEND_NCOL back to 3) to revert
-    # to the older 2-row layout.
-    if LEGEND_NCOL == 2 and len(handles) == 3:
-        handles.append(Line2D([0], [0], linestyle="none", marker=""))
-        labels.append("")
-    # Dedicated FT-throughput entries — coloured patches match the
-    # filled bands on the right axis so the legend doubles as a curve
-    # key. The relative comparison (full vs Temp) lives on the
-    # unthrottled entry so it reads as a positive gain ("how much more
-    # FT throughput the unthrottled run delivers vs the Temp baseline").
-    if ft_temp_mean > 0:
-        handles.append(Patch(facecolor=FT_TEMP_COLOR, alpha=FT_FILL_ALPHA,
-                             edgecolor=FT_TEMP_COLOR))
-        labels.append(
-            f"{DISPLAY_NAME_CO_TEMP} FT Throughput: {ft_temp_mean:.0f} tok/s")
-    if ft_full_mean > 0:
-        label = (f"{DISPLAY_NAME_CO_FULL} FT Throughput: "
-                 f"{ft_full_mean:.0f} tok/s")
-        if ft_temp_mean > 0:
-            delta_pct = (ft_full_mean - ft_temp_mean) / ft_temp_mean * 100.0
-            label += f" ({delta_pct:+.1f}%)"
-        handles.append(Patch(facecolor=FT_FULL_COLOR, alpha=FT_FILL_ALPHA,
-                             edgecolor=FT_FULL_COLOR))
-        labels.append(label)
-    if handles:
-        legend_kwargs = dict(loc=LEGEND_LOC, fontsize=FONTSIZE_LEGEND,
-                             ncol=LEGEND_NCOL)
-        if LEGEND_BBOX_TO_ANCHOR is not None:
-            legend_kwargs["bbox_to_anchor"] = LEGEND_BBOX_TO_ANCHOR
-        # matplotlib fills the legend column-major; permute so the
-        # visual ends up row-major. For LEGEND_NCOL=2 (3-row layout) a
-        # hidden spacer above pads the latency block to 4 entries so
-        # the FT-throughput pair lands cleanly on row 3.
-        handles = _row_major_reorder(handles, LEGEND_NCOL)
-        labels = _row_major_reorder(labels, LEGEND_NCOL)
-        ax.legend(handles, labels, **legend_kwargs)
+        lat_handles.append(_dot_handle(CO_FULL_COLOR))
+        lat_labels.append(DISPLAY_NAME_CO_FULL)
+
+    ft_handles, ft_labels = [], []
+    if SHOW_FT_LEGEND and ft_temp_mean > 0:
+        ft_handles.append(Patch(facecolor=FT_TEMP_COLOR, alpha=FT_FILL_ALPHA,
+                                edgecolor=FT_TEMP_COLOR))
+        ft_labels.append(f"{DISPLAY_NAME_CO_TEMP} FT Throughput")
+    if SHOW_FT_LEGEND and ft_full_mean > 0:
+        ft_handles.append(Patch(facecolor=FT_FULL_COLOR, alpha=FT_FILL_ALPHA,
+                                edgecolor=FT_FULL_COLOR))
+        ft_labels.append(f"{DISPLAY_NAME_CO_FULL} FT Throughput")
+
+    # Render the FT (lower) row first via add_artist; render the latency
+    # (higher) row LAST so it's the axes' "official" legend that
+    # constrained_layout reserves the inter-panel gap for.
+    _leg_kw = dict(loc="lower center", frameon=False,
+                   prop={"weight": "normal", "size": FONTSIZE_LEGEND},
+                   columnspacing=LEGEND_COLUMNSPACING,
+                   handletextpad=LEGEND_HANDLETEXTPAD)
+    if ft_handles:
+        leg_ft = ax.legend(ft_handles, ft_labels, ncol=len(ft_handles),
+                           bbox_to_anchor=LEGEND_FT_BBOX_TO_ANCHOR, **_leg_kw)
+        ax.add_artist(leg_ft)
+        _faux_weight(leg_ft, LEGEND_WEIGHT_STROKE)
+    if lat_handles:
+        leg_lat = ax.legend(lat_handles, lat_labels, ncol=len(lat_handles),
+                            bbox_to_anchor=LEGEND_LAT_BBOX_TO_ANCHOR, **_leg_kw)
+        _faux_weight(leg_lat, LEGEND_WEIGHT_STROKE)
     return t_max
 
 
 def build_figure(input_dir: str, mode: str,
                  factor_temp: str, factor_full: str,
-                 ft_offset: float = 0.0, window_s=None,
-                 gpus=GPUS) -> plt.Figure:
-    # Rows: timeline (HEIGHT_RATIOS[0]) + 1.0 per GPU in ``gpus``. Scale the
-    # figure height so each row keeps its default per-row height regardless of
-    # how many GPUs are shown (one GPU => 2 rows, both => 3).
-    gpus = tuple(gpus)
-    height_ratios = [HEIGHT_RATIOS[0]] + [1.0] * len(gpus)
-    row_unit = FIGSIZE[1] / sum(HEIGHT_RATIOS)
-    fig = plt.figure(figsize=(FIGSIZE[0], row_unit * sum(height_ratios)),
-                     constrained_layout=True)
-    gs_kwargs = dict(figure=fig, height_ratios=height_ratios)
+                 ft_offset: float = 0.0, window_s=None) -> plt.Figure:
+    # Two fixed rows: timeline (HEIGHT_RATIOS[0]) + the 5090 panel.
+    fig = plt.figure(figsize=FIGSIZE, constrained_layout=True)
+    gs_kwargs = dict(figure=fig, height_ratios=list(HEIGHT_RATIOS))
     if ROW_HSPACE is not None:
         gs_kwargs["hspace"] = ROW_HSPACE
-    gs = GridSpec(1 + len(gpus), 1, **gs_kwargs)
+    gs = GridSpec(2, 1, **gs_kwargs)
 
     # Row 0: scheduled request timeline (full width). The timeline file
     # is the x-axis reference: keep its native timestamps (first inference
@@ -522,7 +476,16 @@ def build_figure(input_dir: str, mode: str,
         # this panel matches the per-GPU panels below (bold + tuned size).
         if ax_tl.get_title():
             ax_tl.title.set_fontsize(FONTSIZE_PANEL_TITLE)
-            ax_tl.title.set_fontweight(FONTWEIGHT_TITLE)
+            # Match the legend's faux-semibold weight (DejaVu Sans has no real
+            # medium): normal weight + a same-colour stroke, scaled to the
+            # title's larger size so the apparent weight matches the legend.
+            ax_tl.title.set_fontweight("normal")
+            if LEGEND_WEIGHT_STROKE and LEGEND_WEIGHT_STROKE > 0:
+                _ti_stroke = (LEGEND_WEIGHT_STROKE
+                              * FONTSIZE_PANEL_TITLE / FONTSIZE_LEGEND)
+                ax_tl.title.set_path_effects([pe.withStroke(
+                    linewidth=_ti_stroke,
+                    foreground=ax_tl.title.get_color())])
         ax_tl.xaxis.label.set_fontsize(FONTSIZE_AXIS_LABEL)
         ax_tl.xaxis.label.set_fontweight(FONTWEIGHT_AXIS_LABEL)
         ax_tl.yaxis.label.set_fontsize(FONTSIZE_AXIS_LABEL)
@@ -552,24 +515,20 @@ def build_figure(input_dir: str, mode: str,
                         fontsize=FONTSIZE_PANEL_TITLE,
                         fontweight=FONTWEIGHT_TITLE)
 
-    # Rows 1..N: one GPU per full-width row (whichever GPUs are in ``gpus``).
-    gpu_axes = []
+    # Row 1: the single 5090 panel.
     t_max = float(tl["t_rel_s"].max()) if tl is not None and len(tl["t_rel_s"]) else 0.0
-    for row, gpu in enumerate(gpus, start=1):
-        ax = fig.add_subplot(gs[row, 0])
-        gpu_axes.append(ax)
-        panel_tmax = plot_gpu_panel(
-            ax, os.path.join(input_dir, gpu), gpu, mode,
-            factor_temp=factor_temp, factor_full=factor_full,
-            tl_base=tl_base, ft_offset=ft_offset, window_s=window_s)
-        t_max = max(t_max, panel_tmax)
+    ax_gpu = fig.add_subplot(gs[1, 0])
+    panel_tmax = plot_gpu_panel(
+        ax_gpu, os.path.join(input_dir, GPU), GPU, mode,
+        factor_temp=factor_temp, factor_full=factor_full,
+        tl_base=tl_base, ft_offset=ft_offset, window_s=window_s)
+    t_max = max(t_max, panel_tmax)
 
     if t_max > 0:
         xlim = (0, t_max * 1.01)
         ax_tl.set_xlim(*xlim)
-        for ax in gpu_axes:
-            if ax.has_data():
-                ax.set_xlim(*xlim)
+        if ax_gpu.has_data():
+            ax_gpu.set_xlim(*xlim)
 
     if SUPTITLE:
         fig.suptitle(SUPTITLE, fontsize=14)
@@ -602,40 +561,27 @@ def main() -> None:
                          "on top of the real-timestamp anchor. Default 0.")
     ap.add_argument("--output", default=None,
                     help="Output PNG path. Default: "
-                         "<input-dir>/compare_temporal_both[_<gpu>]_<mode>.png.")
-    # GPU selection: with --5090 or --A100 the figure shows ONLY that GPU
-    # (timeline + one panel = 2 rows), dropping the other. With neither, both
-    # GPUs are shown (timeline + 2 panels = 3 rows), as before.
-    gpu_sel = ap.add_mutually_exclusive_group()
-    gpu_sel.add_argument("--5090", dest="gpu", action="store_const",
-                         const="5090",
-                         help="Plot only the 5090 panel (drop A100).")
-    gpu_sel.add_argument("--A100", dest="gpu", action="store_const",
-                         const="A100",
-                         help="Plot only the A100 panel (drop 5090).")
+                         "<input-dir>/compare_temporal_5090_<mode>.png.")
     args = ap.parse_args()
 
     if not os.path.isdir(args.input_dir):
-        sys.exit(f"[compare_temporal_both] input dir not found: {args.input_dir}")
+        sys.exit(f"[compare_temporal_5090] input dir not found: {args.input_dir}")
 
-    gpus = (args.gpu,) if args.gpu else GPUS
-    gpu_tag = f"_{args.gpu}" if args.gpu else ""
     out_path = args.output or os.path.join(
-        args.input_dir, f"compare_temporal_both{gpu_tag}_{args.mode}.png")
+        args.input_dir, f"compare_temporal_5090_{args.mode}.png")
 
     fig = build_figure(args.input_dir, args.mode,
                        factor_temp=args.factor,
                        factor_full=args.factor_full,
-                       ft_offset=args.ft_offset, window_s=args.window,
-                       gpus=gpus)
+                       ft_offset=args.ft_offset, window_s=args.window)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     fig.savefig(out_path, dpi=PNG_DPI)
-    print(f"[compare_temporal_both] wrote figure → {out_path}")
+    print(f"[compare_temporal_5090] wrote figure → {out_path}")
     if GENERATE_PDF:
         pdf_path = os.path.splitext(out_path)[0] + ".pdf"
         fig.savefig(pdf_path, format="pdf",
                     bbox_inches="tight", pad_inches=0)
-        print(f"[compare_temporal_both] wrote figure → {pdf_path}  (no-margin)")
+        print(f"[compare_temporal_5090] wrote figure → {pdf_path}  (no-margin)")
     plt.close(fig)
 
 

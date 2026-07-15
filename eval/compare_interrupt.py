@@ -50,6 +50,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.patheffects as pe
 from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
@@ -91,14 +92,13 @@ GENERATE_PDF = True
 PNG_DPI = 130
 
 # ---- Figure ----
-FIGSIZE = (15, 4.5)              # single panel; height is enough for legend + data
+FIGSIZE = (12, 4.4)             # single panel; wide enough for the 3-wide top legend
 SUPTITLE = None                  # None disables the figure-level title
 XMAX = 40.0                      # x-axis upper limit (s); None = full timeline span
                                  # (overridable with --xmax)
 
 # ---- Per-panel title ----
-PANEL_TITLE = f"{GPU_DISPLAY_NAME} — E2E latency & FT throughput"
-# Pass None to drop the panel header.
+PANEL_TITLE = None              # set to a string to add a panel header (None = no title)
 
 # ---- Axis labels ----
 XLABEL = "Time (s)"
@@ -106,7 +106,7 @@ YLABEL_LATENCY = "E2E latency (s)"
 YLABEL_FT = "FT throughput (tok/s)"
 
 # ---- Y-axis headroom ----
-YMAX_HEADROOM = 1.55
+YMAX_HEADROOM = 1.65
 
 # ---- Y-axis tick spacing (None = matplotlib auto) ----
 YTICK_LATENCY = 0.4       # left axis (E2E latency, s): a tick every 0.4
@@ -115,7 +115,7 @@ YTICK_FT = 500            # right axis (FT throughput, tok/s): a tick every 500
 # ---- Display names (replace internal series ids in the legend) ----
 DISPLAY_NAME_INF = "vLLM"
 DISPLAY_NAME_CO_TEMP = "DeltaServe-vLLM-Temp"
-DISPLAY_NAME_CO_TEMP_NOINT = "DeltaServe-vLLM-No-Interrupt"
+DISPLAY_NAME_CO_TEMP_NOINT = "DeltaServe-vLLM-No-INTR"
 
 # ---- File-name templates ----
 # ``{mode}`` is the workload tag (e.g. "nutanix"). Edit individual
@@ -130,9 +130,10 @@ FILE_NOINT_META = "bench_meta_co_factor_interrupt_false_{mode}.json"
 
 # ---- Font sizes ----
 FONTSIZE_PANEL_TITLE = 20
-FONTSIZE_AXIS_LABEL = 14
+FONTSIZE_AXIS_LABEL = 16
 FONTSIZE_TICK = 14
-FONTSIZE_LEGEND = 13
+FONTSIZE_LEGEND = 17.5
+TAIL_ANNOTATION_FONTSIZE = 17.5
 
 # ---- Font weights ----
 FONTWEIGHT_TITLE = "bold"
@@ -158,14 +159,27 @@ FONTWEIGHT_AXIS_LABEL = "bold"
 #   center of the panel. ``framealpha`` keeps it readable when the
 #   coloured FT band sits underneath. Drop the bbox y-coord below 0 to
 #   push the box outside the axes (e.g. ``(0.5, -0.18)``).
-LEGEND_LOC = "upper center"               # top (latency) box
-LEGEND_BBOX_TO_ANCHOR = (0.5, 1.0)
-LEGEND_NCOL = 2
+# Two stacked, frame-less, individually-centered legends above the axes
+# (so the 2-entry FT row centers under the 3-entry latency row):
+#   Row 1 (higher): vLLM | DeltaServe-vLLM-Temp | DeltaServe-vLLM-No-INTR
+#   Row 2 (lower):  Temp FT Throughput | No-INTR FT Throughput  (centered)
+# Names only — the avg / 5%-tail numbers move to the in-plot annotation below.
+# Each is loc="lower center"; tune the y-coords to set the gap above the axes.
+LEGEND_LAT_BBOX_TO_ANCHOR = (0.5, 1.13)   # latency row (top)
+LEGEND_FT_BBOX_TO_ANCHOR = (0.5, 1.00)    # FT row (just above the axes)
+LEGEND_COLUMNSPACING = 1.2
+LEGEND_HANDLETEXTPAD = 0.4
+SHOW_FT_LEGEND = True                     # include the two FT-throughput entries
+# Apparent legend weight WITHOUT a real bold font (DejaVu Sans has only
+# normal/bold): a thin same-colour stroke on normal-weight text. Tune the
+# point width for a weight "between" normal and bold — 0 = plain normal,
+# ~0.5 ≈ semibold, ~0.8 ≈ near-bold.
+LEGEND_WEIGHT_STROKE = 0.5
 
-LEGEND_FT_LOC = "lower center"            # bottom (FT throughput) box
-LEGEND_FT_BBOX_TO_ANCHOR = (0.5, 0.0)
-LEGEND_FT_NCOL = 2
-LEGEND_FT_FRAMEALPHA = 0.9
+# ---- In-plot 5%-tail overhead annotation (was in the legend) ----
+SHOW_TAIL_ANNOTATION = True
+TAIL_ANNOTATION_LOC = (0.985, 0.95)       # axes-fraction (x, y), top-RIGHT anchor
+
 
 # ---- Colors ----
 INF_COLOR = "tab:blue"
@@ -188,6 +202,17 @@ MEAN_LINE_ALPHA = 0.5
 MEAN_LINE_WIDTH = 1.0
 
 # ============================================================================
+
+
+def _faux_weight(legend, stroke_pt: float) -> None:
+    """Give ``legend``'s text a weight 'between' normal and bold without a
+    real semibold font: outline each glyph with a thin same-colour stroke
+    (``stroke_pt`` points). 0 → leave as plain normal weight."""
+    if not stroke_pt or stroke_pt <= 0:
+        return
+    for t in legend.get_texts():
+        t.set_path_effects([
+            pe.withStroke(linewidth=stroke_pt, foreground=t.get_color())])
 
 
 def _slow_mean(res, pct: float = 5.0) -> float:
@@ -338,109 +363,80 @@ def plot_panel(ax, gpu_dir: str, mode: str,
     if YTICK_FT and ft_peak > 0:
         ax_r.yaxis.set_major_locator(MultipleLocator(YTICK_FT))
 
-    # ---- legends ----
-    # Top box (3 rows x 2 cols, ROW-major intent):
-    #   Row 1: vLLM                            | (blank spacer)
-    #   Row 2: DeltaServe-vLLM-Temp            | 5% tail overhead vs vLLM
-    #   Row 3: DeltaServe-vLLM-No-Interrupt    | 5% tail overhead vs vLLM
-    # The col-2 dot on rows 2/3 mirrors the row's system colour so the
-    # eye pairs the tail-overhead entry with the latency-avg entry.
-    def _spacer():
-        return Line2D([0], [0], linestyle="none", marker="")
-
-    def _tail_label(co_slow5):
-        """Format the 5% tail-overhead entry for one co-serving system.
-        Falls back to the spacer when vLLM's tail or the system's tail
-        is missing so the row doesn't carry a half-meaningful number."""
-        if not (np.isfinite(co_slow5) and np.isfinite(inf_slow5)):
-            return None
-        oh = _overhead_pct(co_slow5, inf_slow5)
-        if not np.isfinite(oh):
-            return None
-        return f"5% tail {co_slow5:.3f}s ({oh:+.1f}% vs vLLM)"
-
+    # ---- legend at the top (names only) + 5%-tail annotation ----
+    # Row 1: the three latency series (dots, names only).
     lat_handles, lat_labels = [], []
-    # --- Row 1: vLLM + blank spacer
     if inf is not None and np.isfinite(inf_avg):
         lat_handles.append(_dot_handle(INF_COLOR))
-        lat_labels.append(f"{DISPLAY_NAME_INF} (avg {inf_avg:.3f}s)")
-        lat_handles.append(_spacer())
-        lat_labels.append("")
-    # --- Row 2: Temp + Temp's 5% tail overhead
+        lat_labels.append(DISPLAY_NAME_INF)
     if temp is not None and np.isfinite(temp_avg):
-        parts = [f"avg {temp_avg:.3f}s"]
-        avg_oh = _overhead_pct(temp_avg, inf_avg)
-        if np.isfinite(avg_oh):
-            parts.append(f"{avg_oh:+.1f}%")
         lat_handles.append(_dot_handle(CO_TEMP_COLOR))
-        lat_labels.append(f"{DISPLAY_NAME_CO_TEMP} ({', '.join(parts)})")
-        tail_lbl = _tail_label(temp_slow5)
-        if tail_lbl is not None:
-            lat_handles.append(_dot_handle(CO_TEMP_COLOR))
-            lat_labels.append(tail_lbl)
-        else:
-            lat_handles.append(_spacer())
-            lat_labels.append("")
-    # --- Row 3: No-Interrupt + No-Interrupt's 5% tail overhead
+        lat_labels.append(DISPLAY_NAME_CO_TEMP)
     if noint is not None and np.isfinite(noint_avg):
-        parts = [f"avg {noint_avg:.3f}s"]
-        avg_oh = _overhead_pct(noint_avg, inf_avg)
-        if np.isfinite(avg_oh):
-            parts.append(f"{avg_oh:+.1f}%")
         lat_handles.append(_dot_handle(CO_NOINT_COLOR))
-        lat_labels.append(f"{DISPLAY_NAME_CO_TEMP_NOINT} ({', '.join(parts)})")
-        tail_lbl = _tail_label(noint_slow5)
-        if tail_lbl is not None:
-            lat_handles.append(_dot_handle(CO_NOINT_COLOR))
-            lat_labels.append(tail_lbl)
-        else:
-            lat_handles.append(_spacer())
-            lat_labels.append("")
+        lat_labels.append(DISPLAY_NAME_CO_TEMP_NOINT)
 
-    # Bottom box (1 row x 2 cols): FT throughput entries — coloured
-    # patches matching the right-axis bands. Temp shows its absolute
-    # mean; No-Interrupt reports the relative delta vs Temp so the cost
-    # of disabling forward_interruptible reads at a glance.
+    # Row 2: the two FT-throughput bands (patches, names only — no numbers).
     ft_handles, ft_labels = [], []
-    if ft_temp_mean > 0:
-        ft_handles.append(Patch(facecolor=FT_TEMP_COLOR,
-                                alpha=FT_FILL_ALPHA,
+    if SHOW_FT_LEGEND and ft_temp_mean > 0:
+        ft_handles.append(Patch(facecolor=FT_TEMP_COLOR, alpha=FT_FILL_ALPHA,
                                 edgecolor=FT_TEMP_COLOR))
-        ft_labels.append(
-            f"{DISPLAY_NAME_CO_TEMP} FT Throughput: "
-            f"{ft_temp_mean:.0f} tok/s")
-    if ft_noint_mean > 0:
-        label = (f"{DISPLAY_NAME_CO_TEMP_NOINT} FT Throughput: "
-                 f"{ft_noint_mean:.0f} tok/s")
-        if ft_temp_mean > 0:
-            delta_pct = (ft_noint_mean - ft_temp_mean) / ft_temp_mean * 100.0
-            label += f" ({delta_pct:+.1f}%)"
-        ft_handles.append(Patch(facecolor=FT_NOINT_COLOR,
-                                alpha=FT_FILL_ALPHA,
+        ft_labels.append(f"{DISPLAY_NAME_CO_TEMP} FT Throughput")
+    if SHOW_FT_LEGEND and ft_noint_mean > 0:
+        ft_handles.append(Patch(facecolor=FT_NOINT_COLOR, alpha=FT_FILL_ALPHA,
                                 edgecolor=FT_NOINT_COLOR))
-        ft_labels.append(label)
+        ft_labels.append(f"{DISPLAY_NAME_CO_TEMP_NOINT} FT Throughput")
 
-    # Render the top (latency) legend first; ``ax.add_artist`` keeps
-    # it on the axes when the next ``ax.legend`` call would otherwise
-    # replace it.
-    if lat_handles:
-        lat_kwargs = dict(loc=LEGEND_LOC, fontsize=FONTSIZE_LEGEND,
-                          ncol=LEGEND_NCOL)
-        if LEGEND_BBOX_TO_ANCHOR is not None:
-            lat_kwargs["bbox_to_anchor"] = LEGEND_BBOX_TO_ANCHOR
-        lat_h = _row_major_reorder(lat_handles, LEGEND_NCOL)
-        lat_l = _row_major_reorder(lat_labels, LEGEND_NCOL)
-        leg_lat = ax.legend(lat_h, lat_l, **lat_kwargs)
-        ax.add_artist(leg_lat)
+    # Two stacked, frame-less legends, each centered on its own row (ncol =
+    # number of entries), so the FT row centers under the latency row. The
+    # first ``add_artist`` keeps the latency legend when the second call lands.
+    _leg_kw = dict(loc="lower center", frameon=False,
+                   prop={"weight": "normal", "size": FONTSIZE_LEGEND},
+                   columnspacing=LEGEND_COLUMNSPACING,
+                   handletextpad=LEGEND_HANDLETEXTPAD)
+    # Render the FT (lower) row first via add_artist; render the latency
+    # (higher) row LAST so it's the axes' "official" legend that
+    # constrained_layout reserves the full top margin for (otherwise the
+    # higher row clips off the top of the figure).
     if ft_handles:
-        ft_kwargs = dict(loc=LEGEND_FT_LOC, fontsize=FONTSIZE_LEGEND,
-                         ncol=LEGEND_FT_NCOL,
-                         framealpha=LEGEND_FT_FRAMEALPHA)
-        if LEGEND_FT_BBOX_TO_ANCHOR is not None:
-            ft_kwargs["bbox_to_anchor"] = LEGEND_FT_BBOX_TO_ANCHOR
-        ft_h = _row_major_reorder(ft_handles, LEGEND_FT_NCOL)
-        ft_l = _row_major_reorder(ft_labels, LEGEND_FT_NCOL)
-        ax.legend(ft_h, ft_l, **ft_kwargs)
+        leg_ft = ax.legend(ft_handles, ft_labels, ncol=len(ft_handles),
+                           bbox_to_anchor=LEGEND_FT_BBOX_TO_ANCHOR, **_leg_kw)
+        ax.add_artist(leg_ft)
+        _faux_weight(leg_ft, LEGEND_WEIGHT_STROKE)
+    if lat_handles:
+        leg_lat = ax.legend(lat_handles, lat_labels, ncol=len(lat_handles),
+                            bbox_to_anchor=LEGEND_LAT_BBOX_TO_ANCHOR, **_leg_kw)
+        _faux_weight(leg_lat, LEGEND_WEIGHT_STROKE)
+
+    # 5%-tail overhead (+ avg) per co-serving system → in-plot annotation
+    # (the numbers that used to live in the legend).
+    if SHOW_TAIL_ANNOTATION:
+        ann = []
+
+        # Pad the name field to a common width so the ":" lines up across
+        # rows. Requires a monospace font (proportional fonts don't align on
+        # space padding) — set on the ax.text call below.
+        _name_w = max(len(DISPLAY_NAME_CO_TEMP), len(DISPLAY_NAME_CO_TEMP_NOINT))
+
+        def _ann_line(name, slow5):
+            if not (np.isfinite(slow5) and np.isfinite(inf_slow5)):
+                return
+            oh = _overhead_pct(slow5, inf_slow5)
+            if not np.isfinite(oh):
+                return
+            ann.append(f"{name:<{_name_w}} : 5% tail {slow5:.3f}s "
+                       f"({oh:+.1f}% vs vLLM)")
+
+        _ann_line(DISPLAY_NAME_CO_TEMP, temp_slow5)
+        _ann_line(DISPLAY_NAME_CO_TEMP_NOINT, noint_slow5)
+        if ann:
+            ax.text(TAIL_ANNOTATION_LOC[0], TAIL_ANNOTATION_LOC[1],
+                    "\n".join(ann), transform=ax.transAxes,
+                    fontsize=TAIL_ANNOTATION_FONTSIZE, va="top", ha="right",
+                    ma="left",   # left-justify the lines inside the top-right box
+                    family="monospace",  # so the space-padded ":" columns align
+                    bbox=dict(boxstyle="round", facecolor="white",
+                              edgecolor="0.6", alpha=0.85))
     return t_max
 
 

@@ -53,7 +53,7 @@ PNG_DPI = 130
 
 # ---- Figure ----
 FIGSIZE = (10, 5)
-SUBPLOT_HSPACE = 0.05    # vertical gap between the two panels (fraction of panel
+SUBPLOT_HSPACE = 0.09    # vertical gap between the two panels (fraction of panel
                           # height); larger = more space, smaller = tighter
 
 # ---- Binning ----
@@ -85,10 +85,11 @@ AVG_COLOR = "tab:blue"        # mean-util dashed line + right-axis tick
 SHOW_LEGEND = False           # label both the tokens/sec and requests/sec curves
 
 # ---- Fonts ----
-FONTSIZE_TITLE = 15
-FONTSIZE_AXIS_LABEL = 13
-FONTSIZE_TICK = 11
+FONTSIZE_TITLE = 20
+FONTSIZE_AXIS_LABEL = 16
+FONTSIZE_TICK = 14
 FONTWEIGHT_TITLE = "normal"
+
 # ============================================================================
 
 
