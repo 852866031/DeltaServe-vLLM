@@ -50,7 +50,7 @@ finetune:
 # and refit online; FT tokens are admitted only while the predicted step time
 # keeps inference TTFT/TBT within these targets.
 slo:
-  ttft_slo: 0.25                      # time-to-first-token target (seconds)
+  ttft_slo: 0.2                      # time-to-first-token target (seconds)
   avg_tbt_slo: 0.1                   # avg time-between-tokens target (seconds)
   max_tbt_slo: 0.12                   # max single-step time while admitting FT (seconds)
   profile_on_launch: true            # offline profiling pass before serving

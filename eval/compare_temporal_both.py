@@ -97,8 +97,8 @@ GENERATE_PDF = True
 PNG_DPI = 130
 
 # ---- Figure ----
-FIGSIZE = (15, 13)
-HEIGHT_RATIOS = (1.0, 1.0, 1.0)
+FIGSIZE = (14, 13)
+HEIGHT_RATIOS = (0.8, 1.0, 1.0)
 SUPTITLE = None                   # None disables the figure-level title
 
 # Vertical gap between adjacent figure rows as a fraction of an average
@@ -134,10 +134,10 @@ DISPLAY_NAME_CO_FULL = "DeltaServe-vLLM"        # UNthrottled (new) run
 DISPLAY_NAME_TAIL_OVERHEAD = "Lowest 1% overhead"
 
 # ---- Font sizes ----
-FONTSIZE_PANEL_TITLE = 20
-FONTSIZE_AXIS_LABEL = 14
+FONTSIZE_PANEL_TITLE = 22
+FONTSIZE_AXIS_LABEL = 16
 FONTSIZE_TICK = 14
-FONTSIZE_LEGEND = 13
+FONTSIZE_LEGEND = 14.5
 
 # ---- Font weights — matplotlib accepts "normal", "bold", "light", or a
 # numeric value 0–1000. Drop these to "normal" to revert. ----

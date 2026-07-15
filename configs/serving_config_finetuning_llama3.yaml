@@ -45,9 +45,9 @@ finetune:
 # and refit online; FT tokens are admitted only while the predicted step time
 # keeps inference TTFT/TBT within these targets.
 slo:
-  ttft_slo: 0.3                      # time-to-first-token target (seconds)
+  ttft_slo: 0.25                      # time-to-first-token target (seconds)
   avg_tbt_slo: 0.02                   # avg time-between-tokens target (seconds)
-  max_tbt_slo: 0.1                   # max single-step time while admitting FT (seconds)
+  max_tbt_slo: 0.05                   # max single-step time while admitting FT (seconds)
   profile_on_launch: true            # offline profiling pass before serving
   profile_num_repeats: 2             # recorded passes per profiling shape
   # Cap FT tokens per step relative to that step's inference prefill tokens:
@@ -60,7 +60,7 @@ slo:
   # next_sample.input_len AND SLO allows. 0.0 disables (default);
   # 1.0 reproduces the old `match_with_prefill_workload: true` behaviour;
   # >1 admits more aggressively; <1 more conservatively.
-  match_prefill_workload_factor: 0.5
+  match_prefill_workload_factor: 0
   # [unified-phase only] TBT-budget multiplier on decode-only steps when FT
   # is being considered for admission. Inert in this (prefill-only) config —
   # decode-only steps short-circuit to no FT regardless. Exposed here for
