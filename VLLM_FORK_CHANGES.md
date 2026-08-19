@@ -52,6 +52,8 @@ Two kinds of change:
 | P5.5 (F1) — save post-RoPE qh/kh/vh per layer | — | `config/finetune.py`* (new `save_attn_qkv: bool = False` opt-in field), `deltaserve/accumulate.py`* (auto-detect `self_attn.attn` modules per layer; allocate `attn_qh [s_max, q_size]` + `attn_kh/vh [s_max, kv_size]` per layer; new `_make_attn_qkv_pre_hook` reads `args=(q, k, v)` post-RoPE; `zero_offset_range` extended; new `q_size`/`kv_size`/`save_attn_qkv` constructor args), `deltaserve/bwd_services/llama3.py`* (`_build_state` reads `meta["save_attn_qkv"]` → `self.save_attn_qkv`; `layer_forward` accepts `saved_qh/kh/vh` and short-circuits Q/K/V proj + RoPE; `process_backward` extracts saved q/k/v per layer and threads through both paths), `deltaserve/bwd_services/llama3_graph.py`* (`save_attn_qkv` mode flag; new `static_saved_qh/kh/vh` IO; `_forward_core` branches on the mode flag to read from the saved buffers instead of computing Q/K/V/RoPE; `stage_forward_inputs` + `forward` signatures extended with `saved_qh/kh/vh` kwargs), `v1/worker/gpu_worker.py` (derive `q_size = num_heads * head_dim`, `kv_size = num_kv_heads * head_dim`; pass through to `FinetuneAccumulator`; add `save_attn_qkv` to the shared `meta` dict so the backward subprocess knows the mode), `tests/test_llama3_backward_graph.py`* (new `test_layer_forward_saved_qkv_parity` + `test_forward_graph_saved_qkv_parity`: 45 new assertions, parity vs the recompute path) |
 | UnifiedFT — `slo.coserving_admission_phase: both` scheduler | `deltaserve/ft_scheduler_both.py`, `configs/serving_config_finetuning_llama3_both.yaml`, `eval/auto_plot_schedulers.py` | `config/finetune.py`* (new `coserving_admission_phase: str = "prefill"` + `decode_only_ft_safety_margin: float = 0.7` fields under the `slo:` YAML section), `config/vllm.py`* (branch `scheduler_cls` on the phase in `__post_init__`; soft-fall to `"prefill"` with `logger.warning` when `phase=="both"` AND `ft_tokens_admission_constrain_factor != -1`), `deltaserve/ft_scheduler.py`* (extract the FT admission gate to a new `_initial_ft_budget(feats, earliest_arrival)` hook so subclasses can override the `decode_only → 0` short-circuit cleanly), `eval/auto_benchmark.py`* (new `--scheduler {prefill,both}` CLI arg → maps to the corresponding YAML via `_SCHED_CONFIGS`; new `_phase_tag(cfg)` helper reads `slo.coserving_admission_phase` from the loaded YAML; output suffix scheme extended to `_co_factor_<X>_phase_<Y>_<mode>`; `_load_yaml_cfg(config_path)` + `build_server_cmd(..., config_path)` take an explicit path arg), `eval/auto_plot.py`* (drop the E2E latency percentile panel; figure shrinks to a single-row 4-panel layout) |
 
+| P7 — TP=2 co-serving finetuning (M1-M4.1) | `configs/serving_config_finetuning_llama3_tp2.yaml`, `tests/test_llama3_tp_shard.py`, `tests/test_llama3_tp_backward_gloo.py`, `eval-tp/{launch_deltaserve,ft_bench_tp}.py` | `v1/executor/multiproc_executor.py` (**new file for the fork** — non-daemon workers when finetuning + `PR_SET_PDEATHSIG` + lethal death-pipe monitor), `v1/outputs.py` (**new file for the fork** — worker→scheduler relay fields), `v1/core/sched/output.py` (`finetune_backward_trigger` broadcast), `v1/worker/gpu_worker.py` (tp geometry in `meta`, lm_head all-gather, local accumulator widths, `relay_mode`), `v1/worker/gpu_model_runner.py` (relay stash / `execute_trigger` / ack poll), `deltaserve/bwd_services/llama3.py`* (local dims, `lora_shard_slice`, backward NCCL group, the per-layer all-reduces, graph force-off under TP), `deltaserve/bwd_services/base.py`* (child `PR_SET_PDEATHSIG`), `deltaserve/coordinator.py`* (relay mode), `deltaserve/ft_scheduler.py`* (relay wiring), `deltaserve/backward_process.py`* (daemon-guard message) |
+
 `*` = same file extended in a later stage.
 
 > **P5.1:** the backward yields the GPU at every layer boundary while the main process runs an
@@ -513,6 +515,15 @@ truth for FT-tagged requests; set by the injector after construction).
 Stage P2.2. Add `SchedulerOutput.finetune_req_ids: set[str]` (default empty); import
 `field`. Populated by `FinetuneScheduler`, read by the model runner to build the mask.
 
+Stage P7 (TP). Add `SchedulerOutput.finetune_backward_trigger: dict | None`. Under TP>1
+the scheduler decides when to fire a backward (it owns the store + `min_sample_len`) but
+cannot reach the per-rank backward child, whose IPC handle lives on the worker. The
+trigger params `{n, sample_lens, epoch, sleep_s}` ride this struct instead. It must live
+here because `SchedulerOutput` is the only object BROADCAST from EngineCore to every
+worker each step — and the broadcast is load-bearing: it is what makes both ranks fire
+the same step, without which the per-layer NCCL all-reduces deadlock. `None` on ordinary
+steps and for tp=1.
+
 ### `vllm/v1/worker/gpu_worker.py`
 - Stage 1: `dprint` the `enable_finetuning` flag at the end of `init_device()`
   (proves the flag crossed the spawn boundary into the GPU process).
@@ -543,6 +554,17 @@ Stage P2.2. Add `SchedulerOutput.finetune_req_ids: set[str]` (default empty); im
   `max_saved_finetuning_tokens`; this is the *binding* site since the worker creates the
   singleton before the scheduler). Was `cap // 2`.
 
+- Stage P7 (TP): TP geometry + shard awareness. `_maybe_share_finetuning_weights` reads
+  `tp_size`/`tp_rank` from vLLM's TP group and puts them (plus `backward_nccl_port`) in
+  the child's `meta`; it also **all-gathers the vocab-parallel `lm_head` to full**
+  (`get_tp_group().all_gather`, a collective both ranks enter during `load_model`) so the
+  backward's `head_backward` and final norm stay free of vocab parallelism — at the cost
+  of ~1.05 GB resident per rank. `_maybe_setup_finetuning_accumulator` sizes the
+  `mlp_gate_up` / `attn_qkv` / `attn_ctx` buffers to **local** widths (`inter//tp`,
+  `q//tp`, `kv//tp`) to match the TP-sharded module-hook outputs, while the
+  residual-stream buffers (`layer_in`, `final_*`) stay full `hidden_size`; it also sets
+  `coordinator.relay_mode = tp_size > 1`. Every one of these is an identity at tp=1.
+
 ### `vllm/v1/worker/gpu_model_runner.py`
 Stage P2.2. Add `_build_finetune_mask` (per-token bool mask in `InputBatch.req_ids`
 order from `finetune_req_ids`, sets `self._ft_has`/`self._ft_mask_gpu`/`self._ft_num`;
@@ -568,6 +590,56 @@ activation copies it records `coord.capture_done_evt` (a CUDA event) so the back
 can scope its cross-process visibility wait to just the capture, not the whole device.
 
 > Note: `vllm/v1/core/sched/scheduler.py` is **not** modified — we subclass it.
+
+- Stage P7 (TP): relay mode (`coord.relay_mode`, worker side). Three edits, all inert at
+  tp=1: (1) in the FT capture block, do **not** call `coord.record_capture` — stash
+  `(n, sample_lens)` for the relay instead, so the worker never self-triggers a backward;
+  (2) call `coord.execute_trigger(cmd)` when a relayed `finetune_backward_trigger` arrives
+  — including on the **idle 0-token early-return path**, or a buffer-full/epoch-flush
+  trigger issued on an idle step is silently dropped; (3) in `sample_tokens`, attach
+  `coord.poll_backward_relay()`, the stashed saved-counts, and `ft_started` to `output`.
+  That last one lives in `sample_tokens` because the same `output` object is returned by
+  the sync path *and* wrapped by `AsyncGPUModelRunnerOutput`, so setting it there covers
+  both.
+
+### `vllm/v1/executor/multiproc_executor.py`
+Stage P7 (TP). Previously untouched by the fork — TP>1 is the first time the multiproc
+executor is on the finetuning path at all.
+
+- `WorkerProc.make_worker_process`: spawn the worker with `daemon=False` **iff**
+  `finetune_config.enable_finetuning`. Python forbids a daemonic process from having
+  children, and under TP each rank must fork its own backward SFT child, so this is the
+  one change without which TP finetuning cannot launch. TP=1 and every non-finetuning run
+  keep `daemon=True` → bit-identical to upstream. (`UniProcExecutor` never calls this.)
+- `_arm_parent_death_signal()` (new module-level helper) + a call at the very top of
+  `WorkerProc.worker_main`: `prctl(PR_SET_PDEATHSIG, SIGKILL)`. `daemon=False` removes
+  Python's automatic reaping of workers, and the existing death-pipe monitor does **not**
+  cover the gap — it is only armed *after* `WorkerProc.__init__` has run `init_device()`
+  + `load_model()` (~30 s), and on EOF it merely shuts two message queues rather than
+  terminating the process. Without this, an EngineCore crash during init left workers
+  reparented to PID 1 holding ~15 GiB per GPU, which then failed the *next* run with a
+  misleading out-of-memory error. Linux-only, finetuning-only; includes a
+  `getppid() == 1` check for the case where the parent died before the `prctl` landed.
+- `WorkerProc.monitor_death_pipe(..., hard_exit: bool = False)`: on EOF, escalate to
+  `os._exit(1)` after shutting the queues. Defaults `False` → upstream behaviour
+  unchanged; `worker_main` passes `hard_exit=<finetuning enabled>`.
+
+### `vllm/v1/outputs.py`
+Stage P7 (TP). Previously untouched. Adds the worker→scheduler half of the TP relay to
+`ModelRunnerOutput` — this struct is the only object flowing back from a worker to
+EngineCore each step, and under TP the scheduler-side coordinator owns the store and
+admission but not the backward IPC handle:
+
+- `finetune_saved: tuple[int, list[int]] | None` — the `(n, sample_lens)` this rank's
+  runner just wrote into the FT activation buffer, so the scheduler can advance its
+  buffer accounting and decide the next trigger.
+- `finetune_backward_done: dict | None` — the child's ack payload, so the scheduler
+  commits the trained samples and reopens admission.
+- `finetune_ft_started: bool | None` — mirrors the worker coordinator's `ft_started`.
+  `POST /start_finetuning` runs a `collective_rpc` that reaches **workers only**, so
+  without this mirror the EngineCore scheduler never learns FT admission was opened.
+
+All three are `None` for tp=1 (relay mode off).
 
 ### `vllm/v1/engine/core.py`
 Stage P4d: in `EngineCore._handle_client_request` (ADD branch), gated on `print_step_mode`,

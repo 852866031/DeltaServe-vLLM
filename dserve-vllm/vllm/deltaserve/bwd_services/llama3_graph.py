@@ -240,7 +240,9 @@ class Llama3GraphedBackward:
         # Saved attention context (o_proj input) captured in the forward (only
         # used when ``save_attn_ctx`` is on). Staged per layer in
         # ``stage_forward_inputs``; consumed inside ``_forward_core`` to skip
-        # the padded-attention forward. q_size == D for Llama.
+        # the padded-attention forward. NOTE: q_size == D only at tp_size == 1;
+        # under TP q_size is this rank's LOCAL attention width (Hq is local) while
+        # self.D stays the full residual-stream width. Size ctx by q_size, not D.
         self.static_saved_ctx = torch.zeros((s, q_size), dtype=mdt, device=dev)
         # Outputs (flat, model dtype): the rest of the cache the eager tail
         # consumes. qh/kh/vh flat are written alongside the padded scatter.
