@@ -87,6 +87,17 @@ class FinetuneScheduler(AsyncScheduler):
                 int(self._ft_injector.store.total_tokens_in_memory))
         # [eval] finetune-throughput log path (written per completed backward).
         self._coord.bwd_log_path = getattr(ft_cfg, "bwd_log_path", None)
+        # [DeltaServe] Phase 7 / M4.1: under TP>1 this scheduler-side coordinator
+        # is a DIFFERENT process from the worker that owns the backward_process
+        # handle. Enable relay mode so _trigger_backward stashes a command for
+        # SchedulerOutput (drained below) instead of no-op'ing, and so the engine
+        # can apply the worker's relayed saved-counts + done ack. tp=1 → False →
+        # the direct in-process handshake (unchanged).
+        try:
+            _tp = int(self.vllm_config.parallel_config.tensor_parallel_size)
+        except Exception:
+            _tp = 1
+        self._coord.relay_mode = _tp > 1
         # FT admission master switch: when start_on_launch is False, FT stays
         # closed until POST /start_finetuning flips it (the launch profiler
         # bypasses this, so profiling is unaffected).
@@ -790,6 +801,14 @@ class FinetuneScheduler(AsyncScheduler):
         # can restore it cleanly if this batch is pre-empted before dispatch.
         output._ft_admit_snapshot = _admit_snap
 
+        # [DeltaServe] Phase 7 / M4.1: under TP, drain any pending backward
+        # trigger (set by _trigger_backward under relay_mode, from this step's
+        # try_epoch_flush / the engine's apply_relayed_saved) onto the output so
+        # it broadcasts to every worker — each fires its own backward child in
+        # lock-step. None on ordinary steps; inert for tp=1 (relay_mode False).
+        if self._coord.relay_mode:
+            output.finetune_backward_trigger = self._coord.take_trigger_cmd()
+
         # [Phase 4] Stamp the regime + predicted duration for THIS step now,
         # while all requests are still present and the dispatcher reflects the
         # state the runner will execute in. Paired with the measured duration in
@@ -896,6 +915,26 @@ class FinetuneScheduler(AsyncScheduler):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict:
+        # [DeltaServe] Phase 7 / M4.1 (TP): apply the worker's relayed backward
+        # signals to this scheduler-side coordinator (which owns the store +
+        # admission but not the per-rank backward_process IPC handle). Apply the
+        # done ack FIRST (commit trained samples + reopen admission), then this
+        # step's saved-counts (advance buffer accounting → may re-fire the
+        # trigger for the next schedule()). No-op for tp=1 (relay_mode False).
+        if self._coord.relay_mode:
+            # Mirror the worker's ft_started flag (POST /start_finetuning runs a
+            # collective_rpc that only reaches workers) so this scheduler coord
+            # opens admission. One-step lag after the POST is fine.
+            _started = getattr(model_runner_output, "finetune_ft_started", None)
+            if _started is not None and _started and not self._coord.ft_started:
+                self._coord.start_finetuning()
+            _done = getattr(model_runner_output, "finetune_backward_done", None)
+            if _done:
+                self._coord.apply_relayed_done(_done)
+            _saved = getattr(model_runner_output, "finetune_saved", None)
+            if _saved:
+                self._coord.apply_relayed_saved(_saved[0], _saved[1])
+
         # Retire FT requests BEFORE the base loop: free their KV the same step
         # WITHOUT touching finished_req_ids (so the frontend never sees them).
         # Once removed from self.requests, the base loop's `request is None`

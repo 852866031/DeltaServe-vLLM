@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import ctypes
 import multiprocessing
 import os
 import pickle
 import queue
 import signal
+import sys
 import threading
 import time
 import traceback
@@ -97,6 +99,45 @@ class FutureWrapper(Future):
         except Exception as e:
             with suppress(InvalidStateError):
                 self.set_exception(e)
+
+
+def _arm_parent_death_signal(vllm_config: VllmConfig) -> None:
+    """[DeltaServe] Phase 7 / M1: SIGKILL this process when its parent dies.
+
+    Worker processes are spawned NON-daemonic when finetuning is enabled, so that
+    each rank can fork its own backward SFT child (see make_worker_process). That
+    trade removes Python's automatic reaping of daemonic children, and the
+    death-pipe monitor does NOT cover the gap:
+      * it is only armed AFTER ``WorkerProc.__init__`` has run ``init_device()``
+        + ``load_model()`` (~30 s), leaving the whole init window unguarded, and
+      * on EOF it merely shuts the two message queues — it never terminates the
+        process, so a worker not blocked on those queues survives indefinitely.
+    A parent crash then leaks a worker holding the full model in GPU memory
+    (observed: two orphans reparented to PID 1 holding 14.7 GiB each, which
+    wedged the next run with a misleading out-of-memory error).
+
+    ``prctl(PR_SET_PDEATHSIG)`` restores the ``daemon=True`` guarantee at the
+    kernel level, for the process's entire lifetime. Linux-only; a no-op on other
+    platforms and for non-finetuning runs, so upstream behaviour is unchanged.
+    """
+    ft = getattr(vllm_config, "finetune_config", None)
+    if ft is None or not getattr(ft, "enable_finetuning", False):
+        return
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        PR_SET_PDEATHSIG = 1
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(
+            PR_SET_PDEATHSIG, signal.SIGKILL)
+    except Exception as e:  # noqa: BLE001 — never block worker startup on this
+        logger.warning("[deltaserve] could not arm PR_SET_PDEATHSIG: %s", e)
+        return
+    # Race: if the parent died between spawn and the prctl above, the kernel has
+    # already delivered nothing — check explicitly rather than linger forever.
+    if os.getppid() == 1:
+        logger.error("[deltaserve] parent process already gone at worker "
+                     "startup; exiting instead of orphaning GPU memory")
+        os._exit(1)
 
 
 class MultiprocExecutor(Executor):
@@ -672,12 +713,34 @@ class WorkerProc:
             # Have the worker close parent end of this worker's pipes too
             "inherited_fds": inherited_fds if inherited_fds is not None else [],
         }
+        # [DeltaServe] Phase 7 / M1 (TP>1 finetuning): worker processes are
+        # daemonic by default, but a daemonic process cannot spawn children —
+        # and when co-serving finetuning is enabled EACH worker must spawn its
+        # own backward (SFT) child (see gpu_worker.Worker.init_device and the
+        # daemon guard in deltaserve/backward_process.py:start). So make the
+        # worker NON-daemonic exactly when finetuning is enabled. TP=1 and any
+        # non-finetuning run keep daemon=True → bit-identical to before.
+        # Trade-off: non-daemon workers are not auto-killed on parent exit, but
+        # the executor already manages worker lifecycle explicitly (the
+        # MultiprocWorkerMonitor thread + shutdown()), so teardown is unaffected.
+        _ft_enabled = bool(
+            getattr(vllm_config, "finetune_config", None) is not None
+            and vllm_config.finetune_config.enable_finetuning
+        )
+        _worker_daemon = not _ft_enabled
+        if _ft_enabled:
+            print(
+                f"[deltaserve] [executor] spawning VllmWorker-{rank} "
+                f"(local_rank={local_rank}) as NON-daemon so it can fork the "
+                f"backward SFT child (enable_finetuning=True)",
+                flush=True,
+            )
         # Run EngineCore busy loop in background process.
         proc = context.Process(
             target=WorkerProc.worker_main,
             kwargs=process_kwargs,
             name=f"VllmWorker-{rank}",
-            daemon=True,
+            daemon=_worker_daemon,
         )
 
         # Apply NUMA binding if configured
@@ -763,7 +826,15 @@ class WorkerProc:
         destroy_model_parallel()
         destroy_distributed_environment()
 
-    def monitor_death_pipe(self, death_pipe, shutdown_requested: threading.Event):
+    def monitor_death_pipe(self, death_pipe, shutdown_requested: threading.Event,
+                           hard_exit: bool = False):
+        """[DeltaServe] ``hard_exit`` (set when finetuning is enabled) escalates
+        from "shut the message queues" to actually terminating the process.
+        Shutting the queues only unblocks a worker that happens to be waiting on
+        them; a NON-daemonic worker (which is what finetuning runs use, so each
+        rank can fork its backward child) otherwise survives its parent's death
+        and holds the model in GPU memory forever. Defaults False → upstream
+        behaviour is unchanged for ordinary runs."""
         if death_pipe is None:
             return
 
@@ -777,6 +848,10 @@ class WorkerProc:
                 for mq in queues_to_shutdown:
                     if mq is not None:
                         mq.shutdown()
+                if hard_exit:
+                    logger.error("[deltaserve] parent exited; terminating this "
+                                 "non-daemonic worker to release GPU memory")
+                    os._exit(1)
             except Exception as e:
                 logger.warning("Death monitoring error: %s", e)
 
@@ -811,6 +886,11 @@ class WorkerProc:
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
 
+        # [DeltaServe] Phase 7 / M1: arm parent-death SIGKILL BEFORE the model
+        # load below, so an EngineCore crash during init cannot leak this
+        # worker (and its GPU memory). No-op unless finetuning is enabled.
+        _arm_parent_death_signal(kwargs["vllm_config"])
+
         worker = None
         ready_writer = kwargs.pop("ready_pipe")
         death_pipe = kwargs.pop("death_pipe", None)
@@ -839,7 +919,11 @@ class WorkerProc:
             if kwargs["vllm_config"].parallel_config.numa_bind:
                 numa_utils.log_current_affinity_state(f"Worker_{worker.rank}")
 
-            worker.monitor_death_pipe(death_pipe, shutdown_requested)
+            worker.monitor_death_pipe(
+                death_pipe, shutdown_requested,
+                hard_exit=bool(
+                    getattr(kwargs["vllm_config"], "finetune_config", None)
+                    and kwargs["vllm_config"].finetune_config.enable_finetuning))
 
             # Send READY once we know everything is loaded
             ready_writer.send(

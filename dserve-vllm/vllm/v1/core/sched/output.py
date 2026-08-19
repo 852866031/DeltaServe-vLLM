@@ -245,6 +245,13 @@ class SchedulerOutput:
     # force the step eager. Empty for ordinary inference steps.
     finetune_req_ids: set[str] = field(default_factory=set)
 
+    # [DeltaServe] Phase 7 / M4.1: TP backward-trigger command. Under TP>1 the
+    # scheduler can't reach the per-rank backward child (the IPC handle lives on
+    # the worker), so when it decides to fire a backward it puts the cycle params
+    # {n, sample_lens, epoch, sleep_s} here. Broadcast to every worker (lock-step)
+    # → each fires its own child. None on ordinary steps / TP=1.
+    finetune_backward_trigger: dict | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

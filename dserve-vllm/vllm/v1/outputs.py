@@ -265,6 +265,21 @@ class ModelRunnerOutput:
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
+    # [DeltaServe] Phase 7 / M4.1: TP backward relay (worker → scheduler).
+    # ``finetune_saved`` = (n, sample_lens) this rank's runner just saved into the
+    # FT activation buffer (its record_capture result), so the EngineCore
+    # scheduler can advance its buffer accounting + decide the backward trigger.
+    # ``finetune_backward_done`` = the child's ack payload when this rank's
+    # backward finished (so the scheduler commits trained samples + reopens
+    # admission). Both None on ordinary steps / TP=1.
+    finetune_saved: tuple[int, list[int]] | None = None
+    finetune_backward_done: dict | None = None
+    # ``finetune_ft_started`` mirrors the worker coordinator's ft_started flag
+    # (flipped by the collective_rpc from POST /start_finetuning, which only
+    # reaches WORKERS) so the EngineCore scheduler — a different process/coord
+    # under TP — learns FT admission was opened. None for tp=1 (no relay).
+    finetune_ft_started: bool | None = None
+
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 

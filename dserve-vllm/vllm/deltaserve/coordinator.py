@@ -116,6 +116,22 @@ class FinetuneCoordinator:
         self.on_backward_done = None
         self.admission_open = True
         self.pending_backward = False
+        # [DeltaServe] Phase 7 / M4.1: TP relay mode. Under TP>1 (multiproc) the
+        # scheduler (EngineCore) and runner (worker) hold SEPARATE coordinator
+        # singletons: the scheduler decides the trigger but the backward_process
+        # IPC handle lives on the worker's coordinator. When relay_mode is set:
+        #   - scheduler coord (backward_process is None): _trigger_backward stashes
+        #     the trigger params into _pending_trigger_cmd instead of no-op'ing;
+        #     the scheduler drains it onto SchedulerOutput. It applies the worker's
+        #     relayed saved-counts (apply_relayed_saved) and backward-done ack
+        #     (apply_relayed_done).
+        #   - worker coord (backward_process set): executes the relayed trigger
+        #     (execute_trigger → notify_buffer_full) and polls the child ack
+        #     (poll_backward_relay), reporting both back via ModelRunnerOutput.
+        # relay_mode stays False for tp=1 → every path below is inert and the
+        # single-GPU coordinator behaves exactly as before.
+        self.relay_mode = False
+        self._pending_trigger_cmd: dict | None = None
         # [rps_throttle] Sliding-window arrival-rate tracker. Created
         # eagerly with a 1.0s default window so ``note_arrival`` from
         # the engine input-queue drain is always safe to call; the
@@ -553,6 +569,17 @@ class FinetuneCoordinator:
             self.backward_process.notify_buffer_full(
                 self.fill_count, self.backward_sleep_s, list(self.sample_lens),
                 epoch=self.current_epoch)
+        elif self.relay_mode:
+            # [M4.1] Scheduler-side coordinator under TP: no local handle. Stash
+            # the trigger params for the scheduler to broadcast on SchedulerOutput
+            # (→ every worker fires its own backward child, lock-step). The
+            # capture-completion sync happens worker-side in execute_trigger.
+            self._pending_trigger_cmd = {
+                "n": int(self.fill_count),
+                "sample_lens": list(self.sample_lens),
+                "epoch": int(self.current_epoch),
+                "sleep_s": float(self.backward_sleep_s),
+            }
 
     def gpu_pause_backward(self) -> None:
         """[Phase 5] Ask the backward child to yield the GPU (it pauses at its
@@ -623,6 +650,82 @@ class FinetuneCoordinator:
         self.admission_open = True
         self._pending_backward_t0 = None
         self._pending_backward_warned = False
+
+    # -- [M4.1] TP relay bridge -------------------------------------------
+    # Scheduler-side (EngineCore coordinator) helpers: consume what the worker
+    # relays and produce the trigger command for SchedulerOutput.
+
+    def take_trigger_cmd(self) -> dict | None:
+        """Scheduler side: pop the pending trigger command (set by
+        _trigger_backward under relay_mode) to broadcast on SchedulerOutput.
+        None when there's nothing to fire this step."""
+        cmd = self._pending_trigger_cmd
+        self._pending_trigger_cmd = None
+        return cmd
+
+    def apply_relayed_saved(self, n: int, sample_lens: list[int] | None) -> None:
+        """Scheduler side: apply the worker's relayed per-step saved-token count
+        (its record_capture result). Mirrors record_capture so the scheduler's
+        buffer accounting advances and its buffer-full / epoch-flush trigger can
+        fire (→ _pending_trigger_cmd)."""
+        if not self.relay_mode:
+            return
+        self.record_capture(int(n), list(sample_lens) if sample_lens else None)
+
+    def apply_relayed_done(self, resp: dict | None) -> None:
+        """Scheduler side: apply the worker's relayed backward-done ack. Mirrors
+        poll_backward's post-ack path: write the bwd_log row, commit the trained
+        samples, reset the buffer, and reopen FT admission."""
+        if not self.relay_mode or not resp:
+            return
+        if (self.bwd_log_path and isinstance(resp, dict)
+                and resp.get("event") == "activations_processed"):
+            self._write_bwd_log_row(int(resp.get("n", 0)), resp.get("loss"))
+        if self.on_backward_done is not None and self.buffer_samples:
+            try:
+                self.on_backward_done(list(self.buffer_samples))
+            except Exception as e:  # noqa: BLE001
+                dprint(f"[coord] on_backward_done (relay) failed: {e}")
+        self.fill_count = 0
+        self.reserved_fill = 0
+        self.sample_lens = []
+        self.buffer_samples = []
+        self.pending_backward = False
+        self.admission_open = True
+        self._pending_backward_t0 = None
+        self._pending_backward_warned = False
+
+    # Worker-side (per-rank coordinator that owns the backward_process handle).
+
+    def execute_trigger(self, cmd: dict) -> None:
+        """Worker side: fire this rank's backward child for a relayed trigger
+        command. Syncs on the capture-completion event (so the child sees the
+        saved activations) then sends the work signal over the child's pipe."""
+        if self.backward_process is None or not cmd:
+            return
+        if self.fwd_throttle_active:
+            self.gpu_pause_backward()
+        if self.capture_done_evt is not None:
+            self.capture_done_evt.synchronize()
+        else:
+            torch.cuda.synchronize()
+        self.pending_backward = True
+        self.backward_process.notify_buffer_full(
+            int(cmd.get("n", 0)), self.backward_sleep_s,
+            list(cmd.get("sample_lens", [])), epoch=int(cmd.get("epoch", 0)))
+
+    def poll_backward_relay(self) -> dict | None:
+        """Worker side: non-blocking poll of this rank's backward child. Returns
+        the ack payload (to relay to the scheduler via ModelRunnerOutput) when
+        the backward finished, else None. Does NOT run on_backward_done / commit
+        (that is scheduler-side)."""
+        if not self.pending_backward or self.backward_process is None:
+            return None
+        resp = self.backward_process.poll_response()
+        if resp is None:
+            return None
+        self.pending_backward = False
+        return resp
 
     def _write_bwd_log_row(self, n: int, loss) -> None:
         """Append one finetune-throughput row to bwd_log_path. Timestamp is

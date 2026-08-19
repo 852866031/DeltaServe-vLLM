@@ -175,11 +175,18 @@ class BackwardProcess:
         if mp.current_process().daemon:
             raise RuntimeError(
                 "[deltaserve] cannot spawn the backward process from a daemonic "
-                "process. This occurs under the multiproc executor (TP>1), where "
-                "vLLM workers are daemonic and Python forbids them from having "
-                "children. Phase 1 targets single-GPU (UniProcExecutor); "
-                "multi-TP backward spawning is Phase 5."
+                "process. Under the multiproc executor (TP>1) vLLM workers are "
+                "daemonic by default and Python forbids them from having "
+                "children. Phase 7/M1 makes the worker NON-daemonic when "
+                "enable_finetuning is set (see multiproc_executor.make_worker_"
+                "process). If you hit this, that gating did not take effect — "
+                "verify finetune_config.enable_finetuning reached the executor."
             )
+        dprint(
+            f"[backward] BackwardProcess.start on {mp.current_process().name} "
+            f"(daemon={mp.current_process().daemon}) → child device_index="
+            f"{self.device_index} service={self.service_name}"
+        )
 
         # Lazy import to avoid a module-load cycle: bwd_services.base imports the
         # hashing helpers from this module.
