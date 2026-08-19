@@ -171,25 +171,12 @@ the pure-FT (no inference traffic) benchmark — launches the server, POSTs
 `/start_finetuning`, idles for `--duration`, trims + summarizes the bwd_log.
 
 **Phase 7 — tensor parallelism (TP=2). ✅ M0–M4.1, GPU-validated; M4.2 + M5 open.**
-Backward-per-rank: each TP rank runs its own backward child on its own weight shard, with
-a **dedicated NCCL group across the backward children** (they are not in vLLM's inference
-group) carrying **7 all-reduces per layer** — the row-parallel `o_proj` forward output,
-the FFN and attention *partials* of `grad_resid_mid` / `grad_x` (reduced surgically, so
-the full residual passthrough isn't counted `tp_size`×), and the 4 replicated LoRA
-factors. Lock-step across ranks is guaranteed by broadcasting the backward trigger on
-`SchedulerOutput`; without it the collectives deadlock. `tp_size == 1` leaves every path
-inert. Three structural pieces: (M1) workers spawn **non-daemonic** when finetuning is on
-so each can fork its backward child — with `PR_SET_PDEATHSIG` + a lethal death-pipe
-monitor to replace the reaping that `daemon=True` used to provide; (M2) local
-head/intermediate dims + `lora_shard_slice` + an `lm_head` all-gather that removes vocab
-parallelism from the backward; (M4.1) a relay bridging the EngineCore scheduler and the
-worker, which under TP are different processes with different coordinator singletons.
-**Verified:** TP=2 tracks TP=1 cycle-for-cycle to ~0.01 loss on identical data; shard
-23/23; real 2-process gloo gradcheck 10/10; TP=1 gradcheck 12/12 unchanged.
-**Not yet:** no SLO-aware admission under TP (the estimator's timing feedback is severed
-by the process split → `profile_on_launch: false` → cold-start fixed budget), backward
-CUDA graphs force-disabled under TP, and the backward ack reaches the scheduler from
-`output_rank` only.
+Backward-per-rank: each rank trains its own shard in its own backward child, joined by a
+dedicated NCCL group (7 all-reduces per layer). **Verified:** TP=2 trains equivalently to
+TP=1 — cycle-for-cycle to ~0.01 loss on identical data; shard 23/23; real 2-process gloo
+gradcheck 10/10; TP=1 gradcheck 12/12 unchanged. **Not yet:** no SLO-aware admission under
+TP, backward CUDA graphs force-disabled, ack reaches the scheduler from `output_rank` only.
+→ Full detail, invariants, and run commands in **"Tensor parallelism (Phase 7)"** below.
 
 **Current focus:** Phase 7 (TP). In priority order: **M4.2** — relay `push_sample` so
 SLO-aware admission works under TP at all (today TP runs with no SLO gate, so the
@@ -428,6 +415,133 @@ phase's test passes.
    comment is wrong; the real blocker is the missing all-reduces, and NCCL-in-graph is
    supported, so the true obstacles are `_maybe_pause` and `forward_interruptible`).
 
+## Tensor parallelism (Phase 7) — the essentials
+
+Everything you need to work on TP without opening another file. Detail lives in
+`INTEGRATION_PROGRESS.md` (Phase 7) and `VLLM_FORK_CHANGES.md` (stage P7).
+
+**Principle — backward-per-rank.** Mirroring the original DeltaServe (`model_rpc.py`
+inits NCCL per rank and builds per-rank backward services): each TP rank runs its **own**
+backward child on its **own** weight shard. The only cross-rank traffic is a small set of
+all-reduces on a **dedicated NCCL group across the backward children** — they are *not*
+in vLLM's inference NCCL group. `tp_size == 1` leaves every path inert, so single-GPU
+behaviour is bit-identical.
+
+### Milestones + gates
+
+| M | Scope | Gate | Status |
+|---|---|---|---|
+| M1 | Non-daemon workers so each rank can fork its backward child | tp=2 boots, child per rank, clean shutdown, **no orphans on crash** | ✅ GPU-verified |
+| M2 | Shard-aware dims/weights/buffers; `lora_shard_slice`; `lm_head` all-gather | buffer + weight widths == local shard; no shape errors | ✅ 23/23 |
+| M3 | Backward NCCL group + the gradient all-reduces | **summed shard grads ≈ single-GPU reference (~1e-6)** | ✅ 10/10 (real gloo) |
+| M4.1 | Scheduler↔worker control-plane relay | real 2-GPU: loss ↓, no NaN, inference correct | ✅ trains == TP=1 |
+| M4.2 | SLO estimator relay under TP | admission gated by SLO, not a fixed budget | ❌ open |
+| M4.3 | Gradient bucketing + comm stream | fewer/larger collectives; clip made rank-symmetric | ❌ open |
+| M5 | Backward CUDA graphs under TP | graph path re-enabled | ❌ deferred |
+
+### Cross-rank traffic — 7 all-reduces per layer
+
+224 collectives ≈ **218 MB per rank per backward cycle** at `s_max=256`.
+
+| Where | Tensor | Why |
+|---|---|---|
+| forward remat | `o` | `o_proj` is row-parallel → partial sum |
+| backward | `grad_resid_mid − grad_out`, then add back | reduce only the FFN partial; the residual passthrough is already full on every rank and would otherwise be counted `tp_size`× |
+| backward | `grad_x − grad_resid_mid`, then add back | reduce only the attention-path partial |
+| backward | `grad_qA`, `grad_kA`, `grad_vA`, `grad_oB` | replicated factors — grads sum across shards |
+
+`grad_{q,k,v}B` (output-sharded) and `grad_oA` (input-sharded) are already this rank's
+correct shard — **no reduce**. Reducing `grad_x` wholesale double-counts the residual;
+the gloo test caught exactly that.
+
+> **This box has no P2P** (`custom_all_reduce` disabled on the 2× 5090), so all 224
+> collectives cross PCIe — order ~20 ms/cycle, against the ~5 ms of *dispatch* overhead
+> that CUDA graphs remove. That is why **M4.3 is worth more than M5**.
+
+### Load-bearing invariants (break these and it hangs or silently degrades)
+
+- **Lock-step.** Both ranks must fire the backward on the same step, or the collectives
+  deadlock. Guaranteed by *broadcasting* the trigger on `SchedulerOutput` — never make FT
+  admission a per-rank decision.
+- **`_maybe_pause` stays outside any captured region.** It is how the backward yields the
+  GPU to inference; an `mp.Event.wait` cannot be captured. This is why we can never
+  collapse to one graph per step the way an FT-only system does.
+- **`forward_interruptible` conflicts with captured collectives.** Tier-C aborts
+  unilaterally mid-backward; with NCCL in a graph that desyncs the group and hangs both
+  ranks. It is off under TP for this reason.
+- **⚠ The per-layer `clip_grad_norm_` is rank-asymmetric.** It is computed over a
+  rank-local tensor set (full replicated grads + only *this* rank's half of the sharded
+  ones), so each rank derives a slightly different clip scale and applies it to the
+  *identical* reduced replicated grads — slowly desynchronizing the replicated masters.
+  Dormant only because per-layer norms currently stay under `max_norm=1.0` (measured
+  divergence when they don't: ~0.08%/step). **M4.3 fixes it** by moving the clip after a
+  bucketed reduce. Do not add gradient scaling or raise the LR without addressing this.
+- **Vocab padding.** vLLM pads vocab before sharding. Llama-3's 128256 happens to need no
+  padding, so the `lm_head` all-gather is exactly `[vocab, hidden]` — for other models use
+  the real local `lm_head.shape[0]`, not `vocab_size // tp_size`.
+- **MPS per device.** The child-only MPS env must partition each physical GPU
+  independently.
+
+### Open, in priority order
+
+1. **M4.2 — no SLO gate under TP at all.** The runner pushes timing samples to the
+   *worker* coordinator while the scheduler drains its *own*, so the estimator never sees
+   them. Hence `profile_on_launch: false` in the TP config (with it on, profiling drains 0
+   samples and fits a degenerate estimator that then reads "ready" and rejects **all** FT
+   admission). TP therefore runs on the cold-start fixed buffer-cap budget — the project's
+   core value-add is not exercised under TP. Fix: relay `push_sample`.
+2. **Backward ack race.** `execute_model` collects `ModelRunnerOutput` from a single
+   `output_rank`, so admission reopens on one rank's ack while the other child may still
+   be publishing or zeroing buffers.
+3. **M4.3 — bucketing + comm stream.** The 128 replicated-factor grads (4 × 128 KB/layer)
+   are read only by the optimizer → defer into one flat ~16 MB all-reduce after the layer
+   loop: **224 → 97 collectives**. The 96 on the critical path can overlap with compute on
+   a separate stream. Also fixes the clip trap above.
+4. **M5 — graphs under TP.** Note the "full-dim capture buffers" reason once given in the
+   config was **wrong**: `llama3_graph.py` derives every dim from the service, which M2
+   made local. The real blocker is that captured regions have no all-reduces wired in —
+   and NCCL-in-graph *is* supported (Megatron does it), so the true obstacles are
+   `_maybe_pause` and `forward_interruptible` above.
+5. `set_corpus_meta` never reaches the children under TP (guarded on `backward_process is
+   not None`, which is `None` on the scheduler coord) → the child's progress meter shows
+   `N/?`.
+
+### Running it
+
+```bash
+python eval-tp/ft_bench_tp.py --duration 60 --tp 2      # TP co-serving FT bench
+python eval-tp/launch_deltaserve.py --start-finetuning  # just bring a server up
+python tests/test_llama3_tp_shard.py                    # M2 gate (23 cases)
+python tests/test_llama3_tp_backward_gloo.py            # M3 gate (10 cases, real gloo)
+```
+
+- **Tests are standalone scripts — run with `python`, NOT pytest** (pytest is not
+  installed in the `dserve-vllm` env).
+- `ft_bench_tp.py` writes **per-TP** filenames (`bwd_log_tp{N}.csv`, `server_tp{N}.log`)
+  and **truncates** the bwd log per run — the server opens it in append mode, so runs
+  used to silently concatenate. It counts cycles from the CSV, not the server log: under
+  TP **every rank prints its own `[backward]` line**, so log-line counting reports
+  `tp_size`× the real count.
+- `--kill-stale` + a pre-flight check refuse to launch when a previous run left
+  GPU-resident processes (otherwise the next run dies minutes later with a misleading
+  out-of-memory error).
+- Env: `DSERVE_BACKWARD_NCCL_PORT` (default 29677) for the backward group;
+  `DSERVE_TP_DIAG=1` enables `Llama3BackwardService._diag_remat_check`, which
+  rematerializes the full forward from `layer_in[0]` and compares it against the captured
+  activations (inert otherwise).
+
+### Known open issue that is **not** a TP bug
+
+FT loss stalls around ~4.3 after ~25 cycles where an earlier `pure_ft` run reached ~2.6 on
+the same samples — but this **reproduces identically at TP=1**, so it is a config- or
+regime-level training-quality problem. Ruled out: learning rate (lowered to 5e-6 in May,
+before the good run), the data (identical sample sequence and order), code drift (no
+commits touched the FT path after Jun 7), and `save_attn_qkv`/`save_attn_ctx`. The
+`DSERVE_TP_DIAG` diagnostic shows the backward's forward-remat diverging from vLLM's real
+forward (final_in relative error 0.22 → 0.45 over cycles) **equally at TP=1 and TP=2**.
+Next step: re-run `eval/pure_ft_bench.py` and confirm the 2.12 reference still reproduces
+— that curve was only 32 cycles over 5.0 s, so it may be a weaker reference than it looks.
+
 ## Key DeltaServe co-serving contracts to preserve (from DeltaServe/CLAUDE.md)
 
 - `_maybe_pause()` at **every layer boundary** in the backward path is how backward yields
@@ -458,3 +572,17 @@ phase's test passes.
    `dserve-vllm/vllm/deltaserve/accumulate.py` (hook abort check + slice fast path),
    `dserve-vllm/vllm/v1/engine/core.py` (tiers A + B + sentinel routing), and
    `dserve-vllm/vllm/v1/worker/gpu_model_runner.py` (tier C abort wrap + entry-time check).
+7. For Phase 7 (tensor parallelism): the **"Tensor parallelism (Phase 7)"** section above
+   is self-contained — milestones + gates, the all-reduce table, the load-bearing
+   invariants, open items, and run commands. In-tree the integration points are
+   `dserve-vllm/vllm/deltaserve/bwd_services/llama3.py` (`lora_shard_slice`,
+   `_init_tp_group`, the reduces in `layer_forward`/`layer_backward`, local dims in
+   `_build_state`), `dserve-vllm/vllm/v1/worker/gpu_worker.py`
+   (`_maybe_share_finetuning_weights` tp geometry + `lm_head` all-gather;
+   `_maybe_setup_finetuning_accumulator` local buffer widths),
+   `dserve-vllm/vllm/v1/executor/multiproc_executor.py` (non-daemon workers +
+   `_arm_parent_death_signal`), and the relay across
+   `dserve-vllm/vllm/deltaserve/{coordinator,ft_scheduler}.py` +
+   `dserve-vllm/vllm/v1/{core/sched/output.py,outputs.py,worker/gpu_model_runner.py}`.
+   `DeltaServe/dserve/server/router/model_infer/model_rpc.py:63-77` is the original
+   per-rank NCCL init this mirrors.
