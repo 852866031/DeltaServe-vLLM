@@ -1,0 +1,90 @@
+# DeltaServe-on-vLLM serving config — TP=2 co-serving finetuning (Llama-3).
+#
+# Phase 7 / TP work. Same structure as serving_config_finetuning_llama3.yaml,
+# but tensor_parallel_size=2 and the shard-UNAWARE backward optimizations are
+# turned OFF until the milestones that make them shard-correct land:
+#   - backward_cuda_graph  (M5) : captures fixed FULL-dim buffers → wrong under TP
+#   - save_attn_qkv / ctx  (M2) : saved activation widths are full-dim → wrong under TP
+#   - forward_interruptible      : off to keep the first bring-up simple
+#
+# M1 (this milestone) only needs the server to BOOT under TP=2 and each rank to
+# spawn its backward child. Do NOT POST /start_finetuning yet — the backward
+# math is not shard-correct until M2/M3. `start_on_launch: false` keeps FT
+# admission closed so no backward fires during an M1 launch test.
+
+finetune:
+  enable_finetuning: true
+  start_on_launch: false             # hold FT admission closed (M1: launch-only)
+  backward_mps_percentage: 10
+  finetuning_lora_path: ../adapters/llama3-toy-lora-ft
+  data_path: ../alpaca_1000.txt
+  max_saved_finetuning_tokens: 256
+  backward_sleep_seconds: 2.0
+  num_epochs: 20
+  learning_rate: 0.000005
+  weight_decay: 0.01
+  gamma: 0.9
+  backward_fp32: false
+  forward_interruptible: false       # off for TP bring-up
+  ft_only_admission_grace_ms: 0
+  fwd_token_throttle_enable: false
+  fwd_token_throttle: 200
+  backward_cuda_graph: false         # M5 — OFF under TP (full-dim capture buffers)
+  save_attn_qkv: false               # M2 — OFF under TP (full-dim saved activations)
+  save_attn_ctx: false               # M2 — OFF under TP
+
+slo:
+  ttft_slo: 0.25
+  avg_tbt_slo: 0.02
+  max_tbt_slo: 0.05
+  # M4.1: keep profiling OFF under TP. The SLO estimator's timing feedback
+  # (runner push_sample → scheduler drain) is severed by the TP process split
+  # (deferred as M4.2), so profiling only drains 0 samples and fits a DEGENERATE
+  # estimator — which then reads as "ready" and its garbage SLO prediction
+  # rejects ALL FT admission (observed: `ft=0 buf=0/256` every step). With
+  # profiling off the estimator stays cleanly NOT-ready, so admission takes the
+  # cold-start path (fixed coordinator buffer-cap budget, no SLO gate) and FT is
+  # admitted → the backward fires. SLO-aware admission under TP returns with M4.2.
+  profile_on_launch: false
+  profile_num_repeats: 2
+  ft_tokens_admission_constrain_factor: -1
+  match_prefill_workload_factor: 0
+  decode_only_ft_safety_margin: 0.7
+
+debug:
+  print_weight_hash: false
+  print_activation_hash: false
+  print_scheduler_add: true
+  print_engine_batch_exec: true
+  print_engine_batch_done: false
+  print_engine_req_recv: false
+
+adapters:
+  lora_path_0: ../adapters/llama3-toy-lora
+
+lora:
+  enable_lora: true
+  max_loras: 2
+  max_lora_rank: 16
+
+server:
+  host: 127.0.0.1
+  port: 8000
+  rank_id: 0
+  # Single frontend for TP bring-up (fewer moving parts in the launch prints).
+  api_server_count: 1
+
+model:
+  model: meta-llama/Meta-Llama-3-8B
+  tokenizer_mode: auto
+  trust_remote_code: false
+  dtype: auto
+  max_model_len: 2048
+
+engine:
+  gpu_memory_utilization: 0.85
+  enforce_eager: false
+  disable_log_stats: true
+
+parallel:
+  tensor_parallel_size: 2            # <<< TP=2

@@ -4200,6 +4200,18 @@ class GPUModelRunner(
                     self._execute_mm_encoder(scheduler_output)
                     return make_empty_encoder_model_runner_output(scheduler_output)
 
+            # [DeltaServe] Phase 7 / M4.1 (TP): fire a relayed backward trigger
+            # even on an idle (0-token) step so a buffer-full / epoch-flush
+            # trigger the scheduler emitted isn't dropped at the early return
+            # below. Only the IPC send happens here; the ack is polled on the
+            # next forward step (nothing to admit while idle anyway).
+            _ftc_idle = getattr(self, "_ft_coordinator", None)
+            if _ftc_idle is not None and getattr(_ftc_idle, "relay_mode", False):
+                _cmd_idle = getattr(
+                    scheduler_output, "finetune_backward_trigger", None)
+                if _cmd_idle:
+                    _ftc_idle.execute_trigger(_cmd_idle)
+
             if not num_scheduled_tokens:
                 if (
                     self.parallel_config.distributed_executor_backend
@@ -4411,6 +4423,8 @@ class GPUModelRunner(
         # current offset (profiling / no reservation).
         accumulator = getattr(self, "_finetune_accumulator", None)
         coord = getattr(self, "_ft_coordinator", None)
+        # [M4.1] reset the per-step TP relay stash (set in the FT capture block).
+        self._ft_relay_saved = None
         save_acts = self.vllm_config.finetune_config.save_activations
         _stashed_off = getattr(scheduler_output, "_ft_write_offset", None)
         if _stashed_off is not None:
@@ -4714,7 +4728,16 @@ class GPUModelRunner(
                     # record_capture commits the rows + fires the buffer-full /
                     # epoch-flush backward triggers once in-flight saves settle.
                     if coord is not None:
-                        coord.record_capture(self._ft_num, self._ft_sample_lens)
+                        if getattr(coord, "relay_mode", False):
+                            # [DeltaServe] Phase 7 / M4.1 (TP): don't self-trigger
+                            # on the worker coordinator — relay this step's saved
+                            # counts to the EngineCore scheduler, which owns the
+                            # trigger decision (it has the corpus/min_sample_len).
+                            self._ft_relay_saved = (
+                                int(self._ft_num), list(self._ft_sample_lens))
+                        else:
+                            coord.record_capture(
+                                self._ft_num, self._ft_sample_lens)
 
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
@@ -4980,6 +5003,23 @@ class GPUModelRunner(
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
             )
+
+        # [DeltaServe] Phase 7 / M4.1 (TP): relay this rank's backward ack +
+        # saved-counts back to the EngineCore scheduler. NOTE: this runs in
+        # sample_tokens (a different method than execute_model), so the
+        # coordinator is fetched locally here — execute_trigger already fired in
+        # execute_model's per-step block. The same ``output`` is returned by the
+        # sync path AND wrapped by AsyncGPUModelRunnerOutput, so setting the
+        # fields here covers both. Inert for tp=1 (relay_mode False).
+        _coord_relay = getattr(self, "_ft_coordinator", None)
+        if _coord_relay is not None and getattr(_coord_relay, "relay_mode", False):
+            output.finetune_backward_done = _coord_relay.poll_backward_relay()
+            output.finetune_saved = getattr(self, "_ft_relay_saved", None)
+            self._ft_relay_saved = None
+            # Mirror ft_started (set on THIS worker coord by the
+            # deltaserve_start_finetuning collective_rpc) so the EngineCore
+            # scheduler coord — a separate process under TP — opens admission.
+            output.finetune_ft_started = bool(_coord_relay.ft_started)
 
         if not self.use_async_scheduling:
             if self.routed_experts_initialized:

@@ -351,12 +351,29 @@ class Worker(WorkerBase):
             from vllm.deltaserve.backward_process import BackwardProcess
 
             arch = self.model_config.hf_config.architectures[0]
+            tp_size = self.parallel_config.tensor_parallel_size
+            # [DeltaServe] Phase 7 / M1: under TP>1 this runs once PER worker
+            # (one backward child per rank, each pinned to its own GPU via
+            # device_index=local_rank). Print so we can confirm every rank
+            # spawned its child on the right device.
+            print(
+                f"[deltaserve] [worker] rank={self.rank} local_rank="
+                f"{self.local_rank} tp_size={tp_size}: spawning backward SFT "
+                f"child on cuda:{self.local_rank} (arch={arch})",
+                flush=True,
+            )
             self.backward_process = BackwardProcess(
                 mps_percentage=finetune_config.backward_mps_percentage,
                 device_index=self.local_rank,
                 service_name=arch,
             )
             self.backward_process.start()
+            print(
+                f"[deltaserve] [worker] rank={self.rank} local_rank="
+                f"{self.local_rank}: backward child pid="
+                f"{getattr(self.backward_process._proc, 'pid', None)} ready",
+                flush=True,
+            )
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
@@ -398,8 +415,24 @@ class Worker(WorkerBase):
         ft_cfg = self.vllm_config.finetune_config
 
         # Base weights: frozen references, shared zero-copy (no detach copy).
+        # Under TP>1 these are this rank's SHARDS (qkv/gate_up column-parallel,
+        # o/down row-parallel, embed/lm_head vocab-parallel). The backward
+        # service slices them by LOCAL dims (see _build_state); the meta below
+        # carries tp_size/tp_rank so it knows the shard geometry.
         model = self.get_model()
         base_state = {name: p.detach() for name, p in model.named_parameters()}
+
+        # [DeltaServe] Phase 7 / M2: TP shard geometry. tp_size=1 (uniproc) →
+        # everything below is a no-op and the shared state is bit-identical to
+        # the single-GPU path.
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+        from vllm.distributed.parallel_state import get_tp_group
+
+        tp_size = int(get_tensor_model_parallel_world_size())
+        tp_rank = int(get_tensor_model_parallel_rank())
 
         # FT adapter: load its weights as an fp32 master copy on this device.
         ft_state: dict[str, torch.Tensor] = {}
@@ -431,6 +464,25 @@ class Worker(WorkerBase):
                 (k for k in base_state if k.endswith("embed_tokens.weight")), None)
         embed_weight_key = next(
             (k for k in base_state if k.endswith("embed_tokens.weight")), None)
+
+        # [DeltaServe] Phase 7 / M2: the LM head is vocab-parallel under TP, so
+        # this rank only holds a vocab slice. head_backward needs the FULL logits
+        # matrix. All-gather the shard over vLLM's TP group (both ranks call this
+        # collectively during load_model) and hand the backward the full lm_head
+        # — that keeps head_backward (and final-norm) UNCHANGED and removes
+        # vocab-parallelism from the backward entirely. Llama-3's vocab (128256)
+        # has no padding, so the gather is exactly [vocab_size, hidden]; trim
+        # defensively for models vLLM pads.
+        if tp_size > 1 and lm_head_key is not None:
+            shard = base_state[lm_head_key]
+            full_lm = get_tp_group().all_gather(shard.contiguous(), dim=0)
+            full_lm = full_lm[: int(hf_config.vocab_size)].contiguous()
+            base_state[lm_head_key] = full_lm
+            dprint(
+                f"[tp] all-gathered lm_head '{lm_head_key}' shard "
+                f"{tuple(shard.shape)} -> {tuple(full_lm.shape)} "
+                f"(tp_size={tp_size}, tp_rank={tp_rank})"
+            )
 
         # LoRA scaling = alpha / r, read from the FT adapter's PEFT config.
         lora_scaling = 1.0
@@ -492,6 +544,19 @@ class Worker(WorkerBase):
             # per layer to ``activations["attn_ctx"]``. The backward skips the
             # attention-forward recompute and reads ctx directly.
             "save_attn_ctx": bool(ft_cfg.save_attn_ctx),
+            # [DeltaServe] Phase 7 / M2: TP shard geometry. The backward divides
+            # num_attention_heads / num_key_value_heads / intermediate_size by
+            # tp_size to slice its LOCAL shards, and uses tp_rank to slice the
+            # (full, disk-loaded) FT-adapter master into this rank's LoRA shard.
+            # tp_size=1 → local == full → single-GPU behaviour unchanged.
+            "tp_size": int(tp_size),
+            "tp_rank": int(tp_rank),
+            # [DeltaServe] Phase 7 / M3: rendezvous port for the backward-only
+            # NCCL group (the backward children are NOT in vLLM's inference
+            # group). Distinct from vLLM's distributed port; override via env if
+            # 29677 clashes on the box.
+            "backward_nccl_port": int(
+                os.environ.get("DSERVE_BACKWARD_NCCL_PORT", "29677")),
         }
 
         dprint(
@@ -543,8 +608,26 @@ class Worker(WorkerBase):
         head_dim = int(getattr(hf_config, "head_dim", None)
                        or hidden_size // num_heads)
         num_kv_heads = int(getattr(hf_config, "num_key_value_heads", num_heads))
-        q_size = num_heads * head_dim
-        kv_size = num_kv_heads * head_dim
+
+        # [DeltaServe] Phase 7 / M2: the mlp_gate_up / attn_qkv / attn_ctx hooks
+        # capture the TP-SHARDED module outputs, so their buffer widths must be
+        # LOCAL (per-rank). q/k/v and intermediate all shard by tp_size; the
+        # residual-stream buffers (layer_in/final_*) stay full hidden_size.
+        # tp_size=1 → local == full → single-GPU sizing unchanged.
+        from vllm.distributed import get_tensor_model_parallel_world_size
+
+        tp_size = int(get_tensor_model_parallel_world_size())
+        assert num_heads % tp_size == 0 and num_kv_heads % tp_size == 0, (
+            f"TP finetuning needs num_heads ({num_heads}) and num_kv_heads "
+            f"({num_kv_heads}) divisible by tp_size ({tp_size})")
+        q_size = (num_heads // tp_size) * head_dim          # local
+        kv_size = (num_kv_heads // tp_size) * head_dim       # local
+        inter_full = getattr(hf_config, "intermediate_size", None)
+        local_inter = (int(inter_full) // tp_size) if inter_full else None
+        if inter_full is not None:
+            assert int(inter_full) % tp_size == 0, (
+                f"TP finetuning needs intermediate_size ({inter_full}) "
+                f"divisible by tp_size ({tp_size})")
 
         accumulator = FinetuneAccumulator(
             model=model,
@@ -552,7 +635,7 @@ class Worker(WorkerBase):
             hidden_size=hidden_size,
             device=self.device,
             dtype=dtype,
-            intermediate_size=getattr(hf_config, "intermediate_size", None),
+            intermediate_size=local_inter,
             q_size=q_size,
             kv_size=kv_size,
             save_attn_qkv=bool(ft_cfg.save_attn_qkv),
@@ -575,6 +658,12 @@ class Worker(WorkerBase):
         coordinator = get_coordinator(capacity=cap, per_step_budget=cap)
         coordinator.backward_process = backward_process
         coordinator.backward_sleep_s = float(ft_cfg.backward_sleep_seconds)
+        # [DeltaServe] Phase 7 / M4.1: under TP>1 this worker-side coordinator is
+        # a DIFFERENT process from the EngineCore scheduler. Relay mode makes it
+        # a thin executor: the runner calls execute_trigger (on a relayed
+        # SchedulerOutput command) + poll_backward_relay, and reports both back
+        # via ModelRunnerOutput; the scheduler owns the trigger decision + store.
+        coordinator.relay_mode = tp_size > 1
         # [forward_interruptible / tier C] Wire the accumulator's per-layer
         # abort check to the coordinator's threading.Event. The hook does a
         # cheap None-check first, so this is zero-cost when the feature is

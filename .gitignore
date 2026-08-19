@@ -32,6 +32,7 @@ tokenizer.json
 
 # ---- eval run outputs / logs / plots ----
 eval/output/
+eval-tp/output/
 *.log
 
 # ---- local / editor / agent state ----

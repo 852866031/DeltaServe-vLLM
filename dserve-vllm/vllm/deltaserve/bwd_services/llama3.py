@@ -24,6 +24,7 @@ tensors per layer get gradients.
 """
 
 import math
+import os
 import re
 
 import torch
@@ -146,7 +147,7 @@ def _proj_backward(xin, gy, w_base, A, B, scaling, cdt=torch.float32):
 
 def layer_forward(x, lw, scaling, cos, sin, seq_lens, b_start, dims, eps,
                   saved_gate_up=None, saved_qh=None, saved_kh=None,
-                  saved_vh=None, saved_ctx=None):
+                  saved_vh=None, saved_ctx=None, all_reduce=None):
     """Rematerialize one Llama decoder layer forward, returning the ``cache`` the
     manual backward needs (attention internals + MLP pre-activations). The frozen
     `down` matmul / layer output are NOT computed — the backward only needs the
@@ -220,6 +221,14 @@ def layer_forward(x, lw, scaling, cos, sin, seq_lens, b_start, dims, eps,
         ctx_flat = torch.cat(ctx_blocks, 0).reshape(n, D)
 
     o = _proj(ctx_flat, lw["o"], lw["oA"], lw["oB"], scaling)       # [n, D]
+    # [DeltaServe] Phase 7 / M3: o_proj is row-parallel — under TP each rank
+    # holds ctx for its own heads and o.weight sharded on the input dim, so ``o``
+    # is a PARTIAL sum. All-reduce it (mirroring the real forward's post-attention
+    # reduce) so ``resid_mid`` — which feeds the FFN backward + residual — is the
+    # correct full residual on every rank. all_reduce is None for tp=1 (no-op,
+    # single-GPU path unchanged) and for the autograd gradcheck.
+    if all_reduce is not None:
+        o = all_reduce(o)
     resid_mid = x + o
 
     if saved_gate_up is not None:
@@ -328,7 +337,8 @@ def attn_backward_core(qh, kh, vh, grad_ctx, seq_lens, b_start, dims, cdt=torch.
 
 def layer_backward(grad_out, cache, lw, scaling, cos, sin, seq_lens, b_start,
                    dims, eps, cdt=torch.float32,
-                   *, grad_qh_buf=None, grad_kh_buf=None, grad_vh_buf=None):
+                   *, grad_qh_buf=None, grad_kh_buf=None, grad_vh_buf=None,
+                   all_reduce=None):
     """Manual gradient of one layer. Bulk matmuls (FFN-bwd, LoRA-grad, rope/proj-bwd)
     run in ``cdt`` (bf16 in prod, fp32 for the gradcheck); the **attention core**
     (scores/softmax-bwd/dQ/dK/dV) and **RMSNorm backward** always run in fp32 (the
@@ -345,6 +355,16 @@ def layer_backward(grad_out, cache, lw, scaling, cos, sin, seq_lens, b_start,
 
     # --- FFN backward (frozen MLP): grad w.r.t. resid_mid (incl. residual) ---
     grad_resid_mid = ffn_backward_core(grad_out, cache, lw, eps, cdt)
+
+    # [DeltaServe] Phase 7 / M3: resid_mid is a FULL residual-stream tensor, so
+    # its grad must be the full sum before the O-proj/attention/QKV backward
+    # consume it. ffn_backward_core returns (FFN-path partial) + grad_out, where
+    # grad_out is the FULL residual passthrough (identical on every rank). Reduce
+    # ONLY the partial part — subtract grad_out, all-reduce, add it back once —
+    # else the residual would be counted tp_size times.
+    if all_reduce is not None:
+        _gout = grad_out.to(grad_resid_mid.dtype)
+        grad_resid_mid = all_reduce(grad_resid_mid - _gout) + _gout
 
     # --- O backward (cdt) ---
     grad_ctx_flat, grad_oA, grad_oB = _proj_backward(
@@ -373,6 +393,22 @@ def layer_backward(grad_out, cache, lw, scaling, cos, sin, seq_lens, b_start,
 
     grads = {"qA": grad_qA, "qB": grad_qB, "kA": grad_kA, "kB": grad_kB,
              "vA": grad_vA, "vB": grad_vB, "oA": grad_oA, "oB": grad_oB}
+
+    # [DeltaServe] Phase 7 / M3: remaining TP gradient reductions.
+    #   - grad_x: the attention-path term rmsnorm_backward(x, grad_x_norm1) is a
+    #     per-rank partial (q/k/v column-parallel); grad_resid_mid is ALREADY the
+    #     full reduced residual grad. So reduce only (grad_x - grad_resid_mid)
+    #     and add the full residual back once.
+    #   - grad_{q,k,v}A: column-parallel A is REPLICATED → grad sums across
+    #     output-head shards.
+    #   - grad_oB: row-parallel B is REPLICATED → grad sums across input shards.
+    # grad_{q,k,v}B (output-sharded) and grad_oA (input-sharded) are already this
+    # rank's correct shard — no reduce. all_reduce=None (tp=1) → byte-identical.
+    if all_reduce is not None:
+        grad_x = all_reduce(grad_x - grad_resid_mid) + grad_resid_mid
+        for _k in ("qA", "kA", "vA", "oB"):
+            if grads[_k] is not None:
+                grads[_k] = all_reduce(grads[_k])
     return grad_x, grads
 
 
@@ -414,6 +450,29 @@ def head_backward(final_in, lm_w, norm_w, eps, ids, seq_lens, b_start, vocab):
 _PROJ = ("q", "k", "v", "o")
 
 
+def lora_shard_slice(proj: str, ab: str, t: torch.Tensor, tp_rank: int,
+                     tp_size: int, local_q: int, local_kv: int) -> torch.Tensor:
+    """Slice a FULL PEFT LoRA factor into this TP rank's shard (Phase 7 / M2).
+
+    Matches how vLLM shards the served LoRA buffers we publish into (M4):
+      q/k/v (column-parallel): B [out_full, r] sharded on output rows;
+                               A [r, hidden]   replicated (returned whole).
+      o     (row-parallel):    A [r, in_full]  sharded on input cols;
+                               B [hidden, r]   replicated (returned whole).
+    The head partition is contiguous per rank, so each shard is one contiguous
+    slice at offset ``tp_rank * local_width``. ``tp_size == 1`` → identity, so
+    the single-GPU masters are byte-identical to before.
+    """
+    if tp_size == 1:
+        return t
+    if proj in ("q", "k", "v") and ab == "B":
+        w = local_q if proj == "q" else local_kv
+        return t[tp_rank * w:(tp_rank + 1) * w, :]
+    if proj == "o" and ab == "A":
+        return t[:, tp_rank * local_q:(tp_rank + 1) * local_q]
+    return t  # replicated factor (q/k/v A, o B)
+
+
 class Llama3BackwardService(BackwardService):
 
     def __init__(self, device_index: int) -> None:
@@ -434,6 +493,12 @@ class Llama3BackwardService(BackwardService):
         self._grad_qh_buf = None
         self._grad_kh_buf = None
         self._grad_vh_buf = None
+        # [DeltaServe] Phase 7 / M3: TP shard geometry + the backward-only
+        # all-reduce. tp_size=1 (single-GPU) leaves _all_reduce None → no comm.
+        self.tp_size = 1
+        self.tp_rank = 0
+        self._all_reduce = None
+        self._diag_count = 0
 
     # -- build master params + optimizer once weights are received -----------
 
@@ -447,18 +512,71 @@ class Llama3BackwardService(BackwardService):
             dprint(f"[backward] llama3 state build failed: {e}")
             traceback.print_exc()
 
+    def _init_tp_group(self, meta) -> None:
+        """Init (once) the NCCL process group across the backward children and
+        install ``self._all_reduce`` (in-place SUM). No-op for tp_size==1."""
+        self.tp_size = int(meta.get("tp_size", 1))
+        self.tp_rank = int(meta.get("tp_rank", 0))
+        self._all_reduce = None
+        if self.tp_size <= 1:
+            return
+        import torch.distributed as dist
+
+        port = int(meta.get("backward_nccl_port", 29677))
+        if not dist.is_initialized():
+            backend = "nccl" if torch.cuda.is_available() else "gloo"
+            dist.init_process_group(
+                backend=backend,
+                init_method=f"tcp://127.0.0.1:{port}",
+                rank=self.tp_rank, world_size=self.tp_size)
+            dprint(
+                f"[backward] TP group up: rank={self.tp_rank}/{self.tp_size} "
+                f"backend={backend} port={port}")
+
+        def _ar(t):
+            # NCCL/gloo need contiguous input; reduce is in-place SUM.
+            t = t.contiguous()
+            dist.all_reduce(t)
+            return t
+
+        self._all_reduce = _ar
+
     def _build_state(self) -> None:
         meta = self.shared["meta"]
         base = self.shared["base"] or {}
         ft = self.shared["ft"] or {}
-        self.D = int(meta["hidden_size"])
+        # [DeltaServe] Phase 7 / M2: TP shard geometry. Under TP>1 the base
+        # weights shared by the worker are this rank's SHARDS: qkv/gate_up are
+        # column-parallel (sharded on output → local q/k/v/gate/up widths),
+        # o/down are row-parallel (sharded on input → used as-is). So the head
+        # counts and intermediate size the backward slices by are LOCAL =
+        # full // tp_size. hidden_size (residual stream) and vocab stay FULL —
+        # the residual is all-reduced and the worker all-gathers lm_head to full
+        # before sharing. tp_size=1 → local == full → single-GPU behaviour.
+        self.tp_size = int(meta.get("tp_size", 1))
+        self.tp_rank = int(meta.get("tp_rank", 0))
+        # [DeltaServe] Phase 7 / M3: stand up a NCCL group ACROSS the backward
+        # children (one per rank) — they are NOT in vLLM's inference NCCL group.
+        # This carries the per-layer gradient/activation all-reduces. Both
+        # children reach _build_state ~concurrently (both workers share weights
+        # during load_model), so the collective init rendezvouses. tp_size==1 →
+        # no group, self._all_reduce stays None → single-GPU path unchanged.
+        self._init_tp_group(meta)
+        Hq_full = int(meta["num_attention_heads"])
+        Hkv_full = int(meta["num_key_value_heads"])
+        inter_full = int(meta["intermediate_size"])
+        assert Hq_full % self.tp_size == 0 and Hkv_full % self.tp_size == 0 \
+            and inter_full % self.tp_size == 0, (
+                f"[backward] TP finetuning needs Hq({Hq_full}) / Hkv({Hkv_full})"
+                f" / inter({inter_full}) divisible by tp_size({self.tp_size})")
+        self.D = int(meta["hidden_size"])          # full (residual stream)
         self.L = int(meta["num_hidden_layers"])
-        self.Hq = int(meta["num_attention_heads"])
-        self.Hkv = int(meta["num_key_value_heads"])
-        self.Hd = int(meta["head_dim"])
-        self.kv_size = self.Hkv * self.Hd
-        self.q_size = self.Hq * self.Hd
-        self.inter = int(meta["intermediate_size"])
+        self.Hq = Hq_full // self.tp_size          # local q heads
+        self.Hkv = Hkv_full // self.tp_size        # local kv heads
+        self.Hd = int(meta["head_dim"])            # full (per-head, unsharded)
+        self.kv_size = self.Hkv * self.Hd          # local
+        self.q_size = self.Hq * self.Hd            # local
+        self.inter = inter_full // self.tp_size    # local
         self.theta = float(meta["rope_theta"])
         self.eps = float(meta["rms_norm_eps"])
         self.scaling = float(meta.get("lora_scaling", 1.0))
@@ -512,6 +630,16 @@ class Llama3BackwardService(BackwardService):
             }
 
         # FT adapter -> per-layer/proj fp32 master nn.Parameters (child-owned clone).
+        # [DeltaServe] Phase 7 / M2: the adapter is loaded FULL from disk by the
+        # worker, but under TP each rank owns only a shard, matching how vLLM
+        # shards the served LoRA buffers we publish into (M4):
+        #   q/k/v (column-parallel): B [out_full, r] sharded on output rows;
+        #                            A [r, hidden]   replicated (full).
+        #   o     (row-parallel):    A [r, in_full] sharded on input cols;
+        #                            B [hidden, r]   replicated (full).
+        # The head-partition is contiguous per rank (vLLM's QKV/o layout), so the
+        # shard is a single contiguous slice at offset tp_rank * local_width.
+        # tp_size=1 → _shard_lora is identity → single-GPU masters unchanged.
         key_re = re.compile(
             r"layers\.(\d+)\.self_attn\.([qkvo])_proj\.lora_([AB])\.weight")
         params: list[nn.Parameter] = []
@@ -520,7 +648,10 @@ class Llama3BackwardService(BackwardService):
             if m is None:
                 continue
             layer, proj, ab = int(m.group(1)), m.group(2), m.group(3)
-            param = nn.Parameter(t.detach().clone().float())  # fp32 master
+            shard = lora_shard_slice(proj, ab, t, self.tp_rank, self.tp_size,
+                                     self.q_size, self.kv_size)
+            # fp32 master, contiguous so the fused AdamW + IPC publish are happy.
+            param = nn.Parameter(shard.detach().clone().float().contiguous())
             self.lora.setdefault(layer, {}).setdefault(proj, {})[ab] = param
             params.append(param)
 
@@ -561,7 +692,14 @@ class Llama3BackwardService(BackwardService):
         # [Phase 5] Optional CUDA-graph runner. Per-layer FFN-bwd + padded-attn-bwd
         # graphs, captured lazily on first replay. Falls back per-layer on capture
         # or shape-fit failure (gradient values unchanged in either case).
-        if meta.get("backward_cuda_graph"):
+        if meta.get("backward_cuda_graph") and self.tp_size > 1:
+            # [DeltaServe] Phase 7 / M3: the graphed forward/backward regions
+            # have no TP all-reduces wired in (and NCCL-in-a-captured-region is a
+            # hazard), so force EAGER under TP. Re-enabling the graph path under
+            # TP is tracked as M5.
+            dprint("[backward] backward_cuda_graph requested with tp_size="
+                   f"{self.tp_size}; forcing EAGER under TP (graph path is M5)")
+        elif meta.get("backward_cuda_graph"):
             from vllm.deltaserve.bwd_services.llama3_graph import (
                 Llama3GraphedBackward,
             )
@@ -592,6 +730,44 @@ class Llama3BackwardService(BackwardService):
             lw[proj + "B"] = ld.get(proj, {}).get("B")
         return lw
 
+
+    @torch.no_grad()
+    def _diag_remat_check(self, activations, n, seq_lens, b_start, cos, sin):
+        """[TP DIAG, temporary] Rematerialize the FULL forward from layer_in[0]
+        (the embedding output — model-independent) using the CURRENT LoRA masters,
+        and compare against the activations vLLM's REAL forward captured. If the
+        backward's model view matches the SERVED model these agree to ~bf16 noise;
+        a growing divergence localizes where publish/serve disagrees with training."""
+        li = activations.get("layer_in")
+        if not li:
+            return
+        gu = activations.get("mlp_gate_up")
+        x = li[0][:n]
+        rows = []
+        for i in range(self.L):
+            lw = self._layer_weights(i)
+            c = layer_forward(x, lw, self.scaling, cos, sin, seq_lens, b_start,
+                              self.dims, self.eps, all_reduce=self._all_reduce)
+            dg = 0.0
+            if gu:
+                rg = gu[i][:n].float()
+                inter = rg.shape[-1] // 2
+                num = (c["gate"].float() - rg[:, :inter]).abs().max().item()
+                dg = num / (rg[:, :inter].abs().max().item() + 1e-6)
+            h = F.silu(c["gate"]) * c["up"]
+            ffn = F.linear(h, lw["down"])
+            if self._all_reduce is not None:
+                ffn = self._all_reduce(ffn)
+            x = c["resid_mid"] + ffn
+            ref = (li[i + 1][:n] if i + 1 < self.L
+                   else activations["final_in"][:n]).float()
+            d = (x.float() - ref).abs().max().item() / (ref.abs().max().item() + 1e-6)
+            rows.append((i, d, dg))
+        head = " ".join(f"L{i}={d:.1e}/gu{g:.1e}" for i, d, g in rows[:3])
+        tail = " ".join(f"L{i}={d:.1e}" for i, d, _ in rows[-2:])
+        dprint(f"[tpdiag] rank={self.tp_rank} remat-vs-captured rel|d|: "
+               f"{head} ... {tail}")
+
     # -- the real backward (overrides base.process_backward) ------------------
 
     def process_backward(self, activations, sample_lens, n, epoch):
@@ -611,6 +787,10 @@ class Llama3BackwardService(BackwardService):
             torch.zeros(0, device=device)
         cos, sin = rope_cos_sin(positions, self.Hd, self.theta)
         ids = activations["concat_input_ids"][:n]
+        if os.environ.get("DSERVE_TP_DIAG") and self._diag_count < 5:
+            self._diag_count += 1
+            self._diag_remat_check(activations, n, seq_lens, b_start,
+                                   cos, sin)
 
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -675,7 +855,8 @@ class Llama3BackwardService(BackwardService):
                         seq_lens, b_start, self.dims, self.eps,
                         saved_gate_up=gu,
                         saved_qh=qh_i, saved_kh=kh_i, saved_vh=vh_i,
-                        saved_ctx=ctx_i)
+                        saved_ctx=ctx_i,
+                        all_reduce=self._all_reduce)  # M3: o_proj reduce (TP)
                 if self.graph_runner is None:
                     grad_x, grads = layer_backward(
                         g, cache, lw, self.scaling, cos, sin,
@@ -683,7 +864,8 @@ class Llama3BackwardService(BackwardService):
                         cdt=self.bwd_dtype,
                         grad_qh_buf=self._grad_qh_buf,
                         grad_kh_buf=self._grad_kh_buf,
-                        grad_vh_buf=self._grad_vh_buf)
+                        grad_vh_buf=self._grad_vh_buf,
+                        all_reduce=self._all_reduce)  # M3: grad reduces (TP)
                 else:
                     grad_x, grads = self._layer_backward_graphed(
                         i, g, cache, lw, cos, sin, seq_lens, b_start)

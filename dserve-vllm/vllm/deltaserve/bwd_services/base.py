@@ -53,6 +53,34 @@ def get_service(service_name: str):
     )
 
 
+def _arm_parent_death_signal() -> None:
+    """[DeltaServe] Phase 7 / M1: SIGKILL this backward child when its parent
+    worker dies.
+
+    The child is spawned ``daemon=True``, so Python reaps it on a *clean* worker
+    exit — but SIGKILL (which is how an orphaned or wedged worker gets cleaned up)
+    bypasses Python's exit handlers entirely, stranding this process with its
+    share of GPU memory (~650 MB/rank) and, under TP, a rank of the backward
+    NCCL group. Ask the kernel to kill us with the parent instead. Linux-only;
+    a no-op elsewhere."""
+    import ctypes
+    import signal
+    import sys
+
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        PR_SET_PDEATHSIG = 1
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(
+            PR_SET_PDEATHSIG, signal.SIGKILL)
+    except Exception as e:  # noqa: BLE001 — never block the child on this
+        dprint(f"[backward] could not arm PR_SET_PDEATHSIG: {e}")
+        return
+    if os.getppid() == 1:
+        dprint("[backward] parent worker already gone at startup; exiting")
+        os._exit(1)
+
+
 def service_main(conn, mps_percentage: int, device_index: int,
                  service_name: str, gpu_grant=None) -> None:
     """Child-process entry point. Runs in the spawned backward process.
@@ -60,6 +88,7 @@ def service_main(conn, mps_percentage: int, device_index: int,
     `gpu_grant` is the shared mp.Event for the `_maybe_pause` GPU-yield contract
     (SET = may run, CLEARED = yield to an inference prefill)."""
     mark_backward_process()  # make this process's dprint output purple
+    _arm_parent_death_signal()
     if torch.cuda.is_available():
         torch.cuda.set_device(device_index)
     svc = get_service(service_name)(device_index)
