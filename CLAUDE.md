@@ -26,8 +26,11 @@ DeltaServe-vLLM/                    ← this repo root (where we write integrati
 │   ├── pyproject.toml              ← distribution name & `dserve-vllm` console script
 │   ├── vllm/                       ← inner Python package (still `import vllm`)
 │   └── AGENTS.md                   ← upstream vLLM contribution rules (mostly N/A — we're a research fork)
-├── configs/                        ← serving_config_finetuning_{opt,llama3}.yaml (DeltaServe-style YAML)
+├── configs/                        ← serving_config_finetuning_{opt,llama3,llama3_tp2}.yaml (DeltaServe-style YAML)
 ├── scripts/                        ← entry points: ft_experiment_{opt,llama3}.py, launch_deltaserve.py, …
+├── eval/                           ← single-GPU eval: auto_benchmark.py, auto_plot*.py, pure_ft_bench.py
+├── eval-tp/                        ← TP eval: launch_deltaserve.py, ft_bench_tp.py (per-TP logs, --kill-stale)
+├── tests/                          ← standalone scripts (run with `python`, NOT pytest — not installed)
 ├── adapters/                       ← toy LoRA adapters (opt125m / llama3; inference + "-ft" FT target)
 ├── INTEGRATION_PROGRESS.md         ← plan + per-stage progress. Source of truth for *what* to build & *how far*.
 ├── VLLM_FORK_CHANGES.md            ← every change vs upstream vLLM (navigate the fork)
@@ -41,7 +44,7 @@ DeltaServe-vLLM/                    ← this repo root (where we write integrati
 
 ## Current status
 
-**Phases 1–4, 5.2, 5.3, 5.4, 5.5, 6, 6.1 all code-complete (Phases 1–3
+**Phases 1–4, 5.2, 5.3, 5.4, 5.5, 6, 6.1 all code-complete; Phase 7 (TP=2) M0–M4.1 done and GPU-validated (Phases 1–3
 gradcheck-verified, Phases 5.2 + 5.4 + 5.5 graph/eager parity-verified —
 111/111 + 12/12 in `tests/test_llama3_backward{,_graph}.py`); Phase 6 GPU
 validation of the pre-emption pipeline is the user's next run.** The real
@@ -167,20 +170,47 @@ centered on `phase=both`: `both_vs_inf-only` (co-serving overhead vs no-co basel
 the pure-FT (no inference traffic) benchmark — launches the server, POSTs
 `/start_finetuning`, idles for `--duration`, trims + summarizes the bwd_log.
 
-**Current focus:** GPU-validating the `forward_interruptible` pipeline + the unified-phase
-scheduler on the existing `eval/auto_benchmark.py` replay (P99 TTFT outlier reduction +
-FT throughput uplift are the headline metrics). Independent levers:
-- `slo.coserving_admission_phase: both` (new) vs `prefill` (default) — A/B with
-  `auto_benchmark.py --co --scheduler both` and the new `eval/auto_plot_schedulers.py`
-  PNGs.
-- `finetune.match_prefill_workload_factor` (P5.3 leaky-bucket admission, float) vs
-  `ft_tokens_admission_constrain_factor` (proportional cap) — A/B with
-  `auto_benchmark.py --co` and the `_factor_*` suffix.
-- `finetune.backward_cuda_graph` (P5.2 + 5.4) — compare backward latency in the
-  per-cycle log between on/off. 3 captured regions per layer now (forward + FFN-bwd +
-  attn-bwd).
-- `finetune.save_attn_qkv` (P5.5 / F1) — toggles the post-RoPE qh/kh/vh save (+~96 MB
-  activation pool for ~5 ms backward speedup).
+**Phase 7 — tensor parallelism (TP=2). ✅ M0–M4.1, GPU-validated; M4.2 + M5 open.**
+Backward-per-rank: each TP rank runs its own backward child on its own weight shard, with
+a **dedicated NCCL group across the backward children** (they are not in vLLM's inference
+group) carrying **7 all-reduces per layer** — the row-parallel `o_proj` forward output,
+the FFN and attention *partials* of `grad_resid_mid` / `grad_x` (reduced surgically, so
+the full residual passthrough isn't counted `tp_size`×), and the 4 replicated LoRA
+factors. Lock-step across ranks is guaranteed by broadcasting the backward trigger on
+`SchedulerOutput`; without it the collectives deadlock. `tp_size == 1` leaves every path
+inert. Three structural pieces: (M1) workers spawn **non-daemonic** when finetuning is on
+so each can fork its backward child — with `PR_SET_PDEATHSIG` + a lethal death-pipe
+monitor to replace the reaping that `daemon=True` used to provide; (M2) local
+head/intermediate dims + `lora_shard_slice` + an `lm_head` all-gather that removes vocab
+parallelism from the backward; (M4.1) a relay bridging the EngineCore scheduler and the
+worker, which under TP are different processes with different coordinator singletons.
+**Verified:** TP=2 tracks TP=1 cycle-for-cycle to ~0.01 loss on identical data; shard
+23/23; real 2-process gloo gradcheck 10/10; TP=1 gradcheck 12/12 unchanged.
+**Not yet:** no SLO-aware admission under TP (the estimator's timing feedback is severed
+by the process split → `profile_on_launch: false` → cold-start fixed budget), backward
+CUDA graphs force-disabled under TP, and the backward ack reaches the scheduler from
+`output_rank` only.
+
+**Current focus:** Phase 7 (TP). In priority order: **M4.2** — relay `push_sample` so
+SLO-aware admission works under TP at all (today TP runs with no SLO gate, so the
+project's core value-add is not exercised there); the backward **ack race** (admission
+reopens on one rank's ack while the other child may still be publishing); and **M4.3** —
+gradient bucketing + a comm stream, which on a box with **no P2P** is worth more than M5
+(224 collectives ≈ 218 MB/rank/cycle over PCIe ≈ ~20 ms, vs the ~5 ms of dispatch that
+graphing removes) and also fixes a latent rank-asymmetric `clip_grad_norm_`.
+
+**Open, and NOT a TP bug:** FT loss stalls ~4.3 after ~25 cycles where an earlier
+`pure_ft` run reached ~2.6 on the same samples — but this **reproduces identically at
+TP=1**. Ruled out: learning rate, data/order, code drift (no commits touched the FT path
+after Jun 7), and `save_attn_qkv`/`save_attn_ctx`. An env-gated diagnostic
+(`DSERVE_TP_DIAG=1`) shows the backward's forward-remat diverging from vLLM's real
+forward equally at TP=1 and TP=2. Next: re-run `eval/pure_ft_bench.py` to confirm the
+2.12 reference still reproduces (that curve was only 32 cycles / 5.0 s).
+
+Single-GPU levers still pending GPU A/B: `forward_interruptible`,
+`slo.coserving_admission_phase: both`, `finetune.match_prefill_workload_factor` vs
+`ft_tokens_admission_constrain_factor`, `finetune.backward_cuda_graph`,
+`finetune.save_attn_qkv`.
 
 Two living docs track the detail:
 
@@ -336,7 +366,7 @@ Insertion points for DeltaServe pieces:
 Each phase ends in an independently testable state; don't start a phase until the prior
 phase's test passes.
 
-1. **Phase 1 — backward process + shared-memory IPC** (no backward logic). ← *current focus.*
+1. **Phase 1 — backward process + shared-memory IPC** (no backward logic). ✅
    Deliverable: shared-buffer hash round-trips cross-process; MPS vars child-only; clean shutdown.
 2. **Phase 2 — activation capture + FT injection + dedicated FT adapter.** FT samples flow
    through real batches via a dedicated LoRA adapter; their (and only their) activations land
@@ -369,8 +399,9 @@ phase's test passes.
      Llama-3-8B at s_max=256). Forward graph automatically reads from the
      saved buffers when the mode is on.
    - **(future)** Dedicated FT activation pool if vLLM's allocator gets in
-     the way; multi-TP correctness (backward per-rank); profiling-pass
-     extension to cover `decode + FT` shapes (currently online-refit only).
+     the way; profiling-pass extension to cover `decode + FT` shapes
+     (currently online-refit only). *(multi-TP correctness — backward
+     per-rank — has since landed as **Phase 7**.)*
 6. **Phase 6 — inference pre-emption of FT-only stepping (`forward_interruptible`). ✅ code.**
    Three tiers (A: pre-schedule grace; B: post-schedule rollback; C: mid-forward abort via
    per-layer hooks) behind one config flag. Adds the 3-phase store API (`claim` /
@@ -386,15 +417,16 @@ phase's test passes.
    only / mixed / idle steps under the SLO estimator. `slo.decode_only_ft_safety_margin`
    (default 0.7) tightens the TBT budget on decode-only to bound estimator-cold-start risk.
    Soft-fall to `"prefill"` when `ft_tokens_admission_constrain_factor != -1`.
-6. **Phase 6 — inference pre-emption of FT-only stepping (`forward_interruptible`). ✅ code.**
-   Three tiers (A: pre-schedule grace; B: post-schedule rollback; C: mid-forward abort via
-   per-layer hooks) behind one config flag. Adds the 3-phase store API (`claim` /
-   `commit_claimed` / `release_claimed`) and an `FTAborted` sentinel for the runner/engine
-   to thread. Default off → bit-identical behaviour. Pending: GPU validation on the eval
-   replay (target: P99 TTFT outlier reduction from ~80 ms toward ~30 ms).
-7. **Phase 6.1 — slice-based FT activation save. ✅ code.** Per-layer hooks gather FT
-   rows via a slice view instead of `index_select` on the fast path; mask gather is the
-   silent fallback when FT positions are interleaved with non-FT.
+9. **Phase 7 — tensor parallelism (TP=2). 🟡 M0–M4.1 done + GPU-validated.**
+   Backward-per-rank on a dedicated NCCL group across the backward children; 7
+   all-reduces per layer; lock-step guaranteed by broadcasting the trigger on
+   `SchedulerOutput`. M1 non-daemon workers (+ `PR_SET_PDEATHSIG`), M2 shard-aware dims /
+   `lora_shard_slice` / `lm_head` all-gather, M3 the surgical reduce set, M4.1 the
+   scheduler↔worker relay. `tp_size == 1` inert. **Open:** M4.2 (SLO estimator relay —
+   TP currently has no SLO gate), the ack race, M4.3 (gradient bucketing + comm stream),
+   M5 (backward CUDA graphs under TP — note the "full-dim buffers" reason in the config
+   comment is wrong; the real blocker is the missing all-reduces, and NCCL-in-graph is
+   supported, so the true obstacles are `_maybe_pause` and `forward_interruptible`).
 
 ## Key DeltaServe co-serving contracts to preserve (from DeltaServe/CLAUDE.md)
 

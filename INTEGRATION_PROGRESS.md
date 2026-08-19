@@ -73,21 +73,33 @@ layer, not an inference engine. Box-by-box DeltaServe→vLLM mapping lives in `C
 
 ## Next step
 
-Phase 6 (`forward_interruptible` + slice activation save) is code-complete; pending
-**GPU validation on a co-serving replay**. Once verified, the residual TTFT outliers
-under co-serving should drop from "~80 ms (one full FT-only forward)" toward
-"~30 ms (irrecoverable in-flight kernels only)" with `forward_interruptible: true` in
-the YAML. See the new **Phase 6** section below for the full design + verification
-plan.
+**Phase 7 (TP=2) is the active line.** M0–M4.1 are done and GPU-validated on 2× RTX
+5090: TP=2 trains equivalently to TP=1 (cycle-for-cycle to ~0.01 loss on identical
+data). The next items, in priority order, are in the **Phase 7** section below —
+(1) **M4.2**, relaying `push_sample` so SLO-aware admission works under TP at all
+(today TP runs with no SLO gate); (2) the backward **ack race** (admission reopens on
+one rank's ack); (3) **M4.3** gradient bucketing + a comm stream, which is worth more
+than M5 on a box with no P2P and also fixes the latent rank-asymmetric gradient clip.
 
-Phases 5.2 (backward CUDA graphs), 5.3 (perf polish + admission strategies + bug
-fixes), 5.4 (forward-recompute CUDA graph), and 5.5 (save post-RoPE qh/kh/vh per
-layer) have shipped — see the **Phase 5** section for what landed. The
-unified-phase scheduler (`coserving_admission_phase: both`) has shipped as code;
-GPU A/B vs the default prefill-only scheduler is pending — see the
-**"Unified-phase FT scheduler"** section for the verification path. From here on
-we **prioritize Llama-3**; opt-125m stays at its current stage (loss-only) as a
-reference path and is not developed further.
+**Open, and NOT a TP problem:** FT loss stalls around ~4.3 after ~25 cycles where an
+earlier `pure_ft` run reached ~2.6 on the same samples — but this **reproduces
+identically at TP=1**, so it is a config- or regime-level training-quality issue, not a
+tensor-parallelism bug. Ruled out so far: learning rate (lowered to 5e-6 back in May,
+before the good run), the data (identical sample sequence and order), code drift (no
+commits touched the FT path after Jun 7), and `save_attn_qkv`/`save_attn_ctx`. An
+env-gated diagnostic (`DSERVE_TP_DIAG=1` → `Llama3BackwardService._diag_remat_check`)
+rematerializes the full forward from `layer_in[0]` and compares it against the captured
+activations; it shows the remat diverging from vLLM's real forward (final_in relative
+error 0.22 → 0.45 over cycles) **identically at TP=1 and TP=2**. Next step there is to
+re-run `eval/pure_ft_bench.py` and confirm the 2.12 reference still reproduces — note
+that curve was only 32 cycles over 5.0 s, so it may be a weaker reference than it looks.
+
+Phase 6 (`forward_interruptible` + slice activation save) remains code-complete and
+pending GPU validation on a co-serving replay; it is **off** under TP (and conflicts
+with M5 — see the Phase 7 notes). Phases 5.2–5.5 have shipped. The unified-phase
+scheduler (`coserving_admission_phase: both`) has shipped as code; GPU A/B is pending.
+From here on we **prioritize Llama-3**; opt-125m stays at its current stage (loss-only)
+as a reference path.
 
 ---
 
@@ -1028,6 +1040,168 @@ bytes either way; saves one CUDA kernel + one allocation per hook firing
   correctness (backward per-rank). Profiling pass extension to cover `decode + FT`
   and `decode-only + FT` shapes (currently online-refit only). (eval/analysis
   tooling port: ✅ done in P5.3 above.)
+
+## Phase 7 — Tensor parallelism (TP=2) 🟡 (M0–M4.1 done + GPU-validated; M4.2 / M5 open)
+
+**Goal:** make the co-serving LoRA SFT backward correct and runnable under
+`tensor_parallel_size > 1` for Llama-3. Guiding principle, mirroring the original
+DeltaServe (`model_rpc.py` inits NCCL per rank and builds per-rank backward services):
+**backward-per-rank** — each TP rank runs its own backward child on its own weight shard,
+and the only cross-rank traffic is a small set of all-reduces on a **dedicated NCCL group
+across the backward children** (they are not in vLLM's inference group).
+
+Design invariant: FT tokens are identical across ranks (same injected prefill), so all
+ranks fill their activation buffers in lock-step and fire the backward on the same step.
+This keeps admission rank-local and makes the collectives safe — if one rank ran a
+backward the other skipped, the all-reduce would deadlock.
+
+`tp_size == 1` leaves every path below inert, so the single-GPU behaviour is unchanged.
+
+### M1 — process launch ✅ (GPU-verified)
+
+vLLM spawns `WorkerProc` with `daemon=True`, and Python forbids a daemonic process from
+having children — so no rank could fork its backward child. Fixed by spawning the worker
+**non-daemonic** iff `enable_finetuning` (`multiproc_executor.make_worker_process`).
+
+That trade removes Python's automatic reaping, and the pre-existing death-pipe monitor
+does **not** cover the gap: it is armed only *after* `WorkerProc.__init__` has run
+`init_device()` + `load_model()` (~30 s), and on EOF it merely shuts two message queues
+rather than terminating the process. Observed consequence: an EngineCore crash during
+init left both workers reparented to PID 1 holding **14.7 GiB each**, which then failed
+the *next* run with a misleading "free memory less than gpu_memory_utilization" error.
+Fixed by arming `prctl(PR_SET_PDEATHSIG, SIGKILL)` at the top of `worker_main` (before
+the model load) and escalating the death-pipe monitor to `os._exit(1)`; the backward
+child arms PDEATHSIG too, since SIGKILL bypasses Python's cleanup entirely.
+
+**Verified:** TP=2 server boots, two workers each with their own backward child on their
+own GPU; clean Ctrl-C leaves no orphans; and a deliberately crashed EngineCore (bad
+`data_path`, which dies *after* the executor is built — the original repro) now returns
+both GPUs to idle with zero orphaned workers.
+
+### M2 — shard-aware weights, dims, activation buffers ✅
+
+The weights the worker shares are already this rank's shards; the bug was reading their
+dims as full. Now `Hq`, `Hkv`, `inter` are **local** (`full // tp_size`) while
+`hidden_size` (all-reduced residual stream) and `vocab` stay full. New module-level
+`lora_shard_slice()` slices the disk-loaded (full) FT adapter into each rank's shard,
+matching how vLLM shards the served LoRA buffers — q/k/v **B** on output rows, o **A** on
+input cols, replicated factors whole — so the publish path needs **no** change. The
+vocab-parallel `lm_head` is all-gathered to full at load, removing vocab parallelism from
+the backward entirely (cost: ~1.05 GB resident per rank).
+
+**Verified:** `tests/test_llama3_tp_shard.py` 23/23 (shard reconstruction rank0⊕rank1 ==
+full, replicated factors whole, tp=1 identity, local-dim tiling of the fused qkv/gate_up).
+
+### M3 — NCCL group + gradient all-reduces ✅
+
+A second NCCL group across the backward children (`tcp://127.0.0.1:$DSERVE_BACKWARD_NCCL_PORT`,
+default 29677). **7 all-reduces per layer**, and the set is surgical:
+
+| Where | Tensor | Why |
+|---|---|---|
+| forward remat | `o` | `o_proj` is row-parallel → partial sum |
+| backward | `grad_resid_mid` **minus** `grad_out`, then add back | reduce only the FFN partial; the residual passthrough is already full on every rank and would otherwise be counted `tp_size`× |
+| backward | `grad_x` **minus** `grad_resid_mid`, then add back | reduce only the attention-path partial |
+| backward | `grad_qA`, `grad_kA`, `grad_vA`, `grad_oB` | replicated factors — grads sum across shards |
+
+`grad_{q,k,v}B` (output-sharded) and `grad_oA` (input-sharded) are already this rank's
+correct shard and need no reduce. Reducing `grad_x` naively double-counts the residual;
+the gloo test below caught exactly that and drove the surgical form.
+
+**Verified:** `tests/test_llama3_tp_backward_gloo.py` 10/10 — a REAL 2-process gloo
+collective shards a layer, runs each rank through the reduces, and asserts `grad_x` ==
+reference (and identical across ranks), reduced replicated factors == reference, and
+sharded factors concat == reference, all to ~1e-6.
+
+### M4 / M4.1 — publish + control-plane bridge ✅ (GPU-validated)
+
+Publish needed no code change: `_publish_to_served` sizes from `pa.shape`/`pb.shape`, and
+M2 made the masters shard-shaped to match vLLM's already-sharded served buffers.
+
+The real work was the control plane. Under TP>1 the scheduler (EngineCore) and the worker
+are **different processes with different `get_coordinator()` singletons**, and only the
+worker holds the backward IPC handle — so `_trigger_backward` silently no-op'd and no
+backward ever fired. Fixed with a relay, all gated on `relay_mode = tp_size > 1`:
+
+- scheduler → workers: `SchedulerOutput.finetune_backward_trigger` (**broadcast** — this
+  is what guarantees lock-step, without which the collectives deadlock);
+- workers → scheduler: `ModelRunnerOutput.finetune_saved` / `.finetune_backward_done` /
+  `.finetune_ft_started`.
+
+**Verified on 2× RTX 5090:** TP=2 and TP=1 track each other **cycle-for-cycle to ~0.01
+loss** on identical data (same samples, same order, same hyperparameters, same epoch), and
+a self-contained 2-GPU NCCL closed-loop test using the production `layer_forward` /
+`layer_backward` / `head_backward` / `lora_shard_slice` and the exact optimizer+clip loop
+matched tp=1 to **5 decimal places over 60 steps with zero replicated-master drift**.
+TP=1 gradcheck 12/12 unchanged.
+
+### Open items
+
+- **M4.2 — SLO-aware admission under TP (the biggest functional gap).** The runner pushes
+  timing samples to the *worker* coordinator while the scheduler drains its *own*, so the
+  estimator never receives them and online refit is dead under TP. `profile_on_launch` is
+  therefore **off** in the TP config (with it on, profiling drains 0 samples and fits a
+  degenerate estimator that then reads as "ready" and rejects all FT admission). TP
+  consequently runs on the cold-start fixed-budget path with **no SLO gate at all** —
+  i.e. the project's core value-add is not exercised under TP. Fix: relay `push_sample`.
+- **Backward ack race.** `execute_model` collects `ModelRunnerOutput` from a single
+  `output_rank`, so admission reopens on **one** rank's ack while the other child may
+  still be publishing or zeroing buffers. Bounded by the per-layer NCCL lock-step, but
+  real.
+- **`set_corpus_meta` never reaches the children under TP** (guarded on
+  `backward_process is not None`, which is `None` on the scheduler coord) → the child's
+  per-epoch progress meter renders `N/?`.
+- **Latent: the per-layer `clip_grad_norm_` is rank-asymmetric.** It is computed over a
+  rank-local tensor set (full replicated grads + only *this* rank's half of the sharded
+  ones), so each rank derives a slightly different clip scale and applies it to the
+  *identical* reduced replicated grads — slowly desynchronizing the replicated masters.
+  Dormant today only because the per-layer norms do not exceed `max_norm=1.0` (measured
+  divergence when they do: ~0.08%/step). Folding the clip after a bucketed reduce fixes
+  it — see M5 notes.
+- **M5 — backward CUDA graphs under TP** (see below).
+
+### M5 notes — and why it should not be next
+
+`finetune.backward_cuda_graph` is force-disabled at `tp_size > 1` (silent eager
+fallback). **The config comment claiming the blocker is "full-dim capture buffers" is
+wrong**: `llama3_graph.py` derives every dimension from the service (`svc.Hq`, `svc.inter`,
+…), which M2 already made local, and its `D`-sized buffers are residual-stream tensors
+that are legitimately full. The real blocker is that the captured regions have no
+all-reduces wired in.
+
+Note that **NCCL-in-a-captured-region is not forbidden** — NCCL ≥ 2.9 supports graph
+capture, PyTorch's `ProcessGroupNCCL` supports it, and Megatron-LM captures TP all-reduces
+inside per-layer graphs routinely. It requires eager PG init + a warmup collective, and
+identical capture/replay order on every rank — which DeltaServe's broadcast trigger
+already guarantees. Two genuine obstacles remain: (1) `_maybe_pause` must stay *outside*
+any captured region, so unlike an FT-only system we can never collapse to one graph per
+step; (2) `forward_interruptible` tier-C aborts unilaterally mid-backward, which would
+desync the collective and hang both ranks — the abort would have to become a collective
+decision at a layer boundary.
+
+**Higher-value work first (call it M4.3):** on this box there is no P2P, so all 224
+collectives (~218 MB/rank/cycle) cross PCIe — order ~20 ms, against the ~5 ms of *dispatch*
+overhead that graphing removes. Standard FT-system practice (DDP/FSDP gradient bucketing)
+applies directly: the 128 replicated-factor grads (4 × 128 KB per layer) are read only by
+the optimizer, so they can be deferred into **one flat ~16 MB all-reduce** after the layer
+loop — **224 → 97 collectives** — and the 96 that remain on the critical path can overlap
+with compute on a separate comm stream. Doing so also forces the per-layer clip to move
+after the reduce, which fixes the rank-asymmetry above.
+
+### Assets
+
+- `configs/serving_config_finetuning_llama3_tp2.yaml` — TP=2 co-serving config.
+- `eval-tp/launch_deltaserve.py` — HTTP launcher (streams logs, waits on `/health`).
+- `eval-tp/ft_bench_tp.py` — TP co-serving FT bench. Writes **per-TP** filenames
+  (`bwd_log_tp{N}.csv`, `server_tp{N}.log`) and **truncates** the bwd log per run (the
+  server opens it in append mode, so runs used to silently concatenate). Counts cycles
+  from the CSV, not the server log — under TP every rank prints its own `[backward]` line,
+  so log-line counting reports `tp_size`× the real count. `--kill-stale` +
+  a pre-flight check refuse to launch when a previous run left GPU-resident processes.
+- `tests/test_llama3_tp_shard.py`, `tests/test_llama3_tp_backward_gloo.py` (both are
+  standalone scripts — run with `python`, not pytest, which is not installed in the env).
+
+---
 
 ## Top risks
 

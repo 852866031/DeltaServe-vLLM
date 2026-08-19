@@ -3,14 +3,21 @@
 # Phase 7 / TP work. Same structure as serving_config_finetuning_llama3.yaml,
 # but tensor_parallel_size=2 and the shard-UNAWARE backward optimizations are
 # turned OFF until the milestones that make them shard-correct land:
-#   - backward_cuda_graph  (M5) : captures fixed FULL-dim buffers → wrong under TP
-#   - save_attn_qkv / ctx  (M2) : saved activation widths are full-dim → wrong under TP
+#   - backward_cuda_graph  (M5) : the captured regions have no TP all-reduces wired
+#                                 in. (NOT a shape problem: llama3_graph.py derives
+#                                 every dim from the service, which M2 made local.)
+#   - save_attn_qkv / ctx        : off for the first bring-up only — M2 made these
+#                                 buffers local-width, and a TP=2 run with both ON
+#                                 completed 162 cycles with no shape errors.
 #   - forward_interruptible      : off to keep the first bring-up simple
 #
-# M1 (this milestone) only needs the server to BOOT under TP=2 and each rank to
-# spawn its backward child. Do NOT POST /start_finetuning yet — the backward
-# math is not shard-correct until M2/M3. `start_on_launch: false` keeps FT
-# admission closed so no backward fires during an M1 launch test.
+# STATUS: M1-M4.1 have landed and are GPU-validated — TP=2 now trains equivalently
+# to TP=1 (cycle-for-cycle to ~0.01 loss on identical data), so POSTing
+# /start_finetuning is expected to work. `start_on_launch: false` still holds FT
+# admission closed until that POST, which keeps profiling/warmup FT-free.
+#
+# CAVEAT: `profile_on_launch` is off below, so there is NO SLO gate under TP yet —
+# admission uses the cold-start fixed buffer-cap budget. See M4.2.
 
 finetune:
   enable_finetuning: true
@@ -29,9 +36,9 @@ finetune:
   ft_only_admission_grace_ms: 0
   fwd_token_throttle_enable: false
   fwd_token_throttle: 200
-  backward_cuda_graph: false         # M5 — OFF under TP (full-dim capture buffers)
-  save_attn_qkv: false               # M2 — OFF under TP (full-dim saved activations)
-  save_attn_ctx: false               # M2 — OFF under TP
+  backward_cuda_graph: false         # M5 — OFF under TP (no all-reduces in captures)
+  save_attn_qkv: false               # bring-up default; local-width since M2
+  save_attn_ctx: false               # bring-up default; local-width since M2
 
 slo:
   ttft_slo: 0.25
