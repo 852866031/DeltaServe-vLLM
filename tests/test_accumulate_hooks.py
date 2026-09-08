@@ -200,6 +200,72 @@ def run_case(name, contiguous, offset, qk_norm=False):
          acc.resid_mid[0].abs().sum().item() == 0.0)
 
 
+def test_abort_poll_boundary():
+    """[forward_interruptible / tier C] The hooks call ``_abort_poll(boundary)``:
+    only the layer-boundary hook (input_layernorm pre-hook) passes True — under
+    TP that is where the rank-symmetric collective runs — and a True answer
+    raises ``FTAborted`` at that layer, leaving the earlier layers' rows saved
+    and the later ones untouched."""
+    from vllm.deltaserve.coordinator import FTAborted
+    torch.manual_seed(1)
+    model = FakeModel()
+    acc = FinetuneAccumulator(model, max_saved=16, hidden_size=D, device="cpu",
+                              dtype=torch.float32, intermediate_size=INTER,
+                              q_size=HQ * HD, kv_size=HKV * HD,
+                              save_attn_qkv=True, save_attn_ctx=True, save_resid_mid=True)
+    acc.register_hooks()
+    calls = {"boundary": 0, "other": 0}
+    abort_at_layer = 2
+
+    def poll(boundary):
+        if boundary:
+            calls["boundary"] += 1
+            return calls["boundary"] == abort_at_layer + 1   # 3rd boundary = layer 2
+        calls["other"] += 1
+        return False
+    acc._abort_poll = poll
+
+    n_total, n_ft = 10, 4
+    mask = torch.zeros(n_total, dtype=torch.bool); mask[6:10] = True
+    acc.begin_step(mask, n_ft, offset=0, start=6, contiguous=True)
+    raised = False
+    try:
+        model(torch.randn(n_total, D))
+    except FTAborted:
+        raised = True
+    acc.end_step()
+    C.ok("abort: FTAborted raised from the layer-boundary hook", raised)
+    C.ok("abort: boundary polls == layers reached (3), non-boundary polls > 0",
+         calls["boundary"] == abort_at_layer + 1 and calls["other"] > 0,
+         f"calls={calls}")
+    # The boundary hook copies its rows BEFORE polling (buffer state stays
+    # consistent up to the aborting layer), so layer_in is filled through the
+    # aborting layer; everything after that boundary — that layer's resid_mid
+    # and all later layers — is untouched.
+    C.ok("abort: layer_in saved through the aborting layer",
+         all(acc.layer_in[i].abs().sum().item() > 0 for i in range(abort_at_layer + 1)))
+    C.ok("abort: nothing after the aborting boundary",
+         acc.resid_mid[abort_at_layer].abs().sum().item() == 0.0
+         and all(acc.layer_in[i].abs().sum().item() == 0.0
+                 for i in range(abort_at_layer + 1, NL)))
+    acc.zero_offset_range(0, n_ft)
+    C.ok("abort: zero_offset_range clears the partial rows",
+         all(acc.layer_in[i].abs().sum().item() == 0.0 for i in range(NL)))
+    # Off: no poll installed → the armed hooks never raise.
+    model2 = FakeModel()
+    acc2 = FinetuneAccumulator(model2, max_saved=16, hidden_size=D, device="cpu",
+                               dtype=torch.float32, intermediate_size=INTER)
+    acc2.register_hooks()
+    acc2.begin_step(mask, n_ft, offset=0, start=6, contiguous=True)
+    ok = True
+    try:
+        model2(torch.randn(n_total, D))
+    except FTAborted:
+        ok = False
+    acc2.end_step()
+    C.ok("abort poll None: hooks inert", ok and acc2._abort_poll is None)
+
+
 def test_disabled_allocates_nothing():
     acc = FinetuneAccumulator(FakeModel(), max_saved=16, hidden_size=D,
                               device="cpu", dtype=torch.float32,
@@ -227,4 +293,5 @@ if __name__ == "__main__":
     run_case("qwen-style (pre-norm q/k) mask/off=0", contiguous=False,
              offset=0, qk_norm=True)
     test_disabled_allocates_nothing()
+    test_abort_poll_boundary()
     C.finish()

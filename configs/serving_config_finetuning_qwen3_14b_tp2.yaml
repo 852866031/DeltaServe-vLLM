@@ -8,7 +8,8 @@
 #                                 q_norm/k_norm INPUTS (raw projection outputs); the
 #                                 backward re-applies only the elementwise norm + RoPE.
 #   - save_attn_ctx              : ON (supported)
-#   - forward_interruptible      : off to keep the first bring-up simple
+#   - forward_interruptible      : ON — tier C is rank-symmetric under TP (shm arrival
+#                                 counter + a gloo MAX-reduce per layer boundary)
 #   - profile_on_launch          : ON since M4.2 (timing samples ride the TP relay)
 #
 # Memory (per 5090): ~14.8 GB weight shard + 1.5 GB all-gathered lm_head in the
@@ -33,8 +34,9 @@ finetune:
   weight_decay: 0.01
   gamma: 0.9
   backward_fp32: false
-  forward_interruptible: false       # off for TP bring-up
-  ft_only_admission_grace_ms: 0
+  forward_interruptible: true        # tiers A/B (scheduler) + tier C rank-symmetric under TP
+  ft_only_admission_grace_ms: 2.0
+  pause_until_prefill_done: true     # no MPS on this box: keep the bwd paused until the prefill has finished on the GPU
   fwd_token_throttle_enable: false
   fwd_token_throttle: 200
   backward_cuda_graph: true         # TP-safe since M5 (2-GPU gated; live A/B pending)

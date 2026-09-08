@@ -100,24 +100,32 @@ async def _one_request(session, server, idx, served_name):
 async def drive_traffic(server: str, duration_s: float, rps: float,
                         stop: asyncio.Event, served_name: str) -> tuple[int, int]:
     """Fire ~rps requests/s for duration_s. Returns (sent, ok)."""
-    sent = ok = 0
+    sent = 0
+    ok_box = [0]
     interval = 1.0 / max(rps, 0.1)
     t0 = time.monotonic()
     inflight: set = set()
+
+    def _done(t: asyncio.Task) -> None:
+        # Count here: the task is dropped from ``inflight`` in this same
+        # callback, so polling ``inflight`` for finished tasks (the previous
+        # implementation) almost never saw one and reported ~0 ok.
+        inflight.discard(t)
+        try:
+            ok_box[0] += 1 if t.result() is True else 0
+        except Exception:  # noqa: BLE001 — cancelled / raised = not ok
+            pass
+
     async with aiohttp.ClientSession() as session:
         while time.monotonic() - t0 < duration_s and not stop.is_set():
             t = asyncio.create_task(_one_request(session, server, sent, served_name))
             inflight.add(t)
-            t.add_done_callback(inflight.discard)
+            t.add_done_callback(_done)
             sent += 1
-            done = [x for x in list(inflight) if x.done()]
-            for x in done:
-                ok += 1 if x.result() else 0
             await asyncio.sleep(interval)
         if inflight:
-            results = await asyncio.gather(*inflight, return_exceptions=True)
-            ok += sum(1 for x in results if x is True)
-    return sent, ok
+            await asyncio.gather(*inflight, return_exceptions=True)
+    return sent, ok_box[0]
 
 
 

@@ -123,6 +123,12 @@ class FinetuneAccumulator:
         # a C-level atomic bool load, the cheapest cross-thread signal
         # available.
         self._abort_event = None
+        # The check the hooks actually call: ``_abort_poll(boundary) -> bool``.
+        # tp=1: reads the Event (every hook). TP: ``FtAbortPoller.hook_check``
+        # — the rank-symmetric collective runs only from the layer-boundary
+        # hook (``boundary=True``, the input_layernorm pre-hook); the other
+        # hooks in the layer return False without a collective. None = off.
+        self._abort_poll = None
 
         # Discover capture points by module name:
         #   layers.{i}.input_layernorm -> layer_in[i]   (auto-detected; absent on opt)
@@ -247,7 +253,7 @@ class FinetuneAccumulator:
         for layer, mod in self._layer_in_modules.items():
             self._handles.append(
                 mod.register_forward_pre_hook(
-                    self._make_pre_hook(self.layer_in[layer])))
+                    self._make_pre_hook(self.layer_in[layer], boundary=True)))
         if self._final_norm_module is not None:
             self._handles.append(
                 self._final_norm_module.register_forward_pre_hook(
@@ -307,7 +313,7 @@ class FinetuneAccumulator:
             f"{'/resid_mid' if self._save_resid_mid else ''})"
         )
 
-    def _make_pre_hook(self, buf):
+    def _make_pre_hook(self, buf, boundary: bool = False):
         def pre_hook(module, args):
             if not self._active or self._cur_n == 0:
                 return
@@ -334,8 +340,8 @@ class FinetuneAccumulator:
             # the abort signal and bail at this layer boundary. Raising from
             # a forward hook unwinds the model.forward() call via Python
             # exception — execute_model catches FTAborted and rolls back.
-            _evt = self._abort_event
-            if _evt is not None and _evt.is_set():
+            _poll = self._abort_poll
+            if _poll is not None and _poll(boundary):
                 from vllm.deltaserve.coordinator import FTAborted
                 raise FTAborted()
 
@@ -366,8 +372,8 @@ class FinetuneAccumulator:
                 kh_buf[off:off + n].copy_(krows[:n].to(self.dtype))
                 vh_buf[off:off + n].copy_(vrows[:n].to(self.dtype))
             # tier-C abort (same idiom as the other hooks).
-            _evt = self._abort_event
-            if _evt is not None and _evt.is_set():
+            _poll = self._abort_poll
+            if _poll is not None and _poll(False):
                 from vllm.deltaserve.coordinator import FTAborted
                 raise FTAborted()
 
@@ -389,8 +395,8 @@ class FinetuneAccumulator:
             n = min(rows.shape[0], self.max_saved - off)
             if n > 0:
                 buf[off:off + n].copy_(rows[:n].reshape(n, -1).to(self.dtype))
-            _evt = self._abort_event
-            if _evt is not None and _evt.is_set():
+            _poll = self._abort_poll
+            if _poll is not None and _poll(False):
                 from vllm.deltaserve.coordinator import FTAborted
                 raise FTAborted()
 
@@ -415,8 +421,8 @@ class FinetuneAccumulator:
                 ctx_buf[off:off + n].copy_(
                     rows[:n].reshape(n, -1).to(self.dtype))
             # tier-C abort (same idiom as the other hooks).
-            _evt = self._abort_event
-            if _evt is not None and _evt.is_set():
+            _poll = self._abort_poll
+            if _poll is not None and _poll(False):
                 from vllm.deltaserve.coordinator import FTAborted
                 raise FTAborted()
 
@@ -441,8 +447,8 @@ class FinetuneAccumulator:
             # add + the next input_layernorm) — those will run before the
             # next layer's pre_hook gets a chance to raise. Negligible
             # extra cost; the pre_hook is the load-bearing check.
-            _evt = self._abort_event
-            if _evt is not None and _evt.is_set():
+            _poll = self._abort_poll
+            if _poll is not None and _poll(False):
                 from vllm.deltaserve.coordinator import FTAborted
                 raise FTAborted()
 

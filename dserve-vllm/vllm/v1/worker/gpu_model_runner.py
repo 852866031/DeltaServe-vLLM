@@ -4134,6 +4134,8 @@ class GPUModelRunner(
         # common case.
         if getattr(self, "_throttle_held", False):
             _idle_coord = getattr(self, "_ft_coordinator", None)
+            if _idle_coord is not None:
+                self._ft_maybe_resume_backward(_idle_coord)
             _idle_feats = getattr(
                 scheduler_output, "_ft_step_features", None)
             _idle_cfg = self.vllm_config.finetune_config
@@ -4572,13 +4574,30 @@ class GPUModelRunner(
             and self._ft_num == num_tokens_unpadded
         )
         _ft_aborted = False
+        _ft_abort_where = ""
+        # A previous abort's pending marker for sample_tokens is consumed by
+        # any new execute_model call (tp=1 routes the sentinel around
+        # sample_tokens entirely, so the marker must not leak to a later
+        # idle step).
+        self._ft_pending_abort = False
+        _poller = getattr(coord, "ft_abort_poller", None) if coord is not None else None
+        if (_poller is not None and not _ft_only_run and self._ft_has is not None
+                and num_tokens_unpadded > 0):
+            # [tier C under TP] An inference-bearing batch: every arrival so
+            # far has been scheduled — stop counting them as pending.
+            _poller.note_served()
         if _ft_only_run:
             # Pipeline-depth-2 contamination: a prior FT-only batch already
             # tripped the abort flag, but THIS batch was scheduled before
             # the flag was set. Bail at entry — no kernels queued, full
-            # forward saved.
-            if coord.ft_abort_event.is_set():
+            # forward saved. Under TP the entry decision is the poller's
+            # rank-symmetric one (every rank bails or none does).
+            if _poller is not None:
+                _ft_aborted = _poller.entry()
+            elif coord.ft_abort_event.is_set():
                 _ft_aborted = True
+            if _ft_aborted:
+                _ft_abort_where = "entry"
             else:
                 # Mark the live FT-only forward so the input thread starts
                 # signalling, and ensure the hook's check sees a clean event.
@@ -4625,6 +4644,9 @@ class GPUModelRunner(
                         from vllm.deltaserve.coordinator import FTAborted
                         if isinstance(_e, FTAborted):
                             _ft_aborted = True
+                            _ft_abort_where = (
+                                f"layer {_poller.layer_calls}"
+                                if _poller is not None else "mid-forward")
                             model_output = None
                         else:
                             raise
@@ -4664,7 +4686,18 @@ class GPUModelRunner(
             # Releasing here would let the bwd briefly run between
             # heavy steps, defeating the throttle's intent.
             if _pause_bwd and not _pause_throttle:
-                coord.gpu_resume_backward()
+                if (_forward_ok and
+                        self.vllm_config.finetune_config.pause_until_prefill_done):
+                    # Keep the child paused until this prefill has COMPLETED
+                    # on the GPU: record an event behind the forward and
+                    # resume when it has fired (``_ft_maybe_resume_backward``
+                    # on the next execute_model / sample_tokens; the 5 s cap
+                    # in the child's _maybe_pause bounds any missed resume).
+                    _ev = torch.cuda.Event()
+                    _ev.record()
+                    self._ft_resume_evt = _ev
+                else:
+                    coord.gpu_resume_backward()
             # [forward_interruptible / tier C] Always clear the live-FT-only
             # marker — even on aborted / failed forwards — so the input
             # thread stops trying to set the abort event for future batches.
@@ -4674,6 +4707,8 @@ class GPUModelRunner(
             # copy garbage rows.
             if _ft_only_run and coord is not None:
                 coord.ft_only_in_flight = False
+                if _poller is not None:
+                    _poller.finish()
             if _ft_aborted and accumulator is not None:
                 accumulator.end_step()
 
@@ -4688,10 +4723,13 @@ class GPUModelRunner(
         if _ft_aborted:
             if accumulator is not None:
                 accumulator.zero_offset_range(self._ft_offset, self._ft_num)
-            from vllm.v1.outputs import ModelRunnerOutput
-            out = ModelRunnerOutput(req_ids=[], req_id_to_index={})
-            out._ft_aborted = True
-            return out
+            from vllm.deltaserve import dprint
+            dprint(f"[ft-abort] tier C: FT-only forward ({self._ft_num} tokens) "
+                   f"aborted at {_ft_abort_where} for a late inference arrival")
+            # sample_tokens (called by the engine under TP) returns the same
+            # sentinel from its no-state path when this is set.
+            self._ft_pending_abort = True
+            return self._ft_abort_sentinel(coord)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4860,10 +4898,43 @@ class GPUModelRunner(
         _samples = coord.drain_completed_samples()
         output.finetune_timing = _samples or None
 
+    def _ft_maybe_resume_backward(self, coord) -> None:
+        """[pause_until_prefill_done] Resume the backward child once the
+        prefill that paused it has completed on the GPU (non-blocking event
+        query). Called on every execute_model (incl. idle steps) and
+        sample_tokens; a newer pause simply replaces the pending event."""
+        ev = getattr(self, "_ft_resume_evt", None)
+        if ev is not None and ev.query():
+            self._ft_resume_evt = None
+            coord.gpu_resume_backward()
+
+    def _ft_abort_sentinel(self, coord):
+        """[forward_interruptible / tier C] The empty output that tells the
+        engine to roll the FT-only step back. Carries the TP relay fields so
+        an outstanding backward ack is not delayed by the aborted step."""
+        from vllm.v1.outputs import ModelRunnerOutput
+        out = ModelRunnerOutput(req_ids=[], req_id_to_index={})
+        out._ft_aborted = True
+        out.finetune_aborted = True
+        if coord is not None and getattr(coord, "relay_mode", False):
+            self._ft_fill_relay_fields(out, coord)
+        return out
+
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        _rc = getattr(self, "_ft_coordinator", None)
+        if _rc is not None:
+            self._ft_maybe_resume_backward(_rc)
         if self.execute_model_state is None:
+            if getattr(self, "_ft_pending_abort", False):
+                # [forward_interruptible / tier C under TP] execute_model
+                # returned the abort sentinel without leaving sampling state;
+                # the engine still calls sample_tokens (its execute future was
+                # not resolved at dispatch time), so answer with the sentinel
+                # rather than None (which the engine treats as a failure).
+                self._ft_pending_abort = False
+                return self._ft_abort_sentinel(getattr(self, "_ft_coordinator", None))
             kv_connector_output = self.kv_connector_output
             self.kv_connector_output = None
             # receive sampled token ids from the last PP rank.

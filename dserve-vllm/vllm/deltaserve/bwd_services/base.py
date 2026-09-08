@@ -86,7 +86,12 @@ def service_main(conn, mps_percentage: int, device_index: int,
         torch.cuda.set_device(device_index)
     svc = get_service(service_name)(device_index)
     svc._gpu_grant = gpu_grant
-    svc.run(conn)
+    try:
+        svc.run(conn)
+    except KeyboardInterrupt:
+        # Server teardown forwards SIGINT to the process group while a cycle
+        # may be in flight; exit quietly instead of printing a traceback.
+        dprint("[backward] child interrupted by shutdown; exiting")
 
 
 class BackwardService:

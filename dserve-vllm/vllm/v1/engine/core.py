@@ -88,6 +88,15 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
+def _ft_output_aborted(output) -> bool:
+    """[forward_interruptible / tier C] Whether ``output`` is the runner's
+    aborted-FT-only-forward sentinel. The dataclass field survives the
+    worker → engine hop under TP; the dynamic attribute is the in-process
+    (tp=1) marker."""
+    return bool(getattr(output, "finetune_aborted", False)
+                or getattr(output, "_ft_aborted", False))
+
+
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
@@ -113,6 +122,22 @@ class EngineCore:
             )
 
         self.log_stats = log_stats
+
+        # [forward_interruptible / tier C under TP] The workers are separate
+        # processes, so the tp=1 abort Event cannot reach them. Create the
+        # shared-memory arrival counter BEFORE the executor spawns the
+        # workers and hand its name over via the environment they inherit.
+        self._ft_arrival_signal = None
+        _ftc = getattr(vllm_config, "finetune_config", None)
+        if (_ftc is not None and getattr(_ftc, "enable_finetuning", False)
+                and getattr(_ftc, "forward_interruptible", False)
+                and vllm_config.parallel_config.tensor_parallel_size > 1):
+            from vllm.deltaserve import dprint
+            from vllm.deltaserve.coordinator import FtArrivalSignal
+            self._ft_arrival_signal = FtArrivalSignal.create()
+            os.environ[FtArrivalSignal.ENV] = self._ft_arrival_signal.name
+            dprint("[deltaserve] forward_interruptible tier C under TP: arrival "
+                   f"signal {self._ft_arrival_signal.name} (rank-symmetric abort)")
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
@@ -465,7 +490,7 @@ class EngineCore:
         # sentinel ModelRunnerOutput with ``_ft_aborted=True`` when a hook
         # bailed the forward mid-flight. Roll back the FT scheduling and
         # skip update_from_output (the output has no real per-request data).
-        if getattr(model_output, "_ft_aborted", False):
+        if _ft_output_aborted(model_output):
             self.scheduler._rollback_ft_step(scheduler_output)
             return {}, False
 
@@ -799,8 +824,7 @@ class EngineCore:
             if self.is_pooling_model or not model_executed:
                 # No sampling required (no requests scheduled).
                 future = cast(Future[ModelRunnerOutput], exec_future)
-            elif (exec_future.done()
-                  and getattr(exec_future.result(), "_ft_aborted", False)):
+            elif exec_future.done() and _ft_output_aborted(exec_future.result()):
                 # [forward_interruptible / tier C] Entry-time abort path:
                 # the runner returned its sentinel ModelRunnerOutput WITHOUT
                 # setting execute_model_state, so calling sample_tokens here
@@ -869,7 +893,15 @@ class EngineCore:
         # deferred-sampling path below applies to the NEXT batch (which may
         # be a real inference batch with structured output / spec decode),
         # so falling through with empty engine_core_outputs is correct.
-        if getattr(model_output, "_ft_aborted", False):
+        # Under TP the sentinel arrives on the execute_model future (rank 0's
+        # response) while sample_tokens returns its own sentinel — check both.
+        _aborted = _ft_output_aborted(model_output)
+        if not _aborted and exec_model_fut is not None and exec_model_fut.done():
+            try:
+                _aborted = _ft_output_aborted(exec_model_fut.result())
+            except Exception:  # noqa: BLE001 — a failed forward surfaces elsewhere
+                _aborted = False
+        if _aborted:
             self.scheduler._rollback_ft_step(scheduler_output)
             engine_core_outputs: dict[int, EngineCoreOutputs] = {}
         else:
@@ -922,6 +954,10 @@ class EngineCore:
             self.model_executor.shutdown()
         if self.scheduler:
             self.scheduler.shutdown()
+        _sig = getattr(self, "_ft_arrival_signal", None)
+        if _sig is not None:
+            _sig.close()
+            self._ft_arrival_signal = None
 
         # Undo the gc.freeze() from __init__ so that the objects allocated
         # during engine startup (model weights, KV caches, etc.) become
@@ -1946,6 +1982,11 @@ class EngineCoreProc(EngineCore):
                         _coord = getattr(self, "_ft_coord_handle", None)
                         if _coord is not None and _coord.ft_only_in_flight:
                             _coord.ft_abort_event.set()
+                        # [tier C under TP] the workers poll this counter at
+                        # every layer boundary of an FT-only forward.
+                        _sig = getattr(self, "_ft_arrival_signal", None)
+                        if _sig is not None:
+                            _sig.bump()
 
     def process_output_sockets(
         self, output_paths: list[str], coord_output_path: str | None, engine_index: int
