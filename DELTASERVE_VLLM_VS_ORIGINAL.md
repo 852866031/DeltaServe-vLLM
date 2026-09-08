@@ -530,7 +530,7 @@ It still:
 - Sizes the per-layer activation buffers (`[max_saved_finetuning_tokens, hidden]`).
 - Caps per-step FT admission (the coordinator's buffer-space budget).
 - Drives the fixed shape of the backward CUDA-graph capture (the
-  `s_max` in `Llama3GraphedBackward`).
+  `s_max` in `GraphedBackward`).
 
 Two new related knobs the writer may want to mention:
 
@@ -769,8 +769,8 @@ In-tree code worth reading (in order):
 2. `dserve-vllm/vllm/deltaserve/ft_scheduler.py` — the FT-injecting scheduler.
 3. `dserve-vllm/vllm/deltaserve/coordinator.py` — the activation-buffer state machine.
 4. `dserve-vllm/vllm/deltaserve/estimator.py` — the merged SLO estimator.
-5. `dserve-vllm/vllm/deltaserve/bwd_services/llama3.py` — the manual per-layer SFT backward.
-6. `dserve-vllm/vllm/deltaserve/bwd_services/llama3_graph.py` — the CUDA-graph backward.
+5. `dserve-vllm/vllm/deltaserve/bwd_services/common/trainer.py` + `bwd_services/{llama3,qwen3}.py` — the manual per-layer SFT backward (shared trainer + per-family layer math).
+6. `dserve-vllm/vllm/deltaserve/bwd_services/common/graph.py` — the CUDA-graph backward.
 7. `dserve-vllm/vllm/deltaserve/ft_scheduler_both.py` — the unified-phase scheduler (one-page).
 
 For experimental setup:
@@ -891,13 +891,13 @@ A useful diagram for the paper. The port is roughly:
 ```
 Original DeltaServe contribution      In the port, lives where
 ─────────────────────────────────     ──────────────────────────
-LoRA SFT backward (math)          →   bwd_services/llama3.py
+LoRA SFT backward (math)          →   bwd_services/common/* + bwd_services/{llama3,qwen3}.py
 SLO-aware admission gate          →   ft_scheduler.py (gate)
                                        + estimator.py (model)
                                        + coordinator.py (state)
 Backward subprocess + MPS         →   backward_process.py + bwd_services/
 Per-layer pause contract          →   bwd_services/base.py + llama3.py
-Backward CUDA-graph capture       →   bwd_services/llama3_graph.py
+Backward CUDA-graph capture       →   bwd_services/common/graph.py
 Mixed inference+FT batch          →   ft_scheduler.py (injection)
                                        + gpu_model_runner.py edits
                                        + accumulate.py (hooks)

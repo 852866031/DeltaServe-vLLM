@@ -30,6 +30,8 @@ sys.path[:] = [p for p in sys.path
                if os.path.abspath(p or ".") != os.path.dirname(os.path.abspath(__file__))]
 
 from vllm.deltaserve.bwd_services import llama3 as L  # noqa: E402
+from vllm.deltaserve.bwd_services.common.ops import rope_cos_sin  # noqa: E402
+from vllm.deltaserve.bwd_services.common.tp import lora_shard_slice  # noqa: E402
 
 # Small Llama-ish geometry. Hq=4/Hkv=2 GQA, Hd=8 → D=32; TP=2 → local 2/1 heads.
 CFG = dict(Hq=4, Hkv=2, Hd=8, inter=64, r=4, eps=1e-5, scaling=2.0,
@@ -65,7 +67,7 @@ def _rope(cfg):
         b_start.append(acc)
         acc += s
     positions = torch.cat([torch.arange(s) for s in seq_lens]).float()
-    cos, sin = L.rope_cos_sin(positions, cfg["Hd"], cfg["theta"])
+    cos, sin = rope_cos_sin(positions, cfg["Hd"], cfg["theta"])
     return cos, sin, b_start
 
 
@@ -89,7 +91,7 @@ def _shard_lw(lw, rk, cfg):
     # LoRA via the production sharder.
     for proj in ("q", "k", "v", "o"):
         for ab in ("A", "B"):
-            s[proj + ab] = L.lora_shard_slice(proj, ab, lw[proj + ab], rk, tp, ql, kl)
+            s[proj + ab] = lora_shard_slice(proj, ab, lw[proj + ab], rk, tp, ql, kl)
     return s
 
 

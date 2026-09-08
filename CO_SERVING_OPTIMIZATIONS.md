@@ -78,7 +78,7 @@ forward gives us nothing useful for FT loss.
 - Reconstruct full logits inside the backward via `final_hidden @ lm_w.T`
   (fp32; LM-head precision is load-bearing).
 - **Chunked over vocab** (`_VOCAB_CHUNK=16384` in
-  `bwd_services/llama3.py:_logits_chunked`) so the fp32 LM-head temporary
+  `bwd_services/common/head.py:logits_chunked`) so the fp32 LM-head temporary
   is bounded — important on 128K-vocab Llama-3.
 - Per-sample shift-by-1 CE; gradient = `softmax − one-hot`, normalized over
   valid tokens; matches DeltaServe's `_logit_backward` math.
@@ -151,7 +151,7 @@ within an eligible step** (strategy) × **the SLO ceiling** (always-on gate).
 
 Beyond CUDA graphs, the per-cycle work the backward does:
 
-- **Fused AdamW** (`bwd_services/llama3.py:_build_state`,
+- **Fused AdamW** (`bwd_services/common/trainer.py:_build_state`,
   `torch.optim.AdamW(..., fused=True)`) — single CUDA kernel for all 256
   LoRA tensors (8 per layer × 32 layers) instead of per-tensor dispatch.
 - **Persistent `grad_qh/kh/vh` buffers** at s_max
@@ -310,7 +310,7 @@ anything in the engine:
 ## 13. Served-LoRA hot-publish (Phase 3.4)
 
 - After each `optimizer.step()`, the trained fp32 master is written into
-  vLLM's served LoRA stacked buffers (`bwd_services/llama3.py:_publish_to_served`)
+  vLLM's served LoRA stacked buffers (`bwd_services/common/trainer.py:_publish_to_served`)
   — the exact tensors inference reads via punica kernels.
 - Clamp(±6.5e4) + cast to served dtype; `B * scaling` (vLLM punica
   hardcodes `scale=1`, not `α/r` — we bake the scaling into B at publish

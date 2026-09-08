@@ -72,7 +72,10 @@ class FinetuneConfig:
     layer whose saved gate||up is absent (e.g. ``save_activations: false``).
     _maybe_pause() is preserved and called between the FFN-bwd and
     attn-bwd graphs each layer, so the GPU-yield contract for the Phase-5
-    pause and Phase-6 forward_interruptible paths is unaffected. Default
+    pause and Phase-6 forward_interruptible paths is unaffected. TP-safe
+    (Phase 7 / M5): no collective is ever captured — the forward graph is
+    split at the o-proj output and that all-reduce, plus the six
+    backward-side reduces, run eagerly between the replays. Default
     off; mirrors DeltaServe's SFT_service_graph.py."""
 
     backward_cuda_graph_attn_bn_max: int = 8
@@ -111,7 +114,11 @@ class FinetuneConfig:
     LoRA-A grad). Memory cost: ~99 MB at s_max=256 (qh [s_max, q_size] +
     kh/vh [s_max, kv_size] bf16 × 32 layers). Best perf/MB candidate of the
     remaining activation-save optimizations (see ``INTEGRATION_PROGRESS.md``
-    Phase 5 "future activation-save optimization" section). Default off."""
+    Phase 5 "future activation-save optimization" section). Families with a
+    per-head q/k transform before RoPE (Qwen3's q/k-norm) capture q/k at the
+    transform's INPUT instead (pre-hooks on ``self_attn.{q,k}_norm``) so the
+    norm backward has what it needs; the backward re-applies only the
+    elementwise norm + RoPE. Default off."""
 
     save_attn_ctx: bool = False
     """Also save the per-layer attention CONTEXT output (the input to
@@ -125,6 +132,23 @@ class FinetuneConfig:
     per-layer forward recompute collapses to RMSNorm in_ln + O-proj + residual
     (everything else is read from saved buffers). Memory cost: ~33 MB at
     s_max=256 (ctx [s_max, q_size] bf16 × 32 layers). Default off."""
+
+    save_resid_mid: bool = False
+    """Also save the per-layer POST-ATTENTION residual (``layer_in + o_proj
+    output`` = the FFN block's input, ``resid_mid`` in the backward) during
+    the FT forward — one ``forward_pre_hook`` on each
+    ``post_attention_layernorm`` reads its ``(hidden, residual)`` args, the
+    same fused add-norm idiom the ``layer_in`` hooks use. The backward then
+    SKIPS the O-projection recompute (base + LoRA GEMM, ~8.6 GFLOPs/layer on
+    Llama-3-8B at s_max=256) and the residual add; the attention context is
+    still produced for the O-proj BACKWARD. **Under tensor parallelism this
+    also removes the forward remat's ``o`` all-reduce** — the only collective
+    in the forward recompute — so the per-layer cross-rank traffic drops from
+    7 to 6 collectives (the saved value is the already-reduced full residual
+    vLLM's RowParallelLinear produced). With ``save_attn_qkv`` + ``save_attn_ctx``
+    + this on, the per-layer forward recompute is RMSNorm in_ln alone. Memory
+    cost: one [s_max, hidden] buffer per layer — ~64 MB at s_max=256 on
+    Llama-3-8B (bf16 × 32 layers), ~100 MB on Qwen3-14B. Default off."""
 
     backward_sleep_seconds: float = 2.0
     """How long the (stub) backward process sleeps to simulate a backward pass

@@ -1,153 +1,68 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Llama-3 backward service — manual LoRA SFT backward (Phase 3).
+"""Llama-3 family: the per-layer math of the manual LoRA-SFT backward.
 
 Trains the FT LoRA adapter (attention-only q/k/v/o) in the backward subprocess
 from the captured residual-stream activations, while inference keeps serving.
-Mirrors DeltaServe `models/{llama,llama3}/SFT_service.py` but adapted to vLLM:
+Mirrors DeltaServe ``models/{llama,llama3}/SFT_service.py`` but adapted to vLLM:
 
-- PEFT-separate LoRA (`lora_A [r,in]`, `lora_B [out,r]`, delta = scaling·(x@Aᵀ)@Bᵀ)
-  rather than DeltaServe's packed `[2,4r,H,Hd]`; grads derived directly in PEFT layout.
-- vLLM's **fused** base weights (`qkv_proj`/`gate_up_proj`) — sliced once at setup.
-- vLLM RoPE (NeoX rotate-half; cos/sin rebuilt from `inv_freq=1/theta^(2i/d)`).
+- PEFT-separate LoRA (``lora_A [r,in]``, ``lora_B [out,r]``, delta =
+  scaling·(x@Aᵀ)@Bᵀ) rather than DeltaServe's packed ``[2,4r,H,Hd]``; grads
+  derived directly in PEFT layout.
+- vLLM's **fused** base weights (``qkv_proj``/``gate_up_proj``) — sliced once at
+  setup by the trainer.
+- vLLM RoPE (NeoX rotate-half; cos/sin rebuilt from ``inv_freq=1/theta^(2i/d)``).
 - No score clamp (vLLM doesn't clamp).
 
-We capture only the per-layer residual-stream **input** (`layer_in[i]`) + `final_in`,
-so each layer's forward is **rematerialized** from `layer_in[i]` to recover the
-intermediates the manual backward needs, then the gradients are computed by hand.
+We capture only the per-layer residual-stream **input** (``layer_in[i]``) +
+``final_in``, so each layer's forward is **rematerialized** from ``layer_in[i]``
+to recover the intermediates the manual backward needs, then the gradients are
+computed by hand.
 
-Precision (see `deltaserve-backward-precision` memory): scores/softmax/RMSNorm/LM-head
-in fp32; bulk projections in the weights' dtype; fp32 LoRA master / optimizer. The
-manual backward runs in fp32. MLP/embeddings/norms are frozen — only the 8 LoRA
-tensors per layer get gradients.
+This module holds only what is Llama-specific: the decoder-layer composition
+(RMSNorm → Q/K/V (+LoRA) → RoPE → GQA attention → O (+LoRA) → residual →
+SwiGLU FFN) in eager and CUDA-graph form. The building blocks live in
+``bwd_services/common`` and are shared with the other families; the trainer
+service that drives them is ``common/trainer.py``.
+
+Precision (see ``deltaserve-backward-precision`` memory): scores/softmax/RMSNorm/
+LM-head in fp32; bulk projections in the weights' dtype; fp32 LoRA master /
+optimizer. MLP/embeddings/norms are frozen — only the 8 LoRA tensors per layer
+get gradients.
 """
 
-import math
-import os
-import re
-
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
-from vllm.deltaserve import dprint
-from vllm.deltaserve.bwd_services.base import BackwardService
-
-_TOL = 5e-2  # bf16 round-trip tolerance for the capture/forward-fidelity checks
-_VOCAB_CHUNK = 16384
+from vllm.deltaserve.bwd_services.common.attention import (
+    attn_backward_core,
+    attn_forward_core,
+)
+from vllm.deltaserve.bwd_services.common.family import Family
+from vllm.deltaserve.bwd_services.common.ffn import (
+    ffn_backward_core,
+    ffn_forward_tail,
+)
+from vllm.deltaserve.bwd_services.common.ops import (
+    apply_rope,
+    proj,
+    proj_backward,
+    rmsnorm,
+    rmsnorm_backward,
+    rope_backward,
+)
+from vllm.deltaserve.bwd_services.common.tp import reduce_partial
+from vllm.deltaserve.bwd_services.common.trainer import LoraSftTrainerService
 
 
 # --------------------------------------------------------------------------- #
-# Math helpers (module-level so the gradcheck test can call them directly).
-# Everything here operates in the dtype of its inputs, except scores/softmax/
-# RMSNorm internals which upcast to fp32. The gradcheck passes fp32 throughout.
+# Eager layer forward (rematerialization) + backward
 # --------------------------------------------------------------------------- #
-
-def rope_cos_sin(positions: torch.Tensor, head_dim: int, theta: float):
-    """NeoX cos/sin for the given positions. Returns (cos, sin) [n, head_dim//2] fp32."""
-    inv_freq = 1.0 / (theta ** (
-        torch.arange(0, head_dim, 2, dtype=torch.float32, device=positions.device)
-        / head_dim))
-    freqs = torch.outer(positions.float(), inv_freq)   # [n, head_dim//2]
-    return freqs.cos(), freqs.sin()
-
-
-def apply_rope(xh: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
-    """NeoX rotate-half on [n, H, head_dim]; cos/sin [n, head_dim//2]."""
-    h = xh.shape[-1] // 2
-    x1, x2 = xh[..., :h], xh[..., h:]
-    c, s = cos[:, None, :].to(xh.dtype), sin[:, None, :].to(xh.dtype)
-    return torch.cat([x1 * c - x2 * s, x2 * c + x1 * s], dim=-1)
-
-
-def rope_backward(g: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
-    """Inverse of apply_rope (transpose of the rotation)."""
-    h = g.shape[-1] // 2
-    g1, g2 = g[..., :h], g[..., h:]
-    c, s = cos[:, None, :].to(g.dtype), sin[:, None, :].to(g.dtype)
-    return torch.cat([g1 * c + g2 * s, -g1 * s + g2 * c], dim=-1)
-
-
-def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float):
-    """RMSNorm forward (fp32 internal), output cast back to x.dtype."""
-    xf = x.float()
-    inv = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
-    return ((xf * inv) * w.float()).to(x.dtype)
-
-
-def rmsnorm_backward(x: torch.Tensor, grad_y: torch.Tensor, w: torch.Tensor,
-                     eps: float):
-    """Exact gradient of y = rmsnorm(x)·w w.r.t. x (fp32)."""
-    xf = x.float()
-    inv = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)   # 1/rms
-    xhat = xf * inv
-    g_xhat = grad_y.float() * w.float()
-    d = xf.shape[-1]
-    dot = (g_xhat * xhat).sum(-1, keepdim=True)
-    return (g_xhat - xhat * dot / d) * inv
-
-
-def _logits_chunked(h: torch.Tensor, lm_w: torch.Tensor, vocab: int):
-    """fp32 logits = h @ lm_w[:vocab].T, computed in vocab chunks (bounds the fp32
-    LM-head temporary). h [m, D], lm_w [vocab_pad, D]. Returns [m, vocab] fp32."""
-    hf = h.float()
-    out = hf.new_empty((hf.shape[0], vocab))
-    for c in range(0, vocab, _VOCAB_CHUNK):
-        e = min(c + _VOCAB_CHUNK, vocab)
-        out[:, c:e] = hf @ lm_w[c:e].float().t()
-    return out
-
-
-def _proj(xin, w_base, A, B, scaling):
-    """y = xin @ w_base.T + scaling·(xin @ A.T) @ B.T. w_base [out,in], A [r,in], B [out,r].
-
-    The LoRA master is fp32; cast its compute copy to xin's dtype (bf16 in prod,
-    fp32 in the gradcheck) so the matmul dtypes match (DeltaServe fp32-master /
-    low-precision-compute rule)."""
-    y = F.linear(xin, w_base)
-    if A is not None:
-        y = y + scaling * F.linear(F.linear(xin, A.to(xin.dtype)), B.to(xin.dtype))
-    return y
-
-
-def _proj_backward(xin, gy, w_base, A, B, scaling, cdt=torch.float32):
-    """Grad of _proj, computed in the bulk compute dtype ``cdt`` (bf16 in prod,
-    fp32 in the gradcheck). Returns (grad_xin, grad_A, grad_B).
-
-    Casts the weights inside the function on every call. This is intentional
-    and matches DeltaServe's precision contract (bf16 compute for projection
-    backward, fp32 LoRA master).
-
-    Why we don't amortize the casts: DeltaServe packs all 8 LoRA tensors per
-    layer into a single ``[2, 4r, H, Hd]`` buffer cast once at the layer
-    boundary (SFT_service.py:424). We use separate qA/qB/… tensors so the
-    cast count is the cardinality of distinct tensors (7 base + 8 LoRA = 15),
-    and that's the same whether we cast inline or pre-cast. The real-cast
-    count is also mode-symmetric:
-      - bf16 cdt (default): 7 base ``.to(bf16)`` are no-ops, 8 LoRA fp32→bf16
-        are real casts. Total: 8 real casts/layer.
-      - fp32 cdt (``backward_fp32=True``, rare): 7 base bf16→fp32 are real
-        casts (heavier — base tensors are big, e.g. ``down`` is [D, inter]),
-        8 LoRA ``.to(fp32)`` are no-ops. Total: 7 real casts/layer.
-    Amortizing wouldn't change either count. Keep this layout."""
-    xin = xin.to(cdt)
-    gy = gy.to(cdt)
-    grad_xin = gy @ w_base.to(cdt)
-    grad_A = grad_B = None
-    if A is not None:
-        Ac, Bc = A.to(cdt), B.to(cdt)
-        Z = xin @ Ac.t()                       # [n, r]
-        grad_Z = scaling * (gy @ Bc)           # [n, r]
-        grad_A = grad_Z.t() @ xin              # [r, in]
-        grad_B = scaling * (gy.t() @ Z)        # [out, r]
-        grad_xin = grad_xin + grad_Z @ Ac
-    return grad_xin, grad_A, grad_B
-
 
 def layer_forward(x, lw, scaling, cos, sin, seq_lens, b_start, dims, eps,
                   saved_gate_up=None, saved_qh=None, saved_kh=None,
-                  saved_vh=None, saved_ctx=None, all_reduce=None):
+                  saved_vh=None, saved_ctx=None, saved_resid_mid=None,
+                  all_reduce=None):
     """Rematerialize one Llama decoder layer forward, returning the ``cache`` the
     manual backward needs (attention internals + MLP pre-activations). The frozen
     `down` matmul / layer output are NOT computed — the backward only needs the
@@ -164,22 +79,33 @@ def layer_forward(x, lw, scaling, cos, sin, seq_lens, b_start, dims, eps,
     x_norm1``). ``cos/sin`` are unused on this fast path. If any of the three
     saved tensors is absent, the recompute path runs.
 
-    When ``saved_ctx`` ([n, D] = the attention context / o_proj input, captured
-    by a ``self_attn.attn`` forward_hook) is given, the attention forward (the
-    per-sample scores/softmax/AV loop) is SKIPPED — ``ctx_flat`` is read from
-    the saved tensor. ``qh/kh/vh`` are still produced (saved or recomputed)
-    because the attention BACKWARD consumes them. Composes with
+    When ``saved_ctx`` ([n, q_size] = the attention context / o_proj input,
+    captured by a ``self_attn.attn`` forward_hook) is given, the attention
+    forward (the per-sample scores/softmax/AV loop) is SKIPPED — ``ctx_flat``
+    is read from the saved tensor. ``qh/kh/vh`` are still produced (saved or
+    recomputed) because the attention BACKWARD consumes them. Composes with
     ``saved_qh/kh/vh``: with both, only RMSNorm in_ln + O-proj + residual are
     recomputed.
 
-    ``lw`` is a dict of base weights (q,k,v,o,gate,up,in_ln,post_ln) + LoRA
+    When ``saved_resid_mid`` ([n, hidden] = the post-attention residual
+    ``x + o``, captured by a ``post_attention_layernorm`` forward_pre_hook) is
+    given, the O projection (base + LoRA GEMM) and the residual add are
+    SKIPPED — and with it, under TP, the forward's only all-reduce. ``ctx_flat``
+    is still produced (the O-proj BACKWARD reads it). Composes with the other
+    two: with all three saved, only RMSNorm in_ln is recomputed.
+
+    ``lw`` is a dict of base weights (q,k,v,o,gate,up,down,in_ln,post_ln) + LoRA
     (qA,qB,kA,kB,vA,vB,oA,oB). Functional (no in-place) so autograd can differentiate
-    it for the gradcheck. ``dims`` = (Hq, Hkv, Hd, kv_size)."""
+    it for the gradcheck. ``dims`` = (Hq, Hkv, Hd, kv_size); the residual width is
+    ``x.shape[-1]`` and may differ from the attention width ``Hq*Hd``.
+
+    ``all_reduce`` (TP only): o_proj is row-parallel — each rank holds ctx for
+    its own heads and o.weight sharded on the input dim, so ``o`` is a partial
+    sum. Reducing it mirrors the real forward's post-attention reduce so
+    ``resid_mid`` is the full residual on every rank. None for tp=1."""
     Hq, Hkv, Hd, kv_size = dims
     n = x.shape[0]
-    D = Hq * Hd
-    scale = 1.0 / math.sqrt(Hd)
-    kv_repeat = Hq // Hkv
+    q_size = Hq * Hd
 
     x_norm1 = rmsnorm(x, lw["in_ln"], eps)
     if (saved_qh is not None
@@ -190,155 +116,40 @@ def layer_forward(x, lw, scaling, cos, sin, seq_lens, b_start, dims, eps,
         kh = saved_kh.view(n, Hkv, Hd)
         vh = saved_vh.view(n, Hkv, Hd)
     else:
-        q = _proj(x_norm1, lw["q"], lw["qA"], lw["qB"], scaling)        # [n, D]
-        k = _proj(x_norm1, lw["k"], lw["kA"], lw["kB"], scaling)        # [n, kv_size]
-        v = _proj(x_norm1, lw["v"], lw["vA"], lw["vB"], scaling)
+        q = proj(x_norm1, lw["q"], lw["qA"], lw["qB"], scaling)        # [n, q_size]
+        k = proj(x_norm1, lw["k"], lw["kA"], lw["kB"], scaling)        # [n, kv_size]
+        v = proj(x_norm1, lw["v"], lw["vA"], lw["vB"], scaling)
         qh = apply_rope(q.view(n, Hq, Hd), cos, sin)
         kh = apply_rope(k.view(n, Hkv, Hd), cos, sin)
         vh = v.view(n, Hkv, Hd)
 
     if saved_ctx is not None:
         # Skip the attention forward (scores/softmax/AV) — use the saved ctx.
-        ctx_flat = saved_ctx.reshape(n, D)
+        ctx_flat = saved_ctx.reshape(n, q_size)
     else:
-        ctx_blocks = []
-        for st, ln in zip(b_start, seq_lens):
-            q_blk = qh[st:st + ln].transpose(0, 1)      # [Hq, L, Hd]
-            k_blk = kh[st:st + ln].transpose(0, 1)      # [Hkv, L, Hd]
-            v_blk = vh[st:st + ln].transpose(0, 1)
-            if kv_repeat != 1:
-                k_rep = k_blk.repeat_interleave(kv_repeat, 0)
-                v_rep = v_blk.repeat_interleave(kv_repeat, 0)
-            else:
-                k_rep, v_rep = k_blk, v_blk
-            scores = (q_blk.float() @ k_rep.float().transpose(-1, -2)) * scale
-            mask = torch.triu(
-                torch.ones(ln, ln, dtype=torch.bool, device=x.device), 1)
-            scores = scores.masked_fill(mask, -1e9)
-            att = torch.softmax(scores, dim=-1)         # [Hq, L, L] fp32
-            ctx_blk = (att @ v_rep.float()).to(x.dtype).transpose(0, 1)  # [L, Hq, Hd]
-            ctx_blocks.append(ctx_blk)
-        ctx_flat = torch.cat(ctx_blocks, 0).reshape(n, D)
+        ctx_flat = attn_forward_core(qh, kh, vh, seq_lens, b_start, dims, x.dtype)
 
-    o = _proj(ctx_flat, lw["o"], lw["oA"], lw["oB"], scaling)       # [n, D]
-    # [DeltaServe] Phase 7 / M3: o_proj is row-parallel — under TP each rank
-    # holds ctx for its own heads and o.weight sharded on the input dim, so ``o``
-    # is a PARTIAL sum. All-reduce it (mirroring the real forward's post-attention
-    # reduce) so ``resid_mid`` — which feeds the FFN backward + residual — is the
-    # correct full residual on every rank. all_reduce is None for tp=1 (no-op,
-    # single-GPU path unchanged) and for the autograd gradcheck.
-    if all_reduce is not None:
-        o = all_reduce(o)
-    resid_mid = x + o
-
-    if saved_gate_up is not None:
-        # Skip the gate_up matmul — use the saved forward pre-activations.
-        inter = saved_gate_up.shape[-1] // 2
-        gate = saved_gate_up[:, :inter]
-        up = saved_gate_up[:, inter:]
+    if saved_resid_mid is not None:
+        # Skip the O projection (+ its TP all-reduce) — the post-attention
+        # residual was captured in the FT forward (already reduced, full width).
+        resid_mid = saved_resid_mid
     else:
-        x_norm2 = rmsnorm(resid_mid, lw["post_ln"], eps)
-        gate = F.linear(x_norm2, lw["gate"])
-        up = F.linear(x_norm2, lw["up"])
+        o = proj(ctx_flat, lw["o"], lw["oA"], lw["oB"], scaling)     # [n, hidden]
+        if all_reduce is not None:
+            o = all_reduce(o)
+        resid_mid = x + o
+
+    gate, up = ffn_forward_tail(resid_mid, lw, eps, saved_gate_up)
 
     return {"x": x, "x_norm1": x_norm1, "qh": qh, "kh": kh, "vh": vh,
             "ctx_flat": ctx_flat, "resid_mid": resid_mid,
             "gate": gate, "up": up}
 
 
-def ffn_backward_core(grad_out, cache, lw, eps, cdt=torch.float32):
-    """FFN-block backward (frozen MLP, with residual): returns grad_resid_mid.
-
-    Captures the shape-stable bulk of the per-layer backward: cast-in, FFN
-    silu/sigmoid + 3 GEMMs against frozen down/gate/up, rmsnorm-post_ln backward,
-    plus the residual add. Inputs are all sized by the chained ``grad_out``
-    (``[n, D]``) and ``cache`` slices captured at the same n. Pure function over
-    its inputs so it can be wrapped 1:1 by a CUDA graph at fixed n=s_max."""
-    gout = grad_out.to(cdt)
-    gate = cache["gate"].to(cdt)
-    up = cache["up"].to(cdt)
-    sig = torch.sigmoid(gate)
-    silu = gate * sig
-    silu_grad = sig * (1.0 + gate * (1.0 - sig))
-    grad_h_mid = gout @ lw["down"].to(cdt)           # [n, inter]
-    grad_up = grad_h_mid * silu
-    grad_gate = grad_h_mid * up * silu_grad
-    grad_x_norm2 = grad_gate @ lw["gate"].to(cdt) + grad_up @ lw["up"].to(cdt)
-    return rmsnorm_backward(cache["resid_mid"], grad_x_norm2,
-                            lw["post_ln"], eps).to(cdt) + gout
-
-
-def attn_backward_core(qh, kh, vh, grad_ctx, seq_lens, b_start, dims, cdt=torch.float32,
-                       *, grad_qh_buf=None, grad_kh_buf=None, grad_vh_buf=None):
-    """Per-sample GQA attention backward (eager). Returns (grad_qh, grad_kh,
-    grad_vh) in flat ``[n, H_*, Hd]`` layout, in ``cdt``. Per-sample shapes
-    (variable seq_lens) prevent CUDA-graph capture; the runner uses a padded
-    variant for the graphed fast path and silently falls back to this when a
-    batch overflows the padded bounds. Scores/softmax/dQ/dK/dV always run in
-    fp32 (the load-bearing GQA precision rule).
-
-    If ``grad_qh_buf/kh_buf/vh_buf`` are provided (persistent buffers sized at
-    s_max), the function zeroes their first n rows in-place and returns views
-    into them — saves L=32 fresh-allocation zero-fills per backward. Falls
-    back to fresh allocation when not provided (preserves the gradcheck path,
-    which has no service to own persistent buffers)."""
-    Hq, Hkv, Hd, _ = dims
-    scale = 1.0 / math.sqrt(Hd)
-    kv_repeat = Hq // Hkv
-    n = grad_ctx.shape[0]
-    device = grad_ctx.device
-    # Use the persistent buffers only when they're large enough for n. They're
-    # sized at s_max for the production path (n ≤ s_max always); the runner's
-    # eager-fallback inside Llama3GraphedBackward.attn_backward also passes
-    # its own static_grad_* (also s_max). The undersized branch fires only in
-    # contrived parity tests that exceed s_max — we silently alloc fresh.
-    if grad_qh_buf is not None and grad_qh_buf.shape[0] >= n:
-        grad_qh_buf[:n].zero_()
-        grad_kh_buf[:n].zero_()
-        grad_vh_buf[:n].zero_()
-        grad_qh = grad_qh_buf[:n]
-        grad_kh = grad_kh_buf[:n]
-        grad_vh = grad_vh_buf[:n]
-    else:
-        grad_qh = torch.zeros((n, Hq, Hd), dtype=cdt, device=device)
-        grad_kh = torch.zeros((n, Hkv, Hd), dtype=cdt, device=device)
-        grad_vh = torch.zeros((n, Hkv, Hd), dtype=cdt, device=device)
-    qh_f, kh_f, vh_f = qh.float(), kh.float(), vh.float()
-    for st, ln in zip(b_start, seq_lens):
-        q_blk = qh_f[st:st + ln].transpose(0, 1)     # [Hq, L, Hd] fp32
-        k_blk = kh_f[st:st + ln].transpose(0, 1)     # [Hkv, L, Hd] fp32
-        v_blk = vh_f[st:st + ln].transpose(0, 1)
-        if kv_repeat != 1:
-            k_rep = k_blk.repeat_interleave(kv_repeat, 0)
-            v_rep = v_blk.repeat_interleave(kv_repeat, 0)
-        else:
-            k_rep, v_rep = k_blk, v_blk
-        mask = torch.triu(torch.ones(ln, ln, dtype=torch.bool, device=device), 1)
-        scores = (q_blk @ k_rep.transpose(-1, -2)) * scale   # fp32
-        scores = scores.masked_fill(mask, -1e9)
-        att = torch.softmax(scores, dim=-1)          # [Hq, L, L] fp32
-        g = grad_ctx[st:st + ln].transpose(0, 1).float()     # fp32
-        grad_att = g @ v_rep.transpose(-1, -2)       # [Hq, L, L]
-        grad_v_rep = att.transpose(-1, -2) @ g       # [Hq, L, Hd]
-        sm = (grad_att * att).sum(-1, keepdim=True)
-        grad_scores = (att * (grad_att - sm)).masked_fill(mask, 0.0)
-        grad_q_blk = (grad_scores @ k_rep) * scale
-        grad_k_rep = (grad_scores.transpose(-1, -2) @ q_blk) * scale
-        if kv_repeat != 1:
-            grad_k_kv = grad_k_rep.view(Hkv, kv_repeat, ln, Hd).sum(1)
-            grad_v_kv = grad_v_rep.view(Hkv, kv_repeat, ln, Hd).sum(1)
-        else:
-            grad_k_kv, grad_v_kv = grad_k_rep, grad_v_rep
-        grad_qh[st:st + ln] = grad_q_blk.transpose(0, 1).to(cdt)
-        grad_kh[st:st + ln] = grad_k_kv.transpose(0, 1).to(cdt)
-        grad_vh[st:st + ln] = grad_v_kv.transpose(0, 1).to(cdt)
-    return grad_qh, grad_kh, grad_vh
-
-
 def layer_backward(grad_out, cache, lw, scaling, cos, sin, seq_lens, b_start,
                    dims, eps, cdt=torch.float32,
                    *, grad_qh_buf=None, grad_kh_buf=None, grad_vh_buf=None,
-                   all_reduce=None):
+                   all_reduce=None, reduce_factors=True):
     """Manual gradient of one layer. Bulk matmuls (FFN-bwd, LoRA-grad, rope/proj-bwd)
     run in ``cdt`` (bf16 in prod, fp32 for the gradcheck); the **attention core**
     (scores/softmax-bwd/dQ/dK/dV) and **RMSNorm backward** always run in fp32 (the
@@ -348,26 +159,28 @@ def layer_backward(grad_out, cache, lw, scaling, cos, sin, seq_lens, b_start,
 
     ``grad_{qh,kh,vh}_buf`` are optional persistent buffers passed through to
     ``attn_backward_core`` — used by the service to avoid 96 zero-fill kernel
-    launches per backward. Not provided by the gradcheck test."""
+    launches per backward. Not provided by the gradcheck test.
+
+    TP reductions (``all_reduce`` given; 7 per layer incl. the forward's o):
+      - ``grad_resid_mid``: the FFN-path term is a per-rank partial while the
+        residual passthrough (``grad_out``) is already full → reduce only the
+        partial (``reduce_partial``), else the residual counts ``tp_size``×.
+      - ``grad_x``: same shape of argument for the attention-path term vs the
+        already-reduced ``grad_resid_mid``.
+      - ``grad_{q,k,v}A`` / ``grad_oB``: replicated factors → grads sum across
+        shards. ``grad_{q,k,v}B`` (output-sharded) and ``grad_oA``
+        (input-sharded) are already this rank's shard — no reduce."""
     Hq, Hkv, Hd, kv_size = dims
     n = grad_out.shape[0]
-    D = Hq * Hd
+    q_size = Hq * Hd
 
     # --- FFN backward (frozen MLP): grad w.r.t. resid_mid (incl. residual) ---
     grad_resid_mid = ffn_backward_core(grad_out, cache, lw, eps, cdt)
-
-    # [DeltaServe] Phase 7 / M3: resid_mid is a FULL residual-stream tensor, so
-    # its grad must be the full sum before the O-proj/attention/QKV backward
-    # consume it. ffn_backward_core returns (FFN-path partial) + grad_out, where
-    # grad_out is the FULL residual passthrough (identical on every rank). Reduce
-    # ONLY the partial part — subtract grad_out, all-reduce, add it back once —
-    # else the residual would be counted tp_size times.
     if all_reduce is not None:
-        _gout = grad_out.to(grad_resid_mid.dtype)
-        grad_resid_mid = all_reduce(grad_resid_mid - _gout) + _gout
+        grad_resid_mid = reduce_partial(all_reduce, grad_resid_mid, grad_out)
 
     # --- O backward (cdt) ---
-    grad_ctx_flat, grad_oA, grad_oB = _proj_backward(
+    grad_ctx_flat, grad_oA, grad_oB = proj_backward(
         cache["ctx_flat"], grad_resid_mid, lw["o"], lw["oA"], lw["oB"], scaling, cdt)
 
     # --- attention backward (per-sample, GQA): core in fp32, results back to cdt ---
@@ -377,15 +190,15 @@ def layer_backward(grad_out, cache, lw, scaling, cos, sin, seq_lens, b_start,
         seq_lens, b_start, dims, cdt,
         grad_qh_buf=grad_qh_buf, grad_kh_buf=grad_kh_buf, grad_vh_buf=grad_vh_buf)
 
-    grad_q = rope_backward(grad_qh, cos, sin).reshape(n, D)
+    grad_q = rope_backward(grad_qh, cos, sin).reshape(n, q_size)
     grad_k = rope_backward(grad_kh, cos, sin).reshape(n, kv_size)
     grad_v = grad_vh.reshape(n, kv_size)
 
     # --- q/k/v projection backward (input = x_norm1), cdt ---
     xn1 = cache["x_norm1"]
-    gx_q, grad_qA, grad_qB = _proj_backward(xn1, grad_q, lw["q"], lw["qA"], lw["qB"], scaling, cdt)
-    gx_k, grad_kA, grad_kB = _proj_backward(xn1, grad_k, lw["k"], lw["kA"], lw["kB"], scaling, cdt)
-    gx_v, grad_vA, grad_vB = _proj_backward(xn1, grad_v, lw["v"], lw["vA"], lw["vB"], scaling, cdt)
+    gx_q, grad_qA, grad_qB = proj_backward(xn1, grad_q, lw["q"], lw["qA"], lw["qB"], scaling, cdt)
+    gx_k, grad_kA, grad_kB = proj_backward(xn1, grad_k, lw["k"], lw["kA"], lw["kB"], scaling, cdt)
+    gx_v, grad_vA, grad_vB = proj_backward(xn1, grad_v, lw["v"], lw["vA"], lw["vB"], scaling, cdt)
     grad_x_norm1 = gx_q + gx_k + gx_v
 
     # --- RMSNorm backward to x (fp32) + residual path ---
@@ -394,625 +207,194 @@ def layer_backward(grad_out, cache, lw, scaling, cos, sin, seq_lens, b_start,
     grads = {"qA": grad_qA, "qB": grad_qB, "kA": grad_kA, "kB": grad_kB,
              "vA": grad_vA, "vB": grad_vB, "oA": grad_oA, "oB": grad_oB}
 
-    # [DeltaServe] Phase 7 / M3: remaining TP gradient reductions.
-    #   - grad_x: the attention-path term rmsnorm_backward(x, grad_x_norm1) is a
-    #     per-rank partial (q/k/v column-parallel); grad_resid_mid is ALREADY the
-    #     full reduced residual grad. So reduce only (grad_x - grad_resid_mid)
-    #     and add the full residual back once.
-    #   - grad_{q,k,v}A: column-parallel A is REPLICATED → grad sums across
-    #     output-head shards.
-    #   - grad_oB: row-parallel B is REPLICATED → grad sums across input shards.
-    # grad_{q,k,v}B (output-sharded) and grad_oA (input-sharded) are already this
-    # rank's correct shard — no reduce. all_reduce=None (tp=1) → byte-identical.
     if all_reduce is not None:
-        grad_x = all_reduce(grad_x - grad_resid_mid) + grad_resid_mid
-        for _k in ("qA", "kA", "vA", "oB"):
-            if grads[_k] is not None:
-                grads[_k] = all_reduce(grads[_k])
+        grad_x = reduce_partial(all_reduce, grad_x, grad_resid_mid)
+        if reduce_factors:
+            # Inline reduce of the replicated factors. The trainer passes
+            # reduce_factors=False under TP and buckets them instead (M4.3:
+            # one collective per group of layers on the comm stream).
+            for _k in ("qA", "kA", "vA", "oB"):
+                if grads[_k] is not None:
+                    grads[_k] = all_reduce(grads[_k])
     return grad_x, grads
 
 
-def head_backward(final_in, lm_w, norm_w, eps, ids, seq_lens, b_start, vocab):
-    """LM-head + final-norm: per-sample shift CE loss + grad w.r.t. final_in.
-    Returns (loss: float, n_valid: int, grad_final_in [n,D] fp32)."""
-    normed = rmsnorm(final_in, norm_w, eps)
-    n = final_in.shape[0]
-    logit_grad = normed.new_zeros((n, vocab), dtype=torch.float32)
-    total_loss = normed.new_zeros((), dtype=torch.float32)
-    n_valid = 0
-    for st, ln in zip(b_start, seq_lens):
-        if ln < 2:
-            continue
-        h = normed[st:st + ln - 1]                   # positions predict next
-        lg = _logits_chunked(h, lm_w, vocab)         # [ln-1, vocab] fp32
-        tgt = ids[st + 1:st + ln].long()
-        total_loss = total_loss + F.cross_entropy(lg, tgt, reduction="sum")
-        p = torch.softmax(lg, dim=-1)
-        p[torch.arange(ln - 1, device=p.device), tgt] -= 1.0
-        logit_grad[st:st + ln - 1] = p
-        n_valid += int(ln - 1)
-    if n_valid == 0:
-        return 0.0, 0, final_in.new_zeros((n, final_in.shape[-1]), dtype=torch.float32)
-    logit_grad /= n_valid
-    # grad w.r.t. the post-final-norm hidden = logit_grad @ lm_w, chunked over vocab.
-    grad_normed = logit_grad.new_zeros((n, final_in.shape[-1]))
-    for c in range(0, vocab, _VOCAB_CHUNK):
-        e = min(c + _VOCAB_CHUNK, vocab)
-        grad_normed += logit_grad[:, c:e] @ lm_w[c:e].float()
-    grad_final_in = rmsnorm_backward(final_in, grad_normed, norm_w, eps)
-    return float(total_loss.item() / n_valid), n_valid, grad_final_in
+# --------------------------------------------------------------------------- #
+# CUDA-graph path (Phase 5): the captureable forward + the graphed backward
+# --------------------------------------------------------------------------- #
+
+def graph_forward_core(runner, lw: dict) -> None:
+    """The captureable layer-forward body (no eager helpers, no python loop
+    over samples), operating on the ``GraphedBackward`` runner's static
+    buffers. Reads ``static_layer_in`` + ``static_cos/sin`` +
+    ``static_saved_gate_up``; writes:
+
+      - ``static_x_norm1`` (eager Q/K/V LoRA-A bwd input)
+      - ``static_qh_flat / kh_flat / vh_flat`` (eager RoPE-bwd input)
+      - ``static_qh_pad  / kh_pad  / vh_pad`` (Graph B input — scattered)
+      - ``static_ctx_flat`` (eager O-proj bwd input)
+      - ``static_o`` (the O-proj output; the runner's ``forward_tail`` turns
+        it into ``static_resid_mid`` + ``static_gate / static_up`` — the
+        Graph A inputs — after the TP all-reduce when there is one)
+
+    Mirrors ``layer_forward`` with ``saved_gate_up != None`` up to the O
+    projection; differs only in being shape-stable at the fixed ``s_max``
+    slab and writing into static buffers in place."""
+    s = runner.s_max
+    Hq, Hkv, Hd = runner.Hq, runner.Hkv, runner.Hd
+    scaling = runner.scaling
+
+    # 1) RMSNorm(in_ln) on [s_max, D] — runs in BOTH modes (the Q/K/V
+    #    LoRA-A backward needs x_norm1; cheap, ~few MFLOPs).
+    x_norm1 = rmsnorm(runner.static_layer_in, lw["in_ln"], runner.eps)
+    runner.static_x_norm1.copy_(x_norm1)
+
+    if runner.save_attn_qkv:
+        # Fast path: post-RoPE q/k/v were captured in the FT forward and
+        # staged into static_saved_qh/kh/vh by ``stage_forward_inputs``.
+        # Skip Q/K/V proj + RoPE entirely. Bandwidth-only — three model-
+        # dtype reads of [s, q_size] / [s, kv_size].
+        qh = runner.static_saved_qh.view(s, Hq, Hd)
+        kh = runner.static_saved_kh.view(s, Hkv, Hd)
+        vh = runner.static_saved_vh.view(s, Hkv, Hd)
+    else:
+        # 2) Q/K/V projections (base + LoRA) — LoRA `.data` refs are stable.
+        q = proj(x_norm1, lw["q"], lw["qA"], lw["qB"], scaling)      # [s, q_size]
+        k = proj(x_norm1, lw["k"], lw["kA"], lw["kB"], scaling)      # [s, kv]
+        v = proj(x_norm1, lw["v"], lw["vA"], lw["vB"], scaling)
+
+        # 3) RoPE on q, k; pack v.
+        qh = apply_rope(q.view(s, Hq, Hd), runner.static_cos, runner.static_sin)
+        kh = apply_rope(k.view(s, Hkv, Hd), runner.static_cos, runner.static_sin)
+        vh = v.view(s, Hkv, Hd)
+
+    # "Flat" writes (model dtype, shape [s, H, Hd]) — read by the eager
+    # RoPE-bwd tail. In save_attn_qkv mode the eager tail still needs
+    # these reshaped views; copy is cheap and keeps the cache_views
+    # contract identical to the recompute path.
+    runner.static_qh_flat.copy_(qh)
+    runner.static_kh_flat.copy_(kh)
+    runner.static_vh_flat.copy_(vh)
+    # Scatter into padded layout (Graph B inputs). All s_max rows write,
+    # so we MUST use accumulate=True: tail rows (k ≥ n) have
+    # (bn_idx, pos_idx) = (0, 0), which coincides with the legit
+    # (sample 0, position 0) slot — without accumulate they'd overwrite
+    # it (last-write-wins). With accumulate=True, the legit row adds
+    # qh[real_0] and tail rows add 0 (input tail is zero because
+    # rmsnorm(0)·W = 0 and 0·W^T = 0; in save_attn_qkv mode the staged
+    # static_saved_qh/kh/vh tails are zeroed in stage_forward_inputs).
+    # Pre-zeroed in ``stage_forward_inputs`` so accumulate starts from a
+    # clean slab.
+    runner.scatter_qkv_padded(qh, kh, vh)
+
+    # 4) Attention forward → static_ctx_flat. In save_attn_ctx mode the
+    #    forward attention (scores/softmax/AV) is skipped — ctx was captured
+    #    in the FT forward and staged into static_saved_ctx. The q/k/v
+    #    padded scatter above still ran (Graph B / attn-bwd reads it).
+    if runner.save_attn_ctx:
+        runner.static_ctx_flat.copy_(runner.static_saved_ctx)
+    else:
+        runner.padded_attn_forward_core()
+
+    # 5) O projection (base + LoRA) → static_o. The residual add + the saved
+    #    gate||up split are the runner's ``forward_tail``: captured right after
+    #    this at tp_size == 1, run eagerly after the o all-reduce under TP
+    #    (o_proj is row-parallel, so ``o`` is a partial sum per rank — M5).
+    #    In save_resid_mid mode the post-attention residual was staged straight
+    #    into static_resid_mid (Graph A's input): no O projection, no reduce.
+    if not runner.save_resid_mid:
+        o = proj(runner.static_ctx_flat, lw["o"], lw["oA"], lw["oB"], scaling)
+        runner.static_o.copy_(o)
+
+
+@torch.no_grad()
+def layer_backward_graphed(runner, maybe_pause, layer_id, g, cache, lw, scaling,
+                           cos, sin, seq_lens, b_start, dims, eps, cdt,
+                           *, all_reduce=None, reduce_factors=True):
+    """Graphed per-layer backward: Graph A (FFN-bwd) → eager O-bwd → pause
+    (yield GPU to inference) → Graph B (padded-attn-bwd) → eager tail
+    (RoPE / Q-K-V proj / in_ln rmsnorm). Same gradient values as the eager
+    ``layer_backward``; differs only in *when* host dispatch happens.
+
+    Pause cadence: once per layer, between the two graphs — the eager
+    path's once-per-layer pause-at-start is preserved, just relocated to
+    the mid-layer point so each graph runs without yielding (the captured
+    region can't host an mp.Event.wait anyway).
+
+    ``all_reduce`` (TP, M5): the six backward-side reduces of ``layer_backward``
+    at the same points — all in this eager code, never inside a replay."""
+    Hq, _, Hd, kv_size = dims
+    n = g.shape[0]
+    q_size = Hq * Hd
+
+    # --- Graph A: FFN-bwd (frozen MLP, with residual) ---
+    grad_resid_mid = runner.ffn_backward(layer_id, g, cache, lw)
+    if all_reduce is not None:
+        # M5: same reduce set as the eager ``layer_backward`` — the FFN-path
+        # partial only (the residual passthrough ``g`` is already full).
+        grad_resid_mid = reduce_partial(all_reduce, grad_resid_mid, g)
+
+    # --- Eager: O-projection backward (LoRA grad lives here) ---
+    grad_ctx_flat, grad_oA, grad_oB = proj_backward(
+        cache["ctx_flat"], grad_resid_mid, lw["o"],
+        lw["oA"], lw["oB"], scaling, cdt)
+
+    # --- Yield GPU to inference between graphs (preserves the load-bearing
+    # per-layer pause cadence; mp.Event.wait can't run inside a graph). ---
+    maybe_pause()
+
+    # --- Graph B: padded-attention backward CORE ---
+    grad_ctx = grad_ctx_flat.view(n, Hq, Hd)
+    grad_qh, grad_kh, grad_vh = runner.attn_backward(
+        layer_id, cache["qh"], cache["kh"], cache["vh"], grad_ctx,
+        seq_lens, b_start, dims)
+
+    # --- Eager tail: RoPE bwd → Q/K/V proj bwd → in_ln rmsnorm bwd ---
+    grad_q = rope_backward(grad_qh, cos, sin).reshape(n, q_size)
+    grad_k = rope_backward(grad_kh, cos, sin).reshape(n, kv_size)
+    grad_v = grad_vh.reshape(n, kv_size)
+    xn1 = cache["x_norm1"]
+    gx_q, grad_qA, grad_qB = proj_backward(
+        xn1, grad_q, lw["q"], lw["qA"], lw["qB"], scaling, cdt)
+    gx_k, grad_kA, grad_kB = proj_backward(
+        xn1, grad_k, lw["k"], lw["kA"], lw["kB"], scaling, cdt)
+    gx_v, grad_vA, grad_vB = proj_backward(
+        xn1, grad_v, lw["v"], lw["vA"], lw["vB"], scaling, cdt)
+    grad_x_norm1 = gx_q + gx_k + gx_v
+    grad_x = rmsnorm_backward(
+        cache["x"], grad_x_norm1, lw["in_ln"], eps).to(cdt) + grad_resid_mid
+
+    grads = {"qA": grad_qA, "qB": grad_qB, "kA": grad_kA, "kB": grad_kB,
+             "vA": grad_vA, "vB": grad_vB, "oA": grad_oA, "oB": grad_oB}
+
+    if all_reduce is not None:
+        grad_x = reduce_partial(all_reduce, grad_x, grad_resid_mid)
+        if reduce_factors:
+            # Inline reduce of the replicated factors. The trainer passes
+            # reduce_factors=False under TP and buckets them instead (M4.3:
+            # one collective per group of layers on the comm stream).
+            for _k in ("qA", "kA", "vA", "oB"):
+                if grads[_k] is not None:
+                    grads[_k] = all_reduce(grads[_k])
+    return grad_x, grads
 
 
 # --------------------------------------------------------------------------- #
-# Service
+# Family record + service
 # --------------------------------------------------------------------------- #
 
-_PROJ = ("q", "k", "v", "o")
+LLAMA3 = Family(
+    name="llama3",
+    archs=("LlamaForCausalLM", "llama3", "llama"),
+    layer_forward=layer_forward,
+    layer_backward=layer_backward,
+    graph_forward_core=graph_forward_core,
+    layer_backward_graphed=layer_backward_graphed,
+)
 
 
-def lora_shard_slice(proj: str, ab: str, t: torch.Tensor, tp_rank: int,
-                     tp_size: int, local_q: int, local_kv: int) -> torch.Tensor:
-    """Slice a FULL PEFT LoRA factor into this TP rank's shard (Phase 7 / M2).
+class Llama3BackwardService(LoraSftTrainerService):
+    """The Llama-3 backward child: the family-agnostic trainer driving the
+    layer math above."""
 
-    Matches how vLLM shards the served LoRA buffers we publish into (M4):
-      q/k/v (column-parallel): B [out_full, r] sharded on output rows;
-                               A [r, hidden]   replicated (returned whole).
-      o     (row-parallel):    A [r, in_full]  sharded on input cols;
-                               B [hidden, r]   replicated (returned whole).
-    The head partition is contiguous per rank, so each shard is one contiguous
-    slice at offset ``tp_rank * local_width``. ``tp_size == 1`` → identity, so
-    the single-GPU masters are byte-identical to before.
-    """
-    if tp_size == 1:
-        return t
-    if proj in ("q", "k", "v") and ab == "B":
-        w = local_q if proj == "q" else local_kv
-        return t[tp_rank * w:(tp_rank + 1) * w, :]
-    if proj == "o" and ab == "A":
-        return t[:, tp_rank * local_q:(tp_rank + 1) * local_q]
-    return t  # replicated factor (q/k/v A, o B)
-
-
-class Llama3BackwardService(BackwardService):
-
-    def __init__(self, device_index: int) -> None:
-        super().__init__(device_index)
-        self.is_trainer = True
-        self._built = False
-        self.lora: dict = {}            # layer -> {proj -> {"A":Param,"B":Param}}
-        self.base: dict = {}            # layer -> {q,k,v,o,gate,up,down,in_ln,post_ln}
-        self.optimizer = None
-        self.scheduler = None
-        # CUDA-graph runner (Phase 5). Attached in _build_state when
-        # meta["backward_cuda_graph"] is True; None means all-eager (today's
-        # behaviour). See vllm/deltaserve/bwd_services/llama3_graph.py.
-        self.graph_runner = None
-        # Persistent grad_qh/kh/vh buffers (allocated in _build_state once
-        # dims + cdt are known). Reused across layers and backwards by the
-        # eager attn_backward_core path via its grad_*_buf kwargs.
-        self._grad_qh_buf = None
-        self._grad_kh_buf = None
-        self._grad_vh_buf = None
-        # [DeltaServe] Phase 7 / M3: TP shard geometry + the backward-only
-        # all-reduce. tp_size=1 (single-GPU) leaves _all_reduce None → no comm.
-        self.tp_size = 1
-        self.tp_rank = 0
-        self._all_reduce = None
-        self._diag_count = 0
-
-    # -- build master params + optimizer once weights are received -----------
-
-    def _handle_share_weights(self, conn, msg) -> None:
-        super()._handle_share_weights(conn, msg)
-        try:
-            self._build_state()
-            self._built = True
-        except Exception as e:  # noqa: BLE001 — surface but keep the service alive
-            import traceback
-            dprint(f"[backward] llama3 state build failed: {e}")
-            traceback.print_exc()
-
-    def _init_tp_group(self, meta) -> None:
-        """Init (once) the NCCL process group across the backward children and
-        install ``self._all_reduce`` (in-place SUM). No-op for tp_size==1."""
-        self.tp_size = int(meta.get("tp_size", 1))
-        self.tp_rank = int(meta.get("tp_rank", 0))
-        self._all_reduce = None
-        if self.tp_size <= 1:
-            return
-        import torch.distributed as dist
-
-        port = int(meta.get("backward_nccl_port", 29677))
-        if not dist.is_initialized():
-            backend = "nccl" if torch.cuda.is_available() else "gloo"
-            dist.init_process_group(
-                backend=backend,
-                init_method=f"tcp://127.0.0.1:{port}",
-                rank=self.tp_rank, world_size=self.tp_size)
-            dprint(
-                f"[backward] TP group up: rank={self.tp_rank}/{self.tp_size} "
-                f"backend={backend} port={port}")
-
-        def _ar(t):
-            # NCCL/gloo need contiguous input; reduce is in-place SUM.
-            t = t.contiguous()
-            dist.all_reduce(t)
-            return t
-
-        self._all_reduce = _ar
-
-    def _build_state(self) -> None:
-        meta = self.shared["meta"]
-        base = self.shared["base"] or {}
-        ft = self.shared["ft"] or {}
-        # [DeltaServe] Phase 7 / M2: TP shard geometry. Under TP>1 the base
-        # weights shared by the worker are this rank's SHARDS: qkv/gate_up are
-        # column-parallel (sharded on output → local q/k/v/gate/up widths),
-        # o/down are row-parallel (sharded on input → used as-is). So the head
-        # counts and intermediate size the backward slices by are LOCAL =
-        # full // tp_size. hidden_size (residual stream) and vocab stay FULL —
-        # the residual is all-reduced and the worker all-gathers lm_head to full
-        # before sharing. tp_size=1 → local == full → single-GPU behaviour.
-        self.tp_size = int(meta.get("tp_size", 1))
-        self.tp_rank = int(meta.get("tp_rank", 0))
-        # [DeltaServe] Phase 7 / M3: stand up a NCCL group ACROSS the backward
-        # children (one per rank) — they are NOT in vLLM's inference NCCL group.
-        # This carries the per-layer gradient/activation all-reduces. Both
-        # children reach _build_state ~concurrently (both workers share weights
-        # during load_model), so the collective init rendezvouses. tp_size==1 →
-        # no group, self._all_reduce stays None → single-GPU path unchanged.
-        self._init_tp_group(meta)
-        Hq_full = int(meta["num_attention_heads"])
-        Hkv_full = int(meta["num_key_value_heads"])
-        inter_full = int(meta["intermediate_size"])
-        assert Hq_full % self.tp_size == 0 and Hkv_full % self.tp_size == 0 \
-            and inter_full % self.tp_size == 0, (
-                f"[backward] TP finetuning needs Hq({Hq_full}) / Hkv({Hkv_full})"
-                f" / inter({inter_full}) divisible by tp_size({self.tp_size})")
-        self.D = int(meta["hidden_size"])          # full (residual stream)
-        self.L = int(meta["num_hidden_layers"])
-        self.Hq = Hq_full // self.tp_size          # local q heads
-        self.Hkv = Hkv_full // self.tp_size        # local kv heads
-        self.Hd = int(meta["head_dim"])            # full (per-head, unsharded)
-        self.kv_size = self.Hkv * self.Hd          # local
-        self.q_size = self.Hq * self.Hd            # local
-        self.inter = inter_full // self.tp_size    # local
-        self.theta = float(meta["rope_theta"])
-        self.eps = float(meta["rms_norm_eps"])
-        self.scaling = float(meta.get("lora_scaling", 1.0))
-        self.vocab = int(meta["vocab_size"])
-        self.dims = (self.Hq, self.Hkv, self.Hd, self.kv_size)
-        # Mirror the worker-side ``save_attn_qkv`` flag so the optional
-        # graph runner (constructed below) and the eager per-layer loop both
-        # see it. Drives whether ``layer_forward`` / the captured forward
-        # graph short-circuits Q/K/V proj + RoPE using the saved buffers.
-        self.save_attn_qkv = bool(meta.get("save_attn_qkv", False))
-        # Mirror the worker-side ``save_attn_ctx`` flag — drives whether
-        # ``layer_forward`` / the captured forward graph skips the attention
-        # forward (scores/softmax/AV) using the saved ctx buffer.
-        self.save_attn_ctx = bool(meta.get("save_attn_ctx", False))
-
-        # With enable_lora, vLLM wraps the projections, so the frozen base weight is
-        # named e.g. "...qkv_proj.base_layer.weight". Normalize by stripping the
-        # ".base_layer" infix so we can look weights up by their logical names
-        # (norms/lm_head aren't wrapped, so they pass through unchanged).
-        bn = {k.replace(".base_layer.", "."): v for k, v in base.items()}
-
-        def bw(name):
-            if name not in bn:
-                raise KeyError(
-                    f"base weight {name!r} not found (have e.g. "
-                    f"{[k for k in list(bn)[:4]]} … {len(bn)} keys)")
-            return bn[name]
-
-        self.lm_w = bw("lm_head.weight")
-        self.norm_w = bw("model.norm.weight")
-        # Bulk backward compute dtype: model dtype (bf16) by default, fp32 if the
-        # config flag is set. Attention core / RMSNorm-bwd / LM-head stay fp32.
-        self.base_dtype = self.lm_w.dtype
-        self.bwd_dtype = torch.float32 if meta.get("backward_fp32") else self.base_dtype
-
-        # Slice the fused base weights ([out,in]) once into per-layer views.
-        for i in range(self.L):
-            p = f"model.layers.{i}."
-            qkv = bw(p + "self_attn.qkv_proj.weight")
-            gate_up = bw(p + "mlp.gate_up_proj.weight")
-            self.base[i] = {
-                "q": qkv[:self.q_size],
-                "k": qkv[self.q_size:self.q_size + self.kv_size],
-                "v": qkv[self.q_size + self.kv_size:],
-                "o": bw(p + "self_attn.o_proj.weight"),
-                "gate": gate_up[:self.inter],
-                "up": gate_up[self.inter:],
-                "down": bw(p + "mlp.down_proj.weight"),
-                "in_ln": bw(p + "input_layernorm.weight"),
-                "post_ln": bw(p + "post_attention_layernorm.weight"),
-            }
-
-        # FT adapter -> per-layer/proj fp32 master nn.Parameters (child-owned clone).
-        # [DeltaServe] Phase 7 / M2: the adapter is loaded FULL from disk by the
-        # worker, but under TP each rank owns only a shard, matching how vLLM
-        # shards the served LoRA buffers we publish into (M4):
-        #   q/k/v (column-parallel): B [out_full, r] sharded on output rows;
-        #                            A [r, hidden]   replicated (full).
-        #   o     (row-parallel):    A [r, in_full] sharded on input cols;
-        #                            B [hidden, r]   replicated (full).
-        # The head-partition is contiguous per rank (vLLM's QKV/o layout), so the
-        # shard is a single contiguous slice at offset tp_rank * local_width.
-        # tp_size=1 → _shard_lora is identity → single-GPU masters unchanged.
-        key_re = re.compile(
-            r"layers\.(\d+)\.self_attn\.([qkvo])_proj\.lora_([AB])\.weight")
-        params: list[nn.Parameter] = []
-        for key, t in ft.items():
-            m = key_re.search(key)
-            if m is None:
-                continue
-            layer, proj, ab = int(m.group(1)), m.group(2), m.group(3)
-            shard = lora_shard_slice(proj, ab, t, self.tp_rank, self.tp_size,
-                                     self.q_size, self.kv_size)
-            # fp32 master, contiguous so the fused AdamW + IPC publish are happy.
-            param = nn.Parameter(shard.detach().clone().float().contiguous())
-            self.lora.setdefault(layer, {}).setdefault(proj, {})[ab] = param
-            params.append(param)
-
-        # ``fused=True`` uses PyTorch's CUDA-fused AdamW kernel — one launch
-        # for all 256 LoRA tensors (8 per layer × 32 layers) instead of
-        # per-tensor dispatch. Numerically identical to the default AdamW;
-        # cuts a few ms per backward on Llama-3-8B. Requires CUDA tensors
-        # (all our LoRA masters are on the worker device).
-        self.optimizer = torch.optim.AdamW(
-            params, lr=float(meta["learning_rate"]), betas=(0.9, 0.999),
-            weight_decay=float(meta["weight_decay"]), fused=True)
-        self.scheduler = torch.optim.lr_scheduler.StepLR(
-            self.optimizer, step_size=1, gamma=float(meta["gamma"]))
-        dprint(
-            f"[backward] llama3 built: {self.L} layers, {len(params)} LoRA tensors, "
-            f"scaling={self.scaling}, lr={meta['learning_rate']}, "
-            f"wd={meta['weight_decay']}, gamma={meta['gamma']}"
-        )
-
-        # Persistent grad_qh/kh/vh buffers for the eager attn_backward_core path
-        # (passed via attn_backward_core's optional grad_*_buf kwargs). Sized at
-        # s_max so they fit any backward, sliced to [:n] per call. Saves 96
-        # zero-fill kernel launches per backward (32 layers × 3 tensors). The
-        # graphed path has its own static buffers in Llama3GraphedBackward.
-        s_max = int(meta.get("max_saved_finetuning_tokens", 0))
-        if s_max > 0:
-            dev = self.lm_w.device
-            cdt = self.bwd_dtype
-            self._grad_qh_buf = torch.zeros((s_max, self.Hq, self.Hd),
-                                            dtype=cdt, device=dev)
-            self._grad_kh_buf = torch.zeros((s_max, self.Hkv, self.Hd),
-                                            dtype=cdt, device=dev)
-            self._grad_vh_buf = torch.zeros((s_max, self.Hkv, self.Hd),
-                                            dtype=cdt, device=dev)
-        else:
-            self._grad_qh_buf = self._grad_kh_buf = self._grad_vh_buf = None
-
-        # [Phase 5] Optional CUDA-graph runner. Per-layer FFN-bwd + padded-attn-bwd
-        # graphs, captured lazily on first replay. Falls back per-layer on capture
-        # or shape-fit failure (gradient values unchanged in either case).
-        if meta.get("backward_cuda_graph") and self.tp_size > 1:
-            # [DeltaServe] Phase 7 / M3: the graphed forward/backward regions
-            # have no TP all-reduces wired in (and NCCL-in-a-captured-region is a
-            # hazard), so force EAGER under TP. Re-enabling the graph path under
-            # TP is tracked as M5.
-            dprint("[backward] backward_cuda_graph requested with tp_size="
-                   f"{self.tp_size}; forcing EAGER under TP (graph path is M5)")
-        elif meta.get("backward_cuda_graph"):
-            from vllm.deltaserve.bwd_services.llama3_graph import (
-                Llama3GraphedBackward,
-            )
-            s_max = int(meta.get("max_saved_finetuning_tokens", 0))
-            bn_max = int(meta.get("backward_cuda_graph_attn_bn_max", 8))
-            l_max = int(meta.get("backward_cuda_graph_attn_l_max", 64))
-            if s_max <= 0:
-                dprint(
-                    "[backward] backward_cuda_graph requested but "
-                    "max_saved_finetuning_tokens not provided; keeping eager")
-            else:
-                try:
-                    self.graph_runner = Llama3GraphedBackward(
-                        self, s_max=s_max, bn_max=bn_max, l_max=l_max)
-                except Exception as e:  # noqa: BLE001
-                    import traceback
-                    dprint(f"[backward] graph runner init failed: {e}; "
-                           f"falling back to eager backward")
-                    traceback.print_exc()
-                    self.graph_runner = None
-
-    def _layer_weights(self, i: int) -> dict:
-        """Base (compute dtype) + fp32 LoRA params for layer i, as one dict."""
-        lw = dict(self.base[i])
-        ld = self.lora.get(i, {})
-        for proj in _PROJ:
-            lw[proj + "A"] = ld.get(proj, {}).get("A")
-            lw[proj + "B"] = ld.get(proj, {}).get("B")
-        return lw
-
-
-    @torch.no_grad()
-    def _diag_remat_check(self, activations, n, seq_lens, b_start, cos, sin):
-        """[TP DIAG, temporary] Rematerialize the FULL forward from layer_in[0]
-        (the embedding output — model-independent) using the CURRENT LoRA masters,
-        and compare against the activations vLLM's REAL forward captured. If the
-        backward's model view matches the SERVED model these agree to ~bf16 noise;
-        a growing divergence localizes where publish/serve disagrees with training."""
-        li = activations.get("layer_in")
-        if not li:
-            return
-        gu = activations.get("mlp_gate_up")
-        x = li[0][:n]
-        rows = []
-        for i in range(self.L):
-            lw = self._layer_weights(i)
-            c = layer_forward(x, lw, self.scaling, cos, sin, seq_lens, b_start,
-                              self.dims, self.eps, all_reduce=self._all_reduce)
-            dg = 0.0
-            if gu:
-                rg = gu[i][:n].float()
-                inter = rg.shape[-1] // 2
-                num = (c["gate"].float() - rg[:, :inter]).abs().max().item()
-                dg = num / (rg[:, :inter].abs().max().item() + 1e-6)
-            h = F.silu(c["gate"]) * c["up"]
-            ffn = F.linear(h, lw["down"])
-            if self._all_reduce is not None:
-                ffn = self._all_reduce(ffn)
-            x = c["resid_mid"] + ffn
-            ref = (li[i + 1][:n] if i + 1 < self.L
-                   else activations["final_in"][:n]).float()
-            d = (x.float() - ref).abs().max().item() / (ref.abs().max().item() + 1e-6)
-            rows.append((i, d, dg))
-        head = " ".join(f"L{i}={d:.1e}/gu{g:.1e}" for i, d, g in rows[:3])
-        tail = " ".join(f"L{i}={d:.1e}" for i, d, _ in rows[-2:])
-        dprint(f"[tpdiag] rank={self.tp_rank} remat-vs-captured rel|d|: "
-               f"{head} ... {tail}")
-
-    # -- the real backward (overrides base.process_backward) ------------------
-
-    def process_backward(self, activations, sample_lens, n, epoch):
-        self._maybe_pause()
-        if not self._built:
-            raise RuntimeError("llama3 backward state not built (weights not shared)")
-        # Mode tag for the one-line cycle log (set in BackwardService dispatcher).
-        self._last_mode = "graph" if self.graph_runner is not None else "eager"
-        seq_lens = [int(s) for s in sample_lens]
-        b_start, acc = [], 0
-        for s in seq_lens:
-            b_start.append(acc)
-            acc += s
-        device = activations["final_in"].device
-        positions = torch.cat([
-            torch.arange(s, device=device) for s in seq_lens]) if seq_lens else \
-            torch.zeros(0, device=device)
-        cos, sin = rope_cos_sin(positions, self.Hd, self.theta)
-        ids = activations["concat_input_ids"][:n]
-        if os.environ.get("DSERVE_TP_DIAG") and self._diag_count < 5:
-            self._diag_count += 1
-            self._diag_remat_check(activations, n, seq_lens, b_start,
-                                   cos, sin)
-
-        self.optimizer.zero_grad(set_to_none=True)
-
-        # Head: loss + grad w.r.t. final_in (pre-final-norm residual = layer_in[L]).
-        loss, n_valid, g = head_backward(
-            activations["final_in"][:n], self.lm_w, self.norm_w, self.eps,
-            ids, seq_lens, b_start, self.vocab)
-
-        # Saved MLP pre-activations (gate||up) per layer, if captured in the forward
-        # — lets the remat skip the gate_up matmul (the layer's biggest recompute).
-        saved_gu = activations.get("mlp_gate_up")
-        # Saved post-RoPE q/k/v per layer (opt-in via finetune.save_attn_qkv) —
-        # when present, lets the remat skip the second-biggest layer recompute:
-        # Q/K/V projection + RoPE. None when the feature is off.
-        saved_qh_all = activations.get("attn_qh")
-        saved_kh_all = activations.get("attn_kh")
-        saved_vh_all = activations.get("attn_vh")
-        # Saved attention context (o_proj input) per layer (opt-in via
-        # finetune.save_attn_ctx) — lets the remat skip the attention forward
-        # (scores/softmax/AV). None when the feature is off.
-        saved_ctx_all = activations.get("attn_ctx")
-
-        # If the graphed runner is attached, build per-backward scatter indices
-        # + key-pad mask once (re-used across all L layers' padded-attention
-        # replays). Eager fallback for batches that overflow the padded budget.
-        if self.graph_runner is not None:
-            self.graph_runner.begin_backward(n, seq_lens, b_start)
-
-        # Per-layer manual backward, chaining the input gradient down the stack.
-        # Graph runner takes the forward+backward fast path when:
-        #   - runner is attached, AND
-        #   - the padded-attention budget fits this backward (decided once
-        #     in begin_backward → ``graph_runner._attn_fit``), AND
-        #   - this layer's saved gate||up is available (production default).
-        # Otherwise the layer runs the eager ``layer_forward`` + the
-        # appropriate backward path.
-        for i in reversed(range(self.L)):
-            if self.graph_runner is None:
-                # Eager path (today's behaviour). Pause at the layer boundary
-                # before the layer's compute — original yield cadence.
-                self._maybe_pause()
-            lw = self._layer_weights(i)
-            x = activations["layer_in"][i][:n]
-            gu = saved_gu[i][:n] if saved_gu else None
-            qh_i = saved_qh_all[i][:n] if saved_qh_all else None
-            kh_i = saved_kh_all[i][:n] if saved_kh_all else None
-            vh_i = saved_vh_all[i][:n] if saved_vh_all else None
-            ctx_i = saved_ctx_all[i][:n] if saved_ctx_all else None
-            with torch.no_grad():
-                if (self.graph_runner is not None
-                        and self.graph_runner._attn_fit
-                        and gu is not None):
-                    # Graphed forward: writes cache straight into the
-                    # static buffers Graph A / Graph B already read.
-                    cache = self.graph_runner.forward(
-                        i, lw, x, gu, n,
-                        saved_qh=qh_i, saved_kh=kh_i, saved_vh=vh_i,
-                        saved_ctx=ctx_i)
-                else:
-                    cache = layer_forward(
-                        x, lw, self.scaling, cos, sin,
-                        seq_lens, b_start, self.dims, self.eps,
-                        saved_gate_up=gu,
-                        saved_qh=qh_i, saved_kh=kh_i, saved_vh=vh_i,
-                        saved_ctx=ctx_i,
-                        all_reduce=self._all_reduce)  # M3: o_proj reduce (TP)
-                if self.graph_runner is None:
-                    grad_x, grads = layer_backward(
-                        g, cache, lw, self.scaling, cos, sin,
-                        seq_lens, b_start, self.dims, self.eps,
-                        cdt=self.bwd_dtype,
-                        grad_qh_buf=self._grad_qh_buf,
-                        grad_kh_buf=self._grad_kh_buf,
-                        grad_vh_buf=self._grad_vh_buf,
-                        all_reduce=self._all_reduce)  # M3: grad reduces (TP)
-                else:
-                    grad_x, grads = self._layer_backward_graphed(
-                        i, g, cache, lw, cos, sin, seq_lens, b_start)
-            # Write grads to the fp32 master params (cast up from the bulk compute
-            # dtype; PEFT layout matches), then per-layer clip to 1.0 (DeltaServe).
-            ld = self.lora.get(i, {})
-            layer_params = []
-            for proj in _PROJ:
-                pa, pb = ld.get(proj, {}).get("A"), ld.get(proj, {}).get("B")
-                if pa is not None:
-                    pa.grad = grads[proj + "A"].float()
-                    pb.grad = grads[proj + "B"].float()
-                    layer_params += [pa, pb]
-            if layer_params:
-                torch.nn.utils.clip_grad_norm_(layer_params, max_norm=1.0)
-            g = grad_x
-
-        self.optimizer.step()
-        if epoch > self.current_epoch:
-            self.scheduler.step()
-            self.current_epoch = epoch
-
-        # Publish the updated fp32 master into vLLM's served LoRA buffers (the exact
-        # tensors inference reads). Safe with no locking: FT admission is closed for
-        # the whole backward, so the adapter is idle until the done-reply reopens it.
-        self._publish_to_served()
-
-        return loss, n_valid
-
-    @torch.no_grad()
-    def _layer_backward_graphed(self, i, g, cache, lw, cos, sin,
-                                seq_lens, b_start):
-        """Graphed per-layer backward: Graph A (FFN-bwd) → eager O-bwd → pause
-        (yield GPU to inference) → Graph B (padded-attn-bwd) → eager tail
-        (RoPE / Q-K-V proj / in_ln rmsnorm). Same gradient values as the eager
-        ``layer_backward``; differs only in *when* host dispatch happens.
-
-        Pause cadence: once per layer, between the two graphs — the eager
-        path's once-per-layer pause-at-start is preserved, just relocated to
-        the mid-layer point so each graph runs without yielding (the captured
-        region can't host an mp.Event.wait anyway)."""
-        cdt = self.bwd_dtype
-        Hq, _, Hd, kv_size = self.dims
-        n = g.shape[0]
-        D = Hq * Hd
-
-        # --- Graph A: FFN-bwd (frozen MLP, with residual) ---
-        grad_resid_mid = self.graph_runner.ffn_backward(i, g, cache, lw)
-
-        # --- Eager: O-projection backward (LoRA grad lives here) ---
-        grad_ctx_flat, grad_oA, grad_oB = _proj_backward(
-            cache["ctx_flat"], grad_resid_mid, lw["o"],
-            lw["oA"], lw["oB"], self.scaling, cdt)
-
-        # --- Yield GPU to inference between graphs (preserves the load-bearing
-        # per-layer pause cadence; mp.Event.wait can't run inside a graph). ---
-        self._maybe_pause()
-
-        # --- Graph B: padded-attention backward CORE ---
-        grad_ctx = grad_ctx_flat.view(n, Hq, Hd)
-        grad_qh, grad_kh, grad_vh = self.graph_runner.attn_backward(
-            i, cache["qh"], cache["kh"], cache["vh"], grad_ctx,
-            seq_lens, b_start, self.dims)
-
-        # --- Eager tail: RoPE bwd → Q/K/V proj bwd → in_ln rmsnorm bwd ---
-        grad_q = rope_backward(grad_qh, cos, sin).reshape(n, D)
-        grad_k = rope_backward(grad_kh, cos, sin).reshape(n, kv_size)
-        grad_v = grad_vh.reshape(n, kv_size)
-        xn1 = cache["x_norm1"]
-        gx_q, grad_qA, grad_qB = _proj_backward(
-            xn1, grad_q, lw["q"], lw["qA"], lw["qB"], self.scaling, cdt)
-        gx_k, grad_kA, grad_kB = _proj_backward(
-            xn1, grad_k, lw["k"], lw["kA"], lw["kB"], self.scaling, cdt)
-        gx_v, grad_vA, grad_vB = _proj_backward(
-            xn1, grad_v, lw["v"], lw["vA"], lw["vB"], self.scaling, cdt)
-        grad_x_norm1 = gx_q + gx_k + gx_v
-        grad_x = rmsnorm_backward(
-            cache["x"], grad_x_norm1, lw["in_ln"], self.eps).to(cdt) + grad_resid_mid
-
-        grads = {"qA": grad_qA, "qB": grad_qB, "kA": grad_kA, "kB": grad_kB,
-                 "vA": grad_vA, "vB": grad_vB, "oA": grad_oA, "oB": grad_oB}
-        return grad_x, grads
-
-    @torch.no_grad()
-    def _publish_to_served(self) -> None:
-        """Write the trained fp32 master into vLLM's served LoRA stacked buffers
-        (DeltaServe's load-time refresh): per (layer, proj), clamp + cast to the
-        served dtype, with α/r baked into B (vLLM applies scale=1). No transpose —
-        PEFT A [r,in] / B [out,r] match vLLM's stacked layout.
-
-        The scaling convention is load-bearing: vLLM's punica forward calls
-        ``add_lora_linear(..., 1.0, ...)`` (see
-        ``vllm/lora/layers/base_linear.py:226``) — the third positional arg
-        ``scale`` is hardcoded to 1.0, NOT taken from the adapter's stored
-        ``LoRALayerWeights.scaling`` (alpha/r). We multiply ``pb * self.scaling``
-        here so the net inference effect is
-        ``(x @ A) @ (B·s) · 1.0 = s · (x · A · B)`` — the correct PEFT LoRA
-        forward with one scaling application. If vLLM ever switches that
-        callsite to pass the per-adapter scaling instead of 1.0, this publish
-        MUST drop the ``* self.scaling`` multiplication or inference will see
-        ``scaling²`` and silently degrade output quality.
-
-        Locking: relies on the FT adapter being pre-loaded into a dedicated
-        served-LoRA slot at startup (see ``_maybe_share_ft_served_lora`` in
-        ``v1/worker/gpu_worker.py``). No inference request can land on this
-        slot, so the in-place write is race-free with concurrent inference.
-        FT admission is closed for the entire backward cycle (coordinator
-        keeps ``pending_backward=True`` until the child acks), so even FT
-        requests can't read the slot mid-publish."""
-        if not self.lora_buffers:
-            return
-        slot = int(self.lora_buffers["slot"])
-        for i, projd in self.lora_buffers["layers"].items():
-            ld = self.lora.get(int(i), {})
-            for proj, buf in projd.items():
-                pa = ld.get(proj, {}).get("A")
-                pb = ld.get(proj, {}).get("B")
-                if pa is None:
-                    continue
-                a_buf, b_buf = buf["a"], buf["b"]
-                r, in_dim = pa.shape          # PEFT A [r, in]
-                out_dim = pb.shape[0]          # PEFT B [out, r]
-                a_buf[slot, 0, :r, :in_dim].copy_(
-                    pa.clamp(-6.5e4, 6.5e4).to(a_buf.dtype))
-                b_buf[slot, 0, :out_dim, :r].copy_(
-                    (pb * self.scaling).clamp(-6.5e4, 6.5e4).to(b_buf.dtype))
-
-    # -- capture correctness checks (debug-gated) -----------------------------
-
-    def verify_activations(self, activations: dict, n: int) -> None:
-        meta = self.shared["meta"]
-        base = self.shared["base"] or {}
-        ids = activations["concat_input_ids"][:n].long()
-        layer_in = activations.get("layer_in") or []
-        embed_w = base.get(meta.get("embed_weight_key"))
-        if layer_in and embed_w is not None:
-            d = (layer_in[0][:n].float() - embed_w[ids].float()).abs().max().item()
-            scale = embed_w[ids].float().abs().max().item() + 1e-6
-            dprint(f"[verify] layer_in[0] vs embed[ids]: max|Δ|={d:.3e} "
-                   f"rel={d / scale:.3e} {'OK' if d / scale < _TOL else 'FAIL'}")
-        final_in = activations.get("final_in")
-        final_hidden = activations.get("final_hidden")
-        norm_w = base.get(meta.get("norm_weight_key"))
-        if final_in is not None and final_hidden is not None and norm_w is not None:
-            h = rmsnorm(final_in[:n], norm_w, float(meta.get("rms_norm_eps", 1e-5)))
-            fh = final_hidden[:n].float()
-            d = (h.float() - fh).abs().max().item()
-            scale = fh.abs().max().item() + 1e-6
-            dprint(f"[verify] RMSNorm(final_in) vs final_hidden: max|Δ|={d:.3e} "
-                   f"rel={d / scale:.3e} {'OK' if d / scale < _TOL else 'FAIL'}")
+    family = LLAMA3

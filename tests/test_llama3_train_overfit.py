@@ -18,11 +18,13 @@ import os
 import sys
 
 import torch
+import torch.nn.functional as F
 
 sys.path[:] = [p for p in sys.path
                if os.path.abspath(p or ".") != os.path.dirname(os.path.abspath(__file__))]
 
 from vllm.deltaserve.bwd_services import llama3 as L  # noqa: E402
+from vllm.deltaserve.bwd_services.common.ops import rmsnorm, rope_cos_sin  # noqa: E402
 from vllm.deltaserve.bwd_services.llama3 import Llama3BackwardService  # noqa: E402
 
 # Small synthetic Llama with enough capacity to overfit a few fixed sequences.
@@ -76,16 +78,19 @@ def forward_capture(svc, embed_w, ids, seq_lens, b_start):
     """Full forward with the CURRENT master LoRA → the captured-activation dict
     that process_backward consumes (layer_in per layer + final_in + final_hidden)."""
     positions = torch.cat([torch.arange(s) for s in seq_lens])
-    cos, sin = L.rope_cos_sin(positions, Hd, THETA)
+    cos, sin = rope_cos_sin(positions, Hd, THETA)
     x = embed_w[ids]
     layer_in = []
     for i in range(NL):
         layer_in.append(x)
         lw = svc._layer_weights(i)
-        x, _ = L.layer_forward(x, lw, SCALING, cos, sin, seq_lens, b_start,
-                               svc.dims, EPS)
+        c = L.layer_forward(x, lw, SCALING, cos, sin, seq_lens, b_start,
+                            svc.dims, EPS)
+        # layer_forward stops before the frozen down-proj (the backward never
+        # needs the layer output); finish the layer here.
+        x = c["resid_mid"] + F.linear(F.silu(c["gate"]) * c["up"], lw["down"])
     final_in = x
-    final_hidden = L.rmsnorm(final_in, svc.norm_w, EPS)
+    final_hidden = rmsnorm(final_in, svc.norm_w, EPS)
     return {"layer_in": layer_in, "final_in": final_in,
             "final_hidden": final_hidden, "concat_input_ids": ids}
 

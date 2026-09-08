@@ -38,19 +38,12 @@ from vllm.deltaserve.backward_process import (
 
 
 def get_service(service_name: str):
-    """Return the BackwardService subclass for a model architecture string."""
-    if service_name in ("LlamaForCausalLM", "llama3", "llama"):
-        from vllm.deltaserve.bwd_services.llama3 import Llama3BackwardService
+    """Return the BackwardService subclass for a model architecture string
+    (thin shim over ``bwd_services.registry``; imported lazily because the
+    family modules import this module)."""
+    from vllm.deltaserve.bwd_services.registry import get_service as _get
 
-        return Llama3BackwardService
-    if service_name in ("OPTForCausalLM", "opt"):
-        from vllm.deltaserve.bwd_services.opt import OPTBackwardService
-
-        return OPTBackwardService
-    raise NotImplementedError(
-        f"[deltaserve] no backward service for {service_name!r}; supported: "
-        f"LlamaForCausalLM (llama3), OPTForCausalLM (opt-125m)"
-    )
+    return _get(service_name)
 
 
 def _arm_parent_death_signal() -> None:
@@ -99,6 +92,12 @@ def service_main(conn, mps_percentage: int, device_index: int,
 class BackwardService:
     """Base class: the model-agnostic backward recv/dispatch loop."""
 
+    # True for services that actually train (optimizer.step) — they own the
+    # GPU for the whole pass, so the lifecycle skips the simulated sleep. A
+    # class attribute so the registry can answer ``is_trainer(arch)`` without
+    # instantiating the service.
+    is_trainer: bool = False
+
     def __init__(self, device_index: int) -> None:
         self.device_index = int(device_index)
         # Hold onto shared weights/activations so the IPC mappings stay alive.
@@ -113,9 +112,6 @@ class BackwardService:
         self.current_epoch = 0
         # Cumulative valid FT tokens trained since process start (for logging).
         self._total_tokens_trained = 0
-        # True for services that actually train (optimizer.step) — they own the
-        # GPU for the whole pass, so the lifecycle skips the simulated sleep.
-        self.is_trainer = False
         # vLLM's served LoRA stacked buffers (IPC-shared) the trainer publishes
         # the trained weights into; {"slot": int, "layers": {i: {proj: {a,b}}}}.
         self.lora_buffers: dict | None = None
@@ -448,15 +444,17 @@ class BackwardService:
                     t.zero_()
             #torch.cuda.synchronize()
 
-        # Emit the per-cycle log AFTER the sync so the events are queryable.
+        # Emit the per-cycle log with the GPU-strict cycle time. Waiting on the
+        # END event alone (not a device-wide synchronize) is enough to make the
+        # pair queryable; one event-scoped wait per cycle, off the layer loop.
         if can_compute and loss is not None:
-            # if start_evt is not None and end_evt is not None:
-            #     total_ms = start_evt.elapsed_time(end_evt)
-            # elif cpu_elapsed_ms is not None:
-            #     total_ms = cpu_elapsed_ms
-            # else:
-            #     total_ms = float("nan")
-            total_ms = float("nan")
+            if start_evt is not None and end_evt is not None:
+                end_evt.synchronize()
+                total_ms = start_evt.elapsed_time(end_evt)
+            elif cpu_elapsed_ms is not None:
+                total_ms = cpu_elapsed_ms
+            else:
+                total_ms = float("nan")
             # Normalise loss to a float for both the format string and the
             # non-finite check below — `loss` may be a 0-d tensor or a
             # Python float depending on the subclass.
