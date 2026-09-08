@@ -18,7 +18,9 @@ watch the process-launch prints under tensor parallelism:
 
 Usage (dserve-vllm conda env, CUDA env per README.md):
 
-    python eval-tp/launch_deltaserve.py                       # TP=2 config (default)
+    python eval-tp/launch_deltaserve.py                       # llama3 preset (TP=2 YAML)
+    python eval-tp/launch_deltaserve.py --family qwen3-14b    # Qwen3-14B TP=2 preset
+    python eval-tp/launch_deltaserve.py --family qwen3-0.6b   # Qwen3-0.6B single-GPU smoke
     python eval-tp/launch_deltaserve.py --config <yaml>       # any serving YAML
     python eval-tp/launch_deltaserve.py --tp 2                # override tensor_parallel_size
     python eval-tp/launch_deltaserve.py --start-finetuning    # also POST /start_finetuning once healthy
@@ -30,6 +32,7 @@ server process group).
 
 import argparse
 import os
+from dataclasses import dataclass
 import signal
 import subprocess
 import sys
@@ -40,12 +43,32 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent          # eval-tp/
 _ROOT = _HERE.parent                             # repo root (DeltaServe-vLLM/)
-_DEFAULT_CONFIG = _ROOT / "configs" / "serving_config_finetuning_llama3_tp2.yaml"
-_INFER_LORA_DIR = _ROOT / "adapters" / "llama3-toy-lora"
-_INFER_LORA_NAME = "llama3-toy-lora"
-_SERVED_NAME = "llama3"
-_BASE_MODEL_DEFAULT = "meta-llama/Meta-Llama-3-8B"
 _HF_HOME_DEFAULT = "/mnt/storage/huggingface"
+
+# Family presets: the serving YAML each family launches with by default. The
+# YAML is the single source of truth for the base model (``model.model``) and
+# the inference adapter (``adapters.lora_path_0``); the preset name doubles as
+# the served model name and the output-file tag.
+PRESETS: dict[str, Path] = {
+    "llama3": _ROOT / "configs" / "serving_config_finetuning_llama3_tp2.yaml",
+    "qwen3-14b": _ROOT / "configs" / "serving_config_finetuning_qwen3_14b_tp2.yaml",
+    "qwen3-0.6b": _ROOT / "configs" / "serving_config_finetuning_qwen3_0.6b.yaml",
+}
+DEFAULT_FAMILY = "llama3"
+
+
+@dataclass
+class LaunchSpec:
+    """Everything a driver needs about one resolved launch."""
+
+    cmd: list[str]
+    cfg: dict
+    tp: int
+    family: str
+    served_name: str
+    base_model: str
+    infer_lora_name: str
+    infer_lora_dir: str
 
 
 def _strip_repo_from_syspath() -> None:
@@ -78,35 +101,89 @@ def _finetune_cli_args(section: dict) -> list[str]:
     return args
 
 
-def build_server_cmd(config_path: str, port: int, base_model: str,
-                     tp_override: int | None) -> tuple[list[str], dict]:
+def build_server_cmd(config_path: str, port: int, base_model: str | None = None,
+                     tp_override: int | None = None, *,
+                     family: str = DEFAULT_FAMILY,
+                     served_name: str | None = None,
+                     co: bool = True,
+                     bwd_log_path: str | None = None,
+                     api_server_count: int | None = None) -> LaunchSpec:
     """Build the `dserve-vllm serve` command from a DeltaServe YAML.
 
-    Mirrors eval/auto_benchmark.build_server_cmd but always co-serving (the YAML
-    decides enable_finetuning) and single-frontend. Returns (cmd, cfg)."""
+    Mirrors eval/auto_benchmark.build_server_cmd. The base model defaults to
+    the YAML's ``model.model`` and the inference adapter to the YAML's
+    ``adapters.lora_path_0`` (its directory name is the adapter's served name);
+    ``served_name`` defaults to the family.
+
+    ``co=False`` launches the inference-only baseline: the finetune / debug /
+    slo sections are NOT passed, so ``enable_finetuning`` stays at its default
+    (False) and no backward child is spawned. ``bwd_log_path`` (co only) is the
+    backward-throughput CSV the server appends to. ``api_server_count``
+    overrides the YAML's ``server.api_server_count``."""
     _strip_repo_from_syspath()
     from vllm.deltaserve.config_loader import load_yaml_config, split_config
 
     cfg = load_yaml_config(config_path)
-    engine_kwargs, _, _ = split_config(cfg)
-    engine_kwargs.pop("model", None)  # positional to `dserve-vllm serve`
+    engine_kwargs, _, extras = split_config(cfg)
+    yaml_model = engine_kwargs.pop("model", None)  # positional to `dserve-vllm serve`
+    base_model = base_model or yaml_model
+    if not base_model:
+        raise SystemExit(f"[launch-tp] no base model: pass --model or set "
+                         f"model.model in {config_path}")
     if tp_override is not None:
         engine_kwargs["tensor_parallel_size"] = int(tp_override)
+    tp = int(engine_kwargs.get("tensor_parallel_size", 1) or 1)
+
+    infer_lora_dir = (extras.get("adapters") or {}).get("lora_path_0")
+    if not infer_lora_dir:
+        raise SystemExit(f"[launch-tp] {config_path} has no adapters.lora_path_0 "
+                         "(the inference adapter to serve)")
+    infer_lora_name = Path(infer_lora_dir).name
+    served_name = served_name or family
 
     vllm_bin = str(Path(sys.executable).parent / "dserve-vllm")
     cmd = [vllm_bin, "serve", base_model]
     cmd += _engine_cli_args(engine_kwargs)
-    cmd += ["--lora-modules", f"{_INFER_LORA_NAME}={_INFER_LORA_DIR}"]
-    # Pass the finetune / debug / slo sections through as CLI flags.
-    cmd += _finetune_cli_args(cfg.get("finetune") or {})
-    cmd += _finetune_cli_args(cfg.get("debug") or {})
-    cmd += _finetune_cli_args(cfg.get("slo") or {})
+    cmd += ["--lora-modules", f"{infer_lora_name}={infer_lora_dir}"]
+    if co:
+        # Pass the finetune / debug / slo sections through as CLI flags.
+        cmd += _finetune_cli_args(cfg.get("finetune") or {})
+        cmd += _finetune_cli_args(cfg.get("debug") or {})
+        cmd += _finetune_cli_args(cfg.get("slo") or {})
+        if bwd_log_path:
+            cmd.append(f"--finetune-config.bwd_log_path={bwd_log_path}")
     cmd += ["--host", "127.0.0.1", "--port", str(port),
-            "--served-model-name", _SERVED_NAME]
-    api_server_count = int((cfg.get("server") or {}).get("api_server_count", 1) or 1)
+            "--served-model-name", served_name]
+    if api_server_count is None:
+        api_server_count = int((cfg.get("server") or {}).get("api_server_count", 1) or 1)
     if api_server_count > 1:
         cmd += ["--api-server-count", str(api_server_count)]
-    return cmd, cfg
+    return LaunchSpec(cmd=cmd, cfg=cfg, tp=tp, family=family,
+                      served_name=served_name, base_model=base_model,
+                      infer_lora_name=infer_lora_name,
+                      infer_lora_dir=str(infer_lora_dir))
+
+
+def add_launch_args(ap: argparse.ArgumentParser) -> None:
+    """The family / config / model / port / tp flags shared by the eval-tp drivers."""
+    ap.add_argument("--family", choices=sorted(PRESETS), default=DEFAULT_FAMILY,
+                    help="Model family preset: picks the default YAML, the served "
+                         "model name and the output-file tag (default: %(default)s)")
+    ap.add_argument("--config", default=None,
+                    help="Serving YAML (default: the family preset's YAML)")
+    ap.add_argument("--model", default=None,
+                    help="Base model id/path (default: the YAML's model.model)")
+    ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--tp", type=int, default=None,
+                    help="Override tensor_parallel_size from the YAML.")
+
+
+def resolve_launch(args: argparse.Namespace, **kwargs) -> LaunchSpec:
+    """``build_server_cmd`` from the shared CLI flags (+ builder kwargs such as
+    ``co`` / ``bwd_log_path`` / ``api_server_count``)."""
+    config = args.config or str(PRESETS[args.family])
+    return build_server_cmd(config, args.port, args.model, args.tp,
+                            family=args.family, **kwargs)
 
 
 def wait_for_health(server: str, max_wait_s: float, proc: subprocess.Popen) -> bool:
@@ -156,13 +233,7 @@ def terminate(proc: subprocess.Popen) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--config", default=str(_DEFAULT_CONFIG),
-                    help="Serving YAML (default: configs/serving_config_finetuning_llama3_tp2.yaml)")
-    ap.add_argument("--model", default=_BASE_MODEL_DEFAULT,
-                    help="Base model id/path (default: %(default)s)")
-    ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--tp", type=int, default=None,
-                    help="Override tensor_parallel_size from the YAML.")
+    add_launch_args(ap)
     ap.add_argument("--hf-home", default=None,
                     help=f"HF cache root (sets HF_HOME; default {_HF_HOME_DEFAULT}).")
     ap.add_argument("--startup-timeout", type=float, default=600.0)
@@ -174,12 +245,14 @@ def main() -> int:
                     help="Print the resolved server command and exit (no launch).")
     args = ap.parse_args()
 
-    cmd, cfg = build_server_cmd(args.config, args.port, args.model, args.tp)
-    tp = args.tp if args.tp is not None else int(
-        (cfg.get("parallel") or {}).get("tensor_parallel_size", 1) or 1)
+    spec = resolve_launch(args)
+    cmd = spec.cmd
 
-    print(f"[launch-tp] config          = {args.config}", flush=True)
-    print(f"[launch-tp] tensor_parallel = {tp}", flush=True)
+    print(f"[launch-tp] family          = {spec.family} (served as {spec.served_name})", flush=True)
+    print(f"[launch-tp] config          = {args.config or PRESETS[args.family]}", flush=True)
+    print(f"[launch-tp] base model      = {spec.base_model}", flush=True)
+    print(f"[launch-tp] inference LoRA  = {spec.infer_lora_name} ({spec.infer_lora_dir})", flush=True)
+    print(f"[launch-tp] tensor_parallel = {spec.tp}", flush=True)
     print(f"[launch-tp] server cmd      = {' '.join(cmd)}", flush=True)
 
     if args.dry_run:

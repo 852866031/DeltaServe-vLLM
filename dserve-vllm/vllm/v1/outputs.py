@@ -279,6 +279,14 @@ class ModelRunnerOutput:
     # reaches WORKERS) so the EngineCore scheduler — a different process/coord
     # under TP — learns FT admission was opened. None for tp=1 (no relay).
     finetune_ft_started: bool | None = None
+    # [DeltaServe] Phase 7 / M4.2: per-step timing samples for the SLO
+    # estimator, relayed from the worker's coordinator queue (the runner's
+    # CUDA-event ring pushes ``(StepFeatures, duration_s, was_graph, predicted)``
+    # there). The EngineCore scheduler pushes them into ITS coordinator so the
+    # tracker / refit / validation path runs exactly as on a single GPU. Each
+    # entry describes a step ~4 steps older than this output (ring latency).
+    # None when the queue was empty / TP=1 (no relay).
+    finetune_timing: list[tuple] | None = None
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None

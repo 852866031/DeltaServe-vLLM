@@ -252,6 +252,13 @@ class SchedulerOutput:
     # → each fires its own child. None on ordinary steps / TP=1.
     finetune_backward_trigger: dict | None = None
 
+    # [DeltaServe] Phase 7 / M4.2: whether the runner should record this step's
+    # measured duration for the SLO estimator. Stamped per step from the
+    # scheduler-side coordinator's ``record_timing`` (False during the profiling
+    # pass's warmup shapes) so the gate reaches the worker under TP, where the
+    # worker's own coordinator never sees the scheduler's flag.
+    finetune_record_timing: bool = True
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

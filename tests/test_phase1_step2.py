@@ -63,8 +63,8 @@ def main():
     green("MPS env applied to CHILD only:")
     check(f"child inherited {_MPS_ENV}={_TEST_PCT}",
           ready.get("mps_percentage") == str(_TEST_PCT))
-    check(f"child inherited {_MAX_CONN_ENV}=1",
-          ready.get("max_connections") == "1")
+    check(f"child NOT pinned to one hw queue ({_MAX_CONN_ENV} unset — M4.3)",
+          ready.get("max_connections") is None)
     check(f"parent {_MPS_ENV} restored (not leaked)",
           os.environ.get(_MPS_ENV) == prev_mps)
     check(f"parent {_MAX_CONN_ENV} restored (not leaked)",

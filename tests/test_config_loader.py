@@ -55,7 +55,7 @@ def test_loads_and_maps():
     engine_args, extras = engine_args_from_yaml(_CONFIG)
 
     passthrough = ("server", "adapters")
-    special = ("finetune", "debug", *passthrough)
+    special = ("finetune", "debug", "slo", *passthrough)  # slo folds into FinetuneConfig too
 
     # finetune + debug sections -> FinetuneConfig attributes (debug is folded in)
     ft = engine_args.finetune_config

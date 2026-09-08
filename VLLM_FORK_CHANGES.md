@@ -50,9 +50,17 @@ Two kinds of change:
 | Eng obs — per-batch lifecycle trace + ms bwd-log timestamps | — | `config/finetune.py`* (`print_scheduler_add`, `print_engine_batch_exec`, `print_engine_batch_done`, `print_engine_req_recv` — independent gates for the per-batch lifecycle prints; `print_step_mode` becomes a convenience master switch for all four), `deltaserve/coordinator.py`* (`_write_bwd_log_row` uses `isoformat(timespec="milliseconds")`), `v1/engine/core.py`* (`_classify_batch_for_log` decode-only / zero-token gate; `_maybe_log_batch_scheduled` after `schedule()` + `_maybe_log_batch_done` after `future.result()`; engine-recv print gate switched to OR of `print_engine_req_recv | print_step_mode`), `v1/worker/gpu_model_runner.py` (`_log_finetuning_batch` gate switched to OR of `print_engine_batch_exec | print_step_mode`) |
 | P5.4 — forward-recompute CUDA graph (per-layer; 3rd captured region) | — | `deltaserve/bwd_services/llama3_graph.py`* (new `_forward_core` + `_padded_attn_forward_core` + `_capture_forward` + `stage_forward_inputs` + `forward` + `cache_views` methods on `Llama3GraphedBackward`; new static IO `static_layer_in/cos/sin/saved_gate_up/x_norm1/qh_flat/kh_flat/vh_flat/ctx_flat`; `prepare()` pre-captures L=32 forward graphs; `begin_backward()` stages `cos/sin` once per backward; `fwd_failed: set[int]` mirrors `ffn_failed`), `deltaserve/bwd_services/llama3.py`* (`process_backward` per-layer loop routes through `graph_runner.forward(...)` when `_attn_fit` AND `saved_gu` is present; eager `layer_forward(...)` fallback otherwise; layer_forward arg list unchanged in this stage), `config/finetune.py`* (docstring on `backward_cuda_graph` updated to "forward + FFN-bwd + attn-bwd" coverage), `tests/test_llama3_backward_graph.py` (new `test_forward_graph_parity` + `test_forward_overflow_fallback`: 45 new assertions, parity bit-identical to eager `layer_forward`) |
 | P5.5 (F1) — save post-RoPE qh/kh/vh per layer | — | `config/finetune.py`* (new `save_attn_qkv: bool = False` opt-in field), `deltaserve/accumulate.py`* (auto-detect `self_attn.attn` modules per layer; allocate `attn_qh [s_max, q_size]` + `attn_kh/vh [s_max, kv_size]` per layer; new `_make_attn_qkv_pre_hook` reads `args=(q, k, v)` post-RoPE; `zero_offset_range` extended; new `q_size`/`kv_size`/`save_attn_qkv` constructor args), `deltaserve/bwd_services/llama3.py`* (`_build_state` reads `meta["save_attn_qkv"]` → `self.save_attn_qkv`; `layer_forward` accepts `saved_qh/kh/vh` and short-circuits Q/K/V proj + RoPE; `process_backward` extracts saved q/k/v per layer and threads through both paths), `deltaserve/bwd_services/llama3_graph.py`* (`save_attn_qkv` mode flag; new `static_saved_qh/kh/vh` IO; `_forward_core` branches on the mode flag to read from the saved buffers instead of computing Q/K/V/RoPE; `stage_forward_inputs` + `forward` signatures extended with `saved_qh/kh/vh` kwargs), `v1/worker/gpu_worker.py` (derive `q_size = num_heads * head_dim`, `kv_size = num_kv_heads * head_dim`; pass through to `FinetuneAccumulator`; add `save_attn_qkv` to the shared `meta` dict so the backward subprocess knows the mode), `tests/test_llama3_backward_graph.py`* (new `test_layer_forward_saved_qkv_parity` + `test_forward_graph_saved_qkv_parity`: 45 new assertions, parity vs the recompute path) |
+| P5.6 — save the post-attention residual per layer (`save_resid_mid`) | `tests/test_accumulate_hooks.py` | `config/finetune.py`* (new `save_resid_mid: bool = False`), `deltaserve/ft_meta.py`* (meta key), `deltaserve/accumulate.py`* (`_POST_LN_SUFFIX`; `post_attention_layernorm` discovery; per-layer `resid_mid` buffers registered with the existing fused add-norm `_make_pre_hook`; `buffers["resid_mid"]`; `zero_offset_range`), `v1/worker/gpu_worker.py`* (passes the flag), `deltaserve/bwd_services/common/trainer.py`* (mirror flag; `saved_resid_mid=` threaded per layer), `deltaserve/bwd_services/{llama3,qwen3}.py`* (`layer_forward(saved_resid_mid=)` skips O-proj + reduce + residual add; `graph_forward_core` skips step 5 in the mode), `deltaserve/bwd_services/common/graph.py`* (`save_resid_mid` mode; staged straight into `static_resid_mid`; `_forward_needs_reduce`; tail captured with the core when no reduce is needed; eager fallback on a missing saved residual), `tests/test_{llama3,qwen3}_backward_graph.py`* (parity tests), `tests/test_tp_{backward,trainer}_graph_nccl.py`* (save mode + per-layer collective counts), `configs/*.yaml`* (`save_resid_mid: true`) |
 | UnifiedFT — `slo.coserving_admission_phase: both` scheduler | `deltaserve/ft_scheduler_both.py`, `configs/serving_config_finetuning_llama3_both.yaml`, `eval/auto_plot_schedulers.py` | `config/finetune.py`* (new `coserving_admission_phase: str = "prefill"` + `decode_only_ft_safety_margin: float = 0.7` fields under the `slo:` YAML section), `config/vllm.py`* (branch `scheduler_cls` on the phase in `__post_init__`; soft-fall to `"prefill"` with `logger.warning` when `phase=="both"` AND `ft_tokens_admission_constrain_factor != -1`), `deltaserve/ft_scheduler.py`* (extract the FT admission gate to a new `_initial_ft_budget(feats, earliest_arrival)` hook so subclasses can override the `decode_only → 0` short-circuit cleanly), `eval/auto_benchmark.py`* (new `--scheduler {prefill,both}` CLI arg → maps to the corresponding YAML via `_SCHED_CONFIGS`; new `_phase_tag(cfg)` helper reads `slo.coserving_admission_phase` from the loaded YAML; output suffix scheme extended to `_co_factor_<X>_phase_<Y>_<mode>`; `_load_yaml_cfg(config_path)` + `build_server_cmd(..., config_path)` take an explicit path arg), `eval/auto_plot.py`* (drop the E2E latency percentile panel; figure shrinks to a single-row 4-panel layout) |
 
 | P7 — TP=2 co-serving finetuning (M1-M4.1) | `configs/serving_config_finetuning_llama3_tp2.yaml`, `tests/test_llama3_tp_shard.py`, `tests/test_llama3_tp_backward_gloo.py`, `eval-tp/{launch_deltaserve,ft_bench_tp}.py` | `v1/executor/multiproc_executor.py` (**new file for the fork** — non-daemon workers when finetuning + `PR_SET_PDEATHSIG` + lethal death-pipe monitor), `v1/outputs.py` (**new file for the fork** — worker→scheduler relay fields), `v1/core/sched/output.py` (`finetune_backward_trigger` broadcast), `v1/worker/gpu_worker.py` (tp geometry in `meta`, lm_head all-gather, local accumulator widths, `relay_mode`), `v1/worker/gpu_model_runner.py` (relay stash / `execute_trigger` / ack poll), `deltaserve/bwd_services/llama3.py`* (local dims, `lora_shard_slice`, backward NCCL group, the per-layer all-reduces, graph force-off under TP), `deltaserve/bwd_services/base.py`* (child `PR_SET_PDEATHSIG`), `deltaserve/coordinator.py`* (relay mode), `deltaserve/ft_scheduler.py`* (relay wiring), `deltaserve/backward_process.py`* (daemon-guard message) |
+| P8 — Qwen3 family + backward-service restructure | `deltaserve/bwd_services/common/{__init__,ops,attention,ffn,head,tp,family,trainer,graph}.py` (`graph.py` = `git mv` of `llama3_graph.py`), `deltaserve/bwd_services/{registry,qwen3}.py` (qwen3 incl. its `graph_forward_core`; `common/graph.py` gained `static_q_pre`/`static_k_pre`), `deltaserve/ft_meta.py`, `tests/test_qwen3_backward_graph.py`, `configs/serving_config_finetuning_qwen3_{14b_tp2,0.6b}.yaml`, `tests/bwd_harness.py`, `tests/test_qwen3_{backward,tp_shard,tp_backward_gloo,train_overfit}.py`, `scripts/{toy_adapters,init_adapters_qwen3}.py`, `adapters/qwen3-{14b,0.6b}-toy-lora{,-ft}` | `deltaserve/bwd_services/llama3.py`* (now only the Llama-3 layer math + `LLAMA3` + a 5-line service), `deltaserve/bwd_services/base.py`* (`get_service` → registry shim; `is_trainer` class attr), `deltaserve/bwd_services/__init__.py`*, `config/vllm.py`* (finetuning listed as unsupported on the v2 model runner), `v1/worker/gpu_worker.py`* (publish gate via `registry.is_trainer`; `meta` via `ft_meta.build_backward_meta`; `rope_theta` fix; `effective_save_attn_qkv`), `eval-tp/{launch_deltaserve,ft_bench_tp}.py`* (`--family` presets, YAML-derived model/adapter, per-family output names), `tests/test_llama3_*.py`* (import paths; overfit test repaired), `scripts/init_adapters_llama3.py`* (thin wrapper over `toy_adapters.py`) |
+| P7 / M4.2 — SLO estimator + all-rank backward ack under TP | `tests/test_tp_timing_relay.py` | `v1/outputs.py`* (`finetune_timing`), `v1/core/sched/output.py`* (`finetune_record_timing`), `v1/worker/gpu_model_runner.py`* (timing ring: per-step record gate + actual `was_graph`; `sample_tokens` relays the timing queue; `_ft_relay_backward_done` MIN-all-reduce over the TP `cpu_group`), `deltaserve/ft_scheduler.py`* (stamp gate; push relayed samples), `deltaserve/coordinator.py`* (`relay_backward_outstanding` / `poll_own_backward_ack` / `take_relay_ack`; bwd-log header also on an empty file), `deltaserve/bwd_services/base.py`* (cycle-time event read restored), `v1/worker/gpu_model_runner.py`* also relays on the idle 0-token early return via `_ft_fill_relay_fields` (FT stalled through idle valleys without it), `configs/serving_config_finetuning_{llama3_tp2,qwen3_14b_tp2}.yaml`* (`profile_on_launch: true`; qwen3 `ttft_slo 0.4`) |
+| P7 / M5 — backward CUDA graphs under TP | `tests/test_tp_backward_graph_nccl.py`, `tests/test_tp_trainer_graph_nccl.py` | `deltaserve/bwd_services/common/graph.py`* (new `static_o`; new `forward_tail()` = residual add + gate/up split; `_forward_core` captures family core + tail at tp=1 — capture count and tp=1 values unchanged; under TP `forward()` replays the core, all-reduces `static_o[:n]` eagerly, then runs the tail; the eager fallback inside `forward()` now passes `all_reduce`), `deltaserve/bwd_services/{llama3,qwen3}.py`* (`graph_forward_core` ends at `static_o`; `layer_backward_graphed(..., all_reduce=None)` issues the six backward reduces at the same points as `layer_backward` — they were absent before), `deltaserve/bwd_services/common/trainer.py`* (the `tp_size > 1` force-eager branch removed; the loop passes `self._all_reduce` to the graphed backward), `deltaserve/bwd_services/common/family.py`* (contract docstrings), `config/finetune.py`* (docstring), `configs/serving_config_finetuning_{llama3_tp2,qwen3_14b_tp2}.yaml`* (comments) |
+| P7 — corpus-meta relay (`N/?` meter fix) | — | `deltaserve/coordinator.py`* (`corpus_total_tokens`; the relayed trigger command carries `total_tokens_per_epoch`; `execute_trigger` forwards it to the child once via `set_corpus_meta` before `notify_buffer_full`), `deltaserve/ft_scheduler.py`* (stores the total on the coordinator in addition to the tp=1 direct send), `tests/test_tp_timing_relay.py`* (`test_corpus_meta_relay`) |
+| P8.1 — exact `save_attn_qkv` for Qwen3 (pre-norm q/k) | — | `deltaserve/bwd_services/common/family.py`* (`saved_qkv_pre_transform`), `deltaserve/bwd_services/qwen3.py`* (`supports_saved_qkv` back to True + `saved_qkv_pre_transform=True`; `layer_forward(saved_qh/kh=pre-norm)` re-applies norm + RoPE and keeps `q_pre`/`k_pre`; `graph_forward_core` skips the Q/K/V GEMM in the mode), `deltaserve/ft_meta.py`* (`saved_qkv_pre_transform(arch)`), `deltaserve/accumulate.py`* (`_Q_NORM_SUFFIX`/`_K_NORM_SUFFIX` discovery; `attn_qkv_pre_transform` ctor flag; `_make_arg_pre_hook`; q/k from the norm inputs, v from the attn pre-hook; self-disables when the norm modules are missing), `v1/worker/gpu_worker.py`* (passes the stage flag), `config/finetune.py`* (docstring), `tests/test_qwen3_backward.py`* (refusal test → exactness test), `tests/test_qwen3_backward_graph.py`* (`test_saved_qkv_pre_norm`), `tests/test_accumulate_hooks.py`* (Qwen-style fake), `tests/test_tp_backward_graph_nccl.py`* (`save_all` mode), `configs/serving_config_finetuning_{qwen3_14b_tp2,qwen3_0.6b,llama3_tp2}.yaml`* (all three saves on) |
+| P5.7 — LM-head restructure | — | `deltaserve/bwd_services/common/head.py`* (`head_backward` batches every sample's predicting rows into one fp32 GEMM per vocab chunk and converts each bf16 head chunk once per pass — was per sample; explicit fp32 upcast of the normed rows; `logits_chunked` kept as a helper) |
+| P7 / M4.3 — gradient bucketing + comm stream + rank-symmetric clip | `tests/test_tp_bucket_gloo.py` | `deltaserve/bwd_services/common/tp.py`* (`REPLICATED_FACTORS`/`SHARDED_FACTORS`, `BUCKET_LAYERS`, `CommQueue`, `FactorBucket`, `clip_layers_symmetric_`), `deltaserve/bwd_services/common/trainer.py`* (builds the bucket + queue at tp>1; `reduce_factors=False`; stash / submit per group; `wait` → replicated grads to the masters → symmetric clip → step; tp=1 path unchanged), `deltaserve/bwd_services/{llama3,qwen3}.py`* (`reduce_factors=` kwarg on both backward entry points), `deltaserve/backward_process.py`* (no longer sets `CUDA_DEVICE_MAX_CONNECTIONS=1` on the child), `tests/test_tp_trainer_graph_nccl.py`* (rewritten: 5 modes incl. sync/delay bit-identity, clip on, collective counts), `tests/test_phase1_step2.py`* |
 
 `*` = same file extended in a later stage.
 
@@ -481,6 +489,58 @@ qualname string in `config/vllm.py.__post_init__`. Soft-fall to
 
 ---
 
+### `vllm/deltaserve/bwd_services/common/` — the family-agnostic LoRA-SFT trainer stack (P8)
+**Function:** everything the trained families share, split out of the old 1000-line
+`llama3.py`: `ops.py` (RoPE / RMSNorm / LoRA projection + backwards), `attention.py`
+(`attn_forward_core` — the per-sample GQA loop, extracted — and `attn_backward_core`),
+`ffn.py` (`ffn_forward_tail`, `ffn_backward_core`), `head.py` (`head_backward`,
+`logits_chunked`), `tp.py` (`lora_shard_slice`, `init_backward_tp_group`,
+`reduce_partial` — the residual-aware "reduce only the partial" helper), `family.py`
+(the `Family` record: layer functions, frozen per-layer weight map, graph hooks,
+`supports_saved_qkv`), `trainer.py` (`LoraSftTrainerService`: `_build_state` builds
+`self.base[i]` from `family.layer_weights` — fused `qkv`/`gate_up` sliced by local widths,
+everything else copied verbatim, so Qwen3's `q_norm`/`k_norm` arrive with no family code;
+reads `meta["lm_head_key"]` so tied-embedding models work; binds the family's layer
+functions once; `process_backward`, `_publish_to_served`, DIAG, verify), `graph.py`
+(`GraphedBackward`, the `git mv` of `llama3_graph.py`: the captureable forward is the
+family's `graph_forward_core(runner, lw)` — `None` → forward eager, FFN/attn graphs still
+captured; `static_ctx_flat` is `[s, q_size]`, not `[s, hidden]`). Pure moves: Llama-3 numerics
+are bit-identical (all five Llama gates re-pass); `q_size` replaces the old `D = Hq*Hd`
+conflation so `head_dim*num_heads != hidden` models (Qwen3-0.6B) work.
+**Used by:** `bwd_services/llama3.py`, `bwd_services/qwen3.py`, `tests/bwd_harness.py`, all `tests/test_{llama3,qwen3}_*.py`.
+
+### `vllm/deltaserve/bwd_services/qwen3.py` — Qwen3 family (P8)
+**Function:** the Qwen3 layer math: `layer_forward` / `layer_backward` /
+`layer_backward_graphed` composed from `common/*` like Llama-3's, plus the per-head
+`q_norm`/`k_norm` (`rmsnorm` on `[n,H,Hd]`) between the projection and RoPE in the forward
+and the fp32 `rmsnorm_backward` between the RoPE backward and the q/k projection backward;
+the cache carries the pre-norm `q_pre`/`k_pre`. `LAYER_WEIGHTS` = the shared map +
+`self_attn.{q,k}_norm.weight`. `graph_forward_core` (the captureable forward with the norm between projection and RoPE; writes the
+runner's `static_q_pre`/`static_k_pre` for the backward tail — `common/graph.py` allocates them and
+`cache_views` exposes them). `QWEN3 = Family(..., supports_saved_qkv=False)` (the `self_attn.attn`
+hook captures post-norm q/k, so the saved-qkv shortcut is not exact → the trainer recomputes);
+`Qwen3BackwardService(LoraSftTrainerService)`. Graph parity in `tests/test_qwen3_backward_graph.py`.
+No new TP collective (the norm is per-head). Gradchecked in `tests/test_qwen3_backward.py`.
+**Used by:** `bwd_services/registry.py` (`Qwen3ForCausalLM` / `qwen3`).
+
+### `vllm/deltaserve/bwd_services/registry.py` — arch → service (P8)
+**Function:** `_SERVICES` maps HF architecture strings + aliases to `"module:Class"`
+(lazy import — a child only loads its own family); `get_service`, `is_trainer`
+(class-attribute query, False for unknown names), `get_family`, `supported_names`.
+`base.get_service` is a shim over it (the family modules import `base`).
+**Used by:** `bwd_services/base.py`, `v1/worker/gpu_worker.py` (`_maybe_share_ft_served_lora` gate), `deltaserve/ft_meta.py`.
+
+### `vllm/deltaserve/ft_meta.py` — the backward `meta` dict (P8)
+**Function:** `build_backward_meta(hf_config, ft_cfg, ...)` — the single producer of the
+dict `BackwardProcess.share_weights` ships to the child (model dims, weight keys,
+optimizer + backward flags, TP geometry), moved out of the worker; `rope_theta_of`
+(**bug fix**: reads `hf_config.rope_parameters["rope_theta"]` first — under transformers
+5.x the top-level attribute is gone and the old `getattr(..., 10000.0)` silently fed
+theta=10000 to every backward remat; Llama-3 is 5e5, Qwen3 1e6); `read_lora_scaling`
+(alpha/r from `adapter_config.json`); `effective_save_attn_qkv` (off when the family cannot
+consume the saved q/k, so the accumulator does not allocate them).
+**Used by:** `v1/worker/gpu_worker.py`.
+
 ## MODIFIED upstream files
 
 ### `vllm/config/__init__.py`
@@ -494,6 +554,11 @@ Stage 1. Import + `__all__`-export `FinetuneConfig`.
   originally forced `async_scheduling = False`; **P4b made async the default** for
   co-serving — only set `async_scheduling = True` when it's still `None`, made safe by
   reserve-at-inject buffer accounting.)
+- Stage P8: `_get_v2_model_runner_unsupported_features` appends
+  `"DeltaServe co-serving finetuning"` when `finetune_config.enable_finetuning` — all FT
+  hooks live in the v1 runner, so every finetuning run (incl. `Qwen3ForCausalLM`, the one
+  default-v2 arch) is routed to v1 via the upstream mechanism, and an explicit
+  `VLLM_USE_V2_MODEL_RUNNER=1` fails loudly in `_validate_v2_model_runner`.
 
 ### `vllm/engine/arg_utils.py`
 Stage 1. `EngineArgs` gets a `finetune_config` field, a `--finetune-config` CLI arg,
@@ -523,6 +588,9 @@ here because `SchedulerOutput` is the only object BROADCAST from EngineCore to e
 worker each step — and the broadcast is load-bearing: it is what makes both ranks fire
 the same step, without which the per-layer NCCL all-reduces deadlock. `None` on ordinary
 steps and for tp=1.
+- Stage P7 / M4.2: `finetune_record_timing: bool = True` — per-step record gate for the
+  runner's timing ring (the profiling pass's warmup/recorded switch), stamped by the
+  scheduler so it reaches the worker under TP.
 
 ### `vllm/v1/worker/gpu_worker.py`
 - Stage 1: `dprint` the `enable_finetuning` flag at the end of `init_device()`
@@ -564,6 +632,12 @@ steps and for tp=1.
   `q//tp`, `kv//tp`) to match the TP-sharded module-hook outputs, while the
   residual-stream buffers (`layer_in`, `final_*`) stay full `hidden_size`; it also sets
   `coordinator.relay_mode = tp_size > 1`. Every one of these is an identity at tp=1.
+- Stage P8 (generic, no family branches): `_maybe_share_finetuning_weights` builds
+  `meta` via `ft_meta.build_backward_meta` (+ `read_lora_scaling`) instead of an inline
+  dict — this is also where the `rope_theta` bug fix lands; `_maybe_share_ft_served_lora`
+  gates on `bwd_services.is_trainer(arch)` instead of `arch == "LlamaForCausalLM"`;
+  `_maybe_setup_finetuning_accumulator` passes
+  `save_attn_qkv=ft_meta.effective_save_attn_qkv(arch, ft_cfg)`.
 
 ### `vllm/v1/worker/gpu_model_runner.py`
 Stage P2.2. Add `_build_finetune_mask` (per-token bool mask in `InputBatch.req_ids`
@@ -601,6 +675,16 @@ can scope its cross-process visibility wait to just the capture, not the whole d
   That last one lives in `sample_tokens` because the same `output` object is returned by
   the sync path *and* wrapped by `AsyncGPUModelRunnerOutput`, so setting it there covers
   both.
+- Stage P7 / M4.2: the timing ring's owner tuple carries the stamped
+  `finetune_record_timing` (fallback: the local coordinator flag) and the CUDA-graph mode the
+  step actually ran with (pushed as `was_graph`); `sample_tokens` (relay branch) drains the
+  coordinator's timing queue onto `output.finetune_timing` and relays the backward ack via
+  `_ft_relay_backward_done` — own-child poll + MIN all-reduce of a done flag over
+  `get_tp_group().cpu_group` (gloo, no GPU sync, only while a backward is outstanding) so
+  the ack is relayed only once every rank's child is done. The relay fields are filled by
+  `_ft_fill_relay_fields` on BOTH `sample_tokens` outputs and `execute_model`'s idle
+  (0-token) early return — the latter is what the scheduler sees while a backward is
+  outstanding with no inference in flight.
 
 ### `vllm/v1/executor/multiproc_executor.py`
 Stage P7 (TP). Previously untouched by the fork — TP>1 is the first time the multiproc
@@ -640,6 +724,9 @@ admission but not the backward IPC handle:
   without this mirror the EngineCore scheduler never learns FT admission was opened.
 
 All three are `None` for tp=1 (relay mode off).
+- Stage P7 / M4.2: `finetune_timing: list[tuple] | None` — the worker's completed
+  `(StepFeatures, duration_s, was_graph, predicted)` timing samples, drained onto the
+  output every `sample_tokens` so the EngineCore scheduler's estimator sees them under TP.
 
 ### `vllm/v1/engine/core.py`
 Stage P4d: in `EngineCore._handle_client_request` (ADD branch), gated on `print_step_mode`,
@@ -653,6 +740,13 @@ arrival at the engine). No other engine-loop changes.
 | Path | Role |
 |---|---|
 | `configs/serving_config_finetuning_{opt,llama3}.yaml` | sectioned config consumed by the loader |
+| `configs/serving_config_finetuning_qwen3_{14b_tp2,0.6b}.yaml` | P8: Qwen3-14B TP=2 co-serving config (bring-up flags as the Llama TP=2 one; `gpu_memory_utilization 0.80`) and the Qwen3-0.6B single-GPU smoke config |
+| `scripts/toy_adapters.py`, `scripts/init_adapters_{llama3,qwen3}.py` | P8: shared toy-adapter trainer (rank-16 q/k/v/o LoRA, inference + `-ft` copy) with thin per-family entry points; `init_adapters_qwen3.py --size {14b,0.6b}` |
+| `tests/bwd_harness.py`, `tests/test_qwen3_{backward,tp_shard,tp_backward_gloo,train_overfit}.py` | P8: family-parametrized test harness (weights in the `lw` layout, TP sharding, autograd refs, synthetic trainer) + the Qwen3 gates (16/16, 42/42, 10/10, overfit) |
+| `eval-tp/auto_benchmark_tp.py` | TP timeline benchmark: `eval/auto_benchmark.py`'s replay / results-CSV / bwd-log-trim helpers + the family-aware launcher (`--family`, `--tp`, `--co`); modes `--loose` / `--tight` / `--nutanix` / `--nutanix-600-800` from `eval/timelines/5090/`; outputs `timeline_results_<family>_tp<N>[_co_factor_<f>_phase_<p>]_<mode>.csv` + `bwd_log` / `bench_meta` / `server` siblings in `eval-tp/output/` |
+| `eval-tp/auto_plot_tp.py`, `eval-tp/repair_bwd_log.py` | TP plots via `eval/auto_plot.py`'s figure builder (`<mode>_<family>_tp<N>_co_….png`, one colour across modes); bwd-log header/trim repair for logs written before the empty-file header fix |
+| `eval/auto_plot.py`*, `eval/auto_benchmark.py`* | plotter: `make_figure_for_mode(timeline_csv=, infonly_csv=, title=)` overrides, `plot_throughput_curves(ft_on_bottom=True)` (finetune band at the bottom, inference stacked on top — now the default for single-GPU plots too), FT cumulative counter re-based after the window filter (warmup tokens no longer spike the first bin); benchmark: `trim_bwd_log_before` referenced an undefined `cutoff_iso` (NameError at the end of every `--co` run) — fixed |
+| `eval-tp/{launch_deltaserve,ft_bench_tp}.py` | P8: `--family {llama3,qwen3-14b,qwen3-0.6b}` presets (default `llama3`); base model from the YAML's `model.model`, inference adapter from `adapters.lora_path_0`, served name = family; outputs `bwd_log_{family}_tp{N}.csv` / `server_{family}_tp{N}.log` |
 | `scripts/launch_deltaserve.py` | offline launcher: YAML → `LLM`, serves via inference adapter |
 | `scripts/ft_experiment_{opt,llama3}.py` | co-serving harness: launches a real `vllm serve` HTTP server with finetuning, fires a completion every 1s ×N, then shuts it down (server stdout streams the decision logs) |
 | `scripts/train_opt125m_lora.py` | trains the opt-125m toy LoRA adapters |

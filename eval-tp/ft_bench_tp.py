@@ -42,8 +42,7 @@ _ROOT = _HERE.parent
 sys.path.insert(0, str(_HERE))                   # import launch_deltaserve (same dir)
 
 from launch_deltaserve import (  # noqa: E402
-    _DEFAULT_CONFIG, _SERVED_NAME, _BASE_MODEL_DEFAULT, _HF_HOME_DEFAULT,
-    build_server_cmd, terminate,
+    _HF_HOME_DEFAULT, PRESETS, add_launch_args, resolve_launch, terminate,
 )
 
 OUTPUT_DIR = _HERE / "output"
@@ -82,13 +81,13 @@ async def start_finetuning(server: str) -> bool:
         return False
 
 
-async def _one_request(session, server, idx):
+async def _one_request(session, server, idx, served_name):
     prompt = f"Summarize in one sentence (req {idx}): the quick brown fox " \
              f"jumps over the lazy dog and then keeps running for a while."
     try:
         async with session.post(
             f"{server}/v1/completions",
-            json={"model": _SERVED_NAME, "prompt": prompt, "max_tokens": 8,
+            json={"model": served_name, "prompt": prompt, "max_tokens": 8,
                   "temperature": 0.0},
             timeout=30,
         ) as r:
@@ -99,7 +98,7 @@ async def _one_request(session, server, idx):
 
 
 async def drive_traffic(server: str, duration_s: float, rps: float,
-                        stop: asyncio.Event) -> tuple[int, int]:
+                        stop: asyncio.Event, served_name: str) -> tuple[int, int]:
     """Fire ~rps requests/s for duration_s. Returns (sent, ok)."""
     sent = ok = 0
     interval = 1.0 / max(rps, 0.1)
@@ -107,7 +106,7 @@ async def drive_traffic(server: str, duration_s: float, rps: float,
     inflight: set = set()
     async with aiohttp.ClientSession() as session:
         while time.monotonic() - t0 < duration_s and not stop.is_set():
-            t = asyncio.create_task(_one_request(session, server, sent))
+            t = asyncio.create_task(_one_request(session, server, sent, served_name))
             inflight.add(t)
             t.add_done_callback(inflight.discard)
             sent += 1
@@ -245,10 +244,7 @@ def summarize(server_log: str, sent: int, ok: int, tp: int,
 async def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--config", default=str(_DEFAULT_CONFIG))
-    ap.add_argument("--model", default=_BASE_MODEL_DEFAULT)
-    ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--tp", type=int, default=None, help="Override tensor_parallel_size.")
+    add_launch_args(ap)
     ap.add_argument("--duration", type=float, default=60.0)
     ap.add_argument("--rps", type=float, default=4.0, help="Inference requests/s.")
     ap.add_argument("--hf-home", default=None)
@@ -260,19 +256,25 @@ async def main() -> int:
     args = ap.parse_args()
 
     OUTPUT_DIR.mkdir(exist_ok=True)
-    cmd, cfg = build_server_cmd(args.config, args.port, args.model, args.tp)
-    tp = args.tp if args.tp is not None else int(
-        (cfg.get("parallel") or {}).get("tensor_parallel_size", 1) or 1)
-    # Per-TP filenames so a tp=1 control and a tp=2 run never overwrite or
-    # append into each other, and TRUNCATE the bwd log up front: the server
-    # opens it in APPEND mode, so without this each run silently concatenates
-    # onto the previous one's rows (and total_processed_tokens keeps climbing).
-    bwd_log = str(OUTPUT_DIR / f"bwd_log_tp{tp}.csv")
-    server_log = str(OUTPUT_DIR / f"server_tp{tp}.log")
+    # The bwd log path depends on the family + tp the launch resolves to, so
+    # resolve once for the names, then build the real command with the path.
+    spec = resolve_launch(args)
+    # Per-family, per-TP filenames so a tp=1 control and a tp=2 run (or two
+    # families) never overwrite or append into each other, and TRUNCATE the
+    # bwd log up front: the server opens it in APPEND mode, so without this
+    # each run silently concatenates onto the previous one's rows (and
+    # total_processed_tokens keeps climbing).
+    tp = spec.tp
+    bwd_log = str(OUTPUT_DIR / f"bwd_log_{spec.family}_tp{tp}.csv")
+    server_log = str(OUTPUT_DIR / f"server_{spec.family}_tp{tp}.log")
     open(bwd_log, "w").close()
-    cmd.append(f"--finetune-config.bwd_log_path={bwd_log}")
+    spec = resolve_launch(args, bwd_log_path=bwd_log)
+    cmd = spec.cmd
 
-    print(f"[ft-tp] config          = {args.config}", flush=True)
+    print(f"[ft-tp] family          = {spec.family} (served as {spec.served_name})", flush=True)
+    print(f"[ft-tp] config          = {args.config or PRESETS[args.family]}", flush=True)
+    print(f"[ft-tp] base model      = {spec.base_model}", flush=True)
+    print(f"[ft-tp] inference LoRA  = {spec.infer_lora_name}", flush=True)
     print(f"[ft-tp] tensor_parallel = {tp}", flush=True)
     print(f"[ft-tp] server log      = {server_log}", flush=True)
     print(f"[ft-tp] bwd log         = {bwd_log}", flush=True)
@@ -308,7 +310,8 @@ async def main() -> int:
             return 1
         print(f"[ft-tp] driving {args.rps} req/s for {args.duration}s "
               f"(FT rides prefill)…", flush=True)
-        sent, ok = await drive_traffic(server, args.duration, args.rps, stop)
+        sent, ok = await drive_traffic(server, args.duration, args.rps, stop,
+                                       spec.served_name)
         # Give the last in-flight backward a moment to flush its log line.
         await asyncio.sleep(3.0)
         rc = summarize(server_log, sent, ok, tp, bwd_log)

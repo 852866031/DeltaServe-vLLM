@@ -36,6 +36,7 @@ finetune:
   backward_cuda_graph: true
   save_attn_qkv: true
   save_attn_ctx: true               # save attn ctx (o_proj input); skip attention-forward recompute in backward
+  save_resid_mid: true              # save post-attn residual; skip O-proj recompute (only RMSNorm in_ln is recomputed with all three saves)
   # --- Estimator-accuracy validation ---
   validate_estimator: true             # forces async OFF + per-batch CSV append
   # Path is resolved relative to THIS file's dir (configs/), so this lands at

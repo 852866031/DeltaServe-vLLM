@@ -80,11 +80,14 @@ class FinetuneScheduler(AsyncScheduler):
         # One-shot: tell the backward child the FT corpus total token count so
         # it can render a per-epoch progress meter in its per-cycle log.
         # ``backward_process`` is injected on the coordinator by the worker at
-        # init_device time (gpu_worker.py); on a no-FT run it's None and we
-        # skip silently.
+        # init_device time (gpu_worker.py) — on tp=1 send it directly. Under
+        # TP this scheduler-side coordinator has no child, so the value is
+        # kept on the coordinator and rides on the relayed trigger command
+        # (execute_trigger forwards it to each rank's child once).
+        _corpus_total = int(self._ft_injector.store.total_tokens_in_memory)
+        self._coord.corpus_total_tokens = _corpus_total
         if self._coord.backward_process is not None:
-            self._coord.backward_process.set_corpus_meta(
-                int(self._ft_injector.store.total_tokens_in_memory))
+            self._coord.backward_process.set_corpus_meta(_corpus_total)
         # [eval] finetune-throughput log path (written per completed backward).
         self._coord.bwd_log_path = getattr(ft_cfg, "bwd_log_path", None)
         # [DeltaServe] Phase 7 / M4.1: under TP>1 this scheduler-side coordinator
@@ -808,6 +811,8 @@ class FinetuneScheduler(AsyncScheduler):
         # lock-step. None on ordinary steps; inert for tp=1 (relay_mode False).
         if self._coord.relay_mode:
             output.finetune_backward_trigger = self._coord.take_trigger_cmd()
+        # [M4.2] Per-step timing gate for the runner (see SchedulerOutput).
+        output.finetune_record_timing = bool(self._coord.record_timing)
 
         # [Phase 4] Stamp the regime + predicted duration for THIS step now,
         # while all requests are still present and the dispatcher reflects the
@@ -928,6 +933,13 @@ class FinetuneScheduler(AsyncScheduler):
             _started = getattr(model_runner_output, "finetune_ft_started", None)
             if _started is not None and _started and not self._coord.ft_started:
                 self._coord.start_finetuning()
+            # [M4.2] Timing samples the worker's CUDA-event ring completed:
+            # push them into THIS coordinator so the next schedule() drains
+            # them into the tracker / estimator exactly as on a single GPU.
+            _timing = getattr(model_runner_output, "finetune_timing", None)
+            if _timing:
+                for _t in _timing:
+                    self._coord.push_sample(*_t)
             _done = getattr(model_runner_output, "finetune_backward_done", None)
             if _done:
                 self._coord.apply_relayed_done(_done)

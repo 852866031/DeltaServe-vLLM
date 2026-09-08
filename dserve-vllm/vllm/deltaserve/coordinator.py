@@ -132,6 +132,14 @@ class FinetuneCoordinator:
         # single-GPU coordinator behaves exactly as before.
         self.relay_mode = False
         self._pending_trigger_cmd: dict | None = None
+        # Corpus total tokens per epoch (set by the scheduler after
+        # FinetuningStore.load). On tp=1 the scheduler sends it straight to the
+        # child; under relay mode the scheduler coordinator has no child, so
+        # the value rides on every relayed trigger command and the worker
+        # coordinator forwards it to its own child ONCE (the child's per-epoch
+        # progress meter printed ``N/?`` forever before this).
+        self.corpus_total_tokens: int = 0
+        self._corpus_meta_relayed = False
         # [rps_throttle] Sliding-window arrival-rate tracker. Created
         # eagerly with a 1.0s default window so ``note_arrival`` from
         # the engine input-queue drain is always safe to call; the
@@ -245,6 +253,9 @@ class FinetuneCoordinator:
         self._pending_backward_t0: float | None = None
         self._pending_backward_warned = False
         self.pending_backward_warn_s = 5.0
+        # [M4.2] Worker side: this rank's backward ack, held until every rank
+        # reports done (see relay_backward_outstanding / take_relay_ack).
+        self._relay_ack: dict | None = None
 
     def push_sample(self, features, duration, was_graph, predicted) -> None:
         self._completed_samples.append((features, duration, was_graph, predicted))
@@ -579,6 +590,8 @@ class FinetuneCoordinator:
                 "sample_lens": list(self.sample_lens),
                 "epoch": int(self.current_epoch),
                 "sleep_s": float(self.backward_sleep_s),
+                # One int per trigger; the worker forwards it to its child once.
+                "total_tokens_per_epoch": int(self.corpus_total_tokens),
             }
 
     def gpu_pause_backward(self) -> None:
@@ -703,6 +716,13 @@ class FinetuneCoordinator:
         saved activations) then sends the work signal over the child's pipe."""
         if self.backward_process is None or not cmd:
             return
+        # Forward the corpus total to this rank's child the first time it
+        # arrives (pipe sends are ordered, so it lands before the work signal
+        # below and the very first cycle line already shows ``N/total``).
+        total = int(cmd.get("total_tokens_per_epoch", 0) or 0)
+        if total > 0 and not self._corpus_meta_relayed:
+            self.backward_process.set_corpus_meta(total)
+            self._corpus_meta_relayed = True
         if self.fwd_throttle_active:
             self.gpu_pause_backward()
         if self.capture_done_evt is not None:
@@ -718,13 +738,44 @@ class FinetuneCoordinator:
         """Worker side: non-blocking poll of this rank's backward child. Returns
         the ack payload (to relay to the scheduler via ModelRunnerOutput) when
         the backward finished, else None. Does NOT run on_backward_done / commit
-        (that is scheduler-side)."""
-        if not self.pending_backward or self.backward_process is None:
-            return None
-        resp = self.backward_process.poll_response()
-        if resp is None:
-            return None
-        self.pending_backward = False
+        (that is scheduler-side). Single-rank semantics — the runner uses the
+        three-call sequence below instead so the ack is only relayed once EVERY
+        rank's child is done (M4.2 ack-race fix)."""
+        if self.poll_own_backward_ack():
+            return self.take_relay_ack()
+        return None
+
+    # [DeltaServe] Phase 7 / M4.2: the backward ack race. Only ``output_rank``'s
+    # ModelRunnerOutput reaches the scheduler, so relaying this rank's own ack
+    # would reopen admission while the other rank's child may still be
+    # publishing / zeroing buffers. The runner therefore (1) polls its own
+    # child into ``_relay_ack``, (2) all-reduces a "mine is done" flag with MIN
+    # across the TP ranks, and (3) takes + relays the ack only when the reduced
+    # flag says every rank is done — on the same step on every rank, so the
+    # outstanding state clears in lock-step.
+
+    def relay_backward_outstanding(self) -> bool:
+        """Worker side: True while a relayed backward has been fired on this
+        rank and its ack has not yet been handed to the scheduler."""
+        return self.pending_backward or self._relay_ack is not None
+
+    def poll_own_backward_ack(self) -> bool:
+        """Worker side: poll this rank's child once (non-blocking) and stash
+        its ack. Returns True once the ack is held (this rank's backward is
+        done), whether it arrived now or earlier."""
+        if (self._relay_ack is None and self.pending_backward
+                and self.backward_process is not None):
+            resp = self.backward_process.poll_response()
+            if resp is not None:
+                self.pending_backward = False
+                self._relay_ack = resp
+        return self._relay_ack is not None
+
+    def take_relay_ack(self) -> dict | None:
+        """Worker side: hand over the stashed ack (after every rank agreed it
+        is done) and clear the outstanding state."""
+        resp = self._relay_ack
+        self._relay_ack = None
         return resp
 
     def _write_bwd_log_row(self, n: int, loss) -> None:
@@ -739,7 +790,12 @@ class FinetuneCoordinator:
             parent = os.path.dirname(self.bwd_log_path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
-            new_file = not os.path.exists(self.bwd_log_path)
+            # Header on a new OR empty file: the eval drivers truncate the
+            # log at launch (the server appends), which leaves an existing
+            # zero-byte file — without the header the plotter / trimmer
+            # cannot read the rows.
+            new_file = (not os.path.exists(self.bwd_log_path)
+                        or os.path.getsize(self.bwd_log_path) == 0)
             with open(self.bwd_log_path, "a", newline="") as f:
                 w = csv.writer(f)
                 if new_file:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Parity gate for the CUDA-graph backward (Phase 5).
 
-Confirms that ``Llama3GraphedBackward`` (per-layer FFN graph + padded-attention
+Confirms that ``GraphedBackward`` (per-layer FFN graph + padded-attention
 graph) produces gradients bit-identical to the eager core helpers
 (``ffn_backward_core`` + ``attn_backward_core``) over a range of seq_lens at a
 fixed ``s_max`` (max_saved_finetuning_tokens).
@@ -22,9 +22,10 @@ sys.path[:] = [p for p in sys.path
                if os.path.abspath(p or ".") != os.path.dirname(os.path.abspath(__file__))]
 
 from vllm.deltaserve.bwd_services import llama3 as L  # noqa: E402
-from vllm.deltaserve.bwd_services.llama3_graph import (  # noqa: E402
-    Llama3GraphedBackward,
-)
+from vllm.deltaserve.bwd_services.common.attention import attn_backward_core  # noqa: E402
+from vllm.deltaserve.bwd_services.common.ffn import ffn_backward_core  # noqa: E402
+from vllm.deltaserve.bwd_services.common.graph import GraphedBackward  # noqa: E402
+from vllm.deltaserve.bwd_services.common.ops import rope_cos_sin  # noqa: E402
 
 if not torch.cuda.is_available():
     print("CUDA not available — skipping graphed-backward parity test")
@@ -79,7 +80,7 @@ def _mk_svc(D, L_, Hq, Hkv, Hd, inter, eps, mdt, cdt, lws=None,
     runner (LoRA scaling for ``_proj``; RoPE base for cos/sin staging in
     ``begin_backward``)."""
     svc = SimpleNamespace(
-        device_index=0,
+        device_index=0, family=L.LLAMA3,
         D=D, L=L_, Hq=Hq, Hkv=Hkv, Hd=Hd, inter=inter,
         kv_size=Hkv * Hd, eps=eps,
         base_dtype=mdt, bwd_dtype=cdt,
@@ -128,7 +129,7 @@ def test_ffn_graph_parity():
     # runner so its startup prepare() can find them via svc._layer_weights).
     lws = [_make_layer_weights(D, kv_size, inter, r, MDT) for _ in range(L_)]
     svc = _mk_svc(D, L_, Hq, Hkv, Hd, inter, eps, MDT, cdt, lws=lws)
-    runner = Llama3GraphedBackward(svc, s_max=s_max, bn_max=4, l_max=8)
+    runner = GraphedBackward(svc, s_max=s_max, bn_max=4, l_max=8)
 
     # Run two batches with different n / seq_lens — same captured graphs,
     # different staged inputs. begin_backward sets indices; ffn graph is
@@ -142,7 +143,7 @@ def test_ffn_graph_parity():
             cache, g, _ = _make_inputs(seq_lens, D, Hq, Hkv, Hd, inter,
                                        MDT, cdt, s_max)
             # Eager reference
-            ref = L.ffn_backward_core(g, cache, lw, eps, cdt)
+            ref = ffn_backward_core(g, cache, lw, eps, cdt)
             # Graphed
             out = runner.ffn_backward(i, g, cache, lw)
             _check(f"batch{batch_idx} layer{i} grad_resid_mid",
@@ -162,7 +163,7 @@ def test_attn_graph_parity():
 
     lws = [_make_layer_weights(D, kv_size, inter, r, MDT) for _ in range(L_)]
     svc = _mk_svc(D, L_, Hq, Hkv, Hd, inter, eps, MDT, cdt, lws=lws)
-    runner = Llama3GraphedBackward(svc, s_max=s_max, bn_max=bn_max, l_max=l_max)
+    runner = GraphedBackward(svc, s_max=s_max, bn_max=bn_max, l_max=l_max)
 
     # Two fitting batches — re-uses the same per-layer attn graphs.
     for batch_idx, seq_lens in enumerate([[5, 3], [8, 8, 8, 8]]):
@@ -173,7 +174,7 @@ def test_attn_graph_parity():
             cache, _, grad_ctx = _make_inputs(seq_lens, D, Hq, Hkv, Hd, inter,
                                               MDT, cdt, s_max)
             # Eager reference
-            ref_qh, ref_kh, ref_vh = L.attn_backward_core(
+            ref_qh, ref_kh, ref_vh = attn_backward_core(
                 cache["qh"], cache["kh"], cache["vh"], grad_ctx,
                 seq_lens, b_start, dims, cdt)
             # Graphed
@@ -201,7 +202,7 @@ def test_attn_overflow_fallback():
 
     lws = [_make_layer_weights(D, kv_size, inter, r, MDT) for _ in range(L_)]
     svc = _mk_svc(D, L_, Hq, Hkv, Hd, inter, eps, MDT, cdt, lws=lws)
-    runner = Llama3GraphedBackward(svc, s_max=s_max, bn_max=bn_max, l_max=l_max)
+    runner = GraphedBackward(svc, s_max=s_max, bn_max=bn_max, l_max=l_max)
 
     # Overflow on l: max sample length 6 > l_max=4 → fallback.
     seq_lens = [6, 4]
@@ -210,7 +211,7 @@ def test_attn_overflow_fallback():
     runner.begin_backward(n, seq_lens, b_start)
     cache, _, grad_ctx = _make_inputs(seq_lens, D, Hq, Hkv, Hd, inter,
                                       MDT, cdt, s_max)
-    ref_qh, ref_kh, ref_vh = L.attn_backward_core(
+    ref_qh, ref_kh, ref_vh = attn_backward_core(
         cache["qh"], cache["kh"], cache["vh"], grad_ctx,
         seq_lens, b_start, dims, cdt)
     out_qh, out_kh, out_vh = runner.attn_backward(
@@ -239,7 +240,7 @@ def test_forward_graph_parity():
     lws = [_make_layer_weights(D, kv_size, inter, r, MDT) for _ in range(L_)]
     svc = _mk_svc(D, L_, Hq, Hkv, Hd, inter, eps, MDT, cdt, lws=lws,
                   scaling=scaling, theta=theta)
-    runner = Llama3GraphedBackward(svc, s_max=s_max, bn_max=bn_max, l_max=l_max)
+    runner = GraphedBackward(svc, s_max=s_max, bn_max=bn_max, l_max=l_max)
 
     for batch_idx, seq_lens in enumerate([[5, 3], [8, 4]]):
         n = sum(seq_lens)
@@ -248,7 +249,7 @@ def test_forward_graph_parity():
 
         positions = torch.cat([
             torch.arange(s, device=DEVICE) for s in seq_lens])
-        cos, sin = L.rope_cos_sin(positions, Hd, theta)
+        cos, sin = rope_cos_sin(positions, Hd, theta)
 
         for i in range(L_):
             lw = lws[i]
@@ -287,7 +288,7 @@ def test_layer_forward_saved_qkv_parity():
     n = sum(seq_lens)
     b_start = [0, 5]
     positions = torch.cat([torch.arange(s, device=DEVICE) for s in seq_lens])
-    cos, sin = L.rope_cos_sin(positions, Hd, theta)
+    cos, sin = rope_cos_sin(positions, Hd, theta)
     layer_in = torch.randn(n, D, device=DEVICE, dtype=MDT)
     saved_gu = torch.randn(n, 2 * inter, device=DEVICE, dtype=MDT)
 
@@ -313,7 +314,7 @@ def test_layer_forward_saved_qkv_parity():
 def test_forward_graph_saved_qkv_parity():
     """Graphed forward in save_attn_qkv mode must match eager layer_forward
     given the same saved q/k/v. Exercises the captured fast-path branch in
-    Llama3GraphedBackward._forward_core when self.save_attn_qkv=True."""
+    llama3.graph_forward_core when self.save_attn_qkv=True."""
     print("test_forward_graph_saved_qkv_parity:")
     torch.manual_seed(6)
     Hq, Hkv, Hd = 4, 2, 16
@@ -328,7 +329,7 @@ def test_forward_graph_saved_qkv_parity():
     svc = _mk_svc(D, L_, Hq, Hkv, Hd, inter, eps, MDT, cdt, lws=lws,
                   scaling=scaling, theta=theta)
     svc.save_attn_qkv = True
-    runner = Llama3GraphedBackward(svc, s_max=s_max, bn_max=bn_max, l_max=l_max)
+    runner = GraphedBackward(svc, s_max=s_max, bn_max=bn_max, l_max=l_max)
     assert runner.save_attn_qkv, "runner should pick up save_attn_qkv from svc"
 
     for batch_idx, seq_lens in enumerate([[5, 3], [8, 4]]):
@@ -338,7 +339,7 @@ def test_forward_graph_saved_qkv_parity():
 
         positions = torch.cat([
             torch.arange(s, device=DEVICE) for s in seq_lens])
-        cos, sin = L.rope_cos_sin(positions, Hd, theta)
+        cos, sin = rope_cos_sin(positions, Hd, theta)
 
         for i in range(L_):
             lw = lws[i]
@@ -388,7 +389,7 @@ def test_layer_forward_saved_ctx_parity():
     n = sum(seq_lens)
     b_start = [0, 5]
     positions = torch.cat([torch.arange(s, device=DEVICE) for s in seq_lens])
-    cos, sin = L.rope_cos_sin(positions, Hd, theta)
+    cos, sin = rope_cos_sin(positions, Hd, theta)
     layer_in = torch.randn(n, D, device=DEVICE, dtype=MDT)
     saved_gu = torch.randn(n, 2 * inter, device=DEVICE, dtype=MDT)
 
@@ -421,7 +422,7 @@ def test_layer_forward_saved_ctx_parity():
 def test_forward_graph_saved_ctx_parity():
     """Graphed forward in save_attn_ctx mode must match eager layer_forward
     given the same saved ctx. Exercises the captured branch in
-    Llama3GraphedBackward._forward_core when self.save_attn_ctx=True (skips the
+    llama3.graph_forward_core when self.save_attn_ctx=True (skips the
     padded-attention forward; the q/k/v scatter for Graph B still runs)."""
     print("test_forward_graph_saved_ctx_parity:")
     torch.manual_seed(8)
@@ -438,7 +439,7 @@ def test_forward_graph_saved_ctx_parity():
                   scaling=scaling, theta=theta)
     svc.save_attn_qkv = True
     svc.save_attn_ctx = True
-    runner = Llama3GraphedBackward(svc, s_max=s_max, bn_max=bn_max, l_max=l_max)
+    runner = GraphedBackward(svc, s_max=s_max, bn_max=bn_max, l_max=l_max)
     assert runner.save_attn_ctx, "runner should pick up save_attn_ctx from svc"
 
     for batch_idx, seq_lens in enumerate([[5, 3], [8, 4]]):
@@ -448,7 +449,7 @@ def test_forward_graph_saved_ctx_parity():
 
         positions = torch.cat([
             torch.arange(s, device=DEVICE) for s in seq_lens])
-        cos, sin = L.rope_cos_sin(positions, Hd, theta)
+        cos, sin = rope_cos_sin(positions, Hd, theta)
 
         for i in range(L_):
             lw = lws[i]
@@ -478,6 +479,76 @@ def test_forward_graph_saved_ctx_parity():
                        out[key], ref[key], _FP32_TOL)
 
 
+def test_forward_graph_saved_resid_mid_parity():
+    """``save_resid_mid``: the eager ``layer_forward(saved_resid_mid=...)`` and
+    the graphed forward (core skips the O projection; the tail only splits
+    gate||up; ``static_resid_mid`` is staged from the saved buffer) must match
+    the full recompute when fed the residual that recompute produced. Run
+    once with resid_mid alone and once with all three saves (qkv + ctx +
+    resid_mid — the forward collapses to RMSNorm in_ln); also checks the
+    eager fallback when a layer's saved residual is missing."""
+    print("test_forward_graph_saved_resid_mid_parity:")
+    torch.manual_seed(8)
+    Hq, Hkv, Hd = 4, 2, 16
+    D, kv_size, inter, r = Hq * Hd, Hkv * Hd, 32, 4
+    L_, eps, cdt = 2, 1e-5, torch.float32
+    s_max, bn_max, l_max = 16, 4, 8
+    scaling, theta = 2.0, 500000.0
+    dims = (Hq, Hkv, Hd, kv_size)
+    keys = ("x", "x_norm1", "qh", "kh", "vh", "ctx_flat", "resid_mid", "gate", "up")
+
+    for all_saves in (False, True):
+        tag = "all-saves" if all_saves else "resid-mid-only"
+        lws = [_make_layer_weights(D, kv_size, inter, r, MDT) for _ in range(L_)]
+        svc = _mk_svc(D, L_, Hq, Hkv, Hd, inter, eps, MDT, cdt, lws=lws,
+                      scaling=scaling, theta=theta)
+        svc.save_resid_mid = True
+        svc.save_attn_qkv = all_saves
+        svc.save_attn_ctx = all_saves
+        runner = GraphedBackward(svc, s_max=s_max, bn_max=bn_max, l_max=l_max)
+        assert runner.save_resid_mid and not runner.fwd_failed
+        for batch_idx, seq_lens in enumerate([[5, 3], [8, 4]]):
+            n = sum(seq_lens)
+            b_start = [sum(seq_lens[:i]) for i in range(len(seq_lens))]
+            runner.begin_backward(n, seq_lens, b_start)
+            positions = torch.cat([torch.arange(s, device=DEVICE) for s in seq_lens])
+            cos, sin = rope_cos_sin(positions, Hd, theta)
+            for i in range(L_):
+                lw = lws[i]
+                layer_in = torch.randn(n, D, device=DEVICE, dtype=MDT)
+                saved_gu = torch.randn(n, 2 * inter, device=DEVICE, dtype=MDT)
+                full = L.layer_forward(layer_in, lw, scaling, cos, sin, seq_lens,
+                                       b_start, dims, eps, saved_gate_up=saved_gu)
+                saved = dict(saved_resid_mid=full["resid_mid"].contiguous())
+                if all_saves:
+                    saved.update(
+                        saved_qh=full["qh"].reshape(n, -1).contiguous(),
+                        saved_kh=full["kh"].reshape(n, -1).contiguous(),
+                        saved_vh=full["vh"].reshape(n, -1).contiguous(),
+                        saved_ctx=full["ctx_flat"].contiguous())
+                ref = L.layer_forward(layer_in, lw, scaling, cos, sin, seq_lens,
+                                      b_start, dims, eps, saved_gate_up=saved_gu,
+                                      **saved)
+                out = runner.forward(i, lw, layer_in, saved_gu, n, **saved)
+                for key in keys:
+                    _check(f"{tag} b{batch_idx} L{i} eager-saved {key}",
+                           ref[key], full[key], _FP32_TOL)
+                    _check(f"{tag} b{batch_idx} L{i} graph {key}",
+                           out[key], full[key], _FP32_TOL)
+        # Missing saved residual → eager fallback (recompute), still correct.
+        n, seq_lens, b_start = 8, [5, 3], [0, 5]
+        runner.begin_backward(n, seq_lens, b_start)
+        positions = torch.cat([torch.arange(s, device=DEVICE) for s in seq_lens])
+        cos, sin = rope_cos_sin(positions, Hd, theta)
+        layer_in = torch.randn(n, D, device=DEVICE, dtype=MDT)
+        saved_gu = torch.randn(n, 2 * inter, device=DEVICE, dtype=MDT)
+        full = L.layer_forward(layer_in, lws[0], scaling, cos, sin, seq_lens,
+                               b_start, dims, eps, saved_gate_up=saved_gu)
+        out = runner.forward(0, lws[0], layer_in, saved_gu, n)
+        _check(f"{tag} missing-saved fallback resid_mid", out["resid_mid"],
+               full["resid_mid"], _FP32_TOL)
+
+
 def test_forward_overflow_fallback():
     """Batches that overflow (bn_max, l_max) must silently fall back to the
     eager ``layer_forward`` (and still produce the correct cache)."""
@@ -493,7 +564,7 @@ def test_forward_overflow_fallback():
     lws = [_make_layer_weights(D, kv_size, inter, r, MDT) for _ in range(L_)]
     svc = _mk_svc(D, L_, Hq, Hkv, Hd, inter, eps, MDT, cdt, lws=lws,
                   scaling=scaling, theta=theta)
-    runner = Llama3GraphedBackward(svc, s_max=s_max, bn_max=bn_max, l_max=l_max)
+    runner = GraphedBackward(svc, s_max=s_max, bn_max=bn_max, l_max=l_max)
 
     # Overflow on l: max sample length 6 > l_max=4 → fallback.
     seq_lens = [6, 4]
@@ -501,7 +572,7 @@ def test_forward_overflow_fallback():
     b_start = [0, 6]
     runner.begin_backward(n, seq_lens, b_start)
     positions = torch.cat([torch.arange(s, device=DEVICE) for s in seq_lens])
-    cos, sin = L.rope_cos_sin(positions, Hd, theta)
+    cos, sin = rope_cos_sin(positions, Hd, theta)
     layer_in = torch.randn(n, D, device=DEVICE, dtype=MDT)
     saved_gu = torch.randn(n, 2 * inter, device=DEVICE, dtype=MDT)
 
@@ -523,6 +594,7 @@ def main():
     test_forward_graph_saved_qkv_parity()
     test_layer_forward_saved_ctx_parity()
     test_forward_graph_saved_ctx_parity()
+    test_forward_graph_saved_resid_mid_parity()
     test_forward_overflow_fallback()
     print(f"\n{_passed} passed, {_failed} failed")
     sys.exit(1 if _failed else 0)

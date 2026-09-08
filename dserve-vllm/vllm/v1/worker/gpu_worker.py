@@ -484,80 +484,20 @@ class Worker(WorkerBase):
                 f"(tp_size={tp_size}, tp_rank={tp_rank})"
             )
 
-        # LoRA scaling = alpha / r, read from the FT adapter's PEFT config.
-        lora_scaling = 1.0
-        if path:
-            cfg_path = os.path.join(path, "adapter_config.json")
-            if os.path.isfile(cfg_path):
-                import json
+        from vllm.deltaserve.ft_meta import (
+            build_backward_meta,
+            read_lora_scaling,
+        )
 
-                with open(cfg_path) as f:
-                    acfg = json.load(f)
-                r = int(acfg.get("r", 1)) or 1
-                alpha = float(acfg.get("lora_alpha", r))
-                lora_scaling = alpha / r
-
-        num_heads = int(hf_config.num_attention_heads)
-        head_dim = int(getattr(hf_config, "head_dim", None)
-                       or hf_config.hidden_size // num_heads)
-        meta = {
-            "lm_head_key": lm_head_key,
-            "vocab_size": int(hf_config.vocab_size),
-            "logit_scale": float(getattr(hf_config, "logit_scale", 1.0) or 1.0),
-            "rms_norm_eps": float(getattr(hf_config, "rms_norm_eps", 1e-5) or 1e-5),
-            "norm_weight_key": (
-                "model.norm.weight" if "model.norm.weight" in base_state else None),
-            "embed_weight_key": embed_weight_key,
-            # Model dims for the backward's per-layer forward rematerialization.
-            "hidden_size": int(hf_config.hidden_size),
-            "num_hidden_layers": int(hf_config.num_hidden_layers),
-            "num_attention_heads": num_heads,
-            "num_key_value_heads": int(
-                getattr(hf_config, "num_key_value_heads", num_heads)),
-            "head_dim": head_dim,
-            "intermediate_size": int(hf_config.intermediate_size),
-            "rope_theta": float(getattr(hf_config, "rope_theta", 10000.0)),
-            "lora_scaling": float(lora_scaling),
-            # Optimizer hyperparameters (Phase 3 LoRA backward).
-            "learning_rate": float(ft_cfg.learning_rate),
-            "weight_decay": float(ft_cfg.weight_decay),
-            "gamma": float(ft_cfg.gamma),
-            "backward_fp32": bool(ft_cfg.backward_fp32),
-            # CUDA-graph backward (Phase 5). The child instantiates a
-            # Llama3GraphedBackward runner when the flag is set; bn_max/l_max
-            # bound the padded-attention region, s_max comes from
-            # max_saved_finetuning_tokens (same value sizes the activation
-            # buffers, so the FFN graph and the activation pool are aligned).
-            "backward_cuda_graph": bool(ft_cfg.backward_cuda_graph),
-            "backward_cuda_graph_attn_bn_max":
-                int(ft_cfg.backward_cuda_graph_attn_bn_max),
-            "backward_cuda_graph_attn_l_max":
-                int(ft_cfg.backward_cuda_graph_attn_l_max),
-            "max_saved_finetuning_tokens":
-                int(ft_cfg.max_saved_finetuning_tokens),
-            # When True, the forward saves post-RoPE q/k/v per layer to
-            # ``activations["attn_qh"/"attn_kh"/"attn_vh"]``. The backward
-            # short-circuits the Q/K/V proj + RoPE recompute (RMSNorm
-            # in_ln stays — cheap and needed for Q/K/V LoRA-A grad).
-            "save_attn_qkv": bool(ft_cfg.save_attn_qkv),
-            # When True, the forward saves the attention context (o_proj input)
-            # per layer to ``activations["attn_ctx"]``. The backward skips the
-            # attention-forward recompute and reads ctx directly.
-            "save_attn_ctx": bool(ft_cfg.save_attn_ctx),
-            # [DeltaServe] Phase 7 / M2: TP shard geometry. The backward divides
-            # num_attention_heads / num_key_value_heads / intermediate_size by
-            # tp_size to slice its LOCAL shards, and uses tp_rank to slice the
-            # (full, disk-loaded) FT-adapter master into this rank's LoRA shard.
-            # tp_size=1 → local == full → single-GPU behaviour unchanged.
-            "tp_size": int(tp_size),
-            "tp_rank": int(tp_rank),
-            # [DeltaServe] Phase 7 / M3: rendezvous port for the backward-only
-            # NCCL group (the backward children are NOT in vLLM's inference
-            # group). Distinct from vLLM's distributed port; override via env if
-            # 29677 clashes on the box.
-            "backward_nccl_port": int(
-                os.environ.get("DSERVE_BACKWARD_NCCL_PORT", "29677")),
-        }
+        # Everything the child needs to know about the model + this rank's
+        # shard, built in one deltaserve-owned place (no family branches here).
+        meta = build_backward_meta(
+            hf_config, ft_cfg,
+            lm_head_key=lm_head_key,
+            embed_weight_key=embed_weight_key,
+            has_final_norm="model.norm.weight" in base_state,
+            lora_scaling=read_lora_scaling(path),
+            tp_size=tp_size, tp_rank=tp_rank)
 
         dprint(
             f"sharing weights with backward process: base={len(base_state)} "
@@ -592,6 +532,12 @@ class Worker(WorkerBase):
 
         from vllm.deltaserve import dprint
         from vllm.deltaserve.accumulate import FinetuneAccumulator
+        from vllm.deltaserve.ft_meta import (
+            effective_save_attn_qkv,
+            saved_qkv_pre_transform,
+        )
+
+        arch = (self.model_config.hf_config.architectures or [None])[0]
 
         ft_cfg = self.vllm_config.finetune_config
         model = self.get_model()
@@ -638,8 +584,10 @@ class Worker(WorkerBase):
             intermediate_size=local_inter,
             q_size=q_size,
             kv_size=kv_size,
-            save_attn_qkv=bool(ft_cfg.save_attn_qkv),
+            save_attn_qkv=effective_save_attn_qkv(arch, ft_cfg),
+            attn_qkv_pre_transform=saved_qkv_pre_transform(arch),
             save_attn_ctx=bool(ft_cfg.save_attn_ctx),
+            save_resid_mid=bool(ft_cfg.save_resid_mid),
         )
         accumulator.register_hooks()
         ack = backward_process.share_activations(
@@ -681,15 +629,18 @@ class Worker(WorkerBase):
     def _maybe_share_ft_served_lora(self) -> None:
         """Pre-load + pin the FT LoRA adapter and share vLLM's served LoRA stacked
         buffers (CUDA-IPC) with the backward process so the trainer publishes updated
-        weights straight into the tensors inference reads. Llama-3 only (the trainer)."""
+        weights straight into the tensors inference reads. Trainer families only
+        (``bwd_services.registry.is_trainer``)."""
         import re
 
         backward_process = getattr(self, "backward_process", None)
         if backward_process is None:
             return
         arch = (self.model_config.hf_config.architectures or [None])[0]
-        if arch != "LlamaForCausalLM":
-            return  # only the llama3 trainer publishes; opt stays loss-only
+        from vllm.deltaserve.bwd_services import is_trainer
+
+        if not is_trainer(arch):
+            return  # loss-only services (opt) never publish weights
 
         from vllm.deltaserve import dprint
         from vllm.deltaserve.ft_injector import FT_LORA_INT_ID

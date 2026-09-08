@@ -4211,6 +4211,23 @@ class GPUModelRunner(
                     scheduler_output, "finetune_backward_trigger", None)
                 if _cmd_idle:
                     _ftc_idle.execute_trigger(_cmd_idle)
+                # [M4.2] Idle (0-token) steps are how the engine keeps
+                # stepping while a backward is outstanding
+                # (FinetuneScheduler.has_requests), and this early return is
+                # the output the scheduler sees for them (sample_tokens is
+                # not reached). Relay the ack + timing here too — otherwise
+                # the ack only arrives with the next inference batch and FT
+                # stalls through every idle valley. All ranks take this path
+                # in lock-step, so the ack's all-reduce is safe.
+                if not num_scheduled_tokens and not has_kv_transfer_group():
+                    # A private copy: the shared EMPTY sentinel must not be
+                    # mutated. (``copy`` of the module-level constant rather
+                    # than naming the class here — execute_model imports
+                    # ``ModelRunnerOutput`` locally further down, which would
+                    # make the name unbound at this point.)
+                    _idle_out = copy(EMPTY_MODEL_RUNNER_OUTPUT)
+                    self._ft_fill_relay_fields(_idle_out, _ftc_idle)
+                    return _idle_out
 
             if not num_scheduled_tokens:
                 if (
@@ -4471,13 +4488,16 @@ class GPUModelRunner(
             # from update_from_output because the duration is only known now.
             _prev = self._ft_timing_owner[_ft_slot]
             if _prev is not None and _end_evt.query():
-                _prev_sched, _prev_rec = _prev
+                _prev_sched, _prev_rec, _prev_graph = _prev
                 _prev_feats = getattr(_prev_sched, "_ft_step_features", None)
                 if _prev_rec and _prev_feats is not None:
+                    # was_graph = the CUDA-graph mode the runner actually used
+                    # (recorded at forward time), not the scheduler's guess —
+                    # the scheduler cannot see the dispatcher under TP.
                     coord.push_sample(
                         _prev_feats,
                         _start_evt.elapsed_time(_end_evt) / 1000.0,
-                        getattr(_prev_sched, "_ft_step_was_graph", None),
+                        _prev_graph,
                         getattr(_prev_sched, "_ft_step_predicted", None))
             self._ft_timing_owner[_ft_slot] = None
             # [Phase 5] Yield the GPU to this forward if it carries prefill
@@ -4619,8 +4639,15 @@ class GPUModelRunner(
                 # Own the slot with this step's output + whether to record it
                 # (sampled now, at forward time, so the warmup/recorded gate is
                 # correct even though the duration is read RING steps later).
+                # [M4.2] The record gate rides SchedulerOutput (the scheduler
+                # coordinator's flag; the worker's own is never toggled under
+                # TP) — falls back to the local flag for outputs without it.
                 self._ft_timing_owner[_ft_slot] = (
-                    scheduler_output, coord.record_timing)
+                    scheduler_output,
+                    bool(getattr(scheduler_output, "finetune_record_timing",
+                                 coord.record_timing)),
+                    bool(cudagraph_mode is not None
+                         and cudagraph_mode != CUDAGraphMode.NONE))
                 self._ft_timing_pos = (_ft_slot + 1) % len(self._ft_timing_events)
             # [Phase 5] Return the GPU to the backward child after enqueuing the
             # prefill forward. Fire-and-forget (just sets the mp.Event grant) —
@@ -4793,6 +4820,46 @@ class GPUModelRunner(
         return None
 
     @torch.inference_mode
+    def _ft_relay_backward_done(self, coord) -> dict | None:
+        """[DeltaServe] Phase 7 / M4.2: the backward ack to relay this step, or
+        None. Only ``output_rank``'s output reaches the scheduler, so an ack is
+        handed over only once EVERY rank's child is done: each rank polls its
+        own child, the ranks MIN-all-reduce a "mine is done" flag over the TP
+        group's CPU (gloo) group — no GPU sync, and only while a backward is
+        outstanding — and all take their ack on the same step."""
+        if not coord.relay_backward_outstanding():
+            return None
+        mine = coord.poll_own_backward_ack()
+        from vllm.distributed.parallel_state import get_tp_group
+
+        tp = get_tp_group()
+        if tp.world_size > 1:
+            flag = torch.tensor([1 if mine else 0], dtype=torch.int32)
+            torch.distributed.all_reduce(
+                flag, op=torch.distributed.ReduceOp.MIN, group=tp.cpu_group)
+            all_done = bool(flag.item())
+        else:
+            all_done = mine
+        return coord.take_relay_ack() if all_done else None
+
+    def _ft_fill_relay_fields(self, output, coord) -> None:
+        """[DeltaServe] Phase 7: set the worker → scheduler relay fields on
+        ``output`` (called on every step's output under TP — from
+        ``sample_tokens`` for real batches and from ``execute_model``'s idle
+        early return for 0-token steps)."""
+        output.finetune_backward_done = self._ft_relay_backward_done(coord)
+        output.finetune_saved = getattr(self, "_ft_relay_saved", None)
+        self._ft_relay_saved = None
+        # Mirror ft_started (set on THIS worker coord by the
+        # deltaserve_start_finetuning collective_rpc) so the EngineCore
+        # scheduler coord — a separate process under TP — opens admission.
+        output.finetune_ft_started = bool(coord.ft_started)
+        # [M4.2] Relay the timing samples the CUDA-event ring completed
+        # (pushed to THIS worker coord in execute_model). Drained every step,
+        # so the worker-side queue stays bounded.
+        _samples = coord.drain_completed_samples()
+        output.finetune_timing = _samples or None
+
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
@@ -5013,13 +5080,7 @@ class GPUModelRunner(
         # fields here covers both. Inert for tp=1 (relay_mode False).
         _coord_relay = getattr(self, "_ft_coordinator", None)
         if _coord_relay is not None and getattr(_coord_relay, "relay_mode", False):
-            output.finetune_backward_done = _coord_relay.poll_backward_relay()
-            output.finetune_saved = getattr(self, "_ft_relay_saved", None)
-            self._ft_relay_saved = None
-            # Mirror ft_started (set on THIS worker coord by the
-            # deltaserve_start_finetuning collective_rpc) so the EngineCore
-            # scheduler coord — a separate process under TP — opens admission.
-            output.finetune_ft_started = bool(_coord_relay.ft_started)
+            self._ft_fill_relay_fields(output, _coord_relay)
 
         if not self.use_async_scheduling:
             if self.routed_experts_initialized:

@@ -73,35 +73,50 @@ layer, not an inference engine. Box-by-box DeltaServe→vLLM mapping lives in `C
 
 ## Next step
 
-**Phase 7 (TP=2) is the active line.** M0–M4.1 are done and GPU-validated on 2× RTX
-5090: TP=2 trains equivalently to TP=1 (cycle-for-cycle to ~0.01 loss on identical
-data). The next items, in priority order, are in the **Phase 7** section below —
-(1) **M4.2**, relaying `push_sample` so SLO-aware admission works under TP at all
-(today TP runs with no SLO gate); (2) the backward **ack race** (admission reopens on
-one rank's ack); (3) **M4.3** gradient bucketing + a comm stream, which is worth more
-than M5 on a box with no P2P and also fixes the latent rank-asymmetric gradient clip.
+**State on 2026-09-08 (end of the M5 session).** Everything below is in the working
+tree, uncommitted, on branch `tp`. **M5 — backward CUDA graphs under TP — has landed**
+and is gated on the two 5090s with real NCCL (`tests/test_tp_backward_graph_nccl.py`
+1196/1196, `tests/test_tp_trainer_graph_nccl.py` 132/132); every tp=1 gate re-passes
+unchanged. Qwen3-14B at TP=2 co-serves the real timeline workloads with SLO-gated FT
+admission; the estimator relay (M4.2) is GPU-validated.
 
-**Open, and NOT a TP problem:** FT loss stalls around ~4.3 after ~25 cycles where an
-earlier `pure_ft` run reached ~2.6 on the same samples — but this **reproduces
-identically at TP=1**, so it is a config- or regime-level training-quality issue, not a
-tensor-parallelism bug. Ruled out so far: learning rate (lowered to 5e-6 back in May,
-before the good run), the data (identical sample sequence and order), code drift (no
-commits touched the FT path after Jun 7), and `save_attn_qkv`/`save_attn_ctx`. An
-env-gated diagnostic (`DSERVE_TP_DIAG=1` → `Llama3BackwardService._diag_remat_check`)
-rematerializes the full forward from `layer_in[0]` and compares it against the captured
-activations; it shows the remat diverging from vLLM's real forward (final_in relative
-error 0.22 → 0.45 over cycles) **identically at TP=1 and TP=2**. Next step there is to
-re-run `eval/pure_ft_bench.py` and confirm the 2.12 reference still reproduces — note
-that curve was only 32 cycles over 5.0 s, so it may be a weaker reference than it looks.
+**Next session, in priority order:**
 
-Phase 6 (`forward_interruptible` + slice activation save) remains code-complete and
-pending GPU validation on a co-serving replay; it is **off** under TP (and conflicts
-with M5 — see the Phase 7 notes). Phases 5.2–5.5 have shipped. The unified-phase
-scheduler (`coserving_admission_phase: both`) has shipped as code; GPU A/B is pending.
-From here on we **prioritize Llama-3**; opt-125m stays at its current stage (loss-only)
-as a reference path.
+1. **M5 live A/B — graph vs eager under TP=2 on the real models.** Code + 2-GPU gates are
+   done (see "M5 — backward CUDA graphs under TP ✅" under Phase 7). Run
+   `python eval-tp/ft_bench_tp.py --family llama3 --tp 2 --duration 60 --kill-stale` twice,
+   with `backward_cuda_graph: true` (now the YAML default) and `false` in
+   `configs/serving_config_finetuning_llama3_tp2.yaml` (the Qwen3-14B YAML has it on too).
+   The first run of the session used the YAML's old `false` and correctly reported
+   `(eager)`. Expect from EACH child `[bwd-graph] pre-captured forward 32/32 + FFN 32/32 +
+   attn 1/1`, `(graph)` in the cycle lines, cycle loss equal to the eager run
+   cycle-for-cycle (same data), and ~5 ms/cycle less. Both TP YAMLs also turn on
+   `save_resid_mid` (P5.6) — expect `resid-mid pre-hooks on 32` in the `[accumulate]`
+   line and 192 collectives per cycle instead of 224. Then the same for
+   `--family qwen3-14b`.
+2. ~~**M4.3 — gradient bucketing + comm stream + rank-symmetric clip.**~~ Landed
+   2026-09-08 — see "M4.3 — gradient bucketing + comm stream ✅" under Phase 7.
+3. **`forward_interruptible` under TP.** The Qwen3-14B timeline runs show the cost of
+   continuous FT: TTFT p95 sits at the 0.4 s SLO because each burst's first requests wait
+   behind an in-flight FT-only step. Tiers A/B are scheduler-side and TP-safe already;
+   tier C (mid-forward abort) must stay off until it is made rank-symmetric (broadcast the
+   abort, or abort only at step granularity). Gate: TTFT p95/p99 ↓ on loose/tight with FT
+   throughput within ~10% of today's.
+4. **Baselines + estimator residuals.** Run the inference-only baselines
+   (`auto_benchmark_tp.py --family qwen3-14b --tp 2 --{loose,tight,nutanix-600-800}`, no
+   `--co`) so the plots get the grey `inf-only` overlay; run one `validate_estimator: true`
+   TP=2 replay and compare per-regime RMSE with a tp=1 run (a residual growing with `t_in`
+   would be the only reason to add a TP term to the step-time formula — none expected).
+5. **Llama-3 `rope_theta` re-verification** (still pending since Phase 8):
+   `DSERVE_TP_DIAG=1 python eval/pure_ft_bench.py` → remat error at bf16 noise and the
+   2.12 loss reference reproduces. Also the Qwen3-0.6B single-GPU smoke with
+   `backward_cuda_graph: true` (exercises the new Qwen3 forward graph live).
+6. Small items: none open from this list — Qwen3's exact `save_attn_qkv` (pre-norm q/k
+   hooks) and the `N/?` progress meter under TP (corpus total on the relayed trigger)
+   both landed 2026-09-08.
 
----
+**Phase 7 (TP=2) remains the active line.** M0–M4.2 are done and GPU-validated on 2× RTX
+5090.
 
 ## Phase 1 — Backward process + shared-memory IPC
 
@@ -1036,12 +1051,56 @@ bytes either way; saves one CUDA kernel + one allocation per hook firing
     | `mlp_gate_up` (already shipped) | 30 | 469 | 2.0 |
     | `ctx_flat` | 0.7 | 67 | 0.33 |
     | `x_norm1` alone | 0.005 | 67 | 0.002 |
+- **Phase 5.6 — save the post-attention residual per layer. ✅ SHIPPED (2026-09-08).**
+  Opt-in via `finetune.save_resid_mid: bool = False` (ON in every shipped YAML). A
+  `forward_pre_hook` on each `post_attention_layernorm` captures the FT rows of
+  `o + residual` — vLLM's fused add-norm is called with `(o_proj_out, residual)`, so it is
+  the same `args[0] + args[1]` idiom as the `layer_in` hooks; under TP the o_proj output is
+  already the RowParallelLinear-reduced full tensor. New per-layer buffers `resid_mid[i]`
+  (`[s_max, hidden]`) in `FinetuneAccumulator`, in `buffers` / `zero_offset_range`, meta key
+  `save_resid_mid`, trainer mirror + `saved_resid_mid=` threaded into `layer_forward` and
+  `GraphedBackward.forward` for both families.
+  - **Backward:** `layer_forward(saved_resid_mid=…)` skips the O projection (base + LoRA
+    GEMM) + residual add; `ctx_flat` is still produced for the O-proj backward. In the graph
+    runner the saved residual is staged straight into `static_resid_mid` (Graph A's input),
+    the family core skips step 5, and — since there is no `o` reduce left — the forward tail
+    is captured with the core again even under TP (`_forward_needs_reduce`). Eager fallback
+    when the mode is on but a layer's saved residual is absent.
+  - **TP win (the motivation):** the forward remat's `o` all-reduce was the only collective
+    in the forward recompute → **7 → 6 collectives per layer** (Llama-3-8B: 224 → 192 per
+    cycle, all in the backward). Counted per layer, per rank, per path in
+    `tests/test_tp_backward_graph_nccl.py` (eager 7; graph 7; graph + saved 6, forward 0).
+  - **Cost:** +64 MB on Llama-3-8B, +100 MB on Qwen3-14B at s_max=256 (bf16). Saves the
+    ~8.6 GFLOPs/layer O-proj GEMM (~275 GFLOPs/cycle) on top of the reduce.
+  - **Gates:** `tests/test_accumulate_hooks.py` 49/49 (hook level: fake vLLM-named decoder,
+    contiguous + mask paths, non-zero offset, inert off-step, tier-C zeroing);
+    `test_forward_graph_saved_resid_mid_parity` (llama3 graph test → 311/311; resid_mid alone
+    and with qkv + ctx = in_ln-only recompute; missing-saved fallback) and
+    `test_saved_resid_mid_forward_graph` (qwen3 → 217/217); NCCL layer gate 2680/2680 and
+    NCCL trainer gate 212/212 (graph + save == graph exactly).
+  - With `save_attn_qkv` + `save_attn_ctx` + `save_resid_mid`, the per-layer forward
+    recompute is RMSNorm in_ln alone (the Q/K/V LoRA-A grads need `x_norm1`).
+- **Phase 5.7 — LM-head restructure (batched rows, one conversion per chunk per pass).
+  ✅ SHIPPED (2026-09-08).** A kernel-level profile of the real `process_backward` on a
+  synthetic Qwen3-14B-shaped service (2 GPUs, NCCL, graph on, all saves on, no inference
+  contention; `scratchpad/bwd_profile_qwen3.py`) showed the LM head at ~63 ms of a ~168 ms
+  cycle: `head_backward` ran `logits_chunked` per SAMPLE, so the bf16 head was converted
+  to fp32 nine times per cycle (~40 GB of copy traffic, 29 ms) and the fp32 GEMMs ran with
+  ~31 rows each (34 ms, far below peak). Now all predicting rows are gathered into one
+  `[n_valid, D]` matrix, each vocab chunk is converted once per pass (logits pass +
+  `logit_grad @ W` pass), the shift-by-one targets / `n_valid` normalisation are row
+  indexing. **Same math, same fp32 contract** (inputs, accumulation, softmax, CE all
+  fp32; only GEMM tile order differs). One caveat found on the prod path: `rmsnorm`
+  returns the input dtype, so the rows are upcast explicitly (the CPU gates run fp32 and
+  could not see it). **Profile after:** wall 168 → 127 ms (head GEMMs 34 → 15 ms, copy
+  kernels 36 → 16 ms); loss on the same synthetic inputs unchanged. Gates: gradcheck
+  12/12 + 18/18, both overfit runs identical, NCCL trainer 212/212.
 - A dedicated FT activation pool only if vLLM's allocator gets in the way; multi-TP
   correctness (backward per-rank). Profiling pass extension to cover `decode + FT`
   and `decode-only + FT` shapes (currently online-refit only). (eval/analysis
   tooling port: ✅ done in P5.3 above.)
 
-## Phase 7 — Tensor parallelism (TP=2) 🟡 (M0–M4.1 done + GPU-validated; M4.2 / M5 open)
+## Phase 7 — Tensor parallelism (TP=2) 🟡 (M0–M4.2 GPU-validated; M5 + M4.3 2-GPU-gated, live A/B pending)
 
 **Goal:** make the co-serving LoRA SFT backward correct and runnable under
 `tensor_parallel_size > 1` for Llama-3. Guiding principle, mirroring the original
@@ -1135,41 +1194,210 @@ a self-contained 2-GPU NCCL closed-loop test using the production `layer_forward
 matched tp=1 to **5 decimal places over 60 steps with zero replicated-master drift**.
 TP=1 gradcheck 12/12 unchanged.
 
+### M4.2 — SLO estimator + all-rank backward ack under TP ✅ (GPU-validated 2026-09-01)
+
+**Problem.** The coordinator is a process-wide singleton. Under the multiproc executor the
+runner's `push_sample` lands on the worker's coordinator while the scheduler drains its own
+(always empty), so the estimator never became ready, `admit_ft_to_step` stayed on the
+cold-start buffer-cap path, and `profile_on_launch` had to be off (the pass drained 0
+samples). Two more signals were severed the same way: the profiling pass's
+`record_timing` gate (never reached the worker) and the cudagraph dispatcher (the
+scheduler stamped `was_graph=False` every step). Separately, only `output_rank`'s output
+reaches the scheduler, so the backward ack reopened admission on rank 0's child while
+rank 1's could still be publishing (the "ack race").
+
+**Fix — extend the per-signal TP relay; estimator / admission / profiling shapes untouched.**
+- `v1/outputs.py`: `ModelRunnerOutput.finetune_timing: list[tuple] | None`. The runner
+  drains its coordinator queue onto it every `sample_tokens` (bounded queue); the scheduler's
+  `update_from_output` pushes each tuple into its coordinator, so the existing `schedule()`
+  drain → tracker → refit → validation CSV path runs unchanged. Samples describe a step ~4
+  older (ring latency), irrelevant at the 256-step refit cadence.
+- `v1/core/sched/output.py`: `SchedulerOutput.finetune_record_timing: bool = True`, stamped
+  per step from the scheduler coordinator's flag; the runner's ring stores it (fallback: the
+  local flag, so uniproc is unchanged).
+- `gpu_model_runner.py`: the ring owner tuple now also carries the CUDA-graph mode the step
+  **actually** ran with, which is what gets pushed as `was_graph`.
+- Ack race: `coordinator.{relay_backward_outstanding, poll_own_backward_ack, take_relay_ack}`
+  + `gpu_model_runner._ft_relay_backward_done`: each rank polls its own child into a stash,
+  the ranks MIN-all-reduce a done flag over `get_tp_group().cpu_group` (gloo — no GPU sync;
+  only while a backward is outstanding, i.e. a handful of tiny collectives per cycle), and
+  every rank takes its ack on the same step, so rank 0 relays "done" only when both children
+  have published. `poll_backward_relay` keeps its single-rank semantics.
+- Idle steps relay too: `execute_model`'s 0-token early return (the output the scheduler
+  sees for the steps `FinetuneScheduler.has_requests` keeps issuing while a backward is
+  outstanding) now returns a fresh `ModelRunnerOutput` with the relay fields
+  (`_ft_fill_relay_fields`, shared with `sample_tokens`). Found on the first TP timeline
+  run: the ack only arrived with the next inference batch, so FT ran exactly one cycle per
+  traffic burst and stalled through the idle valleys (~40 tok/s vs continuous on one GPU).
+- `bwd_log` header: `coordinator._write_bwd_log_row` writes the header on an empty file
+  too (the eval drivers truncate the log at launch); `eval-tp/repair_bwd_log.py` fixes
+  logs from before that + applies the window trim.
+- `bwd_services/base.py`: the `[backward] nanms` cycle time was a commented-out event read
+  (on single GPU too); restored with an event-scoped `end_evt.synchronize()`.
+- Both TP YAMLs: `profile_on_launch: true`; the M4.2 caveat comments replaced.
+
+**Formula.** No TP term: TP halves the per-layer GEMMs and adds two all-reduces per layer
+whose bytes scale with tokens (absorbed by β, δ) and whose fixed latencies land in `c`; the
+backward child's PCIe traffic during FT lands in γ. The original DeltaServe estimator had
+no TP term either (its tracker timed the whole rank fan-out from the router process, which
+is exactly the single-owner-of-timings property the relay restores). The launch-time
+profiling pass is unchanged and, running through the real executor, calibrates TP-specific
+coefficients. Rank 0's timing suffices: the per-layer all-reduces keep ranks in lock-step.
+
+**Verified (CPU):** `tests/test_tp_timing_relay.py` 22/22 — worker coord → pickle →
+scheduler coord → tracker → estimator ready (both regimes fitted, eager prediction within
+4% of the synthetic cost); `finetune_record_timing` survives the broadcast pickle and the
+runner-side fallback prefers it; two fake ranks whose children ack at different steps relay
+exactly once, on the same step, with rank 0's early ack held rather than lost. Existing
+`test_merged_estimator`, `test_phase1_step{1,2}`, `test_config_loader` unchanged.
+
+**Verified (GPU, Qwen3-14B TP=2, 2× RTX 5090).**
+- The launch-time profiling pass drained **146 relayed samples** and fitted all three
+  regimes (`inf_prefill=69 rmse=0.0011, eager=33 rmse=0.0010, decode_only=44 rmse=0.0008`);
+  `[ft-profile] done: 146 samples` — it was 0 before M4.2.
+- Admission is SLO-gated: per-step `ft=` varies with load (120 … 256) instead of sitting
+  at the 256 cap; `[backward] <ms>ms` prints real cycle times (~630–750 ms eager on the 14B).
+- **Idle-step relay (found on the first timeline run).** With the ack only relayed from
+  `sample_tokens`, FT completed exactly one cycle per traffic burst — the ack reached the
+  scheduler only when the next inference batch ran, so FT stalled through every idle
+  valley (~40 tok/s on loose). After relaying on the 0-token early return too, cycles fire
+  every ~0.35 s in the valleys and the FT band fills them as on a single GPU.
+- Timeline replays (`eval-tp/auto_benchmark_tp.py`, `ttft_slo: 0.4`, `max_tbt_slo 0.05`,
+  prefill-only admission, plots in `eval-tp/plots/`):
+
+| Mode | Requests | TTFT p50 / p95 / p99 | TTFT ≤ 0.4 s | Inference tok/s | FT tok/s | Cycles | FT loss |
+|---|---|---|---|---|---|---|---|
+| loose | 240/240 ok | 77 / 405 / 537 ms | 95.0% | 255 | 467 | 89 | 1.72 → 1.32 |
+| tight | 480/480 ok | 79 / 315 / 541 ms | 97.5% | 490 | 206 | 41 | 1.94 → 1.61 |
+| nutanix 600–800 | 534/534 ok | 75 / 258 / 509 ms | 98.1% | 112 | 239 | 230 | 1.93 → 1.32 |
+
+  The TTFT tail is the price of continuous FT: each burst's first requests wait behind an
+  in-flight FT-only step on the 14B (≈0.3 s eager forward at 256 FT tokens). That is what
+  `forward_interruptible` addresses and it is still off under TP — next-session item 3.
+- Not yet run: the inference-only baselines (no grey overlay in the plots), the
+  `validate_estimator` TP-vs-tp1 residual comparison, and the Llama-3 TP=2 regression
+  A/B against the pre-refactor cycle times (the Llama-3 loose replay ran: 55 cycles,
+  TTFT p50 ≈ 76 ms).
+
+### M5 — backward CUDA graphs under TP ✅ (2-GPU NCCL gated 2026-09-08; live A/B pending)
+
+The captured regions are per layer: forward remat, FFN-bwd (Graph A), padded-attn-bwd
+(Graph B). Of the 7 TP all-reduces per layer only the forward remat's `o` (o-proj partial
+sum) fell inside a capture. Landed as designed — **no collective is ever captured**:
+
+- `common/graph.py`: new `static_o [s, D]` (the family core's last write) and a new
+  `forward_tail()` (`resid_mid = layer_in + o`; gate/up split of the saved gate||up).
+  `_forward_core` captures core + tail together at `tp_size == 1`, so the capture count and
+  the tp=1 values are unchanged (llama3 165/165, qwen3 92/92 re-pass). Under TP `forward()`
+  replays the core, then `all_reduce(static_o[:n])` — the real rows only; the tail rows are
+  zero on every rank, and the shape (`[n, D]`, model dtype) matches the eager
+  `layer_forward` reduce so a rank that fell back to eager for a layer stays lock-step —
+  then runs the tail eagerly. The eager fallback inside `forward()` now also passes
+  `all_reduce` (it silently skipped the o reduce before, but was unreachable under TP).
+- `llama3.py` / `qwen3.py`: `graph_forward_core` stops at `static_o`;
+  `layer_backward_graphed(..., all_reduce=None)` issues the six backward-side reduces at the
+  same points as `layer_backward` (`reduce_partial` after Graph A, `reduce_partial` on
+  `grad_x` + the four replicated-factor reduces at the end). **Correction to the design
+  note above's item 2: they were NOT already there** — the graphed backward had no reduces
+  at all, so dropping the guard alone would have trained silently on un-reduced gradients.
+- `common/trainer.py`: the `tp_size > 1` force-eager branch is gone; the per-layer loop
+  passes `self._all_reduce` to the graphed backward. The runner reads
+  `svc._all_reduce` (set in `_build_state` before the runner is built).
+- Invariants kept: lock-step (identical replay sequence on both ranks from the trigger
+  broadcast; per-rank fallbacks — `fwd_failed` / `ffn_failed` / `attn_failed`, `_attn_fit`
+  — cannot hang because every collective is issued from eager code in the same order and
+  shape on both paths); `_maybe_pause` still between Graph A and B; no NCCL inside any
+  graph, so `forward_interruptible` tier C cannot desync a capture.
+
+**Gates (the "impossible 2-process variant" turned out to be possible — this box has two
+GPUs):**
+- `tests/test_tp_backward_graph_nccl.py` — 2 processes × 2 GPUs, real NCCL, per family ×
+  {fp32, bf16} model dtype: graph-TP == eager-TP on each rank (cache + `grad_x` + all eight
+  LoRA grads, 1e-5), reduced tensors identical across ranks, graph-TP == tp=1 reference
+  (1e-4 fp32 / 3e-2 bf16, sharded factors reassembled), including a padded-attention
+  OVERFLOW batch (the eager forward fallback must still reduce `o`). **1196/1196.**
+- `tests/test_tp_trainer_graph_nccl.py` — the real `LoraSftTrainerService`
+  (`_build_state` → NCCL group → `GraphedBackward` with `_all_reduce`;
+  `process_backward` → clip → fused AdamW) for 4 training steps on a synthetic model, graph
+  vs eager TP2 vs tp=1, both families: losses and masters graph == eager to 1e-7; with the
+  clip off, TP2 == tp=1 to 1e-4 and rank 0 == rank 1. **132/132.** It also makes the M4.3
+  clip trap reproducible (`--clip on`: TP2 drifts from tp=1 — see Open items).
+- tp=1 unchanged: gradcheck 12/12 + 16/16; gloo TP 10/10 × 2; shard 23/23 + 42/42.
+
+**Same session, P5.6 (`save_resid_mid`)** took the forward remat's `o` reduce out
+entirely: with it on (both TP YAMLs) the per-layer collective count is 6, all in the
+backward, and the forward tail is captured with the core again. Both NCCL gates cover the
+mode (layer gate now 2680/2680 incl. per-layer collective counts; trainer gate 212/212).
+
+**Pending:** the live A/B on the real models (Next step item 1): `(graph)` cycle lines,
+cycle loss equal to eager cycle-for-cycle, ~5 ms/cycle (dispatch) saved — less than
+M4.3's ~20 ms of PCIe traffic, which is still the bigger lever.
+
+
 ### Open items
 
-- **M4.2 — SLO-aware admission under TP (the biggest functional gap).** The runner pushes
-  timing samples to the *worker* coordinator while the scheduler drains its *own*, so the
-  estimator never receives them and online refit is dead under TP. `profile_on_launch` is
-  therefore **off** in the TP config (with it on, profiling drains 0 samples and fits a
-  degenerate estimator that then reads as "ready" and rejects all FT admission). TP
-  consequently runs on the cold-start fixed-budget path with **no SLO gate at all** —
-  i.e. the project's core value-add is not exercised under TP. Fix: relay `push_sample`.
-- **Backward ack race.** `execute_model` collects `ModelRunnerOutput` from a single
-  `output_rank`, so admission reopens on **one** rank's ack while the other child may
-  still be publishing or zeroing buffers. Bounded by the per-layer NCCL lock-step, but
-  real.
-- **`set_corpus_meta` never reaches the children under TP** (guarded on
-  `backward_process is not None`, which is `None` on the scheduler coord) → the child's
-  per-epoch progress meter renders `N/?`.
-- **Latent: the per-layer `clip_grad_norm_` is rank-asymmetric.** It is computed over a
-  rank-local tensor set (full replicated grads + only *this* rank's half of the sharded
-  ones), so each rank derives a slightly different clip scale and applies it to the
-  *identical* reduced replicated grads — slowly desynchronizing the replicated masters.
-  Dormant today only because the per-layer norms do not exceed `max_norm=1.0` (measured
-  divergence when they do: ~0.08%/step). Folding the clip after a bucketed reduce fixes
-  it — see M5 notes.
-- **M5 — backward CUDA graphs under TP** (see below).
+- **M5 live A/B** on Llama-3 / Qwen3-14B TP=2 (Next step item 1).
+- ~~**`set_corpus_meta` never reaches the children under TP**~~ (the child's meter
+  printed `N/?`). Fixed 2026-09-08: `FinetuneScheduler` stores the total on
+  `coord.corpus_total_tokens`; under relay mode `_trigger_backward` puts it on every
+  trigger command (one int) and the worker's `execute_trigger` calls the child's
+  `set_corpus_meta` once, ahead of the work signal on the same ordered pipe, so the very
+  first cycle line reads `N/total`. `tests/test_tp_timing_relay.py::test_corpus_meta_relay`.
+- ~~**Latent: the per-layer `clip_grad_norm_` is rank-asymmetric.**~~ Fixed by M4.3
+  (below): the clip runs after the bucketed reduce with a rank-symmetric norm.
 
-### M5 notes — and why it should not be next
+### M4.3 — gradient bucketing + comm stream + rank-symmetric clip ✅ (2026-09-08)
 
-`finetune.backward_cuda_graph` is force-disabled at `tp_size > 1` (silent eager
-fallback). **The config comment claiming the blocker is "full-dim capture buffers" is
-wrong**: `llama3_graph.py` derives every dimension from the service (`svc.Hq`, `svc.inter`,
-…), which M2 already made local, and its `D`-sized buffers are residual-stream tensors
-that are legitimately full. The real blocker is that the captured regions have no
-all-reduces wired in.
+**Motivation, measured.** A kernel-level profile of the real `process_backward` on a
+synthetic Qwen3-14B shape (2 GPUs, NCCL, graph + all saves, no inference) put the 240
+all-reduces per cycle at 37 ms of an ~125 ms cycle, and a microbenchmark gave 0.36 ms per
+2.5 MB reduce / 0.045 ms per 160 KB reduce across the two 5090s (no P2P, host-staged
+PCIe). 160 of the 240 were the replicated LoRA-factor grads, which nobody reads before
+the optimizer. Every reduce was also issued on the compute stream with the child pinned
+to one hardware queue (`CUDA_DEVICE_MAX_CONNECTIONS=1`), so no overlap was possible.
 
-Note that **NCCL-in-a-captured-region is not forbidden** — NCCL ≥ 2.9 supports graph
+**What landed** (`bwd_services/common/tp.py`, `common/trainer.py`, both families,
+`backward_process.py`):
+- `FactorBucket`: one persistent flat buffer (25 MB on Qwen3-14B, 16 MB on Llama-3-8B,
+  compute dtype, outside any graph pool) holding every layer's `qA/kA/vA/oB` grads in
+  backward order, so each group of `BUCKET_LAYERS=8` consecutive layers is one contiguous
+  slice. The trainer `stash`es a layer's four grads as they are produced and submits the
+  group's slice when its last layer is done.
+- `CommQueue`: the dedicated CUDA stream + the ordering, in one place. `submit` records
+  an event on the compute stream and makes the comm stream wait on it (reduce-after-
+  produce), issues the collective, records a completion event; `wait` makes the compute
+  stream wait on all of them (consume-after-reduce). Only persistent buffers are
+  submitted, rewritten no earlier than the next cycle (no overwrite in flight). CPU /
+  gloo: synchronous. Debug: `DSERVE_BWD_COMM_SYNC=1` waits after each submit;
+  `DSERVE_BWD_COMM_DELAY=<cycles>` spins the comm stream before each collective so a
+  missing wait reads stale data deterministically.
+- `clip_layers_symmetric_`: the per-layer clip with `clip_grad_norm_` semantics but the
+  norm over the FULL parameter set — replicated grads (identical on every rank) + the
+  sharded grads' squared norms summed across ranks with one `[L]` all-reduce — so both
+  ranks derive the same coefficient. Runs after `comm.wait()`; tp=1 keeps the original
+  per-layer `clip_grad_norm_` unchanged.
+- Families: `layer_backward` / `layer_backward_graphed` take `reduce_factors=True`; the
+  trainer passes `False` under TP (the default keeps the M3 gloo tests and the
+  layer-level NCCL gate unchanged). `bucket_layers` is meta-configurable (tests use 2
+  over 3 layers).
+- The child no longer sets `CUDA_DEVICE_MAX_CONNECTIONS=1` (DeltaServe's MPS ordering
+  aid; the two-stream design carries explicit event dependencies instead).
+
+**Result.** Qwen3-14B TP=2: 240 → 86 collectives per cycle (80 residual + 5 buckets + 1
+clip vector); uncontended cycle 123 → 121 ms — the bucket reduces overlap the layer
+loop, and the 80 residual reduces (~29 ms) are the TP floor on this box. The main win is
+correctness: TP=2 now equals tp=1 with the clip firing.
+
+**Gates.** `tests/test_tp_bucket_gloo.py` 92/92 (CPU, 2-process gloo, real trainer, 3
+layers / 2 buckets, clip firing: TP2 masters + losses == tp1 to 1e-4, rank0 == rank1,
+12 collectives per cycle). `tests/test_tp_trainer_graph_nccl.py` 220/220 (2 GPUs: graph /
+eager / graph+save / graph+sync / graph+delay — the async comm path bit-identical to the
+sync and delayed modes, TP2 == tp1 with the clip on, counts 12 / 12 / 9 per cycle).
+`tests/test_phase1_step2.py` updated for the removed env var. Every tp=1 gate unchanged.
+
+### M5 notes — why the collectives stay outside the graphs
+
+**NCCL-in-a-captured-region is not forbidden** — NCCL ≥ 2.9 supports graph
 capture, PyTorch's `ProcessGroupNCCL` supports it, and Megatron-LM captures TP all-reduces
 inside per-layer graphs routinely. It requires eager PG init + a warmup collective, and
 identical capture/replay order on every rank — which DeltaServe's broadcast trigger
@@ -1192,14 +1420,144 @@ after the reduce, which fixes the rank-asymmetry above.
 
 - `configs/serving_config_finetuning_llama3_tp2.yaml` — TP=2 co-serving config.
 - `eval-tp/launch_deltaserve.py` — HTTP launcher (streams logs, waits on `/health`).
-- `eval-tp/ft_bench_tp.py` — TP co-serving FT bench. Writes **per-TP** filenames
-  (`bwd_log_tp{N}.csv`, `server_tp{N}.log`) and **truncates** the bwd log per run (the
+- `eval-tp/auto_benchmark_tp.py` — the timeline (real-workload) benchmark under TP: the
+  replay / CSV / trim helpers are imported from `eval/auto_benchmark.py`, the server comes
+  from the family-aware launcher (`--family`, `--tp`, `--co` for co-serving vs baseline).
+  Modes `--loose` / `--tight` / `--nutanix` / `--nutanix-600-800` (the 600–800 s slice of the
+  original Nutanix trace) from `eval/timelines/5090/`. Per-family, per-TP, per-mode output
+  names in `eval-tp/output/`; `--kill-stale` pre-flight as in `ft_bench_tp.py`.
+- `eval-tp/auto_plot_tp.py` — the 4-panel figure for eval-tp runs (`eval/auto_plot.py`'s
+  builder, which gained optional `timeline_csv` / `infonly_csv` / `title` overrides and
+  re-bases the FT cumulative counter so warmup tokens no longer spike the first bin).
+- `eval-tp/ft_bench_tp.py` — TP co-serving FT bench. Writes **per-family, per-TP** filenames
+  (`bwd_log_{family}_tp{N}.csv`, `server_{family}_tp{N}.log`; P8) and **truncates** the bwd log per run (the
   server opens it in append mode, so runs used to silently concatenate). Counts cycles
   from the CSV, not the server log — under TP every rank prints its own `[backward]` line,
   so log-line counting reports `tp_size`× the real count. `--kill-stale` +
   a pre-flight check refuse to launch when a previous run left GPU-resident processes.
 - `tests/test_llama3_tp_shard.py`, `tests/test_llama3_tp_backward_gloo.py` (both are
   standalone scripts — run with `python`, not pytest, which is not installed in the env).
+
+---
+
+## Phase 8 — Qwen3 family + backward-service restructure ✅ (Qwen3-14B TP=2 GPU-validated; 0.6B smoke + Llama rope_theta re-check pending)
+
+**Goal.** Add `Qwen3ForCausalLM` (Qwen/Qwen3-14B-Base at TP=2 on the 2× 5090; Qwen/Qwen3-0.6B-Base
+single-GPU for smoke tests) as a second co-served + LoRA-finetuned family, and restructure
+the backward service so shared logic lives in its own modules and each family has its own
+file — with Llama-3 numerically identical and no slower, and upstream-vLLM edits minimal
+and generic (no Llama/Qwen branches in vLLM files).
+
+**What Qwen3 adds.** Exactly one op: a per-head `RMSNorm(head_dim)` on q and k (`q_norm` /
+`k_norm`, frozen) between the qkv projection and RoPE. Module names, fused qkv/gate_up,
+GQA, SwiGLU, the residual layout, the LoRA layer classes and the TP shard geometry are
+identical to Llama-3; the norm acts within a head, so the 7 all-reduces per layer are
+unchanged. Its backward inserts an fp32 `rmsnorm_backward` between the RoPE backward and
+the q/k projection backward and needs the PRE-norm q/k — which the `self_attn.attn`
+pre-hook does not see (it captures post-norm post-RoPE). Originally the family therefore
+declared `supports_saved_qkv=False` and recomputed Q/K/V; **since 2026-09-08 the q/k save
+hooks the `self_attn.q_norm` / `k_norm` INPUTS instead** (`Family.saved_qkv_pre_transform`,
+`ft_meta.saved_qkv_pre_transform`, `FinetuneAccumulator(attn_qkv_pre_transform=True)`),
+which is exactly the tensor the norm backward needs; the remat skips the Q/K/V GEMM and
+re-applies only the elementwise norm + RoPE — eager `layer_forward` and
+`graph_forward_core` alike. Gates: `tests/test_qwen3_backward.py` (saved pre-norm qkv
+== autograd), `tests/test_qwen3_backward_graph.py::test_saved_qkv_pre_norm` (qkv-only and
+all-saves → 475/475), `tests/test_accumulate_hooks.py` (Qwen-style fake with
+`q_norm`/`k_norm`; disables itself when the norm modules are missing → 147/147),
+`tests/test_tp_backward_graph_nccl.py` `save_all` mode (4020/4020). Qwen3 now matches
+Llama-3: with all three saves the per-layer forward recompute is in_ln alone.
+Qwen3-0.6B additionally has `Hq*Hd = 2048 ≠ hidden = 1024` and a tied
+`lm_head`; both were latent bugs on the Llama-only code and are fixed generically.
+
+### Layout (`dserve-vllm/vllm/deltaserve/bwd_services/`)
+
+| Module | Holds |
+|---|---|
+| `common/ops.py` | `rope_cos_sin`, `apply_rope`, `rope_backward`, `rmsnorm`, `rmsnorm_backward`, `proj`, `proj_backward` |
+| `common/attention.py` | `attn_forward_core` (per-sample GQA loop, extracted from `layer_forward`), `attn_backward_core` |
+| `common/ffn.py` | `ffn_forward_tail` (gate/up or saved), `ffn_backward_core` |
+| `common/head.py` | `head_backward`, `logits_chunked` |
+| `common/tp.py` | `lora_shard_slice`, `init_backward_tp_group`, `reduce_partial` (the residual-aware reduce) |
+| `common/family.py` | `Family` dataclass: `layer_forward` / `layer_backward` / `layer_weights` map / `graph_forward_core` / `layer_backward_graphed` / `supports_saved_qkv` |
+| `common/trainer.py` | `LoraSftTrainerService`: `_build_state` (family weight map, `meta["lm_head_key"]`), `process_backward`, `_publish_to_served`, DIAG, verify |
+| `common/graph.py` | `GraphedBackward` (was `llama3_graph.py`, `git mv`): family forward core delegated; `static_ctx_flat` sized `[s, q_size]` |
+| `llama3.py` | full `layer_forward` / `layer_backward` / `graph_forward_core` / `layer_backward_graphed` + `LLAMA3` + `Llama3BackwardService` |
+| `qwen3.py` | the same with the q/k-norm insertion; its own `graph_forward_core` (norm between projection and RoPE, writes the runner's `static_q_pre`/`static_k_pre`) so all three graph regions run |
+| `registry.py` | arch/alias → `"module:Class"` (lazy import), `is_trainer`, `get_family` |
+| `../ft_meta.py` | `build_backward_meta` (the `meta` dict, moved out of the worker), `rope_theta_of`, `read_lora_scaling`, `effective_save_attn_qkv` |
+
+Family functions are bound once in `_build_state` and called directly on the hot path;
+`reduce_partial` only runs when `all_reduce is not None`; family modules import lazily
+(a Llama child never imports `qwen3.py`).
+
+### Milestones + gates
+
+| Q | Scope | Gate | Status |
+|---|---|---|---|
+| Q0 | `rope_theta` fix (`ft_meta.rope_theta_of`) | Llama-3 DIAG remat error → bf16 noise; `pure_ft_bench` reproduces the 2.12 reference | ✅ code; ❌ GPU re-verify |
+| Q1 | Restructure with Llama-3 bit-parity | all five Llama gates at their counts | ✅ gradcheck 12/12, shard 23/23, gloo 10/10, overfit (99.9% drop), graph parity 165/165 |
+| Q2 | Qwen3 family + CPU tests | gradcheck incl. q/k-norm and `q_size≠hidden`; shard at 0.6B/14B geometry; real-gloo TP; overfit with tied head | ✅ 16/16, 42/42, 10/10, overfit 98.5% drop |
+| Q3 | Generic vLLM unblocks | Qwen3 + finetuning lands on the v1 runner; publish gate via registry; `meta` via `ft_meta` | ✅ code (`test_phase1_step1.py` 8/8) |
+| Q4 | Configs + family-aware eval-tp | `--dry-run` for all three presets prints the right `serve` cmd | ✅ |
+| Q5 | GPU ladder | 0.6B smoke → Llama TP=2 regression → Qwen3-14B TP=2 | ❌ user's next run |
+
+**Upstream vLLM edits (both generic).** `config/vllm.py:_get_v2_model_runner_unsupported_features`
+appends `"DeltaServe co-serving finetuning"` when `enable_finetuning` (routes every
+finetuning run to the v1 runner; an explicit `VLLM_USE_V2_MODEL_RUNNER=1` now errors instead
+of silently serving FT-less). `v1/worker/gpu_worker.py`: the served-LoRA publish gate is
+`registry.is_trainer(arch)` instead of `arch == "LlamaForCausalLM"`; the inline `meta` dict +
+adapter-scaling read became `ft_meta.build_backward_meta` / `read_lora_scaling`; the
+accumulator's `save_attn_qkv` goes through `ft_meta.effective_save_attn_qkv` (off only for a
+family whose backward cannot consume saved q/k at all) and `ft_meta.saved_qkv_pre_transform`
+(which hook stage to capture: post-RoPE at `self_attn.attn`, or the `q_norm`/`k_norm` inputs).
+
+### Verified (CPU)
+
+- `tests/test_llama3_{backward,tp_shard,tp_backward_gloo,train_overfit,backward_graph}.py`
+  — 12/12, 23/23, 10/10, pass, 165/165 after the refactor (imports only). The overfit test
+  had been broken at HEAD (unpacked `layer_forward`'s dict as a pair) and was repaired.
+- `tests/test_qwen3_{backward,tp_shard,tp_backward_gloo,train_overfit}.py` on the shared
+  `tests/bwd_harness.py` — 16/16, 42/42, 10/10, pass.
+- `tests/test_phase1_step1.py` 8/8 (config plumbing incl. the v2-runner entry).
+- `eval-tp/{launch_deltaserve,ft_bench_tp}.py --dry-run` for `llama3`, `qwen3-14b`, `qwen3-0.6b`.
+
+### GPU ladder — status
+
+Done: (4) Qwen3-14B TP=2 — trains (first bench: 99 cycles / 70 s, loss 2.9 → 2.1) and
+co-serves the loose / tight / nutanix-600-800 timelines (table under Phase 7 / M4.2);
+(3) Llama-3 TP=2 ran the loose replay after the refactor (55 cycles, no regressions
+observed; the cycle-for-cycle A/B against the pre-refactor run is still to be read off
+`eval-tp/output/`). Pending: (1) the Llama-3 `rope_theta` DIAG + `pure_ft_bench` re-check
+and (2) the Qwen3-0.6B single-GPU smoke (now also the live test of the Qwen3 forward
+graph with `backward_cuda_graph: true`).
+
+### GPU ladder (original plan; expected outcomes)
+
+1. **Llama-3-8B tp=1, DIAG**: `DSERVE_TP_DIAG=1 python eval/pure_ft_bench.py` → the
+   `[tpdiag] … remat-vs-captured rel|d|` lines should read ~1e-2 or below at every layer
+   (was 0.22 → 0.45); the loss curve should track the 2.12 reference.
+2. **Qwen3-0.6B single GPU**: `python eval-tp/ft_bench_tp.py --family qwen3-0.6b --tp 1
+   --duration 60` → `Qwen3BackwardService` banner, `[backward]` cycles with finite,
+   decreasing loss, inference 200s; with `DSERVE_TP_DIAG=1` the remat error stays small
+   (validates the q/k-norm remat, theta=1e6, the tied head, `q_size≠hidden` in one run).
+3. **Llama-3 TP=2 regression**: `--family llama3 --tp 2` → same cycle time and loss trend
+   as the pre-refactor run (`eval-tp/output/`).
+4. **Qwen3-14B TP=2**: `--family qwen3-14b --tp 2 --duration 120 --kill-stale` → both
+   ranks print `TP group up`, cycles fire, finite decreasing loss, no hang; record per-rank
+   `nvidia-smi` headroom (config starts at `gpu_memory_utilization: 0.80`).
+
+### Follow-ups (scoped, not started)
+
+- ~~**Exact `save_attn_qkv` for Qwen3**~~ — landed 2026-09-08, via the simpler route:
+  pre-hooks on `self_attn.q_norm`/`k_norm` save the PRE-norm q/k (same memory as the
+  Llama-3 save; no `inv_rms` bookkeeping), v from the attn pre-hook; the remat re-applies
+  norm + RoPE. See the Phase 8 section above.
+- ~~Qwen3 `graph_forward_core`~~ — landed: `common/graph.py` gained `static_q_pre`/`static_k_pre`
+  (+ `cache_views` keys), `qwen3.graph_forward_core` writes them; parity vs eager in
+  `tests/test_qwen3_backward_graph.py` (forward cache incl. `q_pre`/`k_pre`, graphed vs
+  eager backward grads, the `save_attn_ctx` branch). Graphs under TP landed in M5.
+- Broader `deltaserve/` regrouping (scheduling / data / backward subpackages) — deferred
+  because it would churn vLLM import strings for no Qwen3 benefit.
 
 ---
 

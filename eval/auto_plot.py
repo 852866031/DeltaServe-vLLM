@@ -215,17 +215,25 @@ def parse_bwd_log_csv(csv_path: str, t0_wall: Optional[datetime.datetime] = None
     items = sorted(dedup.items(), key=lambda x: x[0])
     anchor = t0_wall if t0_wall is not None else items[0][0]
     rel = np.array([(dt - anchor).total_seconds() for dt, _ in items], dtype=float)
+    batch = np.array([v[1] for _, v in items], dtype=float)
     if has_total:
         cum = np.array([v[0] for _, v in items], dtype=float)
     else:
-        cum = np.cumsum(np.array([v[1] for _, v in items], dtype=float))
-    # Drop rows that fall strictly before the anchor (can happen at sub-second
-    # granularity around the benchmark start cutoff); the FT throughput math
-    # downstream assumes monotonically increasing rel times >= 0.
+        cum = np.cumsum(batch)
+    # Drop rows that fall strictly before the anchor (the trim keeps the
+    # ``base_ts`` seconds before the first request; the plot's t=0 is the
+    # first request); the FT throughput math downstream assumes monotonically
+    # increasing rel times >= 0.
     if rel.size and (rel < 0).any():
         keep = rel >= 0
-        rel = rel[keep]
-        cum = cum[keep]
+        rel, cum, batch = rel[keep], cum[keep], batch[keep]
+    # ``total_processed_tokens`` counts from the start of finetuning, so the
+    # first row inside the window carries every token trained before it
+    # (warmup + the pre-window rows just dropped). Re-base so that row
+    # contributes only its own batch — otherwise the whole pre-window total
+    # lands in the first bin as a spike.
+    if has_total and cum.size and np.isfinite(batch[0]) and np.isfinite(cum[0]):
+        cum = cum - (cum[0] - batch[0])
     elapsed = float(rel[-1]) if len(rel) else 0.0
     total = float(cum[-1]) if len(cum) else 0.0
     return rel, cum, (total / elapsed if elapsed > 0 else float("nan"))
@@ -401,7 +409,11 @@ def plot_latency_percentile(ax, res, label, color):
 
 
 def plot_throughput_curves(ax, res, tl, bwd_log, color_inf,
-                           bin_s=1.0, smoothing_window_s=None):
+                           bin_s=1.0, smoothing_window_s=None,
+                           ft_on_bottom=True):
+    """Stacked inference + finetune throughput. ``ft_on_bottom=True`` draws
+    the finetune band from 0 and stacks inference on top of it (the total is
+    the upper edge either way); False keeps the older inference-first order."""
     # Map request idx -> timeline max_new_tokens via row_id.
     tok_by_row = {int(rid): tok for rid, tok in
                   zip(tl["row_id"], tl["max_new_tokens"])}
@@ -439,16 +451,27 @@ def plot_throughput_curves(ax, res, tl, bwd_log, color_inf,
     inf_avg, ft_avg, tot_avg = inf_per_s.mean(), ft_per_s.mean(), total.mean()
     win_s = smoothing_window_s if smoothing_window_s is not None else _auto_window(t_max)
     inf_smooth = _smooth(inf_per_s, win_s, bin_s)
+    ft_smooth = _smooth(ft_per_s, win_s, bin_s)
     total_smooth = _smooth(total, win_s, bin_s)
     if win_s > bin_s:
         ax.plot(centers, total, color="black", linewidth=0.4, alpha=0.20, zorder=1)
-    ax.fill_between(centers, 0, inf_smooth, color=color_inf, alpha=0.20, linewidth=0,
-                    label=f"Inference contribution (avg {inf_avg:.0f} tok/s)", zorder=2)
-    ax.fill_between(centers, inf_smooth, total_smooth, color=FT_SHADE_COLOR, alpha=0.30,
-                    hatch="//", linewidth=0,
-                    label=f"Finetune contribution (avg {ft_avg:.0f} tok/s)", zorder=2)
-    ax.plot(centers, inf_smooth, color=color_inf, linewidth=1.6,
-            label=f"Inference (avg {inf_avg:.0f} tok/s)", zorder=3)
+    if ft_on_bottom:
+        ax.fill_between(centers, 0, ft_smooth, color=FT_SHADE_COLOR, alpha=0.30,
+                        hatch="//", linewidth=0,
+                        label=f"Finetune contribution (avg {ft_avg:.0f} tok/s)", zorder=2)
+        ax.fill_between(centers, ft_smooth, total_smooth, color=color_inf, alpha=0.20,
+                        linewidth=0,
+                        label=f"Inference contribution (avg {inf_avg:.0f} tok/s)", zorder=2)
+        ax.plot(centers, ft_smooth, color=FT_SHADE_COLOR, linewidth=1.6,
+                label=f"Finetune (avg {ft_avg:.0f} tok/s)", zorder=3)
+    else:
+        ax.fill_between(centers, 0, inf_smooth, color=color_inf, alpha=0.20, linewidth=0,
+                        label=f"Inference contribution (avg {inf_avg:.0f} tok/s)", zorder=2)
+        ax.fill_between(centers, inf_smooth, total_smooth, color=FT_SHADE_COLOR, alpha=0.30,
+                        hatch="//", linewidth=0,
+                        label=f"Finetune contribution (avg {ft_avg:.0f} tok/s)", zorder=2)
+        ax.plot(centers, inf_smooth, color=color_inf, linewidth=1.6,
+                label=f"Inference (avg {inf_avg:.0f} tok/s)", zorder=3)
     ax.plot(centers, total_smooth, color="black", linewidth=1.6,
             label=f"Total (avg {tot_avg:.0f} tok/s)", zorder=3)
     title = "Throughput (tokens/s)"
@@ -512,7 +535,17 @@ def plot_ttft_satisfaction(ax, res, slo_s, window_s=5.0, avg_tbt_slo=None):
 def make_figure_for_mode(mode, base_suffix, output_dir, plots_dir,
                          timeline_csv_dir, out_path, slo_s, window_s,
                          throughput_window_s=None, avg_tbt_slo=None,
-                         factor_tag: Optional[str] = None):
+                         factor_tag: Optional[str] = None,
+                         timeline_csv: Optional[str] = None,
+                         infonly_csv: Optional[str] = None,
+                         title: Optional[str] = None):
+    """Render the 4-panel figure for one mode.
+
+    ``timeline_csv`` overrides the ``timeline_<mode>.csv`` lookup under
+    ``timeline_csv_dir`` (modes whose schedule file is named differently, e.g.
+    the Nutanix 600–800 s slice); ``infonly_csv`` overrides the inference-only
+    overlay path (``timeline_results_<mode>.csv``) for output layouts that tag
+    files differently (eval-tp); ``title`` overrides the figure title."""
     # When ``factor_tag`` is provided, the on-disk file names carry the factor
     # in the suffix (``..._factor_<tag>_<mode>.csv``); we extend the base
     # accordingly so all the read paths line up without callers having to
@@ -524,7 +557,8 @@ def make_figure_for_mode(mode, base_suffix, output_dir, plots_dir,
     results_csv = os.path.join(output_dir, f"timeline_results{full}.csv")
     bwd_log_csv = os.path.join(output_dir, f"bwd_log{full}.csv")
     meta_json = os.path.join(output_dir, f"bench_meta{full}.json")
-    timeline_csv = os.path.join(timeline_csv_dir, f"timeline_{mode}.csv")
+    if timeline_csv is None:
+        timeline_csv = os.path.join(timeline_csv_dir, f"timeline_{mode}.csv")
     # results + timeline required; bwd_log + meta optional (no-co runs / old runs).
     ensure_exists(timeline_csv)
     ensure_exists(results_csv)
@@ -566,7 +600,8 @@ def make_figure_for_mode(mode, base_suffix, output_dir, plots_dir,
     # latency for the same mode when its results exist — co-serving overhead
     # becomes visible as a function of time.
     if base_suffix:
-        infonly_csv = os.path.join(output_dir, f"timeline_results_{mode}.csv")
+        if infonly_csv is None:
+            infonly_csv = os.path.join(output_dir, f"timeline_results_{mode}.csv")
         if (os.path.exists(infonly_csv)
                 and os.path.abspath(infonly_csv) != os.path.abspath(results_csv)):
             try:
@@ -580,11 +615,12 @@ def make_figure_for_mode(mode, base_suffix, output_dir, plots_dir,
     plot_ttft_satisfaction(ax_ttft, res, slo_s=slo_s, window_s=window_s,
                            avg_tbt_slo=avg_tbt_slo)
 
-    config_tag = base_suffix.lstrip("_") or "baseline"
-    title = f"{mode}  ({config_tag}"
-    if factor_tag:
-        title += f", factor={factor_tag}"
-    title += ")"
+    if title is None:
+        config_tag = base_suffix.lstrip("_") or "baseline"
+        title = f"{mode}  ({config_tag}"
+        if factor_tag:
+            title += f", factor={factor_tag}"
+        title += ")"
     fig.suptitle(title)
     # constrained_layout handles the partial-row GridSpec; no tight_layout call.
     os.makedirs(plots_dir, exist_ok=True)

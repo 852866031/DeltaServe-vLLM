@@ -28,6 +28,7 @@ sys.path[:] = [p for p in sys.path
                if os.path.abspath(p or ".") != os.path.dirname(os.path.abspath(__file__))]
 
 from vllm.deltaserve.bwd_services import llama3 as L  # noqa: E402
+from vllm.deltaserve.bwd_services.common.tp import lora_shard_slice  # noqa: E402
 
 _passed = 0
 _failed = 0
@@ -57,23 +58,23 @@ def test_lora_shard_reconstruction():
 
     for proj in ("q", "k", "v"):
         # Column-parallel: B sharded on output rows, A replicated.
-        shards = [L.lora_shard_slice(proj, "B", B[proj], rk, tp_size, local_q, local_kv)
+        shards = [lora_shard_slice(proj, "B", B[proj], rk, tp_size, local_q, local_kv)
                   for rk in range(tp_size)]
         recon = torch.cat(shards, dim=0)
         w = local_q if proj == "q" else local_kv
         _ok(f"{proj}.B shard shape", shards[0].shape == (w, r),
             f"{tuple(shards[0].shape)}")
         _ok(f"{proj}.B reconstruct", torch.equal(recon, B[proj]))
-        a0 = L.lora_shard_slice(proj, "A", A[proj], 0, tp_size, local_q, local_kv)
-        a1 = L.lora_shard_slice(proj, "A", A[proj], 1, tp_size, local_q, local_kv)
+        a0 = lora_shard_slice(proj, "A", A[proj], 0, tp_size, local_q, local_kv)
+        a1 = lora_shard_slice(proj, "A", A[proj], 1, tp_size, local_q, local_kv)
         _ok(f"{proj}.A replicated", torch.equal(a0, A[proj]) and torch.equal(a1, A[proj]))
 
     # Row-parallel o: A sharded on input cols, B replicated.
-    a_shards = [L.lora_shard_slice("o", "A", A["o"], rk, tp_size, local_q, local_kv)
+    a_shards = [lora_shard_slice("o", "A", A["o"], rk, tp_size, local_q, local_kv)
                 for rk in range(tp_size)]
     _ok("o.A shard shape", a_shards[0].shape == (r, local_q), f"{tuple(a_shards[0].shape)}")
     _ok("o.A reconstruct", torch.equal(torch.cat(a_shards, dim=1), A["o"]))
-    b0 = L.lora_shard_slice("o", "B", B["o"], 0, tp_size, local_q, local_kv)
+    b0 = lora_shard_slice("o", "B", B["o"], 0, tp_size, local_q, local_kv)
     _ok("o.B replicated", torch.equal(b0, B["o"]))
 
 
@@ -83,7 +84,7 @@ def test_tp1_identity():
     t = torch.randn(4096, 16)
     for proj in ("q", "k", "v", "o"):
         for ab in ("A", "B"):
-            out = L.lora_shard_slice(proj, ab, t, 0, 1, 2048, 512)
+            out = lora_shard_slice(proj, ab, t, 0, 1, 2048, 512)
             _ok(f"{proj}.{ab} identity", out is t or torch.equal(out, t))
 
 

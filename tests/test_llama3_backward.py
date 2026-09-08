@@ -24,6 +24,8 @@ sys.path[:] = [p for p in sys.path
                if os.path.abspath(p or ".") != os.path.dirname(os.path.abspath(__file__))]
 
 from vllm.deltaserve.bwd_services import llama3 as L  # noqa: E402
+from vllm.deltaserve.bwd_services.common.head import head_backward  # noqa: E402
+from vllm.deltaserve.bwd_services.common.ops import rmsnorm, rope_cos_sin  # noqa: E402
 
 _TOL = 1e-3
 _passed = 0
@@ -41,7 +43,7 @@ def _check(name, manual, ref):
 
 def _ref_head_loss(final_in, lm_w, norm_w, eps, ids, seq_lens, b_start, vocab):
     """Autograd-friendly reference for head_backward's loss (per-sample shift CE)."""
-    normed = L.rmsnorm(final_in, norm_w, eps)
+    normed = rmsnorm(final_in, norm_w, eps)
     total = final_in.new_zeros(())
     n_valid = 0
     for st, ln in zip(b_start, seq_lens):
@@ -69,7 +71,7 @@ def test_head():
     loss_ref = _ref_head_loss(final_in, lm_w, norm_w, eps, ids, seq_lens, b_start, vocab)
     grad_ref = torch.autograd.grad(loss_ref, final_in)[0]
 
-    loss_m, n_valid, grad_m = L.head_backward(
+    loss_m, n_valid, grad_m = head_backward(
         final_in.detach(), lm_w, norm_w, eps, ids, seq_lens, b_start, vocab)
 
     print(f"  loss manual={loss_m:.6f} ref={loss_ref.item():.6f} "
@@ -108,7 +110,7 @@ def test_layer():
     n = sum(seq_lens)
 
     positions = torch.cat([torch.arange(s) for s in seq_lens])
-    cos, sin = L.rope_cos_sin(positions, Hd, theta)
+    cos, sin = rope_cos_sin(positions, Hd, theta)
 
     lw_grad = _make_layer_weights(D, kv_size, inter, r, with_grad=True)
     x_req = torch.randn(n, D, dtype=torch.float32, requires_grad=True)

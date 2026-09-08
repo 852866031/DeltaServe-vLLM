@@ -1,10 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""CUDA-graph capture/replay for the Llama-3 LoRA SFT backward (Phase 5).
+"""CUDA-graph capture/replay for the LoRA SFT backward (Phase 5).
 
 Ports DeltaServe ``models/llama/SFT_service_graph.py`` onto our backward
-service. Two graphs per layer:
+service. Family-agnostic: the captureable layer forward is the family's
+``graph_forward_core(runner, lw)`` (see ``common/family.py``); the FFN-bwd and
+padded-attention regions below read no family-specific composition. Three
+captured regions per layer:
+
+  * **Forward graph** — the family's layer rematerialization written into the
+    static buffers the two backward graphs read (skipped, eager fallback, when
+    the family provides no ``graph_forward_core``).
 
   * **FFN graph** — the FFN-block backward (rmsnorm post_ln-bwd + silu/sigmoid
     + down/gate/up GEMMs + residual). Shape-stable at the activation-buffer
@@ -14,16 +21,26 @@ service. Two graphs per layer:
     cached qh/kh/vh + grad_ctx (scatter in, compute, gather out). Bounds come
     from ``finetune.backward_cuda_graph_attn_{bn_max,l_max}``.
 
-Everything outside these two regions stays eager (forward remat, O-proj bwd,
-RoPE bwd, Q/K/V-proj bwd, in_ln rmsnorm bwd, optimizer/publish). ``_maybe_pause``
-is the caller's responsibility — they invoke it BETWEEN our two replays each
+Everything outside these three regions stays eager (O-proj bwd, RoPE bwd,
+Q/K/V-proj bwd, in_ln rmsnorm bwd, optimizer/publish). ``_maybe_pause`` is the
+caller's responsibility — they invoke it BETWEEN our two backward replays each
 layer so the GPU-yield contract is preserved at the same per-layer cadence as
 the all-eager path.
 
+**Tensor parallelism (Phase 7 / M5).** No collective is ever captured. Of the
+7 all-reduces per layer, six live in the family's eager ``layer_backward_graphed``
+around the two backward replays; the seventh — the forward remat's row-parallel
+``o`` — would fall inside the forward capture, so the forward graph is SPLIT at
+the O-proj output: the family core stops at ``static_o``, and the residual add +
+gate/up slice (``forward_tail``) runs inside the same capture at ``tp_size == 1``
+but eagerly after ``all_reduce(static_o[:n])`` under TP. Per-rank eager
+fallbacks stay lock-step safe because every collective is issued from eager
+code in the same order and with the same shapes on both paths.
+
 Capture-failure / shape-fit-failure handling per layer is silent eager fallback:
 the runner adds the layer id to ``ffn_failed`` / ``attn_failed`` and forwards
-to ``ffn_backward_core`` / ``attn_backward_core`` from ``llama3.py`` for the
-rest of the run. Gradient values are bit-identical to eager (same math, just
+to ``ffn_backward_core`` / ``attn_backward_core`` (``common/ffn.py`` /
+``common/attention.py``) for the rest of the run. Gradient values are bit-identical to eager (same math, just
 replayed under fixed shapes).
 
 Persistent static IO buffers live OUTSIDE the shared graph pool — the
@@ -41,19 +58,14 @@ import time
 import torch
 
 from vllm.deltaserve import dprint
-from vllm.deltaserve.bwd_services.llama3 import (
-    _proj,
-    apply_rope,
-    attn_backward_core,
-    ffn_backward_core,
-    layer_forward,
-    rmsnorm,
-    rope_cos_sin,
-)
+from vllm.deltaserve.bwd_services.common.attention import attn_backward_core
+from vllm.deltaserve.bwd_services.common.ffn import ffn_backward_core
+from vllm.deltaserve.bwd_services.common.ops import rope_cos_sin
 
 
-class Llama3GraphedBackward:
-    """Per-layer FFN + padded-attention CUDA graphs for the Llama-3 SFT backward.
+class GraphedBackward:
+    """Per-layer forward + FFN-bwd graphs and one shared padded-attention-bwd
+    graph for the LoRA SFT backward of any family.
 
     Holds one ``torch.cuda.CUDAGraph`` per layer per region. Static IO buffers
     are allocated once at construction and reused across layers (layers run
@@ -69,6 +81,15 @@ class Llama3GraphedBackward:
                 "[backward_cuda_graph] CUDA is not available in this process")
 
         self.svc = svc
+        # The family's layer functions: the captureable forward (may be None
+        # → every layer's forward runs eager) and the eager forward fallback.
+        self._forward_core_fn = svc.family.graph_forward_core
+        self._layer_forward = svc.family.layer_forward
+        # [Phase 7 / M5] The backward children's TP all-reduce (None at
+        # tp_size == 1). Decides whether the forward tail is captured with the
+        # family core or run eagerly after the o-proj reduce (see ``forward``).
+        self._all_reduce = getattr(svc, "_all_reduce", None)
+        self.scaling = float(svc.scaling)
         self.s_max = int(s_max)
         self.bn_max = int(bn_max)
         self.l_max = int(l_max)
@@ -83,10 +104,11 @@ class Llama3GraphedBackward:
         self.kv_repeat = self.Hq // self.Hkv
         self.eps = float(svc.eps)
         self.scale = 1.0 / math.sqrt(self.Hd)
-        # When True, the captured forward graph SKIPS Q/K/V proj + RoPE and
-        # reads post-RoPE q/k/v from ``static_saved_qh/kh/vh`` (staged from
-        # ``activations["attn_qh"/"attn_kh"/"attn_vh"]`` per layer). RMSNorm
-        # in_ln still runs (needed by the eager Q/K/V LoRA-A backward tail).
+        # When True, the captured forward graph SKIPS the Q/K/V projection and
+        # reads q/k/v from ``static_saved_qh/kh/vh`` (staged from
+        # ``activations["attn_qh"/"attn_kh"/"attn_vh"]`` per layer) — post-RoPE
+        # for Llama-3, pre-norm for Qwen3 (whose core re-applies norm + RoPE).
+        # RMSNorm in_ln still runs (needed by the eager Q/K/V LoRA-A backward tail).
         # Mode is fixed at construction; affects which capture branch
         # ``_forward_core`` takes.
         self.save_attn_qkv = bool(getattr(svc, "save_attn_qkv", False))
@@ -97,6 +119,12 @@ class Llama3GraphedBackward:
         # is fixed at construction; affects which capture branch
         # ``_forward_core`` takes.
         self.save_attn_ctx = bool(getattr(svc, "save_attn_ctx", False))
+        # When True, the post-attention residual captured in the FT forward is
+        # staged straight into ``static_resid_mid`` (Graph A's input) and the
+        # family core skips the O projection; the forward tail then only
+        # splits gate||up. Under TP this removes the forward's only all-reduce,
+        # so the tail is captured with the core again (no eager split needed).
+        self.save_resid_mid = bool(getattr(svc, "save_resid_mid", False))
 
         # Per-layer FFN graphs (each binds layer-specific frozen weights:
         # lw["down"], lw["gate"], lw["up"], lw["post_ln"]). Capture/replay
@@ -225,7 +253,7 @@ class Llama3GraphedBackward:
         # Saved MLP gate||up captured in the forward (one buffer per layer
         # in the accumulator; we stage the current layer's into one static
         # buffer per backward call). Skipping the gate_up matmul is the
-        # production path (see Llama3BackwardService.process_backward).
+        # production path (see LoraSftTrainerService.process_backward).
         self.static_saved_gate_up = torch.zeros((s, 2 * inter), dtype=mdt, device=dev)
         # Saved post-RoPE q/k/v captured in the forward (only used when
         # ``save_attn_qkv`` mode is on). Staged per layer in
@@ -247,10 +275,23 @@ class Llama3GraphedBackward:
         # Outputs (flat, model dtype): the rest of the cache the eager tail
         # consumes. qh/kh/vh flat are written alongside the padded scatter.
         self.static_x_norm1 = torch.zeros((s, D), dtype=mdt, device=dev)
+        # Pre-transform q/k for families whose attention applies a per-head
+        # transform between the projection and RoPE (Qwen3's q/k-norm): the
+        # eager backward tail needs the transform's INPUT. Written by such a
+        # family's ``graph_forward_core``; unused (zero) for Llama-3. Cheap
+        # (~2.6 MB at s_max=256 on Qwen3-14B).
+        self.static_q_pre = torch.zeros((s, Hq, Hd), dtype=mdt, device=dev)
+        self.static_k_pre = torch.zeros((s, Hkv, Hd), dtype=mdt, device=dev)
         self.static_qh_flat = torch.zeros((s, Hq, Hd), dtype=mdt, device=dev)
         self.static_kh_flat = torch.zeros((s, Hkv, Hd), dtype=mdt, device=dev)
         self.static_vh_flat = torch.zeros((s, Hkv, Hd), dtype=mdt, device=dev)
-        self.static_ctx_flat = torch.zeros((s, D), dtype=mdt, device=dev)
+        # Attention width (Hq*Hd), NOT the residual width D — they differ under
+        # TP (local heads) and on models whose head_dim*num_heads != hidden.
+        self.static_ctx_flat = torch.zeros((s, q_size), dtype=mdt, device=dev)
+        # O-proj output (the family core's last write). Full residual width;
+        # under TP it is this rank's PARTIAL sum (o_proj is row-parallel) and
+        # ``forward`` all-reduces it before ``forward_tail`` adds the residual.
+        self.static_o = torch.zeros((s, D), dtype=mdt, device=dev)
 
     # ---------------------------------------------------------------- prepare
 
@@ -294,14 +335,20 @@ class Llama3GraphedBackward:
         # Same dummy-batch arming as attn — cos/sin already staged by
         # begin_backward above. Stage zero layer_in / saved_gate_up via
         # the static buffers' default zero state (already zero from
-        # _alloc_static_buffers).
-        for i in range(L):
-            try:
-                self._capture_forward(i, self.svc._layer_weights(i))
-            except Exception as e:  # noqa: BLE001
-                self.fwd_failed.add(i)
-                dprint(f"[bwd-graph] forward layer {i} startup capture failed: "
-                       f"{e}; will fall back to eager at runtime")
+        # _alloc_static_buffers). A family without a captureable forward
+        # runs every layer's forward eager (same fallback as a failed capture).
+        if self._forward_core_fn is None:
+            self.fwd_failed = set(range(L))
+            dprint(f"[bwd-graph] {self.svc.family.name} has no graph forward "
+                   "core; layer forwards run eager, FFN/attn backwards graphed")
+        else:
+            for i in range(L):
+                try:
+                    self._capture_forward(i, self.svc._layer_weights(i))
+                except Exception as e:  # noqa: BLE001
+                    self.fwd_failed.add(i)
+                    dprint(f"[bwd-graph] forward layer {i} startup capture "
+                           f"failed: {e}; will fall back to eager at runtime")
 
         # Reset per-backward state — the real first backward calls
         # begin_backward again with its own seq_lens.
@@ -343,7 +390,7 @@ class Llama3GraphedBackward:
 
         # Stage cos/sin ALWAYS (used by both the graphed forward and the
         # eager forward fallback when the padded-attention budget overflows
-        # — the fallback in ``Llama3GraphedBackward.forward`` reads
+        # — the fallback in ``GraphedBackward.forward`` reads
         # ``static_cos/sin[:n]``). Build positions on CPU = concat(arange(s)
         # for s in seq_lens), pad with zeros — RoPE(zeros, cos=any, sin=any)
         # = zeros because the q/k inputs are already zero in the tail.
@@ -641,9 +688,9 @@ class Llama3GraphedBackward:
         Q/K/V/RoPE region of the same forward graph), writes the flat
         ``static_ctx_flat`` via padded-compute + gather.
 
-        Math mirrors the per-sample loop in ``layer_forward`` (lines 175-191
-        of llama3.py): GQA repeat_interleave, fp32 scores/softmax, causal +
-        key-pad mask, ``att @ v`` cast back to model dtype. Output layout
+        Math mirrors the per-sample loop in ``common/attention.py::
+        attn_forward_core``: GQA repeat_interleave, fp32 scores/softmax,
+        causal + key-pad mask, ``att @ v`` cast back to model dtype. Output layout
         is the flat ``[n, Hq*Hd]`` that the eager O-proj backward
         consumes."""
         bn, lm = self.bn_max, self.l_max
@@ -682,68 +729,12 @@ class Llama3GraphedBackward:
         gathered = ctx_pad[self.static_bn_idx, self.static_pos_idx]   # [s, Hq, Hd]
         self.static_ctx_flat.copy_(gathered.reshape(self.s_max, D))
 
-    def _forward_core(self, lw: dict) -> None:
-        """The captureable layer-forward body (no eager helpers, no python loop
-        over samples). Reads ``static_layer_in`` + ``static_cos/sin`` +
-        ``static_saved_gate_up``; writes:
-
-          - ``static_x_norm1`` (eager Q/K/V LoRA-A bwd input)
-          - ``static_qh_flat / kh_flat / vh_flat`` (eager RoPE-bwd input)
-          - ``static_qh_pad  / kh_pad  / vh_pad`` (Graph B input — scattered)
-          - ``static_ctx_flat`` (eager O-proj bwd input)
-          - ``static_resid_mid`` (Graph A input)
-          - ``static_gate / static_up`` (Graph A input — sliced from saved_gate_up)
-
-        Mirrors ``layer_forward`` with ``saved_gate_up != None``; differs only
-        in being shape-stable at the fixed ``s_max`` slab and writing into
-        static buffers in place."""
-        s, D, inter = self.s_max, self.D, self.inter
-        Hq, Hkv, Hd = self.Hq, self.Hkv, self.Hd
-        kv_size = Hkv * Hd
-        scaling = float(self.svc.scaling)
-        mdt = self.model_dtype
-
-        # 1) RMSNorm(in_ln) on [s_max, D] — runs in BOTH modes (the Q/K/V
-        #    LoRA-A backward needs x_norm1; cheap, ~few MFLOPs).
-        x_norm1 = rmsnorm(self.static_layer_in, lw["in_ln"], self.eps)
-        self.static_x_norm1.copy_(x_norm1)
-
-        if self.save_attn_qkv:
-            # Fast path: post-RoPE q/k/v were captured in the FT forward and
-            # staged into static_saved_qh/kh/vh by ``stage_forward_inputs``.
-            # Skip Q/K/V proj + RoPE entirely. Bandwidth-only — three model-
-            # dtype reads of [s, q_size] / [s, kv_size].
-            qh = self.static_saved_qh.view(s, Hq, Hd)
-            kh = self.static_saved_kh.view(s, Hkv, Hd)
-            vh = self.static_saved_vh.view(s, Hkv, Hd)
-        else:
-            # 2) Q/K/V projections (base + LoRA) — LoRA `.data` refs are stable.
-            q = _proj(x_norm1, lw["q"], lw["qA"], lw["qB"], scaling)      # [s, D]
-            k = _proj(x_norm1, lw["k"], lw["kA"], lw["kB"], scaling)      # [s, kv]
-            v = _proj(x_norm1, lw["v"], lw["vA"], lw["vB"], scaling)
-
-            # 3) RoPE on q, k; pack v.
-            qh = apply_rope(q.view(s, Hq, Hd), self.static_cos, self.static_sin)
-            kh = apply_rope(k.view(s, Hkv, Hd), self.static_cos, self.static_sin)
-            vh = v.view(s, Hkv, Hd)
-
-        # "Flat" writes (model dtype, shape [s, H, Hd]) — read by the eager
-        # RoPE-bwd tail. In save_attn_qkv mode the eager tail still needs
-        # these reshaped views; copy is cheap and keeps the cache_views
-        # contract identical to the recompute path.
-        self.static_qh_flat.copy_(qh)
-        self.static_kh_flat.copy_(kh)
-        self.static_vh_flat.copy_(vh)
-        # Scatter into padded layout (Graph B inputs). All s_max rows write,
-        # so we MUST use accumulate=True: tail rows (k ≥ n) have
-        # (bn_idx, pos_idx) = (0, 0), which coincides with the legit
-        # (sample 0, position 0) slot — without accumulate they'd overwrite
-        # it (last-write-wins). With accumulate=True, the legit row adds
-        # qh[real_0] and tail rows add 0 (input tail is zero because
-        # rmsnorm(0)·W = 0 and 0·W^T = 0; in save_attn_qkv mode the staged
-        # static_saved_qh/kh/vh tails are zeroed in stage_forward_inputs).
-        # Pre-zeroed in ``stage_forward_inputs`` so accumulate starts from a
-        # clean slab.
+    def scatter_qkv_padded(self, qh, kh, vh) -> None:
+        """Scatter flat ``[s_max, H, Hd]`` q/k/v into the padded Graph-B input
+        slabs. ``accumulate=True`` is load-bearing: tail rows (k ≥ n) map to
+        slot (0,0) and must add zero rather than overwrite the real row 0 (the
+        family's forward core guarantees zero tails; the slabs are pre-zeroed
+        in ``stage_forward_inputs``)."""
         self.static_qh_pad.index_put_(
             (self.static_bn_idx, self.static_pos_idx), qh, accumulate=True)
         self.static_kh_pad.index_put_(
@@ -751,23 +742,42 @@ class Llama3GraphedBackward:
         self.static_vh_pad.index_put_(
             (self.static_bn_idx, self.static_pos_idx), vh, accumulate=True)
 
-        # 4) Attention forward → static_ctx_flat. In save_attn_ctx mode the
-        #    forward attention (scores/softmax/AV) is skipped — ctx was captured
-        #    in the FT forward and staged into static_saved_ctx. The q/k/v
-        #    padded scatter above still ran (Graph B / attn-bwd reads it).
-        if self.save_attn_ctx:
-            self.static_ctx_flat.copy_(self.static_saved_ctx)
-        else:
-            self._padded_attn_forward_core()
+    def padded_attn_forward_core(self) -> None:
+        """Public alias of ``_padded_attn_forward_core`` for family forward cores."""
+        self._padded_attn_forward_core()
 
-        # 5) O projection (base + LoRA) → resid_mid = layer_in + o.
-        o = _proj(self.static_ctx_flat, lw["o"], lw["oA"], lw["oB"], scaling)
-        self.static_resid_mid.copy_(self.static_layer_in + o)
-
-        # 6) Slice saved gate||up into separate gate/up. Skip the gate_up
-        #    matmul (the "saved_gate_up != None" path in eager layer_forward).
+    def forward_tail(self) -> None:
+        """The layer forward after the O projection: ``resid_mid = layer_in +
+        o`` and the saved gate||up split into the Graph-A inputs. Reads
+        ``static_o`` (already all-reduced under TP), ``static_layer_in`` and
+        ``static_saved_gate_up``; writes ``static_resid_mid`` / ``static_gate``
+        / ``static_up``. Captured together with the family core at
+        ``tp_size == 1``; run eagerly after the o reduce under TP. Tail rows
+        stay zero (zero ``o`` + zero ``layer_in``). In ``save_resid_mid`` mode
+        ``static_resid_mid`` was staged from the saved buffer, so only the
+        gate||up split remains."""
+        inter = self.inter
+        if not self.save_resid_mid:
+            self.static_resid_mid.copy_(self.static_layer_in + self.static_o)
         self.static_gate.copy_(self.static_saved_gate_up[:, :inter])
         self.static_up.copy_(self.static_saved_gate_up[:, inter:])
+
+    @property
+    def _forward_needs_reduce(self) -> bool:
+        """Whether the forward remat has an all-reduce to run between the
+        captured core and the tail: TP and no saved post-attention residual."""
+        return self._all_reduce is not None and not self.save_resid_mid
+
+    def _forward_core(self, lw: dict) -> None:
+        """The captureable layer-forward body: the family's
+        ``graph_forward_core(runner, lw)`` (in_ln → Q/K/V → RoPE → padded
+        attention → O-proj into ``static_o``), followed by ``forward_tail``
+        when there is no TP reduce to run in between. Under TP without
+        ``save_resid_mid`` the tail runs eagerly in ``forward`` after the o
+        all-reduce, so the captured region ends at ``static_o``."""
+        self._forward_core_fn(self, lw)
+        if not self._forward_needs_reduce:
+            self.forward_tail()
 
     def _capture_forward(self, layer_id: int, lw: dict) -> None:
         """Capture the per-layer forward-recompute graph. Static buffers must
@@ -787,7 +797,9 @@ class Llama3GraphedBackward:
                              saved_qh: torch.Tensor | None = None,
                              saved_kh: torch.Tensor | None = None,
                              saved_vh: torch.Tensor | None = None,
-                             saved_ctx: torch.Tensor | None = None) -> None:
+                             saved_ctx: torch.Tensor | None = None,
+                             saved_resid_mid: torch.Tensor | None = None
+                             ) -> None:
         """Copy this layer's inputs into the static slabs (zero the tail).
         ``cos/sin`` are staged once per backward in ``begin_backward``; the
         ``static_*_pad`` buffers are zeroed here so the in-graph scatter
@@ -828,6 +840,14 @@ class Llama3GraphedBackward:
             self.static_saved_ctx[:n].copy_(saved_ctx.reshape(n, -1))
             if n < s:
                 self.static_saved_ctx[n:].zero_()
+        # Stage the saved post-attention residual straight into Graph A's
+        # input (the forward core + tail leave it untouched in this mode).
+        if self.save_resid_mid and saved_resid_mid is not None:
+            if saved_resid_mid.dtype != self.model_dtype:
+                saved_resid_mid = saved_resid_mid.to(self.model_dtype)
+            self.static_resid_mid[:n].copy_(saved_resid_mid)
+            if n < s:
+                self.static_resid_mid[n:].zero_()
         # Zero the padded q/k/v staging targets before the scatter so tail
         # writes (to slot (0,0)) don't leave stale data from a prior layer.
         self.static_qh_pad.zero_()
@@ -839,7 +859,8 @@ class Llama3GraphedBackward:
                 saved_qh: torch.Tensor | None = None,
                 saved_kh: torch.Tensor | None = None,
                 saved_vh: torch.Tensor | None = None,
-                saved_ctx: torch.Tensor | None = None) -> dict:
+                saved_ctx: torch.Tensor | None = None,
+                saved_resid_mid: torch.Tensor | None = None) -> dict:
         """Graphed layer forward-recompute. Returns the cache dict of static
         views the downstream backward consumes — same shape contract as the
         eager ``layer_forward``.
@@ -850,25 +871,30 @@ class Llama3GraphedBackward:
         ``layer_forward(..., saved_qh=..., saved_kh=..., saved_vh=...)``).
 
         Silent eager fallback when (a) the padded budget didn't fit
-        (``_attn_fit`` False), or (b) this layer's capture/replay raised
-        (added to ``fwd_failed``). Eager fallback calls ``layer_forward(...)``
-        and returns its dict directly."""
+        (``_attn_fit`` False), (b) this layer's capture/replay raised
+        (added to ``fwd_failed``), or (c) ``save_resid_mid`` is on but this
+        layer's saved residual is absent (the captured core would skip the O
+        projection with nothing staged). Eager fallback calls
+        ``layer_forward(...)`` and returns its dict directly."""
         eager_kwargs = dict(
             saved_gate_up=saved_gate_up,
             saved_qh=saved_qh, saved_kh=saved_kh, saved_vh=saved_vh,
-            saved_ctx=saved_ctx,
+            saved_ctx=saved_ctx, saved_resid_mid=saved_resid_mid,
+            all_reduce=self._all_reduce,   # M3/M5: o_proj reduce under TP
         )
         dims = (self.Hq, self.Hkv, self.Hd, self.Hkv * self.Hd)
 
-        if not self._attn_fit or layer_id in self.fwd_failed:
-            return layer_forward(layer_in, lw, self.svc.scaling,
+        if (not self._attn_fit or layer_id in self.fwd_failed
+                or (self.save_resid_mid and saved_resid_mid is None)):
+            return self._layer_forward(layer_in, lw, self.scaling,
                                  self.static_cos[:n], self.static_sin[:n],
                                  self._cur_seq_lens, self._cur_b_start,
                                  dims, self.eps, **eager_kwargs)
 
         self.stage_forward_inputs(layer_in, saved_gate_up, n,
                                   saved_qh=saved_qh, saved_kh=saved_kh,
-                                  saved_vh=saved_vh, saved_ctx=saved_ctx)
+                                  saved_vh=saved_vh, saved_ctx=saved_ctx,
+                                  saved_resid_mid=saved_resid_mid)
 
         if layer_id not in self._fwd_graphs:
             try:
@@ -877,7 +903,7 @@ class Llama3GraphedBackward:
                 self.fwd_failed.add(layer_id)
                 dprint(f"[bwd-graph] forward capture failed for layer "
                        f"{layer_id}: {e}; falling back to eager forward")
-                return layer_forward(layer_in, lw, self.svc.scaling,
+                return self._layer_forward(layer_in, lw, self.scaling,
                                      self.static_cos[:n], self.static_sin[:n],
                                      self._cur_seq_lens, self._cur_b_start,
                                      dims, self.eps, **eager_kwargs)
@@ -888,10 +914,19 @@ class Llama3GraphedBackward:
             self.fwd_failed.add(layer_id)
             dprint(f"[bwd-graph] forward replay failed for layer "
                    f"{layer_id}: {e}; falling back to eager forward")
-            return layer_forward(layer_in, lw, self.svc.scaling,
+            return self._layer_forward(layer_in, lw, self.scaling,
                                  self.static_cos[:n], self.static_sin[:n],
                                  self._cur_seq_lens, self._cur_b_start,
                                  dims, self.eps, **eager_kwargs)
+
+        if self._forward_needs_reduce:
+            # [Phase 7 / M5] The captured region ended at this rank's PARTIAL
+            # o (row-parallel o_proj). Reduce the real rows only — the tail is
+            # zero on every rank — then finish the layer eagerly. Same shape
+            # ([n, D], model dtype) as the eager ``layer_forward`` reduce, so
+            # a rank that fell back to eager for this layer still matches.
+            self._all_reduce(self.static_o[:n])
+            self.forward_tail()
 
         return self.cache_views(n)
 
@@ -915,4 +950,8 @@ class Llama3GraphedBackward:
             "resid_mid": self.static_resid_mid[:n],
             "gate": self.static_gate[:n],
             "up": self.static_up[:n],
+            # Pre-transform q/k (families with a per-head transform before
+            # RoPE — Qwen3 — read these in their backward tail).
+            "q_pre": self.static_q_pre[:n],
+            "k_pre": self.static_k_pre[:n],
         }

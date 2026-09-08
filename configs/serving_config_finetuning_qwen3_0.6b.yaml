@@ -1,0 +1,84 @@
+# DeltaServe-on-vLLM serving config — single-GPU co-serving finetuning (Qwen3-0.6B).
+#
+# Phase 8 smoke-test config: the smallest Qwen3 shares the 14B's architecture
+# (q_norm/k_norm before RoPE, GQA 16/8 heads with head_dim 128 — so the attention
+# width 2048 != hidden 1024 — and a TIED lm_head), which makes it the fast target
+# for validating the Qwen3 backward end to end on one 5090 before the TP=2 run:
+#
+#   python eval-tp/ft_bench_tp.py --family qwen3-0.6b --tp 1 --duration 60
+#   DSERVE_TP_DIAG=1 … → remat-vs-captured error must stay at bf16 noise
+#
+# Single-GPU, so the SLO estimator feedback path is intact: profile_on_launch
+# stays ON (admission is SLO-gated as on Llama-3). backward_cuda_graph is off for
+# the first run; all three captured regions are implemented for Qwen3 (parity in
+# tests/test_qwen3_backward_graph.py) — flip it on to A/B. All three activation
+# saves are on (save_attn_qkv captures the pre-norm q/k, exact for Qwen3).
+
+finetune:
+  enable_finetuning: true
+  start_on_launch: false             # hold FT admission closed until POST /start_finetuning
+  backward_mps_percentage: 10
+  finetuning_lora_path: ../adapters/qwen3-0.6b-toy-lora-ft
+  data_path: ../alpaca_1000.txt
+  max_saved_finetuning_tokens: 256
+  backward_sleep_seconds: 2.0
+  num_epochs: 20
+  learning_rate: 0.000005
+  weight_decay: 0.01
+  gamma: 0.9
+  backward_fp32: false
+  forward_interruptible: false       # off for bring-up
+  ft_only_admission_grace_ms: 0
+  fwd_token_throttle_enable: false
+  fwd_token_throttle: 200
+  backward_cuda_graph: false         # first run eager; A/B on afterwards
+  save_attn_qkv: true                # pre-norm q/k + v saved: skips the Q/K/V GEMM (exact for Qwen3)
+  save_attn_ctx: true
+  save_resid_mid: true              # save post-attn residual; skip O-proj recompute (only RMSNorm in_ln is recomputed with all three saves)
+
+slo:
+  ttft_slo: 0.25
+  avg_tbt_slo: 0.02
+  max_tbt_slo: 0.05
+  profile_on_launch: true
+  profile_num_repeats: 2
+  ft_tokens_admission_constrain_factor: -1
+  match_prefill_workload_factor: 0
+  decode_only_ft_safety_margin: 0.7
+
+debug:
+  print_weight_hash: false
+  print_activation_hash: false
+  print_scheduler_add: true
+  print_engine_batch_exec: true
+  print_engine_batch_done: false
+  print_engine_req_recv: false
+
+adapters:
+  lora_path_0: ../adapters/qwen3-0.6b-toy-lora
+
+lora:
+  enable_lora: true
+  max_loras: 2
+  max_lora_rank: 16
+
+server:
+  host: 127.0.0.1
+  port: 8000
+  rank_id: 0
+  api_server_count: 1
+
+model:
+  model: Qwen/Qwen3-0.6B-Base
+  tokenizer_mode: auto
+  trust_remote_code: false
+  dtype: auto
+  max_model_len: 2048
+
+engine:
+  gpu_memory_utilization: 0.60       # 0.6B: plenty of headroom on a 5090
+  enforce_eager: false
+  disable_log_stats: true
+
+parallel:
+  tensor_parallel_size: 1

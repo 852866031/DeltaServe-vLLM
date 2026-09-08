@@ -62,7 +62,7 @@ CHARS_PER_TOKEN = 4.0     # prompt_length is chars; Llama-3 BPE ≈ 4 chars/toke
 INCLUDE_PROMPT_TOKENS = True   # tokens/sec = prompt_est + max_new_tokens (vs just output)
 
 # ---- Titles / labels ----
-TITLE_TOP = "Company X Production Inference Workload Trace"
+TITLE_TOP = "Nutanix Production Inference Workload Trace"
 TITLE_BOTTOM = "GPU Utilization Under Production Workload"
 XLABEL = "Time (s)"
 YLABEL_TOKENS = "Tokens/sec"

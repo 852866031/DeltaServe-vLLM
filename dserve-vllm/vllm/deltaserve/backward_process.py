@@ -196,10 +196,14 @@ class BackwardProcess:
         self._conn = parent_conn
 
         # --- MPS env wrapping: child-only constrained partition ---
+        # [M4.3] CUDA_DEVICE_MAX_CONNECTIONS=1 is deliberately NOT set any more:
+        # it pins every stream of the child onto one hardware work queue, which
+        # makes the comm-stream overlap of the bucketed all-reduces impossible.
+        # (DeltaServe set it for deterministic NCCL ordering under MPS; the
+        # backward's collectives are issued in program order on two streams
+        # with explicit event dependencies, which does not need it.)
         prev_mps = os.environ.get(_MPS_PERCENTAGE_ENV)
-        prev_max_conn = os.environ.get(_MAX_CONNECTIONS_ENV)
         os.environ[_MPS_PERCENTAGE_ENV] = str(self.mps_percentage)
-        os.environ[_MAX_CONNECTIONS_ENV] = "1"
         try:
             self._proc = self._ctx.Process(
                 target=service_main,
@@ -210,14 +214,12 @@ class BackwardProcess:
             )
             dprint(
                 f"[backward] spawning child ({self.service_name}) with "
-                f"{_MPS_PERCENTAGE_ENV}={self.mps_percentage} "
-                f"{_MAX_CONNECTIONS_ENV}=1"
+                f"{_MPS_PERCENTAGE_ENV}={self.mps_percentage}"
             )
             self._proc.start()
         finally:
             # Restore parent env immediately so inference keeps the full GPU.
             _restore_env(_MPS_PERCENTAGE_ENV, prev_mps)
-            _restore_env(_MAX_CONNECTIONS_ENV, prev_max_conn)
 
         # Parent doesn't use the child's end of the pipe.
         child_conn.close()

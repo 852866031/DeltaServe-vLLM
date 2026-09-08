@@ -2024,6 +2024,16 @@ class VllmConfig:
         if model_config is not None and model_config.has_inner_state:
             unsupported.append("hybrid/mamba models")
 
+        # [DeltaServe] Co-serving finetuning hooks the V1 runner's input prep,
+        # forward and sampling (FT injection, activation accumulation, the
+        # backward relay); the V2 runner carries none of them. Listing it here
+        # routes finetuning runs to V1 for every default-V2 architecture and
+        # makes an explicit VLLM_USE_V2_MODEL_RUNNER=1 fail loudly instead of
+        # silently serving without finetuning.
+        finetune_config = getattr(self, "finetune_config", None)
+        if finetune_config is not None and finetune_config.enable_finetuning:
+            unsupported.append("DeltaServe co-serving finetuning")
+
         if self.parallel_config.prefill_context_parallel_size > 1:
             unsupported.append("prefill context parallelism")
 

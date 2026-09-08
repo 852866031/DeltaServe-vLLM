@@ -39,6 +39,7 @@ finetune:
   backward_cuda_graph: true
   save_attn_qkv: true
   save_attn_ctx: true               # save attn ctx (o_proj input); skip attention-forward recompute in backward
+  save_resid_mid: true              # save post-attn residual; skip O-proj recompute (only RMSNorm in_ln is recomputed with all three saves)
 
 # SLO-aware FT admission + execution-time estimator (Phase 4).
 # Folded into FinetuneConfig by the loader. The estimator is profiled at launch

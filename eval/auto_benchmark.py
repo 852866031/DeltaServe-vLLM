@@ -503,7 +503,7 @@ def trim_bwd_log_before(path: str, cutoff: datetime.datetime) -> None:
         w.writeheader()
         w.writerows(kept)
     print(f"[bench] trimmed bwd_log {path}: kept {len(kept)}/{len(all_rows)} "
-          f"rows (cutoff {cutoff_iso})", flush=True)
+          f"rows (cutoff {cutoff.isoformat(timespec='milliseconds')})", flush=True)
 
 
 WARMUP_START_OFFSET_S = 1.0

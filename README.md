@@ -412,6 +412,19 @@ Useful flags (`--help` for the full list):
 When the script finishes, `ls adapters/llama3-toy-lora{,-ft}` should each show
 `adapter_config.json`, `adapter_model.safetensors`, and a tokenizer.
 
+**Qwen3 (Phase 7 TP=2 target).** The same trainer is shared through
+`scripts/toy_adapters.py`; `scripts/init_adapters_qwen3.py` is the Qwen3 entry
+point. It builds `adapters/qwen3-<size>-toy-lora{,-ft}` for `--size 14b`
+(`Qwen/Qwen3-14B-Base`, the TP=2 model — needs both GPUs) or `--size 0.6b`
+(`Qwen/Qwen3-0.6B-Base`, same architecture for single-GPU smoke tests). Base
+weights are fetched to `$HF_HOME` on the first run, so unset `HF_HUB_OFFLINE`
+for that run only:
+
+```bash
+python scripts/init_adapters_qwen3.py                # 14b
+python scripts/init_adapters_qwen3.py --size 0.6b
+```
+
 ### 2. Run the timeline benchmark
 
 `eval/auto_benchmark.py` does the following end-to-end, in one invocation:
