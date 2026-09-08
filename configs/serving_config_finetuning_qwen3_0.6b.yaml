@@ -17,7 +17,7 @@
 finetune:
   enable_finetuning: true
   start_on_launch: false             # hold FT admission closed until POST /start_finetuning
-  backward_mps_percentage: 10
+  backward_mps_percentage: 0         # no MPS daemon on this box; the pause contract protects prefill
   finetuning_lora_path: ../adapters/qwen3-0.6b-toy-lora-ft
   data_path: ../alpaca_1000.txt
   max_saved_finetuning_tokens: 256

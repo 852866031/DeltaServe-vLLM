@@ -202,8 +202,11 @@ class BackwardProcess:
         # (DeltaServe set it for deterministic NCCL ordering under MPS; the
         # backward's collectives are issued in program order on two streams
         # with explicit event dependencies, which does not need it.)
+        # mps_percentage == 0 → no MPS (the default): spawn a plain CUDA
+        # context and leave the env untouched.
         prev_mps = os.environ.get(_MPS_PERCENTAGE_ENV)
-        os.environ[_MPS_PERCENTAGE_ENV] = str(self.mps_percentage)
+        if self.mps_percentage > 0:
+            os.environ[_MPS_PERCENTAGE_ENV] = str(self.mps_percentage)
         try:
             self._proc = self._ctx.Process(
                 target=service_main,
@@ -213,8 +216,10 @@ class BackwardProcess:
                 daemon=True,
             )
             dprint(
-                f"[backward] spawning child ({self.service_name}) with "
-                f"{_MPS_PERCENTAGE_ENV}={self.mps_percentage}"
+                f"[backward] spawning child ({self.service_name}) "
+                + (f"with {_MPS_PERCENTAGE_ENV}={self.mps_percentage} (needs an MPS daemon)"
+                   if self.mps_percentage > 0 else
+                   "without MPS (time-sliced context; pause contract protects prefill)")
             )
             self._proc.start()
         finally:

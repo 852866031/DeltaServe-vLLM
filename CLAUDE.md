@@ -623,7 +623,11 @@ the gloo test caught exactly that.
 - **Vocab padding.** vLLM pads vocab before sharding. Llama-3's 128256 happens to need no
   padding, so the `lm_head` all-gather is exactly `[vocab, hidden]` — for other models use
   the real local `lm_head.shape[0]`, not `vocab_size // tp_size`.
-- **MPS per device.** The child-only MPS env must partition each physical GPU
+- **No MPS by default (2026-09-08).** `backward_mps_percentage: 0` spawns the child as a
+  plain CUDA context; no daemon runs on this box and none is assumed. Prefill latency is
+  protected by the yield contract instead: `_maybe_pause` + `pause_until_prefill_done`
+  (default on). Set a percentage > 0 only with `nvidia-cuda-mps-control -d` running.
+- **MPS per device (only if MPS is enabled).** The child-only MPS env must partition each physical GPU
   independently.
 
 ### M4.2 — the SLO estimator under TP (GPU-validated 2026-09-01)
@@ -748,7 +752,9 @@ collapse to bf16 noise) and `eval/pure_ft_bench.py` (the 2.12 reference should r
   the GPU to inference. It is load-bearing.
 - Backward runs on its own CUDA stream; time it with `torch.cuda.synchronize()` before
   reading the wall clock (else you measure host dispatch, not GPU completion).
-- MPS partitioning is the mechanism for true concurrent execution (the env-var wrap above).
+- MPS partitioning was DeltaServe's mechanism for true concurrent execution; this project
+  runs **without MPS by default** (`backward_mps_percentage: 0`) and relies on the pause
+  contract, extended to hold until the prefill completes (`pause_until_prefill_done`).
 - fp32 LM head / final norm precision rule; fp32 `scores` matmul for GQA attention backward
   (downgrading to fp16 caused llama3 loss to plateau). Relevant in Phase 3.
 - CUDA-graph pool aliasing: persistent buffers (LoRA `.grad`, attention `ctx`) must live
