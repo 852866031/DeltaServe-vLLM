@@ -24,7 +24,7 @@
 finetune:
   enable_finetuning: true
   start_on_launch: false             # hold FT admission closed (M1: launch-only)
-  backward_mps_percentage: 10
+  backward_mps_percentage: 0         # no MPS daemon on this box; the pause contract protects prefill
   finetuning_lora_path: ../adapters/qwen3-14b-toy-lora-ft
   data_path: ../alpaca_1000.txt
   max_saved_finetuning_tokens: 256
@@ -36,7 +36,6 @@ finetune:
   backward_fp32: false
   forward_interruptible: true        # tiers A/B (scheduler) + tier C rank-symmetric under TP
   ft_only_admission_grace_ms: 2.0
-  pause_until_prefill_done: true     # no MPS on this box: keep the bwd paused until the prefill has finished on the GPU
   fwd_token_throttle_enable: false
   fwd_token_throttle: 200
   backward_cuda_graph: true         # TP-safe since M5 (2-GPU gated; live A/B pending)

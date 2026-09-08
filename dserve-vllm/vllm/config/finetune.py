@@ -23,12 +23,16 @@ class FinetuneConfig:
     False (default), vLLM behaves exactly like upstream — no extra process,
     no overhead."""
 
-    backward_mps_percentage: int = 10
-    """CUDA MPS active-thread percentage granted to the backward (SFT) process.
-    Applied as CUDA_MPS_ACTIVE_THREAD_PERCENTAGE only while spawning the child,
-    so it inherits a constrained MPS partition and inference keeps the rest.
-    Mirrors DeltaServe's model_rpc.py (=10). Requires the MPS daemon to be
-    running to take effect."""
+    backward_mps_percentage: int = 0
+    """CUDA MPS active-thread percentage granted to the backward (SFT) process,
+    or 0 (default) for no MPS: the child is spawned as an ordinary CUDA context
+    that the driver time-slices against inference, and the GPU-yield contract
+    (``_maybe_pause`` + ``pause_until_prefill_done``) is what protects prefill
+    latency. A value > 0 is applied as CUDA_MPS_ACTIVE_THREAD_PERCENTAGE only
+    while spawning the child (inference keeps the rest) and takes effect only
+    if an MPS control daemon is running (``nvidia-cuda-mps-control -d``) — it
+    is a hard SM cap on the child even when inference is idle. DeltaServe's
+    model_rpc.py used 10 under MPS; this project runs without a daemon."""
 
     finetuning_lora_path: str | None = None
     """Path to the dedicated finetuning LoRA adapter (PEFT format dir). This is
@@ -364,14 +368,15 @@ class FinetuneConfig:
     ``ms / ft_forward_ms`` of FT throughput during idle; benefit scales with
     inference QPS. Set 0 to disable A while keeping B and C."""
 
-    pause_until_prefill_done: bool = False
+    pause_until_prefill_done: bool = True
     """Keep the backward child paused until the inference prefill that paused
-    it has actually COMPLETED on the GPU. The default (False) re-sets the GPU
+    it has actually COMPLETED on the GPU (default). ``False`` re-sets the GPU
     grant right after the prefill kernels are *enqueued* — fire-and-forget,
-    designed for MPS where the child's SM share is bounded anyway. Without an
-    MPS daemon the child then resumes while the prefill is still executing and
-    the two contexts time-slice, roughly doubling the prefill's TTFT (measured
-    on the tight trace: burst-start TTFT 80-200 ms vs 40 ms inference-only).
+    only adequate under MPS where the child's SM share is bounded anyway.
+    Without an MPS daemon (the default here) the child would then resume while
+    the prefill is still executing and the two contexts time-slice, roughly
+    doubling the prefill's TTFT (measured on the tight trace: burst-start TTFT
+    80-200 ms vs 40 ms inference-only; 55-67 ms with this on).
     When True the runner records a CUDA event after the forward and resumes
     the child only once that event has completed (checked without blocking on
     the next execute_model / sample_tokens call; idle steps keep the engine
