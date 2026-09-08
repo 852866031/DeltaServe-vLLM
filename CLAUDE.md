@@ -85,7 +85,13 @@ stalling HTTP accept + SSE streaming. Fix: **`disable_log_stats` now auto-defaul
 engine-side timing, so it's unaffected. Frontend output processing can also be sharded with
 `--api-server-count N` (1 shared EngineCore + N frontends).
 
-**Phase 6 (`forward_interruptible`) — three-tier inference pre-emption of FT-only stepping.**
+**Phase 6 (`forward_interruptible`) — three-tier inference pre-emption of FT-only stepping.
+Works under TP since 2026-09-08 (rank-symmetric tier C — see the Phase 7 invariants), and
+`finetune.pause_until_prefill_done` (opt-in, ON in the TP YAMLs) keeps the backward child
+paused until the prefill has actually completed on the GPU — without MPS the old
+enqueue-time resume let the child time-slice against the prefill. Tight-trace result
+(Qwen3-14B TP=2): burst-start TTFT 55–67 ms (inference-only 38–41; before: 40–458),
+run-max TTFT 577 → 150 ms, 100 % satisfaction, FT −5 %.**
 Behind one config flag (`finetune.forward_interruptible`, default `False` → bit-identical
 to today when off). When on, late-arriving inference requests pre-empt FT-only stepping at
 three windows: **(A)** pre-schedule grace poll on `input_queue` (default 2 ms via
@@ -240,16 +246,16 @@ fp32/bf16, incl. the overflow fallback) and `tests/test_tp_trainer_graph_nccl.py
 yet:** the live graph-vs-eager A/B on the real models.
 → Full detail, invariants, and run commands in **"Tensor parallelism (Phase 7)"** below.
 
-**Current focus (next session):** Phase 7 (TP). In priority order: the **M5 live A/B**
-(`ft_bench_tp.py --family llama3 --tp 2` with `backward_cuda_graph` true vs false —
-expect `(graph)` cycle lines, equal loss cycle-for-cycle, ~5 ms/cycle less); **M4.3** —
-gradient bucketing + a comm stream (224 → 97 collectives, ~20 ms/cycle on this no-P2P
-box) which also fixes the rank-asymmetric `clip_grad_norm_` — now reproducible with
-`tests/test_tp_trainer_graph_nccl.py --clip on`; **`forward_interruptible` under TP** to
-bring the TTFT tail down (p95 sits at the SLO because bursts wait behind an in-flight
-FT-only step); then the inference-only baselines, a `validate_estimator` TP-vs-tp1
-residual check, the Llama-3 `rope_theta` DIAG re-check, and the Qwen3-0.6B single-GPU
-smoke. The ordered plan with gates is the "Next step" section of INTEGRATION_PROGRESS.md.
+**Current focus (next session):** the TP line is feature-complete for now — M5, M4.3,
+`forward_interruptible` under TP, the pause fix and the head restructure all landed and
+were validated on the Qwen3-14B timelines on 2026-09-08 (loose 98.3 % / nutanix 99.4 % /
+tight 100 % TTFT satisfaction at 642 / 392 / 262 FT tok/s; the earlier Qwen3 baselines
+were 95.0 / 98.1 %). Remaining, in priority order: the Llama-3 TP=2 replays with the same
+stack; bringing up an MPS daemon (`nvidia-cuda-mps-control -d`) so `backward_mps_percentage`
+actually partitions the SMs — the ~2× cycle inflation under load is driver time-slicing;
+a `validate_estimator` TP-vs-tp1 residual check; the Llama-3 `rope_theta` DIAG re-check;
+the Qwen3-0.6B single-GPU smoke. The ordered plan with gates is the "Next step" section of
+INTEGRATION_PROGRESS.md.
 
 **Open, and NOT a TP bug — likely cause found (Phase 8):** FT loss stalls ~4.3 after
 ~25 cycles where an earlier `pure_ft` run reached ~2.6 on the same samples, identically
@@ -581,9 +587,22 @@ the gloo test caught exactly that.
 - **`_maybe_pause` stays outside any captured region.** It is how the backward yields the
   GPU to inference; an `mp.Event.wait` cannot be captured. This is why we can never
   collapse to one graph per step the way an FT-only system does.
-- **`forward_interruptible` conflicts with captured collectives.** Tier-C aborts
-  unilaterally mid-backward; with NCCL in a graph that desyncs the group and hangs both
-  ranks. It is off under TP for this reason.
+- **Tier-C aborts must be rank-symmetric (2026-09-08).** An FT-only forward runs a TP
+  collective every layer, so one rank leaving at layer k while the other continues hangs
+  both. Under TP the abort is therefore a joint decision: the EngineCore input thread
+  bumps a shared-memory arrival counter (`coordinator.FtArrivalSignal`, name passed to
+  the workers via `DSERVE_FT_ARRIVAL_SHM`), and each worker's `FtAbortPoller`
+  MAX-all-reduces its local "arrivals changed" bit over the TP group's gloo `cpu_group`
+  once at entry and once per layer boundary (the `input_layernorm` pre-hook; the other
+  hooks in a layer run no collective). The poller is active only between `entry()` and
+  `finish()`, i.e. for FT-ONLY forwards — a co-serving batch with inference tokens is
+  never aborted (an early version did, and took the inference requests' step with it).
+  The engine reads the abort from `ModelRunnerOutput.finetune_aborted` (a real field —
+  the dynamic `_ft_aborted` attribute does not survive the worker → engine hop), on the
+  execute_model future under TP and from `sample_tokens`' pending-abort sentinel. tp=1
+  keeps the `threading.Event` path. Gates: `tests/test_ft_abort_tp.py` (2-process gloo,
+  asymmetric observations → same abort layer on both ranks, equal collective counts,
+  inactive poller runs none) + `tests/test_accumulate_hooks.py::test_abort_poll_boundary`.
 - **The per-layer clip is rank-symmetric (M4.3) — keep it that way.** Under TP the
   clip runs after the bucketed reduce via `tp.clip_layers_symmetric_`: the norm sums
   the replicated grads (identical on every rank) and the sharded grads' squared norms
@@ -653,9 +672,11 @@ inference-only baselines and a `validate_estimator` TP-vs-tp1 residual compariso
    per cycle; uncontended cycle 123 → 121 ms (the bucket reduces overlap, the 80
    residual reduces remain the floor). Gates: `tests/test_tp_bucket_gloo.py` 92/92 (CPU,
    clip firing, TP2 == tp1), NCCL trainer 220/220 (sync/delay bit-identical, counts).
-3. **`forward_interruptible` under TP.** Tiers A/B are scheduler-side and TP-safe; tier C
-   (mid-forward abort) must be made rank-symmetric before it is enabled with TP. Target:
-   the timeline TTFT p95/p99 tail (bursts wait behind an in-flight FT-only step).
+3. ~~**`forward_interruptible` under TP.**~~ Landed 2026-09-08: tier C is rank-symmetric
+   (see the invariant above); ON in both TP YAMLs with a 2 ms tier-A grace. Live: the
+   Qwen3-14B `ft_bench` shows both ranks aborting FT-only forwards at the same layer
+   (`[ft-abort] tier C: … aborted at layer k` from each worker). Trade-off measured on
+   the tight trace — see the Phase 6 / TP section of INTEGRATION_PROGRESS.md.
 4. ~~`set_corpus_meta` never reaches the children under TP~~ — fixed 2026-09-08: the
    scheduler keeps the corpus total on its coordinator (`corpus_total_tokens`), every
    relayed trigger command carries it, and the worker's `execute_trigger` forwards it to

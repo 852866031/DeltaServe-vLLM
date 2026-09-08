@@ -61,6 +61,196 @@ class RpsTracker:
         return len(self._arrivals) / self._window_s
 
 
+class FtArrivalSignal:
+    """[forward_interruptible / tier C under TP] A monotonic inference-arrival
+    counter in POSIX shared memory, written by the EngineCore input thread on
+    every ADD and read by every TP worker. Under TP the workers are separate
+    processes from the engine, so the tp=1 ``threading.Event`` never reaches
+    them; a counter (rather than a flag) lets each worker compare "arrivals
+    now" against "arrivals when this FT-only forward started". Single writer,
+    8-byte aligned store — a torn read can only make an abort spurious or one
+    poll late, never wrong."""
+
+    ENV = "DSERVE_FT_ARRIVAL_SHM"
+
+    def __init__(self, shm, owner: bool) -> None:
+        self._shm = shm
+        self._owner = owner
+        # No persistent buffer export (a live memoryview/ctypes view would make
+        # SharedMemory.close() raise BufferError at interpreter exit); struct
+        # packs/unpacks through a transient view.
+        import struct
+        self._pack = struct.Struct("<Q")
+
+    @classmethod
+    def create(cls) -> "FtArrivalSignal":
+        from multiprocessing import shared_memory
+        name = f"dserve_ft_arrivals_{os.getpid()}"
+        shm = shared_memory.SharedMemory(name=name, create=True, size=8)
+        sig = cls(shm, owner=True)
+        sig._pack.pack_into(shm.buf, 0, 0)
+        return sig
+
+    @classmethod
+    def attach(cls, name: str) -> "FtArrivalSignal":
+        from multiprocessing import shared_memory
+        return cls(shared_memory.SharedMemory(name=name, create=False), owner=False)
+
+    @property
+    def name(self) -> str:
+        return self._shm.name
+
+    def bump(self) -> None:
+        self._pack.pack_into(self._shm.buf, 0, self.read() + 1)
+
+    def read(self) -> int:
+        return self._pack.unpack_from(self._shm.buf, 0)[0]
+
+    def close(self) -> None:
+        try:
+            self._shm.close()
+            if self._owner:
+                self._shm.unlink()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# [forward_interruptible / tier C] How many layers the CPU launch may run
+# ahead of the GPU inside an FT-only forward. The abort check runs in a
+# forward hook at CPU launch time; unbounded, the CPU finishes launching all
+# layers long before the GPU executes them, so an arrival early in the
+# forward's wall time is seen at a late layer index (measured: aborts
+# clustered at layers 31-36 of 40) and an arrival after the last launch is
+# not seen at all. Waiting on the event of the layer launched two boundaries
+# ago keeps the GPU fed while making the check track GPU progress.
+_LAUNCH_AHEAD_LAYERS = 2
+
+
+class _LaunchAheadGate:
+    def __init__(self) -> None:
+        import collections
+        self._events: collections.deque = collections.deque()
+        self._cuda = torch.cuda.is_available()
+
+    def reset(self) -> None:
+        self._events.clear()
+
+    def step(self) -> None:
+        if not self._cuda:
+            return
+        ev = torch.cuda.Event()
+        ev.record()
+        self._events.append(ev)
+        if len(self._events) > _LAUNCH_AHEAD_LAYERS:
+            self._events.popleft().synchronize()
+
+
+class LocalAbortPoller:
+    """[forward_interruptible / tier C at tp=1] Same interface as
+    ``FtAbortPoller`` over the in-process ``threading.Event`` (set by the
+    engine's input thread on an ADD while an FT-only forward is in flight),
+    with the same launch-ahead bound so an abort tracks GPU progress."""
+
+    def __init__(self, event) -> None:
+        self.event = event
+        self.active = False
+        self.layer_calls = 0
+        self._gate = _LaunchAheadGate()
+
+    def note_served(self) -> None:
+        pass
+
+    def entry(self) -> bool:
+        self.layer_calls = 0
+        self._gate.reset()
+        aborted = self.event.is_set()
+        self.active = not aborted
+        return aborted
+
+    def layer(self) -> bool:
+        self.layer_calls += 1
+        self._gate.step()
+        return self.event.is_set()
+
+    def hook_check(self, boundary: bool) -> bool:
+        return self.layer() if (boundary and self.active) else False
+
+    def finish(self) -> None:
+        self.active = False
+
+
+class FtAbortPoller:
+    """[forward_interruptible / tier C under TP] The rank-symmetric abort
+    decision. Every TP rank must leave an FT-only forward at the SAME layer
+    (or not at all) or the next TP collective deadlocks, so a rank's local
+    observation ("arrivals changed since this forward started") is MAX-
+    all-reduced over the TP group's gloo ``cpu_group`` before it is acted on:
+    one tiny CPU collective at entry and one per layer boundary, no GPU sync.
+    Both ranks call ``entry`` / ``layer`` at identical points (same
+    SchedulerOutput, same hooks), so the collective counts always match."""
+
+    def __init__(self, signal: FtArrivalSignal, cpu_group) -> None:
+        self.signal = signal
+        self.group = cpu_group
+        self.seen = signal.read()       # arrivals accounted for (served / re-scheduled)
+        self._entry = self.seen
+        self._flag = torch.zeros(1, dtype=torch.int64)
+        self.layer_calls = 0
+        self.reduces = 0
+        self._gate = _LaunchAheadGate()
+        # True only between ``entry()`` and ``finish()`` — i.e. while an
+        # FT-ONLY forward is on the GPU. The accumulator hooks are armed for
+        # every FT-bearing batch, including co-serving batches that carry
+        # inference tokens; those must never be aborted (their inference
+        # requests would lose the step), so ``hook_check`` is inert when
+        # inactive and, being a plain attribute read, runs no collective.
+        self.active = False
+
+    def _symmetric(self, local: bool) -> bool:
+        import torch.distributed as dist
+        self._flag.fill_(1 if local else 0)
+        dist.all_reduce(self._flag, op=dist.ReduceOp.MAX, group=self.group)
+        self.reduces += 1
+        return bool(self._flag.item())
+
+    def note_served(self) -> None:
+        """An inference-bearing batch is being executed: whatever arrived so
+        far has been scheduled, so it no longer counts as pending."""
+        self.seen = self.signal.read()
+
+    def entry(self) -> bool:
+        """At the start of an FT-only forward: abort before any kernel if an
+        arrival is pending (landed after the last inference batch)."""
+        cur = self.signal.read()
+        self._entry = cur
+        self.layer_calls = 0
+        self._gate.reset()
+        aborted = self._symmetric(cur != self.seen)
+        self.active = not aborted
+        return aborted
+
+    def layer(self) -> bool:
+        """At a layer boundary of the FT-only forward. Bounds the CPU's
+        launch-ahead first so the decision reflects GPU progress."""
+        self.layer_calls += 1
+        self._gate.step()
+        return self._symmetric(self.signal.read() != self._entry)
+
+    def hook_check(self, boundary: bool) -> bool:
+        """What the accumulator hooks call: only the layer-boundary hook
+        (``input_layernorm`` pre-hook) runs the collective; every other hook
+        in the layer returns False without one, keeping the per-rank
+        collective count identical and the cost to one reduce per layer."""
+        return self.layer() if (boundary and self.active) else False
+
+    def finish(self) -> None:
+        """After the FT-only forward (completed or aborted): the arrivals seen
+        so far will be scheduled next step (rollback re-schedules; a completed
+        step frees the engine), so they are accounted for."""
+        self.active = False
+        self.seen = self.signal.read()
+
+
 class FTAborted(Exception):
     """[forward_interruptible / tier C] Sentinel raised from an FT activation
     hook when ``FinetuneCoordinator.ft_abort_event`` is set mid-forward
@@ -244,6 +434,9 @@ class FinetuneCoordinator:
         # before kernel dispatch in execute_model and cleared in its
         # finally block.
         self.ft_only_in_flight = False
+        # [forward_interruptible / tier C under TP] Worker side: the
+        # rank-symmetric poller (None at tp=1 → the threading.Event path).
+        self.ft_abort_poller = None
         # [diag] Wall-clock instant the current pending backward was kicked
         # off (set by _trigger_backward, cleared in poll_backward on ack).
         # poll_backward warns once if the gap to "now" exceeds the threshold

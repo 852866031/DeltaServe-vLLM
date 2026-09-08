@@ -279,6 +279,11 @@ class ModelRunnerOutput:
     # reaches WORKERS) so the EngineCore scheduler — a different process/coord
     # under TP — learns FT admission was opened. None for tp=1 (no relay).
     finetune_ft_started: bool | None = None
+    # [forward_interruptible / tier C] True on the empty sentinel output the
+    # runner returns when an FT-only forward was aborted. A real dataclass
+    # field (not a dynamic attribute) so it survives the worker → engine hop
+    # under TP; the engine rolls the FT scheduling back when it sees it.
+    finetune_aborted: bool = False
     # [DeltaServe] Phase 7 / M4.2: per-step timing samples for the SLO
     # estimator, relayed from the worker's coordinator queue (the runner's
     # CUDA-event ring pushes ``(StepFeatures, duration_s, was_graph, predicted)``

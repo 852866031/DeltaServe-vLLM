@@ -96,12 +96,9 @@ admission; the estimator relay (M4.2) is GPU-validated.
    `--family qwen3-14b`.
 2. ~~**M4.3 — gradient bucketing + comm stream + rank-symmetric clip.**~~ Landed
    2026-09-08 — see "M4.3 — gradient bucketing + comm stream ✅" under Phase 7.
-3. **`forward_interruptible` under TP.** The Qwen3-14B timeline runs show the cost of
-   continuous FT: TTFT p95 sits at the 0.4 s SLO because each burst's first requests wait
-   behind an in-flight FT-only step. Tiers A/B are scheduler-side and TP-safe already;
-   tier C (mid-forward abort) must stay off until it is made rank-symmetric (broadcast the
-   abort, or abort only at step granularity). Gate: TTFT p95/p99 ↓ on loose/tight with FT
-   throughput within ~10% of today's.
+3. ~~**`forward_interruptible` under TP.**~~ Landed 2026-09-08 — see "forward_interruptible
+   under TP (rank-symmetric tier C)" under Phase 7 for the design, the gates and the tight-
+   trace A/B.
 4. **Baselines + estimator residuals.** Run the inference-only baselines
    (`auto_benchmark_tp.py --family qwen3-14b --tp 2 --{loose,tight,nutanix-600-800}`, no
    `--co`) so the plots get the grey `inf-only` overlay; run one `validate_estimator: true`
@@ -1394,6 +1391,86 @@ layers / 2 buckets, clip firing: TP2 masters + losses == tp1 to 1e-4, rank0 == r
 eager / graph+save / graph+sync / graph+delay — the async comm path bit-identical to the
 sync and delayed modes, TP2 == tp1 with the clip on, counts 12 / 12 / 9 per cycle).
 `tests/test_phase1_step2.py` updated for the removed env var. Every tp=1 gate unchanged.
+
+### forward_interruptible under TP (rank-symmetric tier C) ✅ (2026-09-08)
+
+**Why it was inert.** Tiers A (pre-schedule grace poll) and B (post-schedule rollback) run
+in the EngineCore process and were TP-safe from the start. Tier C's abort signal was a
+`threading.Event` on the *engine's* coordinator, set by the input thread; under TP the
+workers check their *own* coordinators in other processes, so the event never reached
+them — and had it reached one rank only, that rank would have left the FT-only forward
+while the other waited in the next layer's TP all-reduce forever.
+
+**Design.**
+- `coordinator.FtArrivalSignal`: an 8-byte POSIX shared-memory counter. `EngineCore.__init__`
+  creates it before the executor spawns the workers (when finetuning + `forward_interruptible`
+  + tp>1) and exports its name as `DSERVE_FT_ARRIVAL_SHM`; the input thread bumps it on every
+  ADD; `shutdown()` unlinks it. Written through `struct` (no persistent buffer export, which
+  would make `SharedMemory.close()` raise at exit).
+- `coordinator.FtAbortPoller` (one per worker, built in `gpu_worker` with the TP group's gloo
+  `cpu_group`): `entry()` at the start of an FT-only forward, `layer()` at each layer
+  boundary — each MAX-all-reduces the rank's local "counter moved" bit, so all ranks take the
+  same decision at the same layer; one CPU collective per layer, no GPU sync. `note_served()`
+  on inference-bearing batches and `finish()` after the FT-only forward account for arrivals
+  that have been scheduled. **Active only between `entry()` and `finish()`**: the accumulator
+  hooks are armed for every FT-bearing batch, including co-serving batches with inference
+  tokens, and the first live run aborted 291 of those (their inference requests lost the step)
+  — `hook_check` is inert when the poller is inactive and runs no collective.
+- `accumulate.py`: hooks call `_abort_poll(boundary)`; only the `input_layernorm` pre-hook
+  passes `boundary=True` (one collective per layer); tp=1 installs `Event.is_set` for every
+  hook as before.
+- `ModelRunnerOutput.finetune_aborted`: a real dataclass field for the sentinel (the dynamic
+  `_ft_aborted` attribute is lost across the worker → engine hop). The engine's
+  `_ft_output_aborted` checks it on the model output and, under `step_with_batch_queue`, on
+  the execute_model future too; the runner's `sample_tokens` returns the sentinel (with the
+  TP relay fields) when execute_model left a pending abort, since under TP the engine still
+  calls it. The runner logs `[ft-abort] tier C: FT-only forward (n tokens) aborted at
+  entry|layer k for a late inference arrival`.
+- Backward child: `service_main` exits quietly on `KeyboardInterrupt` (server teardown
+  forwards SIGINT; the two shutdown tracebacks in every log were that).
+- `eval-tp/ft_bench_tp.py`: the inference `ok` counter was broken (tasks were dropped from the
+  in-flight set by a done-callback before the loop could read them → "0/N ok" in every run);
+  counted in the callback now.
+
+**Two more findings from the tight-trace replays, both fixed the same day.**
+- *The burst's first request was slow even with tier C on.* Most burst starts land while
+  the **backward** is running, not during an FT-only forward (the FT-only forward is ~60 ms
+  of a ~430 ms cycle), so nothing was there to abort — and the prefill itself ran at
+  80–200 ms instead of 40 ms. Cause: the `_maybe_pause` grant was re-set right after the
+  prefill was *enqueued* ("fire-and-forget", designed for MPS), so without an MPS daemon the
+  child resumed while the prefill was still executing and the two contexts time-sliced.
+  Fix: `finetune.pause_until_prefill_done` (opt-in; ON in the TP YAMLs) — the runner records
+  a CUDA event behind the forward and resumes the child only once it has fired
+  (`_ft_maybe_resume_backward`, a non-blocking `query()` on every execute_model incl. idle
+  steps and on sample_tokens; the child's 5 s cap bounds any missed resume).
+- *Aborts clustered at layers 31–36.* Partly the 4 rps bench's periodicity (FT-only forwards
+  start at a fixed phase after each request), partly that the hooks run at CPU launch time
+  while the GPU trails. `_LaunchAheadGate` (in both pollers, incl. the new tp=1
+  `LocalAbortPoller`) waits on the event of the layer launched two boundaries ago before
+  each check, so the decision tracks GPU progress and an abort stops real GPU work.
+
+**Tight-trace A/B (Qwen3-14B TP=2, 8 bursts of 60 requests, TTFT SLO 0.4 s):**
+
+| run | TTFT sat % | p95 | p99 | max | first request of each burst (ms) | FT tok/s |
+|---|---|---|---|---|---|---|
+| inference-only | 100.0 | 85 ms | 86 ms | 113 ms | 40 41 40 39 38 40 38 41 | — |
+| co, interruption off | 99.2 | 97 ms | 377 ms | 577 ms | 92 52 144 53 44 40 458 58 | 277 |
+| co, interruption on | 99.2 | 101 ms | 391 ms | 524 ms | 111 115 77 198 84 101 84 72 | ~266 |
+| co, off + pause fix | 100.0 | 103 ms | 172 ms | 196 ms | 64 44 144 50 39 42 173 50 | — |
+| **co, on + pause fix** | **100.0** | **86 ms** | **91 ms** | **150 ms** | **55 60 67 61 61 60 59 64** | **262** |
+
+Loose and nutanix-600-800 (before these two fixes, graphs + saves + M4.3 + head): TTFT
+satisfaction 98.3 / 99.4 % at 642 / 392 FT tok/s (1 Sept: 95.0 / 98.1 at 467 / 239);
+inference-only 100 / 100 %; co-serving TTFT p95 306 / 162 ms vs 84 / 76 ms — the tail that
+the fixes above address.
+
+**Gates.** `tests/test_ft_abort_tp.py` 10/10 (2-process gloo: quiet forward → no abort and
+1 + L collectives per rank; an arrival only rank 0 observes → BOTH ranks abort at the same
+layer with equal collective counts; an arrival before the forward → both abort at entry;
+`finish` / `note_served` clear it; inactive poller inert with no collective; the sentinel
+field survives pickle). `tests/test_accumulate_hooks.py::test_abort_poll_boundary` (raise from
+the boundary hook, rows consistent up to the aborting layer). Live (Qwen3-14B TP=2 `ft_bench`,
+4 rps): both ranks armed on the same signal; every `[ft-abort]` pair reports the same layer.
 
 ### M5 notes — why the collectives stay outside the graphs
 

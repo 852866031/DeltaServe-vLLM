@@ -350,7 +350,11 @@ class FinetuneConfig:
     flight, and the per-layer activation hooks raise a sentinel exception
     that ``execute_model`` catches and treats as an empty step. When False
     (default), every hook short-circuits and behaviour is bit-identical to
-    today."""
+    today. Under tensor parallelism tier C is rank-symmetric: the engine
+    publishes an arrival counter in shared memory and every rank MAX-reduces
+    its local decision over the TP group's gloo group at entry and at each
+    layer boundary, so all ranks leave the FT-only forward at the same layer
+    (one CPU collective per layer; never for co-serving batches)."""
 
     ft_only_admission_grace_ms: float = 2.0
     """[forward_interruptible] Tier-A grace window (ms) the engine main loop
@@ -359,6 +363,20 @@ class FinetuneConfig:
     previous busy-loop drain and the upcoming schedule call. Cost is roughly
     ``ms / ft_forward_ms`` of FT throughput during idle; benefit scales with
     inference QPS. Set 0 to disable A while keeping B and C."""
+
+    pause_until_prefill_done: bool = False
+    """Keep the backward child paused until the inference prefill that paused
+    it has actually COMPLETED on the GPU. The default (False) re-sets the GPU
+    grant right after the prefill kernels are *enqueued* — fire-and-forget,
+    designed for MPS where the child's SM share is bounded anyway. Without an
+    MPS daemon the child then resumes while the prefill is still executing and
+    the two contexts time-slice, roughly doubling the prefill's TTFT (measured
+    on the tight trace: burst-start TTFT 80-200 ms vs 40 ms inference-only).
+    When True the runner records a CUDA event after the forward and resumes
+    the child only once that event has completed (checked without blocking on
+    the next execute_model / sample_tokens call; idle steps keep the engine
+    stepping while a backward is outstanding, so the check always runs). Cost:
+    the child yields for the whole prefill instead of one layer."""
 
     # --- fwd-token throttle (extends the prefill-gated pause) ---
     fwd_token_throttle_enable: bool = False

@@ -11,7 +11,8 @@
 #   - save_attn_qkv / ctx        : ON — M2 made these buffers local-width, and a
 #                                 TP=2 run with both ON completed 162 cycles with
 #                                 no shape errors.
-#   - forward_interruptible      : off to keep the first bring-up simple
+#   - forward_interruptible      : ON — tier C is rank-symmetric under TP (shm arrival
+#                                 counter + a gloo MAX-reduce per layer boundary)
 #
 # STATUS: M1-M4.1 have landed and are GPU-validated — TP=2 now trains equivalently
 # to TP=1 (cycle-for-cycle to ~0.01 loss on identical data), so POSTing
@@ -34,8 +35,9 @@ finetune:
   weight_decay: 0.01
   gamma: 0.9
   backward_fp32: false
-  forward_interruptible: false       # off for TP bring-up
-  ft_only_admission_grace_ms: 0
+  forward_interruptible: true        # tiers A/B (scheduler) + tier C rank-symmetric under TP
+  ft_only_admission_grace_ms: 2.0
+  pause_until_prefill_done: true     # no MPS on this box: keep the bwd paused until the prefill has finished on the GPU
   fwd_token_throttle_enable: false
   fwd_token_throttle: 200
   backward_cuda_graph: true          # TP-safe since M5 (set false for the eager side of the A/B)

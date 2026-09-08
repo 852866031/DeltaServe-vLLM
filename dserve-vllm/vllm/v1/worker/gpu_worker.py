@@ -618,6 +618,32 @@ class Worker(WorkerBase):
         # off (event simply never gets set by the input thread).
         if ft_cfg.forward_interruptible:
             accumulator._abort_event = coordinator.ft_abort_event
+            _shm_name = os.environ.get("DSERVE_FT_ARRIVAL_SHM")
+            if tp_size > 1 and _shm_name:
+                # [tier C under TP] the engine's arrival counter + the TP
+                # group's gloo cpu_group make the abort decision rank-
+                # symmetric (one CPU collective per layer boundary).
+                from vllm.deltaserve.coordinator import (
+                    FtAbortPoller,
+                    FtArrivalSignal,
+                )
+                from vllm.distributed.parallel_state import get_tp_group
+
+                _poller = FtAbortPoller(FtArrivalSignal.attach(_shm_name),
+                                        get_tp_group().cpu_group)
+                coordinator.ft_abort_poller = _poller
+                accumulator._abort_poll = _poller.hook_check
+                dprint("[deltaserve] forward_interruptible tier C under TP armed "
+                       f"(arrival signal {_shm_name}, rank {get_tp_group().rank_in_group})")
+            elif tp_size > 1:
+                dprint("[deltaserve] forward_interruptible under TP: no arrival "
+                       "signal from the engine — tier C inert (tiers A/B active)")
+            else:
+                from vllm.deltaserve.coordinator import LocalAbortPoller
+
+                _poller = LocalAbortPoller(coordinator.ft_abort_event)
+                coordinator.ft_abort_poller = _poller
+                accumulator._abort_poll = _poller.hook_check
 
         # Inject into the runner: it sets the per-step mask + drives accumulation,
         # the accumulating offset, and the one-shot hash verification.
