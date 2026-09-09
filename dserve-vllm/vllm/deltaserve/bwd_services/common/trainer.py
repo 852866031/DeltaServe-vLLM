@@ -117,9 +117,12 @@ class LoraSftTrainerService(BackwardService):
         # [DeltaServe] Phase 7 / M3: stand up a NCCL group ACROSS the backward
         # children (one per rank) — they are NOT in vLLM's inference NCCL group.
         # This carries the per-layer gradient/activation all-reduces.
+        from vllm.deltaserve.bwd_services.common import tp as _tp
         self._all_reduce = init_backward_tp_group(
             self.tp_size, self.tp_rank,
             int(meta.get("backward_nccl_port", DEFAULT_BACKWARD_NCCL_PORT)))
+        # [pause] the gloo group the rank-symmetric pause agrees over (tp>1).
+        self._pause_group = _tp.backward_cpu_group()
         Hq_full = int(meta["num_attention_heads"])
         Hkv_full = int(meta["num_key_value_heads"])
         inter_full = int(meta["intermediate_size"])
@@ -386,7 +389,7 @@ class LoraSftTrainerService(BackwardService):
         # Head: loss + grad w.r.t. final_in (pre-final-norm residual = layer_in[L]).
         loss, n_valid, g = head_backward(
             activations["final_in"][:n], self.lm_w, self.norm_w, self.eps,
-            ids, seq_lens, b_start, self.vocab)
+            ids, seq_lens, b_start, self.vocab, pause_fn=self._maybe_pause)
 
         # Saved MLP pre-activations (gate||up) per layer, if captured in the forward
         # — lets the remat skip the gate_up matmul (the layer's biggest recompute).

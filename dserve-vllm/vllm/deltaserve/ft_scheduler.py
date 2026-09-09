@@ -27,6 +27,7 @@ from vllm.deltaserve.estimator import (
     StepFeatures,
 )
 from vllm.deltaserve.ft_injector import FinetuneInjector
+from vllm.deltaserve.step_trace import StepTraceWriter
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -135,6 +136,21 @@ class FinetuneScheduler(AsyncScheduler):
             getattr(ft_cfg, "estimator_validation_path", None)
             or self._stats_csv_path)
         self._validation_header_written = False
+        # [step_trace] Per-step predicted-vs-actual trace (estimator
+        # validation WITHOUT changing the system under test — async
+        # scheduling stays as configured). None → every hook is one
+        # ``is None`` check. The context a step's row needs from the
+        # scheduler side (stamp time, raw prediction, what admission
+        # reasoned on) is kept here keyed by the step sequence number, and
+        # joined when the runner's timing sample for that step is drained;
+        # only the int rides on the SchedulerOutput. See step_trace.py.
+        _trace_path = getattr(ft_cfg, "step_trace_path", None)
+        self._trace = StepTraceWriter(_trace_path) if _trace_path else None
+        self._step_seq = 0
+        self._trace_ctx: dict[int, tuple] = {}
+        self._admit_trace: list | None = None
+        if self._trace is not None:
+            dprint(f"[ft-sched] step trace → {_trace_path}")
         # SLO targets (seconds) for the admission gate.
         self._ttft_slo = float(ft_cfg.ttft_slo)
         self._max_tbt_slo = float(ft_cfg.max_tbt_slo)
@@ -260,6 +276,10 @@ class FinetuneScheduler(AsyncScheduler):
         is_decode_only = (feats.t_in == 0 and feats.b_d > 0)
         is_idle = (feats.t_in == 0 and feats.b_d == 0)
         has_prefill = (feats.t_in > 0)
+        # [step_trace] What admission reasoned on (filled in as we go).
+        _at = self._admit_trace
+        if _at is not None:
+            _at[0:4] = [feats.t_in, feats.p, feats.b_d, feats.k]
 
         # ─── Stage 2: phase gate ────────────────────────────────────────
         ft_cfg = self.vllm_config.finetune_config
@@ -295,6 +315,12 @@ class FinetuneScheduler(AsyncScheduler):
         ttft_deadline = (
             (earliest_arrival + 0.9 * self._ttft_slo)
             if (has_prefill and earliest_arrival is not None) else None)
+
+        if _at is not None:
+            _at[5] = t_baseline if self._estimator.is_ready else None
+            _at[8] = queue_wait
+            if ttft_deadline is not None:
+                _at[7] = ttft_deadline - now - queue_wait - t_baseline
 
         # Headroom checks against the BASELINE — if the step is already over
         # SLO without FT, no point even trying to admit.
@@ -407,6 +433,10 @@ class FinetuneScheduler(AsyncScheduler):
             # buffer budget was the only cap.)
 
             admitted.append(candidate)
+            if _at is not None:
+                _at[4] = len(admitted)
+                if self._estimator.is_ready:
+                    _at[6] = t_with_ft
             cur_t_in += candidate.input_len
             cur_t_ft += candidate.input_len
             cur_p += 1
@@ -606,6 +636,64 @@ class FinetuneScheduler(AsyncScheduler):
         except Exception as e:
             dprint(f"[ft-sched] validation row append failed: {e}")
 
+    # ─── [step_trace] per-step predicted-vs-actual trace ─────────────────
+    _TRACE_CTX_MAX = 512   # steps whose timing never arrives are evicted
+
+    def _trace_stamp(self, output: SchedulerOutput) -> None:
+        """Stamp this step's sequence number on the output and keep the
+        scheduler-side context for its row (joined in ``_trace_step`` when
+        the runner's timing sample arrives, or written by
+        ``_trace_rollback`` if the step is pre-empted)."""
+        seq = self._step_seq
+        self._step_seq = seq + 1
+        output._ft_step_seq = seq
+        feats = output._ft_step_features
+        est = self._estimator
+        pred_raw = (est.predict(feats, apply_margin=False)
+                    if est.is_ready else None)
+        ctx = self._trace_ctx
+        ctx[seq] = (time.time(), feats, output._ft_step_predicted, pred_raw,
+                    est.select_regime(feats), bool(self._coord.pending_backward),
+                    self._admit_trace, output._ft_running_inf,
+                    output._ft_waiting)
+        if len(ctx) > self._TRACE_CTX_MAX:
+            ctx.pop(next(iter(ctx)))
+
+    _EMPTY_ADMIT = (None,) * 9
+
+    def _trace_step(self, feats, dur, was_graph, predicted, extra) -> None:
+        """One timed step: join the runner's ``extra`` (seq, t_exec, host
+        time, paused flag) with the stamped context and enqueue the row."""
+        seq = extra[0] if extra else None
+        ctx = self._trace_ctx.pop(seq, None) if seq is not None else None
+        t_exec, host_s, paused = (extra[1:4] if extra else (None, None, None))
+        if ctx is None:
+            t_sched = pred_raw = regime_used = pending = None
+            at, run_inf, waiting = self._EMPTY_ADMIT, None, None
+        else:
+            t_sched, _, _, pred_raw, regime_used, pending, at, run_inf, waiting = ctx
+            at = at or self._EMPTY_ADMIT
+        self._trace.put_row((
+            seq, "step", t_sched, t_exec, feats.regime(), regime_used, was_graph,
+            feats.t_in, feats.p, feats.t_ft, feats.b_d, feats.k, feats.s,
+            at[0], at[1], at[2], at[3], at[4], at[5], at[6], at[7], at[8],
+            pred_raw, predicted, dur, host_s, pending, paused, run_inf, waiting))
+
+    def _trace_rollback(self, output: SchedulerOutput) -> None:
+        """A pre-empted (tier B/C) FT-only step: it never completes a forward,
+        so write its row here with no actual time."""
+        seq = getattr(output, "_ft_step_seq", None)
+        ctx = self._trace_ctx.pop(seq, None) if seq is not None else None
+        if ctx is None:
+            return
+        t_sched, feats, predicted, pred_raw, regime_used, pending, at, run_inf, waiting = ctx
+        at = at or self._EMPTY_ADMIT
+        self._trace.put_row((
+            seq, "rollback", t_sched, None, feats.regime(), regime_used, None,
+            feats.t_in, feats.p, feats.t_ft, feats.b_d, feats.k, feats.s,
+            at[0], at[1], at[2], at[3], at[4], at[5], at[6], at[7], at[8],
+            pred_raw, predicted, None, None, pending, None, run_inf, waiting))
+
     def shutdown(self) -> None:
         # [Phase 4] Dump the predicted-vs-actual estimator stats before teardown.
         # Skipped in validate_estimator mode: the mode-"w" dump would clobber the
@@ -615,6 +703,8 @@ class FinetuneScheduler(AsyncScheduler):
                 self.write_estimator_stats()
         except Exception as e:
             dprint(f"[ft-sched] estimator stats dump failed: {e}")
+        if self._trace is not None:
+            self._trace.close()
         super().shutdown()
 
     # ─── Offline-profiling helpers (used by EngineCore.profile_execution_model) ──
@@ -662,7 +752,7 @@ class FinetuneScheduler(AsyncScheduler):
         # [Phase 4] Drain step durations the runner finished timing (deferred
         # CUDA-event ring) into the tracker. Pairs each step's features (stamped
         # at schedule) with its measured duration (read a few steps later).
-        for feats, dur, was_graph, predicted in (
+        for feats, dur, was_graph, predicted, *_extra in (
                 self._coord.drain_completed_samples()):
             if dur > 0:
                 self._tracker.add(feats, dur, predicted=predicted,
@@ -670,6 +760,9 @@ class FinetuneScheduler(AsyncScheduler):
                 if self._validate_estimator:
                     self._append_validation_row(
                         feats, dur, was_graph, predicted)
+                if self._trace is not None:
+                    self._trace_step(feats, dur, was_graph, predicted,
+                                     _extra[0] if _extra else None)
 
         # Live refit of the SLO estimator every REFIT_EVERY steps. Skipped during
         # offline profiling (one fit at the end of the pass).
@@ -719,6 +812,9 @@ class FinetuneScheduler(AsyncScheduler):
         # triggered sample must also satisfy the proportional cap or
         # admission is 0 (credit retained for a later step). See
         # admit_ft_to_step() Stage 4 for the actual logic.
+        self._admit_trace = (
+            [None, None, None, None, 0, None, None, None, None]
+            if self._trace is not None else None)
         admitted_now, ft_reqs = self.admit_ft_to_step()
         for req in ft_reqs:
             self._enqueue_waiting_request(req)
@@ -828,6 +924,11 @@ class FinetuneScheduler(AsyncScheduler):
         # sample later — was_graph is frozen here).
         if output.total_num_scheduled_tokens > 0:
             feats, lora_ids = self._features_from_output(output)
+            # [decode_bwd] The backward child has work in flight: a decode-only
+            # step will share the GPU with it (it never pauses the child), so
+            # the estimator routes it to its own regime; a prefill-carrying
+            # step is excluded from the fits (see estimator.py).
+            feats.bwd = bool(self._coord.pending_backward)
             was_graph = self._will_use_graph(
                 feats, lora_ids, output.total_num_scheduled_tokens)
             # Composition-derived regime selection (was_graph stays as an
@@ -854,6 +955,8 @@ class FinetuneScheduler(AsyncScheduler):
         output._ft_running_inf = sum(
             1 for r in self.running if not getattr(r, "is_finetuning", False))
         output._ft_waiting = len(self.waiting)
+        if self._trace is not None and output.total_num_scheduled_tokens > 0:
+            self._trace_stamp(output)
         return output
 
     def _rollback_ft_step(self, scheduler_output: SchedulerOutput) -> int:
@@ -921,6 +1024,8 @@ class FinetuneScheduler(AsyncScheduler):
         scheduler_output.finetune_req_ids = set()
         scheduler_output._ft_samples = []
         scheduler_output._ft_tokens_reserved = 0
+        if self._trace is not None:
+            self._trace_rollback(scheduler_output)
         return len(ft_ids)
 
     def update_from_output(

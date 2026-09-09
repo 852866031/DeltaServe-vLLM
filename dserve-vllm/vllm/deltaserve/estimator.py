@@ -30,6 +30,15 @@ to vLLM's CUDA-graph runtime mode under the default
     Design matrix [S, T_in, T_ft, B_d, K, 1] (full 6 cols).
   * ``DECODE_ONLY`` — ``T_in == 0 AND T_ft == 0 AND B_d > 0``, runtime mode FULL.
     Design matrix [B_d, K, 1] (3 cols; prefill terms ≡ 0).
+  * ``DECODE_BWD``  — a decode-only step while the backward child has work in
+    flight (``StepFeatures.bwd``). Same design matrix as DECODE_ONLY, its own
+    coefficients: without MPS the driver time-slices the two contexts and a
+    decode step runs 1.5-2× (p99 up to 9×) slower — decode-only steps never
+    pause the child. Falls back to DECODE_ONLY until it has fitted.
+    Prefill-carrying steps taken with a backward in flight (the child is
+    paused, but what it already enqueued still runs) are EXCLUDED from the
+    INF_PREFILL / EAGER fits: admission never happens during a backward, so
+    they are neither used nor predictable — they only biased the clean fit.
 
 Selection is composition-derived: `predict()` picks the right regime from the
 input features. The optional `regime=` override lets callers force a specific
@@ -69,7 +78,9 @@ REFIT_EVERY = 256
 REGIME_INF_PREFILL = "inf_prefill"
 REGIME_EAGER = "eager"
 REGIME_DECODE_ONLY = "decode_only"
-REGIMES = (REGIME_INF_PREFILL, REGIME_EAGER, REGIME_DECODE_ONLY)
+REGIME_DECODE_BWD = "decode_bwd"
+REGIMES = (REGIME_INF_PREFILL, REGIME_EAGER, REGIME_DECODE_ONLY,
+           REGIME_DECODE_BWD)
 
 
 @dataclass
@@ -91,6 +102,10 @@ class StepFeatures:
     # Exact per-request prefill token counts (inference + FT). When present, S
     # is computed exactly; otherwise the T_in²/P proxy is used.
     prefill_lens: Sequence[int] | None = None
+    # The backward child had work in flight when this step was scheduled
+    # (coordinator.pending_backward). Selects DECODE_BWD for decode-only
+    # steps; excludes prefill-carrying steps from the fit (see module doc).
+    bwd: bool = False
 
     @property
     def s(self) -> float:
@@ -117,11 +132,19 @@ class StepFeatures:
             return REGIME_EAGER
         elif self.t_in > 0:
             return REGIME_INF_PREFILL
+        elif self.bwd:
+            return REGIME_DECODE_BWD
         else:
             # decode-only OR pure-idle. Pure-idle (b_d == 0) won't be
             # predicted in practice (no inference cost to compute), but it
             # routes here for completeness.
             return REGIME_DECODE_ONLY
+
+    @property
+    def contended(self) -> bool:
+        """A prefill-carrying step taken with a backward in flight: kept in
+        the tracker (observability) but excluded from every fit."""
+        return self.bwd and self.t_in > 0
 
 
 @dataclass
@@ -291,11 +314,25 @@ class MergedExecutionEstimator:
         p = self._params[regime]
         if p.is_fitted:
             return regime, p
-        # Cold-start fallback — try fitted regimes in priority order.
-        for r in (REGIME_EAGER, REGIME_INF_PREFILL, REGIME_DECODE_ONLY):
+        # Cold-start fallback — try fitted regimes in priority order. The
+        # contended-decode regime has no profiling-pass samples (no backward
+        # runs then), so it borrows the clean decode fit until its first refit.
+        order = (REGIME_EAGER, REGIME_INF_PREFILL, REGIME_DECODE_ONLY)
+        if regime == REGIME_DECODE_BWD:
+            order = (REGIME_DECODE_ONLY,) + order
+        for r in order:
             if self._params[r].is_fitted:
                 return r, self._params[r]
         return regime, p  # still unfitted; predict returns 0
+
+    def select_regime(self, features: StepFeatures,
+                      regime: str | None = None) -> str | None:
+        """The regime whose coefficients ``predict`` would use for these
+        features (observability: exposes the cold-start fallback). None
+        before any fit."""
+        if not self.is_ready:
+            return None
+        return self._select(features, regime=regime)[0]
 
     def predict(self, features: StepFeatures,
                 regime: str | None = None,
@@ -333,13 +370,19 @@ class MergedExecutionEstimator:
         buckets: dict[str, tuple[list[list[float]], list[float]]] = {
             r: ([], []) for r in REGIMES
         }
+        n_contended = 0
         for f, dur in zip(tracker.features, tracker.durations):
+            if f.contended:
+                n_contended += 1
+                continue
             r = f.regime()
             X, y = buckets[r]
             X.append(self._row_for_regime(f, r))
             y.append(dur)
 
         msg_parts: list[str] = []
+        if n_contended:
+            msg_parts.append(f"excluded {n_contended} contended prefill")
         for r in REGIMES:
             X, y = buckets[r]
             self._params[r], self._rmse[r] = self._fit_regime(
@@ -361,7 +404,7 @@ class MergedExecutionEstimator:
         elif regime == REGIME_EAGER:
             # Full 6-column formula.
             return [f.s, f.t_in, f.t_ft, f.b_d, f.k, 1.0]    # 6 cols
-        else:  # REGIME_DECODE_ONLY
+        else:  # REGIME_DECODE_ONLY / REGIME_DECODE_BWD
             # T_in ≡ T_ft ≡ 0 within this regime → α, β, γ columns dropped.
             return [f.b_d, f.k, 1.0]                          # 3 cols
 
@@ -378,7 +421,7 @@ class MergedExecutionEstimator:
         elif regime == REGIME_EAGER:
             # Columns: full [S, T_in, T_ft, B_d, K, 1].
             alpha, beta, gamma, delta, epsilon, c = (float(v) for v in coef)
-        else:  # REGIME_DECODE_ONLY
+        else:  # REGIME_DECODE_ONLY / REGIME_DECODE_BWD
             # Columns: [B_d, K, 1] → δ, ε, c. α, β, γ ≡ 0.
             delta, epsilon, c = (float(v) for v in coef)
             alpha = beta = gamma = 0.0

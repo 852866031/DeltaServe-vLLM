@@ -450,8 +450,13 @@ class FinetuneCoordinator:
         # reports done (see relay_backward_outstanding / take_relay_ack).
         self._relay_ack: dict | None = None
 
-    def push_sample(self, features, duration, was_graph, predicted) -> None:
-        self._completed_samples.append((features, duration, was_graph, predicted))
+    def push_sample(self, features, duration, was_graph, predicted,
+                    extra=None) -> None:
+        """Queue one timed step for the scheduler's drain. ``extra`` is the
+        runner's step-trace context ``(seq, t_exec, host_s, paused_bwd)`` or
+        None (consumers unpack with ``*rest`` so both shapes work)."""
+        self._completed_samples.append(
+            (features, duration, was_graph, predicted, extra))
 
     def drain_completed_samples(self) -> list:
         out = self._completed_samples

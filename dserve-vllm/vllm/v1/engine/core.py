@@ -743,7 +743,7 @@ class EngineCore:
             # pushed during the last step, after that step's schedule() drain).
             # The last few steps' events may still sit in the runner's ring and
             # are dropped — negligible against the full sweep.
-            for feats, dur, wg, pred in coord.drain_completed_samples():
+            for feats, dur, wg, pred, *_ in coord.drain_completed_samples():
                 if dur > 0:
                     sched._tracker.add(feats, dur, predicted=pred, was_graph=wg)
             sched._estimator.data_fit(sched._tracker)

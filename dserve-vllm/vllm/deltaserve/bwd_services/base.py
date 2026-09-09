@@ -123,6 +123,19 @@ class BackwardService:
         # [Phase 5] Shared GPU-yield event (set by service_main). SET = may run;
         # CLEARED = the main process is running an inference prefill → yield.
         self._gpu_grant = None
+        # [pause] Run-ahead bound (see FinetuneConfig.backward_run_ahead_
+        # boundaries): a ring of CUDA events, one per _maybe_pause boundary;
+        # resolved from meta on first use (-1 = not yet).
+        self._run_ahead: int = -1
+        self._boundary_events: list = []
+        self._boundary_pos: int = 0
+        # [pause] Under TP the pause must be rank-symmetric (set by the
+        # trainer to the children's gloo group): if one child blocks at
+        # boundary i while the other has already issued the next residual
+        # all-reduce, that NCCL kernel spins on the GPU waiting for its peer
+        # for the whole pause — measured on Qwen3-14B TP=2 as every prefill
+        # of a burst running 2× slower with the child "paused".
+        self._pause_group = None
         # Tag for the per-cycle one-line log: trainer subclasses set this to
         # "graph" or "eager" depending on which backward path they took.
         self._last_mode: str = "eager"
@@ -140,12 +153,57 @@ class BackwardService:
         is running an inference prefill (grant cleared), so prefill pre-empts the
         backward within one layer's kernels. No-op (instant) when the grant is
         set, which is the steady state. Bounded wait so a missed re-set can't
-        hang the backward forever."""
+        hang the backward forever.
+
+        The grant wait only stops *enqueueing*; the GPU still runs whatever this
+        process had already queued. With graph replays the CPU launches a whole
+        cycle in a few ms, so without a bound a "paused" child kept the GPU busy
+        for the rest of its cycle. ``backward_run_ahead_boundaries`` (meta)
+        therefore keeps the CPU at most N boundaries ahead: record an event
+        here, wait for the one recorded N boundaries ago."""
+        depth = self._run_ahead
+        if depth < 0:
+            meta = (self.shared or {}).get("meta") or {}
+            depth = int(meta.get("backward_run_ahead_boundaries", 0) or 0)
+            self._run_ahead = depth
+            if depth > 0:
+                self._boundary_events = [
+                    torch.cuda.Event() for _ in range(depth + 1)]
+                self._boundary_pos = 0
+        if depth > 0:
+            ring = self._boundary_events
+            pos = self._boundary_pos
+            ring[pos].record()
+            self._boundary_pos = (pos + 1) % len(ring)
+            # The slot we are about to overwrite next holds the event recorded
+            # ``depth`` boundaries ago — wait until the GPU has passed it.
+            ring[self._boundary_pos].synchronize()
         g = self._gpu_grant
-        if g is not None and not g.is_set():
-            print(f"[backward] GPU grant cleared — yielding to inference prefill; ")
-            g.wait(timeout=5.0)
-            print(f"[backward] GPU grant re-set — resuming backward")
+        if g is None:
+            return
+        grp = self._pause_group
+        if grp is None:
+            if not g.is_set():
+                g.wait(timeout=5.0)
+            return
+        # Rank-symmetric (tp>1): every rank reaches every boundary, so the
+        # ranks agree with a MAX all-reduce whether ANY grant is cleared and
+        # block together; while blocked they poll their own grant and agree
+        # with a MIN all-reduce that ALL are set again before any proceeds.
+        # The loop exit depends only on the reduced value (the deadline is
+        # folded into it), so no rank can leave the loop alone.
+        import torch.distributed as dist
+        flag = torch.tensor([0 if g.is_set() else 1], dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=grp)
+        if not int(flag.item()):
+            return
+        deadline = time.monotonic() + 5.0
+        while True:
+            mine = g.wait(timeout=0.002) or time.monotonic() > deadline
+            flag = torch.tensor([1 if mine else 0], dtype=torch.int32)
+            dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=grp)
+            if int(flag.item()):
+                return
 
     # -- per-model hooks ---------------------------------------------------
 

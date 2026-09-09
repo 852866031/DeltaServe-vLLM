@@ -25,6 +25,7 @@ finetune:
   enable_finetuning: true
   start_on_launch: false             # hold FT admission closed (M1: launch-only)
   backward_mps_percentage: 0         # no MPS daemon on this box; the pause contract protects prefill
+  backward_run_ahead_boundaries: 2   # child CPU ≤2 _maybe_pause boundaries ahead of its GPU → a pause lands within ~3-6 ms (0 = unbounded)
   finetuning_lora_path: ../adapters/qwen3-14b-toy-lora-ft
   data_path: ../alpaca_1000.txt
   max_saved_finetuning_tokens: 256

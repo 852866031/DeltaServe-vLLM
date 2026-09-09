@@ -32,6 +32,7 @@ Output (eval-tp/output/), tagged by family, TP size, co-serving knobs and mode:
 
     timeline_results_<family>_tp<N>[_co_factor_<f>_phase_<p>]_<mode>.csv
     bwd_log_<family>_tp<N>_co_factor_<f>_phase_<p>_<mode>.csv          (co only)
+    step_trace_<family>_tp<N>_co_factor_<f>_phase_<p>_<mode>.csv       (co + --step-trace)
     bench_meta_<family>_tp<N>[...]_<mode>.json                          (t_first_wall anchor)
     server_<family>_tp<N>[...]_<mode>.log                               (both ranks' output)
 
@@ -129,6 +130,11 @@ async def main() -> int:
                     help="Stream the server's output to this terminal instead of "
                          "the per-run log file (both ranks print, so the file is "
                          "the default under TP).")
+    ap.add_argument("--step-trace", action="store_true",
+                    help="(co only) write the per-step predicted-vs-actual "
+                         "estimator trace to output/step_trace<suffix>.csv "
+                         "(finetune.step_trace_path; near-zero cost, see "
+                         "analyze_step_trace.py)")
     ap.add_argument("--kill-stale", action="store_true",
                     help="Kill leftover GPU-resident processes from a previous run "
                          "instead of refusing to launch.")
@@ -154,9 +160,12 @@ async def main() -> int:
     meta_path = str(OUTPUT_DIR / f"bench_meta{suffix}.json")
     server_log = str(OUTPUT_DIR / f"server{suffix}.log")
     bwd_log = str(OUTPUT_DIR / f"bwd_log{suffix}.csv") if args.co else None
+    step_trace = (str(OUTPUT_DIR / f"step_trace{suffix}.csv")
+                  if (args.co and args.step_trace) else None)
     if bwd_log:
         open(bwd_log, "w").close()   # the server appends; start clean
         spec = resolve_launch(args, co=True, bwd_log_path=bwd_log,
+                              step_trace_path=step_trace,
                               api_server_count=args.api_server_count)
     cmd = spec.cmd
 
@@ -171,6 +180,8 @@ async def main() -> int:
     print(f"[bench-tp] results         = {out_csv}", flush=True)
     if bwd_log:
         print(f"[bench-tp] bwd log         = {bwd_log}", flush=True)
+    if step_trace:
+        print(f"[bench-tp] step trace      = {step_trace}", flush=True)
     print(f"[bench-tp] server log      = {'terminal' if args.stream_log else server_log}",
           flush=True)
     print(f"[bench-tp] server cmd      = {' '.join(cmd)}", flush=True)

@@ -107,6 +107,7 @@ def build_server_cmd(config_path: str, port: int, base_model: str | None = None,
                      served_name: str | None = None,
                      co: bool = True,
                      bwd_log_path: str | None = None,
+                     step_trace_path: str | None = None,
                      api_server_count: int | None = None) -> LaunchSpec:
     """Build the `dserve-vllm serve` command from a DeltaServe YAML.
 
@@ -118,7 +119,9 @@ def build_server_cmd(config_path: str, port: int, base_model: str | None = None,
     ``co=False`` launches the inference-only baseline: the finetune / debug /
     slo sections are NOT passed, so ``enable_finetuning`` stays at its default
     (False) and no backward child is spawned. ``bwd_log_path`` (co only) is the
-    backward-throughput CSV the server appends to. ``api_server_count``
+    backward-throughput CSV the server appends to; ``step_trace_path`` (co only)
+    the per-step predicted-vs-actual trace (``finetune.step_trace_path``, see
+    eval-tp/analyze_step_trace.py). ``api_server_count``
     overrides the YAML's ``server.api_server_count``."""
     _strip_repo_from_syspath()
     from vllm.deltaserve.config_loader import load_yaml_config, split_config
@@ -152,6 +155,8 @@ def build_server_cmd(config_path: str, port: int, base_model: str | None = None,
         cmd += _finetune_cli_args(cfg.get("slo") or {})
         if bwd_log_path:
             cmd.append(f"--finetune-config.bwd_log_path={bwd_log_path}")
+        if step_trace_path:
+            cmd.append(f"--finetune-config.step_trace_path={step_trace_path}")
     cmd += ["--host", "127.0.0.1", "--port", str(port),
             "--served-model-name", served_name]
     if api_server_count is None:

@@ -70,6 +70,7 @@ def init_backward_tp_group(tp_size: int, tp_rank: int,
         return None
     import torch.distributed as dist
 
+    global _CPU_GROUP
     if not dist.is_initialized():
         backend = "nccl" if torch.cuda.is_available() else "gloo"
         dist.init_process_group(
@@ -78,6 +79,11 @@ def init_backward_tp_group(tp_size: int, tp_rank: int,
             rank=tp_rank, world_size=tp_size)
         dprint(f"[backward] TP group up: rank={tp_rank}/{tp_size} "
                f"backend={backend} port={port}")
+    if _CPU_GROUP is None:
+        # A gloo group over the same rendezvous for the rank-symmetric pause
+        # (BackwardService._maybe_pause): CPU collectives only, never a GPU
+        # kernel, so agreeing to pause cannot itself occupy the GPU.
+        _CPU_GROUP = dist.new_group(backend="gloo")
 
     def _all_reduce(t: torch.Tensor) -> torch.Tensor:
         # NCCL/gloo need contiguous input; reduce is in-place SUM.
@@ -86,6 +92,15 @@ def init_backward_tp_group(tp_size: int, tp_rank: int,
         return t
 
     return _all_reduce
+
+
+_CPU_GROUP = None
+
+
+def backward_cpu_group():
+    """The gloo group across the backward children (None at tp=1 / before
+    ``init_backward_tp_group``)."""
+    return _CPU_GROUP
 
 
 def reduce_partial(all_reduce, total: torch.Tensor,
