@@ -1,16 +1,16 @@
 # Weekly report — week of September 1
 
 DeltaServe on vLLM: co-serving LoRA finetuning next to inference on two RTX 5090s
-(tensor parallelism across the two GPUs). This week closed the remaining gaps in the
-backward pass under tensor parallelism, cut the backward's own cost by about a third,
-made inference pre-emption of finetuning work with two GPUs, and validated the whole
-stack on both model families (Llama-3-8B and Qwen3-14B) against recorded request traces.
+(tensor parallelism across the two GPUs). This report covers closing the remaining gaps in
+the backward pass under tensor parallelism, cutting the backward's own cost by about a
+third, making inference pre-emption of finetuning work with two GPUs, and validating the
+whole stack on both model families (Llama-3-8B and Qwen3-14B) against recorded request traces.
 
 ## 1. CUDA graphs for the backward pass, now with tensor parallelism
 
 **Background.** The finetuning backward pass runs in a separate process on each GPU. It
 rematerializes each transformer layer's forward from saved activations, then computes the
-LoRA gradients by hand. Before this week the backward could run as a set of CUDA graphs on
+LoRA gradients by hand. Previously the backward could run as a set of CUDA graphs on
 a single GPU (a graph replays a pre-recorded sequence of kernels with one launch, removing
 per-kernel dispatch cost), but with two GPUs it was forced back to eager execution.
 
@@ -52,7 +52,7 @@ and compares losses and adapter weights across graph, eager, and single-GPU (220
 **The pipeline and where the GPUs must talk.** Each backward cycle walks the layers from
 the top down. Under tensor parallelism every layer needs a few all-reduces because each
 GPU holds only half of the attention heads and half of the feed-forward block. The two
-diagrams below show the same cycle before and after this week's changes; the right-hand
+diagrams below show the same cycle before and after the optimizations; the right-hand
 diagram is also the reference for the transfer changes in 2.2.
 
 ![Where the two GPUs exchange data in one backward cycle, before and after](figures/weekly_sept_1/fig2_allreduce_pipeline.png)
@@ -97,7 +97,7 @@ needs. Capturing q and k at the input of the norm modules makes the shortcut exa
 **A kernel-level profile changed the priorities.** One real backward cycle on a
 Qwen3-14B-shaped model, two GPUs, no inference running, graphs and all saves on:
 
-| component | before | after this week | what changed |
+| component | before | after | what changed |
 |---|---|---|---|
 | LM head | 63 ms | ~21 ms | per-sample GEMMs with ~31 rows each, and the bf16 head converted to fp32 nine times per cycle → all rows batched into one GEMM per vocabulary chunk, each chunk converted once per pass; same fp32 math (verified to 1e-7) |
 | NCCL all-reduces | 37 ms | ~34 ms | 240 → 86 collectives; the 80 residual reduces remain on the critical path |
@@ -106,7 +106,7 @@ Qwen3-14B-shaped model, two GPUs, no inference running, graphs and all saves on:
 | staging copies | 10 ms | 10 ms | saved activations into the graphs' static buffers |
 | **cycle** | **~165 ms** | **~121 ms** | |
 
-Over the week the uncontended Qwen3-14B cycle went from ~194 ms (eager, no saves) to
+In total the uncontended Qwen3-14B cycle went from ~194 ms (eager, no saves) to
 ~121 ms: roughly 5 ms from graphs, 15 ms from the activation saves, 42 ms from the head,
 and a few ms from the transfer changes in 2.2.
 
@@ -148,52 +148,22 @@ this hardware. The real gain is the correctness fix.
 
 ## 3. Inference pre-empting finetuning-only steps
 
-**What it is.** When no inference request is waiting, the scheduler builds steps made only
-of finetuning samples. An inference request that arrives during such a step would
-otherwise wait for it to finish. Pre-emption lets the request cut in at three points: a
-short wait on the input queue before an FT-only step is scheduled, a rollback if a
-request landed between scheduling and dispatch, and an abort in the middle of the forward.
-The mid-forward abort is an event that the engine's input thread sets on arrival and that
-the per-layer activation hooks check; the hook raises, the runner returns an empty result,
-and the scheduler restores its bookkeeping so the samples are retried later.
-
-**Single GPU.** Everything runs in one process, so a shared in-memory event is enough.
-
-**Two GPUs: the challenges.** The GPU workers are separate processes from the engine, so
-the event never reached them; the feature was silently inert. Worse, even with a signal,
-each GPU checking it independently would be wrong: an FT-only forward runs a collective
-every layer, so if one GPU leaves at layer k while the other continues, the other blocks
-forever in the next collective. The abort has to be a joint decision. Further, the
-"aborted" marker on the result was a dynamic attribute that did not survive the
-worker-to-engine hop, and the engine's async pipeline calls a second sampling entry point
-that also had to know about the abort.
-
-**What we built.** The engine publishes an arrival counter in POSIX shared memory,
-created before the workers are spawned. Each worker compares the counter against its
-value at forward start, once at entry and once per layer boundary, and MAX-all-reduces
-its local bit over the TP group's CPU (gloo) group before acting, so both GPUs always take
-the same decision at the same layer; one small CPU collective per layer, no GPU sync. The
-first live run exposed a mistake: the hooks are armed for every batch that carries
-finetuning samples, including mixed batches with inference tokens, and those were being
-aborted too, taking their inference requests' step with them. The decision is now active
-only for FT-only forwards. Two secondary findings were also fixed: the CPU launches layers
-far ahead of the GPU, so a hook-time abort only saved the un-launched tail (the poller now
-bounds the launch-ahead to two layers), and, most importantly, most burst-start requests
-were slow for a different reason entirely.
-
 <table>
 <tr>
-<td width="52%" valign="top">
+<td width="58%" valign="top">
 
-<b>The pause finding.</b> On the dense trace, the first request of each burst usually
-arrived while the backward was running, not during an FT-only forward. Its prefill took
-80 to 200 ms instead of 40 ms because the "yield the GPU to prefill" grant was re-set right
-after the prefill was enqueued, not when it finished, so the backward resumed immediately
-and the two processes time-sliced against each other on the GPU. The runner now records a
-CUDA event behind the prefill and resumes the backward only when that event has completed.
+<p><b>What it is.</b> When no inference request is waiting, the scheduler builds steps made only of finetuning samples. An inference request that arrives during such a step would otherwise wait for it to finish. Pre-emption lets the request cut in at three points: a short wait on the input queue before an FT-only step is scheduled, a rollback if a request landed between scheduling and dispatch, and an abort in the middle of the forward. The mid-forward abort is an event that the engine's input thread sets on arrival and that the per-layer activation hooks check; the hook raises, the runner returns an empty result, and the scheduler restores its bookkeeping so the samples are retried later.</p>
+
+<p><b>Single GPU.</b> Everything runs in one process, so a shared in-memory event is enough.</p>
+
+<p><b>Two GPUs: the challenges.</b> The GPU workers are separate processes from the engine, so the event never reached them; the feature was silently inert. Worse, even with a signal, each GPU checking it independently would be wrong: an FT-only forward runs a collective every layer, so if one GPU leaves at layer k while the other continues, the other blocks forever in the next collective. The abort has to be a joint decision. Further, the "aborted" marker on the result was a dynamic attribute that did not survive the worker-to-engine hop, and the engine's async pipeline calls a second sampling entry point that also had to know about the abort.</p>
+
+<p><b>What we built.</b> The engine publishes an arrival counter in POSIX shared memory, created before the workers are spawned. Each worker compares the counter against its value at forward start, once at entry and once per layer boundary, and MAX-all-reduces its local bit over the TP group's CPU (gloo) group before acting, so both GPUs always take the same decision at the same layer; one small CPU collective per layer, no GPU sync. The first live run exposed a mistake: the hooks are armed for every batch that carries finetuning samples, including mixed batches with inference tokens, and those were being aborted too, taking their inference requests' step with them. The decision is now active only for FT-only forwards. Two secondary findings were also fixed: the CPU launches layers far ahead of the GPU, so a hook-time abort only saved the un-launched tail (the poller now bounds the launch-ahead to two layers), and, most importantly, most burst-start requests were slow for a different reason entirely.</p>
+
+<p><b>The pause finding.</b> On the dense trace, the first request of each burst usually arrived while the backward was running, not during an FT-only forward. Its prefill took 80 to 200 ms instead of 40 ms because the "yield the GPU to prefill" grant was re-set right after the prefill was enqueued, not when it finished, so the backward resumed immediately and the two processes time-sliced against each other on the GPU. The runner now records a CUDA event behind the prefill and resumes the backward only when that event has completed.</p>
 
 </td>
-<td width="48%" valign="top">
+<td width="42%" valign="top">
 
 <img src="figures/weekly_sept_1/fig4_preemption.png" alt="Yielding the GPU to a prefill: before vs after" width="100%">
 
