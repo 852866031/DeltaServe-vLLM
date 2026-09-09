@@ -37,6 +37,8 @@ Llama-3-8B: 65 graphs, captured once at startup in about 0.3 s. The GPU-yield po
 between the two backward replays of each layer, once per layer, unchanged from the eager
 path.
 
+![One layer of the backward: captured regions, eager segments, and where the GPUs exchange data](figures/weekly_sept_1/fig1_backward_graphs.png)
+
 **Verification.** Two new tests run on both GPUs with real NCCL: a layer-level parity test
 (graph equals eager on each GPU to 1e-5, equals the single-GPU reference, identical across
 GPUs, including the fallback path when a batch overflows the padded attention budget;
@@ -45,45 +47,65 @@ and compares losses and adapter weights across graph, eager, and single-GPU (220
 
 ## 2. What the backward actually costs, and what we removed
 
-**Cross-GPU traffic.** Per layer the backward needed 7 all-reduces: 1 in the forward
-rematerialization and 6 in the backward (two residual-stream gradients, four replicated
-LoRA-factor gradients). On Qwen3-14B (40 layers) that is 280 collectives per cycle, about
-205 MB per GPU. This box has no peer-to-peer link between the GPUs, so every collective
-crosses PCIe through host memory: measured 0.36 ms per 2.5 MB reduce and 0.045 ms per
-160 KB reduce.
+**The pipeline and where the GPUs must talk.** Each backward cycle walks the layers from
+the top down. Under tensor parallelism every layer needs a few all-reduces because each
+GPU holds only half of the attention heads and half of the feed-forward block. The two
+diagrams below show the same cycle before and after this week's changes.
 
-**Activation saving instead of recompute.** The backward used to recompute most of each
-layer's forward from the saved layer input. We now save three more per-layer tensors during
-the inference forward, each behind a config flag:
+![Where the two GPUs exchange data in one backward cycle, before and after](figures/weekly_sept_1/fig2_allreduce_pipeline.png)
 
-| saved tensor | what the backward no longer recomputes | memory (Qwen3-14B, 256 tokens) |
+**All-reduce inventory per layer** (sizes for Qwen3-14B at 256 tokens; measured cost on
+this box, whose GPUs have no peer-to-peer link so every collective crosses PCIe through
+host memory):
+
+| all-reduce | tensor | size | cost | before | after |
+|---|---|---|---|---|---|
+| output-projection partial sum | forward rematerialization | 2.5 MB | 0.36 ms | every layer | gone: the post-attention residual is saved in the forward |
+| feed-forward gradient partial | backward | 2.5 MB | 0.36 ms | every layer, inline | every layer, inline |
+| attention-path gradient partial | backward | 2.5 MB | 0.36 ms | every layer, inline | every layer, inline |
+| replicated LoRA-factor gradients (q/k/v A, o B) | backward | 4 × 160 KB | 4 × 0.045 ms | every layer, inline | into a flat buffer, one reduce per 8 layers on a second stream |
+| clip norms | after the loop | 40 floats | negligible | — | one reduce per cycle |
+| **per cycle (40 layers)** | | | | **280 collectives** | **86 collectives** |
+
+**Activation saving instead of recompute.** The backward used to rebuild most of each
+layer's forward from the saved layer input. Three more per-layer tensors are now saved
+during the inference forward, each behind a config flag:
+
+| saved tensor | captured where | what the backward no longer recomputes | memory (Qwen3-14B, 256 tokens, per GPU) |
+|---|---|---|---|
+| q/k/v | post-RoPE for Llama-3; pre-norm q/k plus v for Qwen3 | the Q/K/V projection GEMM and RoPE (Qwen3: only its per-head norm and RoPE remain, both elementwise) | ~48 MB |
+| attention context | output of the attention kernel | the attention forward: scores, softmax, AV | ~16 MB |
+| post-attention residual | input of the post-attention norm | the output-projection GEMM, the residual add, and the forward's only all-reduce | ~100 MB (full width) |
+
+Qwen3 needed its own variant for q/k: its per-head normalisation sits between the
+projection and RoPE, so the values seen after attention are not what the norm's backward
+needs. Capturing q and k at the input of the norm modules makes the shortcut exact.
+
+**What is still recomputed per layer, with everything on:**
+
+| item | recomputed? | why |
 |---|---|---|
-| post-RoPE q/k/v (Llama-3) or pre-norm q/k + v (Qwen3) | the Q/K/V projection GEMM and RoPE | ~48 MB per GPU |
-| attention context | the attention forward (scores, softmax, AV) | ~16 MB per GPU |
-| post-attention residual | the output-projection GEMM, the residual add, **and the forward's only all-reduce** | ~100 MB |
+| input RMSNorm | yes | the Q/K/V LoRA-A gradients need the normalised input; it is one elementwise pass, cheaper to redo than to store |
+| Q/K/V projection, attention forward, output projection | no | saved above |
+| feed-forward gate/up pre-activations | no | saved since an earlier phase |
+| softmax inside the attention backward | yes | rebuilt from q/k, standard practice (storing it would cost a per-layer [samples, heads, L, L] tensor) |
+| LM head logits | yes, once per cycle | the inference forward only materialises last-token logits; the full fp32 logits GEMM is unavoidable |
 
-With all three on, the per-layer forward recompute is a single RMSNorm, and the
-cross-GPU traffic drops to 6 collectives per layer, all in the backward. Qwen3 needed its
-own variant: its per-head q/k normalisation sits between the projection and RoPE, so the
-values captured after attention are not what the norm's backward needs. Capturing q and k
-at the input of the norm modules instead makes the shortcut exact for Qwen3 too.
+**A kernel-level profile changed the priorities.** One real backward cycle on a
+Qwen3-14B-shaped model, two GPUs, no inference running, graphs and all saves on:
 
-**A kernel-level profile changed the priorities.** Profiling one real backward cycle on a
-Qwen3-14B-shaped model (two GPUs, no inference running) showed where the ~165 ms went:
+| component | before | after this week | what changed |
+|---|---|---|---|
+| LM head | 63 ms | ~21 ms | per-sample GEMMs with ~31 rows each, and the bf16 head converted to fp32 nine times per cycle → all rows batched into one GEMM per vocabulary chunk, each chunk converted once per pass; same fp32 math (verified to 1e-7) |
+| NCCL all-reduces | 37 ms | ~34 ms | 240 → 86 collectives; the 80 residual reduces remain on the critical path |
+| feed-forward and attention backward GEMMs | 22 ms | 22 ms | untouched (bf16, near their microbenchmark) |
+| elementwise and reductions | 17 ms | 17 ms | norm backwards in fp32, SiLU, clipping, AdamW |
+| staging copies | 10 ms | 10 ms | saved activations into the graphs' static buffers |
+| **cycle** | **~165 ms** | **~121 ms** | |
 
-| component | ms | note |
-|---|---|---|
-| LM head | 63 | per-sample GEMMs with ~31 rows each, and the bf16 head converted to fp32 nine times per cycle |
-| NCCL all-reduces | 37 | 240 collectives |
-| feed-forward and attention backward GEMMs | 22 | |
-| elementwise / reductions | 17 | |
-| copies | 10 | staging saved activations |
-
-The LM head was the largest single item and mostly waste: the same fp32 result is produced
-by batching all samples' rows into one GEMM per vocabulary chunk and converting each chunk
-once per pass. Same math, same fp32 precision (verified to 1e-7 against the old
-implementation), and the cycle dropped from 165 ms to 123 ms. Together with graphs and the
-saves, the uncontended Qwen3-14B cycle went from ~194 ms to ~121 ms this week.
+Over the week the uncontended Qwen3-14B cycle went from ~194 ms (eager, no saves) to
+~121 ms: roughly 5 ms from graphs, 15 ms from the activation saves, 42 ms from the head,
+and a few ms from the transfer changes in the next section.
 
 ## 3. GPU-to-GPU transfer: bucketing and a communication stream
 
@@ -92,8 +114,10 @@ the compute, at the point where each gradient was produced. 160 of them were the
 replicated LoRA-factor gradients, which nobody reads until the optimizer step at the end
 of the cycle. Each reduce is a rendezvous between the two GPUs, and the backward process
 was also started with the CUDA setting that pins every stream onto a single hardware queue
-(inherited from the original DeltaServe, where it served MPS ordering), so no overlap
-between communication and compute was possible even in principle.
+(inherited from the original DeltaServe), so no overlap between communication and compute
+was possible even in principle.
+
+![Compute stream vs communication stream, before and after bucketing](figures/weekly_sept_1/fig3_bucketing_streams.png)
 
 There was also a correctness problem hiding in the same place: gradient clipping ran
 per layer on each GPU over the tensors that GPU held, replicated factors in full but only
@@ -140,6 +164,8 @@ forever in the next collective. The abort has to be a joint decision. Further, t
 worker-to-engine hop, and the engine's async pipeline calls a second sampling entry point
 that also had to know about the abort.
 
+![Pre-empting a finetuning-only step on two GPUs, and the pause fix](figures/weekly_sept_1/fig4_preemption.png)
+
 **What we built.** The engine publishes an arrival counter in POSIX shared memory,
 created before the workers are spawned. Each worker compares the counter against its
 value at forward start, once at entry and once per layer boundary, and MAX-all-reduces
@@ -156,8 +182,8 @@ were slow for a different reason entirely.
 **The pause finding.** On the dense trace, the first request of each burst usually
 arrived while the backward was running, not during an FT-only forward. Its prefill took
 80 to 200 ms instead of 40 ms because the "yield the GPU to prefill" grant was re-set right
-after the prefill was enqueued, not when it finished, so without MPS the backward resumed
-immediately and time-sliced against the prefill. The runner now records a CUDA event
+after the prefill was enqueued, not when it finished, so the backward resumed immediately
+and the two processes time-sliced against each other on the GPU. The runner now records a CUDA event
 behind the prefill and resumes the backward only when that event has completed.
 
 **Result on the dense trace (Qwen3-14B, 8 bursts of 60 requests):**
@@ -168,9 +194,10 @@ behind the prefill and resumes the backward only when that event has completed.
 | co-serving, before | 99.2 % | 377 ms | 577 ms | 92 52 144 53 44 40 458 58 | 277 |
 | co-serving, after | 100 % | 91 ms | 150 ms | 55 60 67 61 61 60 59 64 | 262 |
 
-## 5. Validation and a discovery about MPS
+## 5. Validation
 
-Both families now co-serve the loose, dense, and Nutanix traces with the full stack:
+Both families now co-serve the loose, dense, and Nutanix traces with the full stack
+(inference-only satisfaction is 100 % on every trace):
 
 | | TTFT satisfaction (loose / dense / Nutanix) | FT tok/s |
 |---|---|---|
@@ -182,12 +209,6 @@ rematerialization now matches the served model to bf16 noise and the loss no lon
 stalls), and the Qwen3-0.6B single-GPU path, which needed a fix for models whose LM head
 is tied to the embedding.
 
-One finding worth knowing: the backward process has always been launched with an MPS
-thread-percentage variable, but no MPS control daemon runs on this machine, so the
-variable was inert and the backward was simply time-sliced against inference by the
-driver. We made "no MPS" the explicit default and rely on the pause contract instead. The
-consequence is that a backward cycle under inference load takes roughly twice its
-uncontended time; that trade-off is now understood rather than assumed.
 
 ## 6. Next
 
