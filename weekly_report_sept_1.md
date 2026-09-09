@@ -164,8 +164,6 @@ forever in the next collective. The abort has to be a joint decision. Further, t
 worker-to-engine hop, and the engine's async pipeline calls a second sampling entry point
 that also had to know about the abort.
 
-![Pre-empting a finetuning-only step on two GPUs, and the pause fix](figures/weekly_sept_1/fig4_preemption.png)
-
 **What we built.** The engine publishes an arrival counter in POSIX shared memory,
 created before the workers are spawned. Each worker compares the counter against its
 value at forward start, once at entry and once per layer boundary, and MAX-all-reduces
@@ -185,6 +183,8 @@ arrived while the backward was running, not during an FT-only forward. Its prefi
 after the prefill was enqueued, not when it finished, so the backward resumed immediately
 and the two processes time-sliced against each other on the GPU. The runner now records a CUDA event
 behind the prefill and resumes the backward only when that event has completed.
+
+![Yielding the GPU to a prefill: before vs after](figures/weekly_sept_1/fig4_preemption.png)
 
 **Result on the dense trace (Qwen3-14B, 8 bursts of 60 requests):**
 
