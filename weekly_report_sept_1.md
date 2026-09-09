@@ -222,10 +222,61 @@ rematerialization now matches the served model to bf16 noise and the loss no lon
 stalls), and the Qwen3-0.6B single-GPU path, which needed a fix for models whose LM head
 is tied to the embedding.
 
+## 5. Verifying the step-time predictor on two GPUs, and what it exposed
 
-## 5. Next
+<p><b>Why this matters.</b> The scheduler only admits finetuning samples into an inference step when a step-time predictor says the step will still meet its latency targets: time-to-first-token for waiting requests and time-between-tokens for running ones. The predictor is a small linear model of the step's composition (prefill tokens, finetuning tokens, decode requests, cached context), seeded by a profiling pass at launch and refit online. On two GPUs its accuracy had never been checked, and we suspected it was off even on one.</p>
 
-The SLO estimator's coefficients are fitted with no backward running; with the pause now
-holding through the whole prefill, the contention pattern has changed. The next step is a
-two-GPU versus single-GPU residual comparison of the estimator to see whether its
-step-time model needs a tensor-parallel term.
+<p><b>How we checked it.</b> The server can now record a trace with one row per step: the composition that actually ran, what the admission decision assumed it would be, the predicted time, the GPU time measured with CUDA events, the CPU time spent dispatching, and whether the backward process had work in flight or was paused. It costs a few microseconds per step on the scheduler thread and writes from a helper thread, so it does not perturb what it measures (the previous validation mode switched asynchronous scheduling off, i.e. it measured a different system). An analysis tool joins the trace with the per-request results and the backward log, scores the predictor per step type, splits the misses by suspected cause, and lists every SLO violation with the steps that ran while the request waited.</p>
+
+<p><b>What we found.</b> On the dense and Nutanix traces the predictor is accurate for every step the admission decision actually reasons on: within 1 to 2 ms, median measured/predicted 1.00. Every systematic miss had one cause: the backward process sharing the GPU. Without MPS the driver time-slices the two processes, so
+(1) decode-only steps, which by design never pause the backward, ran 1.5 to 1.9× their prediction at the median and up to 9× (a 16 ms step taking 195 ms);
+(2) prefill steps, which do pause the backward, were still 10 to 15 % slow at the median and up to 2.3× right after a backward started; and
+(3) these contended samples leaked into the online refit and distorted it, so even clean decode steps were over-predicted by 8 %.
+Two suspects were cleared: the admission decision's guess of the step composition was right 95 % of the time and conservative otherwise, and the CPU was never the bottleneck. The damage showed up in time-between-tokens, not in time-to-first-token, which is why it had gone unnoticed.</p>
+
+![Predictor accuracy before and after, by step type](figures/weekly_sept_1/fig5_predictor_before_after.png)
+
+*Measured over predicted step time by step type, median (bars) and 90th percentile (ticks), before and after this week's fixes. 1.0 is exact.*
+
+**What we fixed.**
+
+1. *The predictor knows about the backward.* Decode-only steps taken while the backward is running now use their own set of coefficients, and prefill steps taken during a backward are kept out of the fit (admission never happens during a backward, so they are neither used nor predictable). Clean decode steps are back to 1.00; contended ones are centred (median 0.94 to 0.99) but keep a wide spread, because a decode step either overlaps a chunk of backward work or it does not. Pausing the backward for decode-only steps was deliberately not done: it would cost finetuning throughput for a time-between-tokens benefit, and we accept that cost for now.
+
+   *How it is implemented.* The predictor is a set of linear models, one per step type, selected by the step's composition; the change adds one more of the same decode form, selected when the step is decode-only and the scheduler's own "backward outstanding" flag is set (that flag is stamped onto the step's feature record at scheduling time and travels with the measured time back into the refit). The launch profiling pass never runs a backward, so the new model borrows the clean decode coefficients until its first online refit a few seconds into serving.
+
+   | step type | when it applies | inputs of the linear model |
+   |---|---|---|
+   | inference prefill | prefill tokens present, no finetuning samples | Σ (prefill length)², prefill tokens, decode requests, cached context, constant |
+   | with finetuning samples | any finetuning tokens in the step (runs without CUDA graphs) | the above plus finetuning tokens |
+   | decode only | no prefill, backward idle | decode requests, cached context, constant |
+   | decode only, backward running (**new**) | no prefill, backward outstanding | same inputs, own coefficients |
+
+   Prefill steps that overlap a backward are marked contended and left out of every fit. The new model still over-predicts the roughly 30 % of contended decode steps during which the backward is outstanding but not actually on the GPU (its CPU-side tail, or a pause for a prefill); telling those apart needs one more scheduler-side feature and is not done.
+
+2. *Making the pause actually pause.* The "yield the GPU to a prefill" signal only stops the backward from enqueueing more work; the GPU still runs whatever is already queued. With CUDA graphs the backward's CPU launches a whole cycle in a few milliseconds, so a "paused" backward kept the GPU busy for the rest of its cycle. The backward now keeps its CPU at most two boundaries ahead of its GPU, so a pause takes effect within a few milliseconds. That alone made the loose trace *worse* (5 violations, every prefill of a burst at 2×, backward cycles stretched to 2.5 s), and the trace showed why: the two GPUs' backward processes stopped at different boundaries, and the one ahead had already issued the next GPU-to-GPU reduction, which spins on its GPU waiting for the paused peer for the entire pause; inference's own reductions then drag both GPUs down to half speed. The pause decision is now agreed between the two backward processes at every boundary with a cheap CPU collective, so they stop and resume together. The LM-head part of the cycle, previously an uninterruptible 18 ms block at the very start, also got boundaries.
+
+**Result** (Qwen3-14B, two GPUs, time-to-first-token target 0.4 s):
+
+| trace | TTFT satisfaction | co-serving p50 / p95 / p99 | inference-only p50 / p95 / p99 | paused prefill, measured/predicted (median, 90th pct) | FT tok/s |
+|---|---|---|---|---|---|
+| loose | **100 %** (98.3 % last week) | 75 / 95 / 132 ms | 72 / 84 / 86 ms | 1.07, 1.37 (was 1.95, 2.10 with the first fix alone) | 685 |
+| dense | 100 % | 76 / 94 / 121 ms | 74 / 85 / 86 ms | 1.09, 1.23 (was 1.09, 1.24) | 289 |
+| Nutanix 600–800 s | **100 %** (99.4 % last week) | 74 / 115 / 178 ms | 63 / 76 / 81 ms | 1.10, 1.31 (was 1.15, 1.70) | 420 |
+
+Finetuning throughput is unchanged by the fixes. The remaining 6 to 7 ms on the first prefill after a backward starts is the two boundaries of run-ahead plus the agreement latency. Time-between-tokens still pays for the decode-only contention we chose to keep: the worst gap exceeds 50 ms on 57 / 60 / 188 requests versus 26 / 1 / 15 inference-only. Also noted along the way: on this hardware admission is bound by the time-between-tokens target, not time-to-first-token — a co-serving step with both decodes and finetuning samples costs about 50 ms, right at the target, so only the smallest samples ride inference steps and most finetuning runs in the idle gaps.
+
+**The three traces after the fixes.** Each figure below shows, per step, the predicted versus measured time (left), the measured/predicted ratio over the run with backward activity marked (middle), and the distribution of that ratio for prefill steps with and without a backward in flight (right).
+
+![Per-step predictor accuracy, loose trace](figures/weekly_sept_1/fig6_step_trace_loose.png)
+
+![Per-step predictor accuracy, dense trace](figures/weekly_sept_1/fig6_step_trace_dense.png)
+
+![Per-step predictor accuracy, Nutanix 600–800 s](figures/weekly_sept_1/fig6_step_trace_nutanix.png)
+
+And the request-level view of the same runs (request rate, end-to-end latency against the inference-only baseline, finetuning versus inference throughput, and the time-to-first-token satisfaction line):
+
+![Loose trace: timeline, latency, throughput, TTFT satisfaction](figures/weekly_sept_1/fig7_timeline_loose.png)
+
+![Dense trace: timeline, latency, throughput, TTFT satisfaction](figures/weekly_sept_1/fig7_timeline_dense.png)
+
+![Nutanix 600–800 s: timeline, latency, throughput, TTFT satisfaction](figures/weekly_sept_1/fig7_timeline_nutanix.png)

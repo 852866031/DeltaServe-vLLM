@@ -478,7 +478,12 @@ _SERIES = {"inf_prefill": "#2a78d6", "eager": "#eb6834", "decode_only": "#1baf7a
 REGIMES = tuple(_SERIES)
 
 
-def plot(steps: list[Step], results, t0, slo, window, out_png: str) -> None:
+_MODE_TITLES = {"tight": "tight (dense) trace", "loose": "loose trace",
+                "nutanix": "Nutanix trace", "nutanix-600-800": "Nutanix 600–800 s trace"}
+
+
+def plot(steps: list[Step], results, t0, slo, window, out_png: str,
+         title: str = "") -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -493,7 +498,9 @@ def plot(steps: list[Step], results, t0, slo, window, out_png: str) -> None:
         if not rs:
             continue
         ax.scatter([s.pred_raw * 1e3 for s in rs], [s.actual * 1e3 for s in rs],
-                   s=9, alpha=0.45, color=col, edgecolors="none", label=f"{reg} (n={len(rs)})")
+                   s=9, alpha=0.45, color=col, edgecolors="none",
+                   label=f"{reg} (n={len(rs)}, median {pct([s.ratio for s in rs], .5):.2f}×, "
+                         f"rmse {rmse(rs) * 1e3:.1f} ms)")
     lim = max([s.actual for s in win] + [s.pred_raw for s in win] + [1e-3]) * 1e3
     ax.plot([0.5, lim], [0.5, lim], color="#9a9a94", lw=1, ls="--", label="actual = pred")
     ax.set_xscale("log"); ax.set_yscale("log")
@@ -520,6 +527,18 @@ def plot(steps: list[Step], results, t0, slo, window, out_png: str) -> None:
             ax.plot([], [], color="#e34948", lw=0.8, label=f"TTFT > SLO ({len(viol)})")
     ax.axhline(1.0, color="#9a9a94", lw=1, ls="--")
     ax.set_yscale("log"); ax.set_ylim(0.3, max(4, max(s.ratio for s in win) * 1.1))
+    ratios = [s.ratio for s in win]
+    lines = [f"all steps (n={len(win)}): median {pct(ratios, .5):.2f}×, "
+             f"90th {pct(ratios, .9):.2f}×, >1.5× on {sum(r > 1.5 for r in ratios) / len(ratios) * 100:.1f}%",
+             f"backward in flight: {sum(1 for s in win if s.pending_bwd) / len(win) * 100:.0f}% of steps"]
+    if results and t0 is not None:
+        ok = [r for r in results if r["ttft"] is not None]
+        nv = sum(1 for r in ok if r["ttft"] > slo)
+        lines.append(f"TTFT ≤ {slo:g} s: {len(ok) - nv}/{len(ok)} requests "
+                     f"({(1 - nv / max(1, len(ok))) * 100:.1f}%)")
+    ax.text(0.02, 0.97, "\n".join(lines), transform=ax.transAxes, fontsize=8,
+            va="top", ha="left",
+            bbox=dict(boxstyle="round,pad=0.35", facecolor="white", edgecolor="#c8c8c3", alpha=0.9))
     ax.set_xlabel("time since first request (s)"); ax.set_ylabel("measured / predicted")
     ax.set_title("ratio over the run"); ax.legend(frameon=False, fontsize=8, loc="upper right")
     ax.grid(True, color="#e6e6e2", lw=0.6)
@@ -530,15 +549,19 @@ def plot(steps: list[Step], results, t0, slo, window, out_png: str) -> None:
         rs = sorted(s.ratio for s in win if sel(s) and s.regime in ("inf_prefill", "eager"))
         if rs:
             ax.plot(rs, [i / len(rs) for i in range(len(rs))], color=col, lw=2,
-                    label=f"{lab} (n={len(rs)})")
+                    label=f"{lab} (n={len(rs)}): median {pct(rs, .5):.2f}×, "
+                          f"90th {pct(rs, .9):.2f}×, max {rs[-1]:.2f}×")
     ax.axvline(1.0, color="#9a9a94", lw=1, ls="--")
-    ax.set_xlim(0.8, max(1.5, pct([s.ratio for s in win if s.regime != "decode_only"], .999) * 1.05))
+    ax.set_xlim(0.8, max(1.5, pct([s.ratio for s in win
+                                   if s.regime in ("inf_prefill", "eager")], .999) * 1.05))
     ax.set_xlabel("measured / predicted (prefill-carrying steps)")
     ax.set_ylabel("CDF"); ax.set_title("interference check")
     ax.legend(frameon=False, fontsize=8); ax.grid(True, which="both", color="#e6e6e2", lw=0.6)
     for a in axes:
         for sp in ("top", "right"):
             a.spines[sp].set_visible(False)
+    if title:
+        fig.suptitle(title, fontsize=13, fontweight="bold")
     fig.tight_layout()
     fig.savefig(out_png, dpi=130)
     print(f"[analyze] plot → {out_png}")
@@ -602,8 +625,10 @@ def main() -> int:
         with open(args.report, "w") as f:
             f.write("\n".join(lines) + "\n")
     if args.plot:
+        title = (f"{_MODE_TITLES.get(mode, mode)} — {args.family}, TP={args.tp}, "
+                 f"co-serving, TTFT SLO {slo:g} s — predicted vs measured step time")
         plot(steps, results, t0, slo, summary["window"],
-             str(Path(trace).with_suffix(".png")))
+             str(Path(trace).with_suffix(".png")), title=title)
     return 0
 
 
