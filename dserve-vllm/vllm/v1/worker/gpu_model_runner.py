@@ -1130,6 +1130,16 @@ class GPUModelRunner(
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+        # [DeltaServe] FT requests retire scheduler-side without entering
+        # finished_req_ids (the frontend must never see them); drop their
+        # cached state here so ``self.requests`` does not grow by one entry
+        # per FT injection. Same removals as the finished path above, so the
+        # condense() below covers them.
+        for req_id in (getattr(scheduler_output, "finetune_retired_req_ids", None) or ()):
+            if self.requests.pop(req_id, None) is not None:
+                self.num_prompt_logprobs.pop(req_id, None)
+            if req_id in self.input_batch.req_id_to_index:
+                self.input_batch.remove_request(req_id)
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.

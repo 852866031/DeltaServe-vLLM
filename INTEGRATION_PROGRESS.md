@@ -99,15 +99,16 @@ admission; the estimator relay (M4.2) is GPU-validated.
 3. ~~**`forward_interruptible` under TP.**~~ Landed 2026-09-08 — see "forward_interruptible
    under TP (rank-symmetric tier C)" under Phase 7 for the design, the gates and the tight-
    trace A/B.
-4. **Baselines + estimator residuals.** Run the inference-only baselines
-   (`auto_benchmark_tp.py --family qwen3-14b --tp 2 --{loose,tight,nutanix-600-800}`, no
-   `--co`) so the plots get the grey `inf-only` overlay; run one `validate_estimator: true`
-   TP=2 replay and compare per-regime RMSE with a tp=1 run (a residual growing with `t_in`
-   would be the only reason to add a TP term to the step-time formula — none expected).
-5. **Llama-3 `rope_theta` re-verification** (still pending since Phase 8):
-   `DSERVE_TP_DIAG=1 python eval/pure_ft_bench.py` → remat error at bf16 noise and the
-   2.12 loss reference reproduces. Also the Qwen3-0.6B single-GPU smoke with
-   `backward_cuda_graph: true` (exercises the new Qwen3 forward graph live).
+4. **Baselines + estimator residuals.** Inference-only baselines are DONE for Qwen3-14B
+   and Llama-3 TP=2 on loose / tight / nutanix-600-800 (tables under "Validation
+   2026-09-08 (evening)" in Phase 7). Still open, next session: one
+   `validate_estimator: true` TP=2 replay vs a tp=1 run — compare per-regime RMSE (a
+   residual growing with `t_in` would be the only reason for a TP term in the formula).
+5. ~~**Llama-3 `rope_theta` re-verification**~~ and ~~**Qwen3-0.6B smoke**~~ — both DONE
+   2026-09-08: the DIAG remat error is at bf16 noise and no longer grows (was 0.22 → 0.45),
+   `pure_ft_bench` passes 2.10 at cycle ~30 and keeps descending (863 cycles, 2097 FT
+   tok/s, all `(graph)`); the 0.6B smoke trains once the worker resolves the tied
+   `lm_head` through the LoRA-wrapped embedding (see "Validation 2026-09-08 (evening)").
 6. Small items: none open from this list — Qwen3's exact `save_attn_qkv` (pre-norm q/k
    hooks) and the `N/?` progress meter under TP (corpus total on the relayed trigger)
    both landed 2026-09-08.
@@ -1472,6 +1473,41 @@ field survives pickle). `tests/test_accumulate_hooks.py::test_abort_poll_boundar
 the boundary hook, rows consistent up to the aborting layer). Live (Qwen3-14B TP=2 `ft_bench`,
 4 rps): both ranks armed on the same signal; every `[ft-abort]` pair reports the same layer.
 
+### Validation 2026-09-08 (evening) — both families, full stack, no MPS
+
+Stack: graphs (M5) + all three activation saves + head restructure + M4.3 bucketing +
+`forward_interruptible` (rank-symmetric tier C) + `pause_until_prefill_done`, no MPS daemon.
+Timeline replays via `eval-tp/auto_benchmark_tp.py`, inference-only vs co-serving.
+
+| family / trace | TTFT SLO | inf-only sat % · p50 / p95 | co sat % · p50 / p95 / p99 | TBT p50 inf → co | FT tok/s |
+|---|---|---|---|---|---|
+| Qwen3-14B loose | 0.4 s | 100 · 72 / 84 ms | 98.3 · 77 / 306 / 439 ms | 25.7 → 26.5 ms | 642 |
+| Qwen3-14B tight | 0.4 s | 100 · 74 / 85 ms | 100 · 75 / 86 / 91 ms | 28.6 → 28.9 ms | 262 |
+| Qwen3-14B nutanix 600–800 | 0.4 s | 100 · 63 / 76 ms | 99.4 · 73 / 162 / 368 ms | 18.0 → 19.1 ms | 392 |
+| Llama-3-8B loose | 0.25 s | 100 · 46 / 53 ms | 99.2 · 98 / 192 / 246 ms | 15.1 → 26.5 ms | 1088 |
+| Llama-3-8B tight | 0.25 s | 100 · 47 / 53 ms | 96.9 · 121 / 240 / 295 ms | 15.4 → 36.2 ms | 641 |
+| Llama-3-8B nutanix 600–800 | 0.25 s | 100 · 39 / 48 ms | 98.5 · 69 / 193 / 266 ms | 10.6 → 18.9 ms | 814 |
+
+(Qwen3 loose / nutanix were run before the pause fix; tight after. 1 Sept Qwen3 baselines:
+95.0 / 98.1 % at 467 / 239 tok/s.) Llama-3's tight run shows the co-serving cost most
+clearly: burst-start TTFT 38–65 ms vs 27–28 ms inference-only, but the REST of each
+burst runs at 128 ms median TTFT and 36 ms TBT (vs 47 / 15 ms) — Llama-3's SLO gate
+(0.25 s) admits FT into almost every prefill of a burst and every such step runs eager.
+Zero NaN, zero tracebacks, no stuck backward in any run; losses 5.77 → 1.36–1.62 (Llama-3),
+2.93 → 1.4 (Qwen3).
+
+**Known-issues sweep (same evening).** *FT loss divergence in the loose-co run* — not
+reproduced in any of today's six co-serving replays (all descend monotonically apart from
+epoch-boundary jumps); closed. *Runner `self.requests` leak for FT requests* — fixed: the
+scheduler stamps `SchedulerOutput.finetune_retired_req_ids` (retired in `update_from_output`
+or rolled back) and `_update_states` drops those entries + input-batch slots. *Dead-child
+wedge (C7)* — the coordinator now DISABLES finetuning with an error when the child is dead
+(`is_alive()` False after the 5 s warning) or unresponsive for 60 s, in both the tp=1 poll
+and the TP relay path, instead of leaving admission silently closed. *`test_config_loader`*
+— the one failing check expected the hub model id verbatim; vLLM rewrites it to the local
+snapshot path under `HF_HUB_OFFLINE`, the test accepts that form now (32/32). *avg-TBT
+admission gate* — still deferred (design item, needs per-request last-token tracking).
+
 ### M5 notes — why the collectives stay outside the graphs
 
 **NCCL-in-a-captured-region is not forbidden** — NCCL ≥ 2.9 supports graph
@@ -1517,7 +1553,7 @@ after the reduce, which fixes the rank-asymmetry above.
 
 ---
 
-## Phase 8 — Qwen3 family + backward-service restructure ✅ (Qwen3-14B TP=2 GPU-validated; 0.6B smoke + Llama rope_theta re-check pending)
+## Phase 8 — Qwen3 family + backward-service restructure ✅ (Qwen3-14B TP=2 GPU-validated; 0.6B smoke + Llama rope_theta re-check done 2026-09-08)
 
 **Goal.** Add `Qwen3ForCausalLM` (Qwen/Qwen3-14B-Base at TP=2 on the 2× 5090; Qwen/Qwen3-0.6B-Base
 single-GPU for smoke tests) as a second co-served + LoRA-finetuned family, and restructure
@@ -1571,7 +1607,7 @@ Family functions are bound once in `_build_state` and called directly on the hot
 
 | Q | Scope | Gate | Status |
 |---|---|---|---|
-| Q0 | `rope_theta` fix (`ft_meta.rope_theta_of`) | Llama-3 DIAG remat error → bf16 noise; `pure_ft_bench` reproduces the 2.12 reference | ✅ code; ❌ GPU re-verify |
+| Q0 | `rope_theta` fix (`ft_meta.rope_theta_of`) | Llama-3 DIAG remat error → bf16 noise; `pure_ft_bench` reproduces the 2.12 reference | ✅ GPU-verified 2026-09-08 (rel err 1e-4…5e-3 per layer, 6e-2 at the last layer, stable across cycles; loss 5.77 → 2.10 by cycle 30 → ~1.0) |
 | Q1 | Restructure with Llama-3 bit-parity | all five Llama gates at their counts | ✅ gradcheck 12/12, shard 23/23, gloo 10/10, overfit (99.9% drop), graph parity 165/165 |
 | Q2 | Qwen3 family + CPU tests | gradcheck incl. q/k-norm and `q_size≠hidden`; shard at 0.6B/14B geometry; real-gloo TP; overfit with tied head | ✅ 16/16, 42/42, 10/10, overfit 98.5% drop |
 | Q3 | Generic vLLM unblocks | Qwen3 + finetuning lands on the v1 runner; publish gate via registry; `meta` via `ft_meta` | ✅ code (`test_phase1_step1.py` 8/8) |
@@ -1600,13 +1636,14 @@ family whose backward cannot consume saved q/k at all) and `ft_meta.saved_qkv_pr
 
 ### GPU ladder — status
 
-Done: (4) Qwen3-14B TP=2 — trains (first bench: 99 cycles / 70 s, loss 2.9 → 2.1) and
-co-serves the loose / tight / nutanix-600-800 timelines (table under Phase 7 / M4.2);
-(3) Llama-3 TP=2 ran the loose replay after the refactor (55 cycles, no regressions
-observed; the cycle-for-cycle A/B against the pre-refactor run is still to be read off
-`eval-tp/output/`). Pending: (1) the Llama-3 `rope_theta` DIAG + `pure_ft_bench` re-check
-and (2) the Qwen3-0.6B single-GPU smoke (now also the live test of the Qwen3 forward
-graph with `backward_cuda_graph: true`).
+All four rungs done (2026-09-08): (1) Llama-3 tp=1 DIAG + `pure_ft_bench` — remat error at
+bf16 noise, stable across cycles; 863 cycles / 100 s, 2097 FT tok/s, loss 5.77 → 2.10 at
+cycle ~30 → ~1.0 (the old stall at ~4.3 is gone); (2) Qwen3-0.6B single-GPU smoke — 654
+cycles / 60 s, loss 4.40 → ~0.8 into epoch 1, 240/240 inference OK, after fixing the tied
+`lm_head` resolution (the LoRA-wrapped embedding is named `…embed_tokens.base_layer.weight`
+on the worker; the child looks keys up by their normalized name, so `lm_head_key` came out
+None); (3) Llama-3 TP=2 co-serves loose / tight / nutanix-600-800 with the full stack; (4)
+Qwen3-14B TP=2 likewise — tables under Phase 7 "Validation 2026-09-08 (evening)".
 
 ### GPU ladder (original plan; expected outcomes)
 

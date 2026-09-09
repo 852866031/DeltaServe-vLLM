@@ -457,13 +457,24 @@ class Worker(WorkerBase):
         # LM-head weight appears under the embedding param name; fall back to that
         # when there is no separate "lm_head.weight".
         hf_config = self.model_config.hf_config
-        if "lm_head.weight" in base_state:
+        # With enable_lora vLLM wraps LoRA-capable modules, so a parameter can
+        # be named "...embed_tokens.base_layer.weight" (Qwen3-0.6B ties lm_head
+        # to the embedding and the wrapped embedding is what we see). Resolve
+        # on the NORMALIZED names the child looks up (it strips ".base_layer."
+        # the same way) and keep the raw name for our own indexing.
+        _norm2raw = {k.replace(".base_layer.", "."): k for k in base_state}
+        if "lm_head.weight" in _norm2raw:
             lm_head_key = "lm_head.weight"
         else:
             lm_head_key = next(
-                (k for k in base_state if k.endswith("embed_tokens.weight")), None)
+                (k for k in _norm2raw if k.endswith("embed_tokens.weight")), None)
         embed_weight_key = next(
-            (k for k in base_state if k.endswith("embed_tokens.weight")), None)
+            (k for k in _norm2raw if k.endswith("embed_tokens.weight")), None)
+        lm_head_raw = _norm2raw.get(lm_head_key) if lm_head_key else None
+        if lm_head_key is None:
+            dprint("[deltaserve] WARNING: no lm_head / embed_tokens weight among the "
+                   f"shared base tensors (e.g. {list(base_state)[:3]}) — the backward "
+                   "child cannot build its state")
 
         # [DeltaServe] Phase 7 / M2: the LM head is vocab-parallel under TP, so
         # this rank only holds a vocab slice. head_backward needs the FULL logits
@@ -473,11 +484,11 @@ class Worker(WorkerBase):
         # vocab-parallelism from the backward entirely. Llama-3's vocab (128256)
         # has no padding, so the gather is exactly [vocab_size, hidden]; trim
         # defensively for models vLLM pads.
-        if tp_size > 1 and lm_head_key is not None:
-            shard = base_state[lm_head_key]
+        if tp_size > 1 and lm_head_raw is not None:
+            shard = base_state[lm_head_raw]
             full_lm = get_tp_group().all_gather(shard.contiguous(), dim=0)
             full_lm = full_lm[: int(hf_config.vocab_size)].contiguous()
-            base_state[lm_head_key] = full_lm
+            base_state[lm_head_raw] = full_lm
             dprint(
                 f"[tp] all-gathered lm_head '{lm_head_key}' shard "
                 f"{tuple(shard.shape)} -> {tuple(full_lm.shape)} "
@@ -495,7 +506,7 @@ class Worker(WorkerBase):
             hf_config, ft_cfg,
             lm_head_key=lm_head_key,
             embed_weight_key=embed_weight_key,
-            has_final_norm="model.norm.weight" in base_state,
+            has_final_norm="model.norm.weight" in _norm2raw,
             lora_scaling=read_lora_scaling(path),
             tp_size=tp_size, tp_rank=tp_rank)
 

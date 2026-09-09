@@ -246,27 +246,19 @@ fp32/bf16, incl. the overflow fallback) and `tests/test_tp_trainer_graph_nccl.py
 yet:** the live graph-vs-eager A/B on the real models.
 → Full detail, invariants, and run commands in **"Tensor parallelism (Phase 7)"** below.
 
-**Current focus (next session):** the TP line is feature-complete for now — M5, M4.3,
-`forward_interruptible` under TP, the pause fix and the head restructure all landed and
-were validated on the Qwen3-14B timelines on 2026-09-08 (loose 98.3 % / nutanix 99.4 % /
-tight 100 % TTFT satisfaction at 642 / 392 / 262 FT tok/s; the earlier Qwen3 baselines
-were 95.0 / 98.1 %). Remaining, in priority order: the Llama-3 TP=2 replays with the same
-stack; bringing up an MPS daemon (`nvidia-cuda-mps-control -d`) so `backward_mps_percentage`
-actually partitions the SMs — the ~2× cycle inflation under load is driver time-slicing;
-a `validate_estimator` TP-vs-tp1 residual check; the Llama-3 `rope_theta` DIAG re-check;
-the Qwen3-0.6B single-GPU smoke. The ordered plan with gates is the "Next step" section of
-INTEGRATION_PROGRESS.md.
+**Current focus (next session):** the `validate_estimator` TP-vs-tp1 residual check (the
+estimator's coefficients are fitted with no backward running, and the pause-until-done
+change altered the contention pattern). Everything else on the TP line landed and was
+validated on 2026-09-08 for both families — see "Validation status" in the TP section.
+MPS is deliberately off (`backward_mps_percentage: 0`); the ~2× backward-cycle inflation
+under inference load is driver time-slicing and is accepted.
 
-**Open, and NOT a TP bug — likely cause found (Phase 8):** FT loss stalls ~4.3 after
-~25 cycles where an earlier `pure_ft` run reached ~2.6 on the same samples, identically
-at TP=1 and TP=2, with `DSERVE_TP_DIAG=1` showing the backward's forward-remat diverging
-from vLLM's real forward. Phase 8 found that under the installed transformers 5.8.1 vLLM
-normalizes RoPE into `hf_config.rope_parameters["rope_theta"]` and the worker's
-`getattr(hf_config, "rope_theta", 10000.0)` silently returned **10000 instead of
-500000**, so the remat's RoPE never matched the served model. Fixed generically in
-`deltaserve/ft_meta.py:rope_theta_of`. **Not yet re-verified on GPU** — the first item
-of the Phase 8 ladder is to re-run the DIAG + `eval/pure_ft_bench.py` and confirm the
-remat error collapses and the 2.12 reference reproduces.
+**Resolved (verified on GPU 2026-09-08):** the FT loss stall at ~4.3 was the worker reading
+`rope_theta` from an `hf_config` attribute transformers 5.x no longer sets (theta 10000 vs
+Llama-3's 500000), fixed generically in `deltaserve/ft_meta.py:rope_theta_of`. The
+`DSERVE_TP_DIAG=1` remat error is now at bf16 noise and stable across cycles (was growing
+0.22 → 0.45), and `eval/pure_ft_bench.py` passes the 2.10 reference at cycle ~30 and keeps
+descending (863 cycles / 100 s, 2097 FT tok/s).
 
 Single-GPU levers still pending GPU A/B: `forward_interruptible`,
 `slo.coserving_admission_phase: both`, `finetune.match_prefill_workload_factor` vs
@@ -360,14 +352,13 @@ qh/kh/vh per layer** (mirror the existing `mlp_gate_up` save pattern). Documente
 future work in `INTEGRATION_PROGRESS.md` Phase 5 section; expected ~5 ms / backward win
 for +99 MB at s_max=256 (best perf/MB ratio of the candidates).
 
-Known open issues: FT loss divergence in the loose-co eval run (training-quality, not
-the SLO gate); avg-TBT admission gate deferred; pre-existing minor leak in the
-runner's `self.requests` (`CachedRequestState`) for FT requests — they're never added
-to `finished_req_ids`, so the per-request state lingers (small, bounded by `num FT
-requests ever`, not a correctness issue); dead-child deadlock surface (if the backward
-subprocess crashes, `_claimed` stays non-empty forever → FT admission wedges silently
-after a one-shot 5 s warning — documented in `.claude/plans/backward-review-issues.md`
-as C7, deliberately deferred).
+Known open issues (swept 2026-09-08): the avg-TBT admission gate is still deferred (needs
+per-request last-token tracking). Closed that day: the loose-co FT loss divergence (not
+reproduced in six co-serving replays), the runner `self.requests` leak for FT requests
+(`SchedulerOutput.finetune_retired_req_ids` → dropped in `_update_states`), and the
+dead-child wedge (a dead or 60 s-unresponsive backward child now DISABLES finetuning with
+an error instead of silently closing admission; `.claude/plans/backward-review-issues.md`
+C7). The Qwen3-0.6B tied `lm_head` is resolved through the LoRA-wrapped embedding name.
 
 > Historical note: the original Phase-1 plan called the activation save "capture"; it
 > was renamed **accumulate** to avoid confusion with CUDA-graph capture.
@@ -734,17 +725,14 @@ adapter (`adapters.lora_path_0`). `--config` / `--model` still override.
   rematerializes the full forward from `layer_in[0]` and compares it against the captured
   activations (inert otherwise).
 
-### Known open issue that is **not** a TP bug
+### Validation status (2026-09-08)
 
-FT loss stalls around ~4.3 after ~25 cycles where an earlier `pure_ft` run reached ~2.6 on
-the same samples — identically at TP=1 and TP=2, with the `DSERVE_TP_DIAG` diagnostic
-showing the backward's forward-remat diverging from vLLM's real forward (final_in relative
-error 0.22 → 0.45 over cycles). **Likely cause found in Phase 8:** the worker read
-`rope_theta` from an `hf_config` attribute that transformers 5.x no longer sets (the value
-moved to `rope_parameters["rope_theta"]`), so the remat's RoPE used theta=10000 against a
-served model at 500000. Fixed generically in `deltaserve/ft_meta.py:rope_theta_of`.
-Verification pending on GPU: re-run with `DSERVE_TP_DIAG=1` (the remat error should
-collapse to bf16 noise) and `eval/pure_ft_bench.py` (the 2.12 reference should reproduce).
+Both families co-serve all three timelines with the full stack (tables in
+INTEGRATION_PROGRESS.md, Phase 7 "Validation 2026-09-08 (evening)"): Qwen3-14B TP=2 TTFT
+satisfaction 98.3 / 100 / 99.4 % (loose / tight / nutanix-600-800) at 642 / 262 / 392 FT
+tok/s; Llama-3-8B TP=2 99.2 / 96.9 / 98.5 % at 1088 / 641 / 814 tok/s (SLO 0.25 s). The
+Llama-3 `rope_theta` DIAG and the Qwen3-0.6B single-GPU smoke are done. Next session: the
+`validate_estimator` TP-vs-tp1 residual comparison.
 
 ## Key DeltaServe co-serving contracts to preserve (from DeltaServe/CLAUDE.md)
 

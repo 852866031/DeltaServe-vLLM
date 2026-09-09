@@ -57,6 +57,10 @@ class FinetuneScheduler(AsyncScheduler):
         tokenize = self._build_tokenize()
         self._ft_injector = FinetuneInjector(ft_cfg, tokenize, block_hasher)
         self._block_hasher = block_hasher
+        # FT request ids retired (update_from_output) or rolled back
+        # (_rollback_ft_step) since the last schedule(); stamped on the next
+        # SchedulerOutput so the runner drops their cached state.
+        self._ft_retired_pending: list[str] = []
 
         # [Phase 4] Offline-profiling control. When `_profiling_mode` is set the
         # launch driver supplies the exact batch composition, so the automatic
@@ -775,6 +779,9 @@ class FinetuneScheduler(AsyncScheduler):
                     dropped_ft_samples.append(_s)
             # else: in-flight from a prior step — leave for its own retire.
         output.finetune_req_ids = scheduled_ft
+        if self._ft_retired_pending:
+            output.finetune_retired_req_ids = self._ft_retired_pending
+            self._ft_retired_pending = []
         # [forward_interruptible] Release samples we claimed at admit but
         # didn't actually schedule — return them to the selectable pool so
         # the next step can pick them up. (Today this path is rare; before
@@ -884,6 +891,7 @@ class FinetuneScheduler(AsyncScheduler):
             if req in self.running:
                 self.running.remove(req)
             self._free_blocks(req)
+            self._ft_retired_pending.append(req_id)   # runner may hold state (tier C)
         # Restore the activation-buffer reservation and the in-flight
         # samples list on the coordinator.
         samples = getattr(scheduler_output, "_ft_samples", None) or []
@@ -959,6 +967,7 @@ class FinetuneScheduler(AsyncScheduler):
             if req in self.running:
                 self.running.remove(req)
             self._free_blocks(req)
+            self._ft_retired_pending.append(req_id)
 
         # NOTE: estimator samples are recorded in schedule() by draining the
         # coordinator's completed-sample queue — the runner times each step with

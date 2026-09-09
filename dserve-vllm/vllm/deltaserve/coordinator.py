@@ -800,6 +800,47 @@ class FinetuneCoordinator:
         if self.backward_process is not None:
             self.backward_process.set_pause(False)
 
+    # A backward that has been outstanding this long (vs ~0.1-0.5 s normally)
+    # is treated as dead even when the child's liveness is unknown (relay mode).
+    backward_dead_after_s = 60.0
+
+    def _check_backward_stuck(self, alive) -> None:
+        """[diag] Warn once when a backward has been outstanding longer than
+        ``pending_backward_warn_s``; if the child is known dead (``alive`` is
+        False) or the wait exceeds ``backward_dead_after_s``, DISABLE
+        finetuning (``ft_started=False``) with an error instead of leaving FT
+        admission silently closed forever (the C7 wedge)."""
+        t0 = self._pending_backward_t0
+        if t0 is None:
+            return
+        waited = time.monotonic() - t0
+        if (not self._pending_backward_warned
+                and waited > self.pending_backward_warn_s):
+            exitcode = getattr(getattr(self.backward_process, "_proc", None),
+                               "exitcode", None)
+            dprint(
+                f"[coord] !!! backward STUCK: no ack in {waited:.1f}s "
+                f"(threshold {self.pending_backward_warn_s:.1f}s) | "
+                f"child alive={alive} exitcode={exitcode} | FT admission stays "
+                f"CLOSED until the ack arrives — likely the backward subprocess "
+                f"died (CUDA OOM / segfault / OS kill). Check stderr above for "
+                f"[backward] traces."
+            )
+            self._pending_backward_warned = True
+        # Only after the warning threshold: server teardown kills the child
+        # before the coordinator stops polling, which would otherwise print a
+        # spurious "DEAD after 0s" at every shutdown.
+        if (waited > self.pending_backward_warn_s
+                and (alive is False or waited > self.backward_dead_after_s)
+                and self.ft_started):
+            dprint(
+                f"[coord] !!! backward child {'DEAD' if alive is False else 'unresponsive'} "
+                f"after {waited:.0f}s — FINETUNING DISABLED for the rest of this run "
+                f"(inference continues; restart the server to resume finetuning)."
+            )
+            self.ft_started = False
+            self.admission_open = False
+
     def poll_backward(self) -> None:
         """Non-blocking: reopen admission once the backward pass has finished.
 
@@ -808,33 +849,18 @@ class FinetuneCoordinator:
         exactly the samples whose activations were just trained on. Done
         BEFORE clearing ``buffer_samples`` so the hook sees the full list.
         """
-        if not self.pending_backward or self.backward_process is None:
+        if not self.pending_backward:
+            return
+        if self.backward_process is None:
+            # Relay mode (scheduler-side coordinator under TP): the ack comes
+            # through apply_relayed_done; only the stuck-detector runs here.
+            self._check_backward_stuck(alive=None)
             return
         resp = self.backward_process.poll_response()
         if resp is None:
-            # [diag] No ack yet. If we've been waiting longer than the
-            # warning threshold, log once — the child has almost certainly
-            # crashed (typical backward takes ~100ms, so >5s means dead).
-            # Also probe the child's exitcode if available so the user
-            # knows whether the OS reaped it.
-            if (not self._pending_backward_warned
-                    and self._pending_backward_t0 is not None
-                    and time.monotonic() - self._pending_backward_t0
-                        > self.pending_backward_warn_s):
-                waited = time.monotonic() - self._pending_backward_t0
-                exitcode = getattr(getattr(self.backward_process, "_proc", None),
-                                   "exitcode", None)
-                alive = getattr(getattr(self.backward_process, "_proc", None),
-                                "is_alive", lambda: None)()
-                dprint(
-                    f"[coord] !!! backward STUCK: no ack in {waited:.1f}s "
-                    f"(threshold {self.pending_backward_warn_s:.1f}s) | "
-                    f"child alive={alive} exitcode={exitcode} | "
-                    f"FT admission stays CLOSED until ack arrives — likely "
-                    f"the backward subprocess died (CUDA OOM / segfault / "
-                    f"OS kill). Check stderr above for [backward] traces."
-                )
-                self._pending_backward_warned = True
+            alive = getattr(getattr(self.backward_process, "_proc", None),
+                            "is_alive", lambda: None)()
+            self._check_backward_stuck(alive=alive)
             return
         if (self.bwd_log_path and isinstance(resp, dict)
                 and resp.get("event") == "activations_processed"):
