@@ -335,6 +335,20 @@ class FinetuneConfig:
     if both are None, validation rows are dropped (warned once). Intended
     location: eval/estimator/."""
 
+    step_trace_path: str | None = None
+    """Per-step predicted-vs-actual trace for estimator validation. When set,
+    the FT scheduler writes one CSV row per timed step (composition features,
+    the RAW and margined predictions, the admission-time baseline / accepted
+    prediction, the CUDA-event GPU time, the host dispatch time, the
+    backward-in-flight / paused flags, scheduler occupancy) plus one row per
+    rolled-back FT-only step. Unlike ``validate_estimator`` it does NOT change
+    the system under test (async scheduling stays as configured) and it costs
+    nothing on the hot path beyond a few float formats per step: rows are
+    formatted where the timing sample is drained (already off the forward's
+    critical path) and handed to a daemon writer thread that owns the file.
+    None (default) disables everything (one ``is None`` check per step).
+    Analyse with ``eval-tp/analyze_step_trace.py``."""
+
     bwd_log_path: str | None = None
     """If set, append one row per completed backward to this CSV (timestamp,
     epoch, batch_idx, batch_tokens, batch_loss, total_processed_tokens) — the
@@ -367,6 +381,18 @@ class FinetuneConfig:
     previous busy-loop drain and the upcoming schedule call. Cost is roughly
     ``ms / ft_forward_ms`` of FT throughput during idle; benefit scales with
     inference QPS. Set 0 to disable A while keeping B and C."""
+
+    backward_run_ahead_boundaries: int = 2
+    """[pause] How far the backward child's CPU may run ahead of its GPU, in
+    ``_maybe_pause`` boundaries (roughly half a layer each on the graphed
+    path). At every boundary the child records a CUDA event and waits for the
+    event recorded this many boundaries earlier, so at most that much work is
+    queued on the GPU when a pause request lands — the pause then takes
+    effect within ~1-2 boundaries (3-6 ms) instead of after everything the
+    child had already enqueued (the graphed loop launches a whole cycle in a
+    few ms; measured on Qwen3-14B TP=2: paused prefills still ran 1.15-2.3×).
+    0 restores the unbounded behaviour. No GPU idle as long as a boundary's
+    GPU time exceeds its launch cost, which holds for every real model."""
 
     pause_until_prefill_done: bool = True
     """Keep the backward child paused until the inference prefill that paused

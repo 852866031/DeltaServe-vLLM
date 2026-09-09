@@ -4480,6 +4480,8 @@ class GPUModelRunner(
         _pause_bwd = False
         _pause_throttle = False
         _ft_slot = -1
+        _ft_t_wall0 = 0.0
+        _ft_t_host0 = 0.0
         if _ft_time_step:
             if getattr(self, "_ft_timing_events", None) is None:
                 _RING = 4  # > batch-queue depth (2) so a reused slot is settled
@@ -4500,7 +4502,7 @@ class GPUModelRunner(
             # from update_from_output because the duration is only known now.
             _prev = self._ft_timing_owner[_ft_slot]
             if _prev is not None and _end_evt.query():
-                _prev_sched, _prev_rec, _prev_graph = _prev
+                _prev_sched, _prev_rec, _prev_graph, _prev_extra = _prev
                 _prev_feats = getattr(_prev_sched, "_ft_step_features", None)
                 if _prev_rec and _prev_feats is not None:
                     # was_graph = the CUDA-graph mode the runner actually used
@@ -4510,7 +4512,8 @@ class GPUModelRunner(
                         _prev_feats,
                         _start_evt.elapsed_time(_end_evt) / 1000.0,
                         _prev_graph,
-                        getattr(_prev_sched, "_ft_step_predicted", None))
+                        getattr(_prev_sched, "_ft_step_predicted", None),
+                        _prev_extra)
             self._ft_timing_owner[_ft_slot] = None
             # [Phase 5] Yield the GPU to this forward if it carries prefill
             # tokens (TTFT-critical): pause the backward child for its duration.
@@ -4571,6 +4574,10 @@ class GPUModelRunner(
                 # _trigger_backward to decide whether to pre-pause
                 # the bwd before signaling it to start.
                 coord.fwd_throttle_active = _pause_throttle
+            # [step_trace] host-side clocks bracketing the forward dispatch
+            # (two clock reads; the trace joins them by the stamped seq).
+            _ft_t_wall0 = time.time()
+            _ft_t_host0 = time.perf_counter()
             _start_evt.record()
         # [forward_interruptible / tier C] Arm the per-layer abort path if
         # this is a pure FT-only forward (any inference present would suffer
@@ -4679,7 +4686,11 @@ class GPUModelRunner(
                     bool(getattr(scheduler_output, "finetune_record_timing",
                                  coord.record_timing)),
                     bool(cudagraph_mode is not None
-                         and cudagraph_mode != CUDAGraphMode.NONE))
+                         and cudagraph_mode != CUDAGraphMode.NONE),
+                    # [step_trace] (seq, t_exec wall, host dispatch s, paused)
+                    (getattr(scheduler_output, "_ft_step_seq", None),
+                     _ft_t_wall0, time.perf_counter() - _ft_t_host0,
+                     _pause_bwd))
                 self._ft_timing_pos = (_ft_slot + 1) % len(self._ft_timing_events)
             # [Phase 5] Return the GPU to the backward child after enqueuing the
             # prefill forward. Fire-and-forget (just sets the mp.Event grant) —

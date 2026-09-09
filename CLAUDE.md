@@ -246,10 +246,19 @@ fp32/bf16, incl. the overflow fallback) and `tests/test_tp_trainer_graph_nccl.py
 yet:** the live graph-vs-eager A/B on the real models.
 → Full detail, invariants, and run commands in **"Tensor parallelism (Phase 7)"** below.
 
-**Current focus (next session):** the `validate_estimator` TP-vs-tp1 residual check (the
-estimator's coefficients are fitted with no backward running, and the pause-until-done
-change altered the contention pattern). Everything else on the TP line landed and was
-validated on 2026-09-08 for both families — see "Validation status" in the TP section.
+**Estimator validation under TP (2026-09-08, night) — done, Qwen3-14B TP=2.** The
+per-step trace (`finetune.step_trace_path`; `eval-tp/auto_benchmark_tp.py --step-trace`
++ `eval-tp/analyze_step_trace.py`) showed the predictor accurate for every step admission
+reasons on (eager p50 1.00 / p99 1.06) and every systematic miss caused by the backward
+child sharing the GPU. Landed: a `decode_bwd` estimator regime (decode-only steps with a
+backward in flight predict with their own coefficients; contended prefills are excluded
+from the fits), and the pause fix — run-ahead-bounded (`backward_run_ahead_boundaries`)
+AND rank-symmetric (see the TP invariant below), with the LM head chunk loops as
+boundaries. Loose / tight / nutanix-600-800 at TTFT SLO 0.4 s: **100 / 100 / 100 %**
+(loose was 97.9-98.3 %); paused prefills 1.07-1.10× p50. Decode-only steps still share
+the GPU with the child by decision (worst-TBT > 50 ms on 57/60/188 requests vs
+26/1/15 inference-only). Details in INTEGRATION_PROGRESS.md, Phase 7 "Estimator
+validation under TP". Llama-3 was not re-run.
 MPS is deliberately off (`backward_mps_percentage: 0`); the ~2× backward-cycle inflation
 under inference load is driver time-slicing and is accepted.
 
@@ -594,6 +603,23 @@ the gloo test caught exactly that.
   keeps the `threading.Event` path. Gates: `tests/test_ft_abort_tp.py` (2-process gloo,
   asymmetric observations → same abort layer on both ranks, equal collective counts,
   inactive poller runs none) + `tests/test_accumulate_hooks.py::test_abort_poll_boundary`.
+- **The backward pause is rank-symmetric and run-ahead-bounded (2026-09-08, night) —
+  keep both.** `_maybe_pause` only stops the child *enqueueing*; the GPU still runs what
+  is queued. Two things follow. (1) `backward_run_ahead_boundaries` (default 2) keeps the
+  child's CPU ≤ N boundaries ahead of its GPU (a CUDA-event ring in `_maybe_pause`), so a
+  pause lands within ~3-6 ms instead of after the whole cycle the graphed loop had
+  launched. (2) Under TP the two children must block at the **same** boundary: if one
+  has already issued the next residual all-reduce, that NCCL kernel spins on its GPU
+  waiting for the paused peer for the entire pause, and — via the inference all-reduces
+  — every prefill of the burst runs 2× slower on both ranks (measured: loose trace,
+  paused prefills 1.95×, cycles of 2.5 s, 5 TTFT violations). So `_maybe_pause` agrees
+  over the children's gloo group (`tp.backward_cpu_group()`): MAX-all-reduce "any grant
+  cleared" at every boundary, then a MIN-all-reduce poll until all grants are set again;
+  the loop exits only on the reduced value. The LM head's vocab-chunk loops are pause
+  boundaries too (the head was an uninterruptible ~18 ms block at the start of every
+  cycle, exactly where the first prefill after the trigger lands). Never add a
+  collective between two boundaries that only one rank can reach, and never make the
+  pause decision rank-local.
 - **The per-layer clip is rank-symmetric (M4.3) — keep it that way.** Under TP the
   clip runs after the bucketed reduce via `tp.clip_layers_symmetric_`: the norm sums
   the replicated grads (identical on every rank) and the sharded grads' squared norms

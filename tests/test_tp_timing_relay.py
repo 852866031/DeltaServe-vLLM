@@ -71,7 +71,7 @@ def test_timing_round_trip():
     for t in wire.finetune_timing:
         sched.push_sample(*t)
     tracker = StepExecutionTracker()
-    for feats, d, was_graph, predicted in sched.drain_completed_samples():
+    for feats, d, was_graph, predicted, *_ in sched.drain_completed_samples():
         if d > 0:
             tracker.add(feats, d, predicted=predicted, was_graph=was_graph)
     C.ok("tracker holds every relayed sample", tracker.size() == 24)

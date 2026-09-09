@@ -82,6 +82,10 @@ admission; the estimator relay (M4.2) is GPU-validated.
 
 **Next session, in priority order:**
 
+0. **Act on the step-trace findings** (see "Estimator validation under TP (2026-09-08,
+   night)" under Phase 7): the predictor is accurate; the misses are backward-child
+   interference on decode-only steps (TBT) and on paused prefills (pause is late).
+
 1. **M5 live A/B — graph vs eager under TP=2 on the real models.** Code + 2-GPU gates are
    done (see "M5 — backward CUDA graphs under TP ✅" under Phase 7). Run
    `python eval-tp/ft_bench_tp.py --family llama3 --tp 2 --duration 60 --kill-stale` twice,
@@ -1550,6 +1554,79 @@ after the reduce, which fixes the rank-asymmetry above.
   a pre-flight check refuse to launch when a previous run left GPU-resident processes.
 - `tests/test_llama3_tp_shard.py`, `tests/test_llama3_tp_backward_gloo.py` (both are
   standalone scripts — run with `python`, not pytest, which is not installed in the env).
+
+### Estimator validation under TP (2026-09-08, night) — the per-step trace
+
+**Tooling.** `finetune.step_trace_path` (new) makes the FT scheduler write one CSV row per
+timed step — realized features, the RAW and margined prediction, what the admission loop
+reasoned on (`est_*`, `t_baseline`, `t_admit`, `ttft_slack`, `queue_wait`), the CUDA-event
+GPU time, the host dispatch time, `pending_bwd` (scheduler) / `paused_bwd` (runner), and
+occupancy — plus one row per rolled-back FT-only step. Unlike `validate_estimator` it does
+not change the system under test (async scheduling stays on). Cost: ~4 µs per step on the
+scheduler thread (measured; `tests/test_step_trace.py`), file I/O on a daemon thread that
+flushes once per second; off → one `is None` check. Only the step sequence number rides on
+the SchedulerOutput; the runner returns `(seq, t_exec, host_s, paused)` in the existing
+timing tuple. `eval-tp/auto_benchmark_tp.py --step-trace` writes
+`eval-tp/output/step_trace<suffix>.csv`; `eval-tp/analyze_step_trace.py --family … --tight`
+joins it with the results / bwd_log / server log and prints the per-regime accuracy, the
+interference splits, admission fidelity, the worst misses and every TTFT violation
+(`--plot` for the 3-panel PNG).
+
+**Result (Qwen3-14B TP=2, full stack, tight + nutanix-600-800, both 100 % TTFT).** The
+model is accurate for every step the admission gate reasons on: eager (FT-carrying) steps
+ratio p50 1.00 / p99 1.06, RMSE 1.3 ms; clean inference prefill 0.99 / 1.16, RMSE 2 ms;
+admission's own prediction for the admitted set vs actual p99 1.06, max 1.36. Every
+systematic miss has one root cause — **the backward child sharing the GPU (driver
+time-slicing, no MPS):**
+
+| steps | tight | nutanix 600–800 |
+|---|---|---|
+| decode-only, backward in flight (never paused by design) | ratio p50 1.45 · p99 2.9 (n=25) | p50 1.87 · p90 2.72 · p99 9.0 (n=518); 16-ms steps of 100–195 ms |
+| inference prefill, backward in flight, child *paused* | p50 1.09 (+3 ms) | p50 1.15 · p90 1.70 · p99 2.26 (+8 ms mean); 1.39 right after the FT-only step that triggered the backward |
+| everything else | 1.00 | 0.99 (decode 0.92 — see below) |
+| worst-TBT > 50 ms (co vs inference-only) | 115 vs 26 of 480 | 184 vs 15 of 534 |
+
+43 of the 45 decode steps > 50 ms on nutanix had a backward in flight. The contended
+samples also enter the online refit: the decode-only RMSE climbs 0.7 → 4.6 ms across
+the fit log and the *clean* decode steps end up over-predicted by 8 % (ratio 0.92). The
+backward pays too: cycle p50 148 ms but p90 313 ms (uncontended 121). Secondary
+findings: (i) admission on this box is **TBT-bound, not TTFT-bound** — every prefill step
+that admitted nothing (438 on tight, 239 on nutanix) had decodes present and an eager
+co-serving step costs ~50 ms ≈ `max_tbt_slo`, so only the 23-token samples ride
+co-serving steps and FT mostly runs as 253-token FT-only steps in idle gaps; (ii) eager
+steps are host-blocked (host ≈ GPU, growing with tokens 45 → 63 ms) — launch-queue
+back-pressure, i.e. GPU-bound, not a CPU problem; (iii) "wrong schedule" is not a factor:
+the realized composition differs from what admission reasoned on in 5 % of admitted
+steps (a decode finished in between — conservative), rollbacks 15 / tier-C aborts 14 on
+nutanix. Proposed fixes are in the session write-up: tag contended samples (exclude from
+the admission fit, fit a contention factor), a TBT-aware pause on decode-only steps (or
+MPS), and bounding the child's GPU run-ahead so a pause takes effect within a layer
+(today `_maybe_pause` only stops enqueueing; the graphed loop has no host sync, so the
+GPU keeps running what was already queued).
+
+**Acted on the same night (Qwen3 only, TTFT SLO 0.4 s).** (1) The estimator got a fourth
+regime, `decode_bwd` (`StepFeatures.bwd`, stamped from `coord.pending_backward`): a
+decode-only step with a backward in flight predicts with its own coefficients (falls back
+to `decode_only` until its first refit); prefill-carrying steps taken with a backward in
+flight are excluded from every fit. Clean decode went from ratio 0.92 to 1.00 on nutanix;
+`decode_bwd` is centred (p50 0.94-0.99 where it has samples) but keeps a wide spread
+(p90 1.3, p99 3.7 — the contention is bimodal). Pausing the child on decode-only steps
+is out of scope by decision. (2) The pause: `backward_run_ahead_boundaries` (CUDA-event
+ring, default 2) alone made the loose trace WORSE (paused prefills 1.95×, 2.5 s cycles,
+5 violations, 97.9 %) — the two children then blocked at different boundaries and the
+rank that had issued the next residual all-reduce spun that NCCL kernel on its GPU for
+the whole pause. The pause is now rank-symmetric (gloo agreement at every boundary,
+`tp.backward_cpu_group()`), and the LM head's vocab-chunk loops are boundaries too.
+Result, all three traces, TTFT satisfaction **100 / 100 / 100 %** (loose / tight /
+nutanix-600-800) at co-serving TTFT p50/p95/p99 of 75/95/132, 76/94/121, 74/115/178 ms
+(inference-only 72/84/86, 74/85/86, 63/76/81); paused prefills with a backward in flight
+run 1.07-1.10× p50 / 1.23-1.37× p90 (was 1.09-1.95 p50 / 1.24-2.10 p90); backward
+cycle max 456 ms (was 2558 on loose); FT tokens unchanged (30.8k / 13.5k / 77.6k per
+window). The residual +6-7 ms on the first prefill after the trigger is the run-ahead
+depth plus the agreement latency. Worst-TBT > 50 ms stays at 57 / 60 / 188 requests vs
+26 / 1 / 15 inference-only — the decode-only contention, by decision untouched. Gates:
+`tests/test_merged_estimator.py` 49/49, `tests/test_tp_trainer_graph_nccl.py --family
+qwen3` 111/111 (run-ahead 2 + the agreement path).
 
 ---
 

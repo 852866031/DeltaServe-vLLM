@@ -39,9 +39,15 @@ def logits_chunked(h: torch.Tensor, lm_w: torch.Tensor, vocab: int):
     return out
 
 
-def head_backward(final_in, lm_w, norm_w, eps, ids, seq_lens, b_start, vocab):
+def head_backward(final_in, lm_w, norm_w, eps, ids, seq_lens, b_start, vocab,
+                  pause_fn=None):
     """LM-head + final-norm: per-sample shift CE loss + grad w.r.t. final_in.
     Returns (loss: float, n_valid: int, grad_final_in [n,D] fp32).
+
+    ``pause_fn`` (the service's ``_maybe_pause``) is called once per vocab
+    chunk in both passes: the head is ~18 ms on Qwen3-14B and used to be one
+    uninterruptible block at the very start of the cycle — exactly where the
+    first inference prefill after the buffer-full trigger lands.
 
     Rows ``st .. st+ln-2`` of each sample predict ids ``st+1 .. st+ln-1``;
     samples with ``ln < 2`` contribute nothing. The loss is the SUM of the
@@ -70,6 +76,8 @@ def head_backward(final_in, lm_w, norm_w, eps, ids, seq_lens, b_start, vocab):
     # (the bf16 head chunk converted once here).
     logits = h.new_empty((n_valid, vocab))
     for c in range(0, vocab, VOCAB_CHUNK):
+        if pause_fn is not None:
+            pause_fn()
         e = min(c + VOCAB_CHUNK, vocab)
         logits[:, c:e] = h @ lm_w[c:e].float().t()
     total_loss = F.cross_entropy(logits, tgt, reduction="sum")
@@ -82,6 +90,8 @@ def head_backward(final_in, lm_w, norm_w, eps, ids, seq_lens, b_start, vocab):
     # head chunk converted once again); scatter back to the full [n, D].
     grad_rows = p.new_zeros((n_valid, D))
     for c in range(0, vocab, VOCAB_CHUNK):
+        if pause_fn is not None:
+            pause_fn()
         e = min(c + VOCAB_CHUNK, vocab)
         grad_rows += p[:, c:e] @ lm_w[c:e].float()
     grad_normed = grad_rows.new_zeros((n, D))         # fp32 [n, D]

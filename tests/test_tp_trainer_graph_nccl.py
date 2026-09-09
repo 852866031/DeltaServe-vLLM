@@ -157,6 +157,9 @@ def make_meta(fam_name, *, tp_size, tp_rank, port, graph, save_rm=False):
                 embed_weight_key="model.embed_tokens.weight",
                 tp_size=tp_size, tp_rank=tp_rank, backward_nccl_port=port,
                 backward_cuda_graph=graph, backward_cuda_graph_attn_bn_max=BN_MAX,
+                # exercise the run-ahead-bounded _maybe_pause ring (event
+                # record + synchronize per boundary) on the real trainer
+                backward_run_ahead_boundaries=2,
                 backward_cuda_graph_attn_l_max=L_MAX,
                 max_saved_finetuning_tokens=S_MAX,
                 save_attn_qkv=False, save_attn_ctx=False,
@@ -170,6 +173,11 @@ def make_service(fam_name, base, ft, meta, device):
                   "meta": meta}
     svc._build_state()
     svc._built = True
+    # A grant that is always SET: exercises the rank-symmetric pause's
+    # per-boundary gloo agreement (tp>1) without ever blocking.
+    import multiprocessing as _mp
+    svc._gpu_grant = _mp.Event()
+    svc._gpu_grant.set()
     return svc
 
 
@@ -210,7 +218,11 @@ class ReduceCounter:
         dist.all_reduce = self._wrapped
 
     def _wrapped(self, *a, **k):
-        self.n += 1
+        # Count only the data-path collectives (NCCL, default group). The
+        # rank-symmetric pause agrees over the children's gloo CPU group
+        # (``group=`` set) — not a GPU collective, not counted.
+        if k.get("group") is None:
+            self.n += 1
         return self._real(*a, **k)
 
 

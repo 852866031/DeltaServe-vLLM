@@ -126,6 +126,8 @@ def build_backward_meta(hf_config: Any, ft_cfg: Any, *, lm_head_key: str | None,
         # region; s_max comes from max_saved_finetuning_tokens (the same value
         # sizes the activation buffers, so graphs and the pool are aligned).
         "backward_cuda_graph": bool(ft_cfg.backward_cuda_graph),
+        "backward_run_ahead_boundaries":
+            int(getattr(ft_cfg, "backward_run_ahead_boundaries", 0)),
         "backward_cuda_graph_attn_bn_max":
             int(ft_cfg.backward_cuda_graph_attn_bn_max),
         "backward_cuda_graph_attn_l_max":

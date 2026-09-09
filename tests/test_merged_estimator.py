@@ -16,6 +16,7 @@ import sys
 import numpy as np
 
 from vllm.deltaserve.estimator import (
+    REGIME_DECODE_BWD,
     REGIME_DECODE_ONLY,
     REGIME_EAGER,
     REGIME_INF_PREFILL,
@@ -322,7 +323,68 @@ def test_refit_cadence():
     check("refit fires at 256 and 512", fires == 2)
 
 
+TRUE_DECODE_BWD = dict(delta=1.1e-3, epsilon=3.0e-5, c=0.012)   # ~2x decode
+
+
+def test_decode_bwd_regime():
+    print("test: decode_bwd regime (decode-only with a backward in flight)")
+    rng = np.random.default_rng(7)
+    est = MergedExecutionEstimator()
+    tracker = StepExecutionTracker()
+    # Clean decode + contended decode + clean prefill + CONTENDED prefill
+    # (bwd=True with t_in>0: must be excluded from the inf_prefill fit).
+    for _ in range(60):
+        f = make_decode_only_features(rng)
+        tracker.add(f, true_time_decode_only(f))
+        g = make_decode_only_features(rng)
+        g.bwd = True
+        p = TRUE_DECODE_BWD
+        tracker.add(g, p["delta"] * g.b_d + p["epsilon"] * g.k + p["c"])
+        h = make_inf_prefill_features(rng)
+        tracker.add(h, true_time_inf_prefill(h))
+        c = make_inf_prefill_features(rng)
+        c.bwd = True
+        tracker.add(c, 3.0 * true_time_inf_prefill(c))   # wildly slow
+    check("decode+bwd routes to DECODE_BWD",
+          StepFeatures(b_d=3, k=300, bwd=True).regime() == REGIME_DECODE_BWD)
+    check("decode w/o bwd routes to DECODE_ONLY",
+          StepFeatures(b_d=3, k=300).regime() == REGIME_DECODE_ONLY)
+    check("prefill+bwd stays INF_PREFILL (contended)",
+          StepFeatures(t_in=64, p=1, bwd=True).regime() == REGIME_INF_PREFILL
+          and StepFeatures(t_in=64, p=1, bwd=True).contended)
+    est.data_fit(tracker)
+    check("decode_bwd fitted", est._params[REGIME_DECODE_BWD].is_fitted)
+    db = est._params[REGIME_DECODE_BWD]
+    check(f"decode_bwd delta {db.delta:.3e} ≈ {TRUE_DECODE_BWD['delta']:.3e}",
+          abs(db.delta - TRUE_DECODE_BWD["delta"]) < 1e-5)
+    check(f"decode_bwd c {db.c:.4f} ≈ {TRUE_DECODE_BWD['c']:.4f}",
+          abs(db.c - TRUE_DECODE_BWD["c"]) < 1e-4)
+    do = est._params[REGIME_DECODE_ONLY]
+    check(f"decode_only unpolluted (c {do.c:.4f} ≈ {TRUE_DECODE_ONLY['c']:.4f})",
+          abs(do.c - TRUE_DECODE_ONLY["c"]) < 1e-4)
+    ip = est._params[REGIME_INF_PREFILL]
+    check(f"inf_prefill unpolluted by contended prefills (c {ip.c:.4f})",
+          abs(ip.c - TRUE_INF_PREFILL["c"]) < 1e-4)
+    f = StepFeatures(b_d=4, k=500, bwd=True)
+    pred = est.predict(f, apply_margin=False)
+    truth = TRUE_DECODE_BWD["delta"] * 4 + TRUE_DECODE_BWD["epsilon"] * 500 + TRUE_DECODE_BWD["c"]
+    check(f"predict(bwd) {pred * 1e3:.2f}ms ≈ {truth * 1e3:.2f}ms", abs(pred - truth) < 1e-4)
+    check("select_regime reports decode_bwd", est.select_regime(f) == REGIME_DECODE_BWD)
+    # Cold-start: decode_bwd unfitted → borrows decode_only, not eager.
+    est2 = MergedExecutionEstimator()
+    t2 = StepExecutionTracker()
+    for _ in range(40):
+        f = make_decode_only_features(rng)
+        t2.add(f, true_time_decode_only(f))
+        e = make_eager_features(rng)
+        t2.add(e, true_time_eager(e))
+    est2.data_fit(t2)
+    r, _ = est2._select(StepFeatures(b_d=2, k=100, bwd=True))
+    check(f"cold decode_bwd falls back to decode_only ({r})", r == REGIME_DECODE_ONLY)
+
+
 def main():
+    test_decode_bwd_regime()
     test_recovery()
     test_prediction()
     test_unfitted_safe()
