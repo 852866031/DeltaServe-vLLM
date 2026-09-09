@@ -258,6 +258,11 @@ class SchedulerOutput:
     # pass's warmup shapes) so the gate reaches the worker under TP, where the
     # worker's own coordinator never sees the scheduler's flag.
     finetune_record_timing: bool = True
+    # [DeltaServe] FT requests retired by the scheduler since the previous
+    # step (they never enter ``finished_req_ids`` — the frontend must not see
+    # them), so the runner can drop their cached ``CachedRequestState`` /
+    # input-batch slot instead of leaking one entry per FT injection.
+    finetune_retired_req_ids: list[str] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

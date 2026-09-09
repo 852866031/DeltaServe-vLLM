@@ -75,8 +75,15 @@ def test_loads_and_maps():
         if section in special:
             continue
         for key, want in (body or {}).items():
-            check(f"{section}.{key} -> EngineArgs.{key} == {want!r}",
-                  getattr(engine_args, key, _MISSING) == want)
+            got = getattr(engine_args, key, _MISSING)
+            if key == "model" and isinstance(got, str) and got != want:
+                # vLLM's arg_utils replaces a hub model id with its local
+                # snapshot path under HF_HUB_OFFLINE; accept that form.
+                ok = str(want).replace("/", "--") in got and got.startswith("/")
+                check(f"{section}.{key} -> EngineArgs.{key} == {want!r} "
+                      f"(or its local snapshot path)", ok)
+                continue
+            check(f"{section}.{key} -> EngineArgs.{key} == {want!r}", got == want)
 
     # relative adapter paths are resolved to absolute by the loader
     check("finetuning_lora_path resolved to absolute",
