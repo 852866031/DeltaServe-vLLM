@@ -94,20 +94,48 @@ needs. Capturing q and k at the input of the norm modules makes the shortcut exa
 | softmax inside the attention backward | yes | rebuilt from q/k, standard practice (storing it would cost a per-layer [samples, heads, L, L] tensor) |
 | LM head logits | yes, once per cycle | the inference forward only materialises last-token logits; the full fp32 logits GEMM is unavoidable |
 
-**A kernel-level profile changed the priorities.** One real backward cycle on a
-Qwen3-14B-shaped model, two GPUs, no inference running, graphs and all saves on:
+**Where a cycle's time goes.** One real backward cycle on a Qwen3-14B-shaped model, two
+GPUs, no inference running, graphs and all activation saves on, bucketing on. Each phase
+of the right-hand diagram above was timed with CUDA events on the compute stream, so the
+numbers are the time the stream spends in that phase, including any waiting; the bucket
+reduces run on the communication stream and are listed separately. Eager phases include
+the moments the GPU idles while the CPU launches their kernels.
 
-| component | before | after | what changed |
+| phase (as in the diagram) | ms per cycle | share | note |
 |---|---|---|---|
-| LM head | 63 ms | ~21 ms | per-sample GEMMs with ~31 rows each, and the bf16 head converted to fp32 nine times per cycle → all rows batched into one GEMM per vocabulary chunk, each chunk converted once per pass; same fp32 math (verified to 1e-7) |
-| NCCL all-reduces | 37 ms | ~34 ms | 240 → 86 collectives; the 80 residual reduces remain on the critical path |
-| feed-forward and attention backward GEMMs | 22 ms | 22 ms | untouched (bf16, near their microbenchmark) |
-| elementwise and reductions | 17 ms | 17 ms | norm backwards in fp32, SiLU, clipping, AdamW |
-| staging copies | 10 ms | 10 ms | saved activations into the graphs' static buffers |
-| **cycle** | **~165 ms** | **~121 ms** | |
+| Loss + LM-head backward | 22.0 | 18 % | fp32 logits and logit-gradient GEMMs; was 63 ms before the restructure |
+| Forward rematerialization | 10.6 | 9 % | the input RMSNorm plus staging the saved activations into the graphs' static buffers |
+| FFN backward | 19.9 | 16 % | graph replay; the largest GEMMs of the layer |
+| all-reduce: FFN partial | 15.6 | 13 % | 40 × 2.5 MB over PCIe |
+| O-proj backward | 0.1 | | eager |
+| Attention backward | 7.9 | 6 % | graph replay |
+| RoPE + q/k-norm backward | 2.7 | 2 % | eager, elementwise |
+| Q/K/V backward | 11.8 | 10 % | eager; mostly launch gaps, the arithmetic is small |
+| Input-norm backward | 7.0 | 6 % | eager, fp32 |
+| all-reduce: attention partial | 15.5 | 13 % | 40 × 2.5 MB over PCIe |
+| wait for buckets + gradient clipping | 5.1 | 4 % | includes the one [L]-vector reduce |
+| Optimizer step (fused AdamW) | 0.4 | | |
+| pause boundaries | 0.2 | | host-side waits only |
+| **compute stream total** | **119** | | cycle wall 122 ms |
+| bucket reduces (communication stream) | 3.6 | overlapped | off the critical path |
+
+Two things stand out. The two residual all-reduces are 31 ms, a quarter of the cycle, and
+are the floor for tensor parallelism on hardware without a peer-to-peer link. The eager
+phases between those two reduces (O-proj, Q/K/V, RoPE, norm backwards) add up to about
+22 ms of stream time for a few milliseconds of arithmetic; now that no collective sits
+among them, they are the natural next candidate for graph capture.
+
+**What changed to get here:**
+
+| component | before | after |
+|---|---|---|
+| LM head | 63 ms | 22 ms: all rows batched into one GEMM per vocabulary chunk, each bf16 chunk converted to fp32 once per pass (was per sample); same fp32 math, verified to 1e-7 |
+| collectives | 37 ms, 240 on the compute stream | 31 ms on the compute stream (80 residual reduces) + 3.6 ms overlapped on the communication stream (5 buckets) + 1 reduce inside clipping |
+| forward rematerialization | Q/K/V GEMM, attention, O-proj GEMM and an all-reduce per layer | one RMSNorm per layer plus staging copies |
+| **cycle** | **~165 ms** | **~122 ms** |
 
 In total the uncontended Qwen3-14B cycle went from ~194 ms (eager, no saves) to
-~121 ms: roughly 5 ms from graphs, 15 ms from the activation saves, 42 ms from the head,
+~122 ms: roughly 5 ms from graphs, 15 ms from the activation saves, 41 ms from the head,
 and a few ms from the transfer changes in 2.2.
 
 ### 2.2 GPU-to-GPU transfer: bucketing and a communication stream
