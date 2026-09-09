@@ -257,7 +257,11 @@ AND rank-symmetric (see the TP invariant below), with the LM head chunk loops as
 boundaries. Loose / tight / nutanix-600-800 at TTFT SLO 0.4 s: **100 / 100 / 100 %**
 (loose was 97.9-98.3 %); paused prefills 1.07-1.10× p50. Decode-only steps still share
 the GPU with the child by decision (worst-TBT > 50 ms on 57/60/188 requests vs
-26/1/15 inference-only). Details in INTEGRATION_PROGRESS.md, Phase 7 "Estimator
+26/1/15 inference-only). Known and documented, not done: `decode_bwd` is bimodal (29 %
+of contended decodes see an idle child — CPU tail / paused for a prefill — and are
+over-predicted 2×; two scheduler-side features would fix it), and the admission margin
+`1 + 1.5·RMSE` has the RMSE in seconds, i.e. it is a 0.2-0.8 % factor (faithful to the
+original tracker; a relative or absolute margin would be a real one). Details in INTEGRATION_PROGRESS.md, Phase 7 "Estimator
 validation under TP". Llama-3 was not re-run.
 MPS is deliberately off (`backward_mps_percentage: 0`); the ~2× backward-cycle inflation
 under inference load is driver time-slicing and is accepted.

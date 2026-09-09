@@ -1628,6 +1628,24 @@ depth plus the agreement latency. Worst-TBT > 50 ms stays at 57 / 60 / 188 reque
 `tests/test_merged_estimator.py` 49/49, `tests/test_tp_trainer_graph_nccl.py --family
 qwen3` 111/111 (run-ahead 2 + the agreement path).
 
+**Two follow-up findings from the trace (2026-09-08, night).** (a) *The contended decode
+regime is bimodal.* Of the 589 decode-only steps taken with a backward outstanding on
+nutanix, 29 % ran at 0.95× the clean decode cost (the last ~60 ms of a cycle — optimizer,
+publish, ack — is CPU/PCIe work, and during a burst the child is paused for the prefills),
+53 % at the 2.1× of fair time-slicing, 12 % worse (queued behind head chunks / bucketed
+reduces). One linear model fits the mixture and lands on 2.1×, so `decode_bwd` over-
+predicts the idle mode by 2×; RMSE 20 ms is the distance between the modes. Two
+scheduler-side features would separate them: "the previously scheduled step carried a
+prefill" (⇒ child paused under `pause_until_prefill_done`) and the elapsed fraction of a
+typical cycle. Not implemented. (b) *The admission safety margin is effectively inert.*
+`predict()` multiplies by `1 + 1.5·RMSE` with the RMSE in **seconds**, faithful to the
+original `tracker.py` — a factor of 1.002-1.008 on the regimes admission uses (1.03 on
+`decode_bwd`). Harmless for TTFT (≈290 ms of slack against 40-65 ms steps) but no
+protection at all on the TBT check, where a co-serving step sits at the 50 ms limit. A
+relative margin (`1 + k·RMSE/mean`) or an absolute one (`+ k·RMSE`) would be a real
+one; unchanged for now. The step trace records both `pred_raw` (model) and `pred`
+(margined, what admission consumed); every accuracy figure uses `pred_raw`.
+
 ---
 
 ## Phase 8 — Qwen3 family + backward-service restructure ✅ (Qwen3-14B TP=2 GPU-validated; 0.6B smoke + Llama rope_theta re-check done 2026-09-08)
