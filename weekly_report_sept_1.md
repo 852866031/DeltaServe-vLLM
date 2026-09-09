@@ -45,12 +45,15 @@ GPUs, including the fallback path when a batch overflows the padded attention bu
 4020 checks) and a trainer-level test that runs the real training loop for several steps
 and compares losses and adapter weights across graph, eager, and single-GPU (220 checks).
 
-## 2. What the backward actually costs, and what we removed
+## 2. Where the backward's time goes, and what we removed
+
+### 2.1 Recompute, activation saving, and the LM head
 
 **The pipeline and where the GPUs must talk.** Each backward cycle walks the layers from
 the top down. Under tensor parallelism every layer needs a few all-reduces because each
 GPU holds only half of the attention heads and half of the feed-forward block. The two
-diagrams below show the same cycle before and after this week's changes.
+diagrams below show the same cycle before and after this week's changes; the right-hand
+diagram is also the reference for the transfer changes in 2.2.
 
 ![Where the two GPUs exchange data in one backward cycle, before and after](figures/weekly_sept_1/fig2_allreduce_pipeline.png)
 
@@ -105,19 +108,19 @@ Qwen3-14B-shaped model, two GPUs, no inference running, graphs and all saves on:
 
 Over the week the uncontended Qwen3-14B cycle went from ~194 ms (eager, no saves) to
 ~121 ms: roughly 5 ms from graphs, 15 ms from the activation saves, 42 ms from the head,
-and a few ms from the transfer changes in the next section.
+and a few ms from the transfer changes in 2.2.
 
-## 3. GPU-to-GPU transfer: bucketing and a communication stream
+### 2.2 GPU-to-GPU transfer: bucketing and a communication stream
 
-**Before.** All 240 reductions per cycle were issued inline, on the same CUDA stream as
-the compute, at the point where each gradient was produced. 160 of them were the
-replicated LoRA-factor gradients, which nobody reads until the optimizer step at the end
-of the cycle. Each reduce is a rendezvous between the two GPUs, and the backward process
-was also started with the CUDA setting that pins every stream onto a single hardware queue
-(inherited from the original DeltaServe), so no overlap between communication and compute
-was possible even in principle.
-
-![Compute stream vs communication stream, before and after bucketing](figures/weekly_sept_1/fig3_bucketing_streams.png)
+**Before** (left-hand side of the diagram above). All 240 reductions per cycle were
+issued inline, on the same CUDA stream as the compute, at the point in the layer where
+each gradient was produced: the two residual-stream partials that the next operation needs
+immediately, and the four replicated LoRA-factor gradients that nobody reads until the
+optimizer step at the end of the cycle. Each reduce is a rendezvous between the two GPUs,
+so the compute stream stalled 7 times per layer, and the backward process was started
+with the CUDA setting that pins every stream onto a single hardware queue (inherited from
+the original DeltaServe), so no overlap between communication and compute was possible
+even in principle.
 
 There was also a correctness problem hiding in the same place: gradient clipping ran
 per layer on each GPU over the tensors that GPU held, replicated factors in full but only
@@ -125,12 +128,13 @@ its own half of the sharded ones. The two GPUs derived slightly different clip s
 applied them to gradients that are supposed to be identical, so their replicated adapter
 weights drifted apart whenever a layer's gradient norm exceeded the clip threshold.
 
-**After.** The factor gradients are copied into one persistent flat buffer as they are
-produced and reduced once per group of eight layers on a dedicated communication stream,
-overlapping the next group's compute; 240 collectives become 86 (80 residual reduces, 5
-buckets, 1 for clipping). Clipping runs after the bucketed reduce with a norm that sums
-the sharded halves across GPUs in one tiny collective, so both GPUs scale identically. The
-single-queue setting is gone.
+**After** (right-hand side). The two residual-stream reduces stay where they are, since
+the next operation depends on them. The four factor gradients are instead copied into one
+persistent flat buffer as they are produced and reduced once per group of eight layers on
+a dedicated communication stream, overlapping the next group's compute; 240 collectives
+become 86 (80 residual reduces, 5 buckets, 1 for clipping). Clipping moves after the
+bucketed reduce and uses a norm that sums the sharded halves across GPUs in one tiny
+collective, so both GPUs scale identically. The single-queue setting is gone.
 
 **Ordering correctness** lives in one helper: every submit waits for the producing
 compute, every consumer waits for the completion event, only persistent buffers are
@@ -142,7 +146,7 @@ single-GPU run. The measured time saving is small, about 2 ms per cycle, because
 residual reduces stay on the critical path; that is the floor for tensor parallelism on
 this hardware. The real gain is the correctness fix.
 
-## 4. Inference pre-empting finetuning-only steps
+## 3. Inference pre-empting finetuning-only steps
 
 **What it is.** When no inference request is waiting, the scheduler builds steps made only
 of finetuning samples. An inference request that arrives during such a step would
@@ -177,14 +181,25 @@ far ahead of the GPU, so a hook-time abort only saved the un-launched tail (the 
 bounds the launch-ahead to two layers), and, most importantly, most burst-start requests
 were slow for a different reason entirely.
 
-**The pause finding.** On the dense trace, the first request of each burst usually
+<table>
+<tr>
+<td width="52%" valign="top">
+
+<b>The pause finding.</b> On the dense trace, the first request of each burst usually
 arrived while the backward was running, not during an FT-only forward. Its prefill took
 80 to 200 ms instead of 40 ms because the "yield the GPU to prefill" grant was re-set right
 after the prefill was enqueued, not when it finished, so the backward resumed immediately
-and the two processes time-sliced against each other on the GPU. The runner now records a CUDA event
-behind the prefill and resumes the backward only when that event has completed.
+and the two processes time-sliced against each other on the GPU. The runner now records a
+CUDA event behind the prefill and resumes the backward only when that event has completed.
 
-![Yielding the GPU to a prefill: before vs after](figures/weekly_sept_1/fig4_preemption.png)
+</td>
+<td width="48%" valign="top">
+
+<img src="figures/weekly_sept_1/fig4_preemption.png" alt="Yielding the GPU to a prefill: before vs after" width="100%">
+
+</td>
+</tr>
+</table>
 
 **Result on the dense trace (Qwen3-14B, 8 bursts of 60 requests):**
 
@@ -194,7 +209,7 @@ behind the prefill and resumes the backward only when that event has completed.
 | co-serving, before | 99.2 % | 377 ms | 577 ms | 92 52 144 53 44 40 458 58 | 277 |
 | co-serving, after | 100 % | 91 ms | 150 ms | 55 60 67 61 61 60 59 64 | 262 |
 
-## 5. Validation
+## 4. Validation
 
 Both families now co-serve the loose, dense, and Nutanix traces with the full stack
 (inference-only satisfaction is 100 % on every trace):
@@ -210,7 +225,7 @@ stalls), and the Qwen3-0.6B single-GPU path, which needed a fix for models whose
 is tied to the embedding.
 
 
-## 6. Next
+## 5. Next
 
 The SLO estimator's coefficients are fitted with no backward running; with the pause now
 holding through the whole prefill, the contention pattern has changed. The next step is a
