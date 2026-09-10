@@ -196,15 +196,32 @@ class FinetuneScheduler(AsyncScheduler):
         earliest_waiting_arrival)."""
         b_d = 0
         k = 0.0
+        budget = self.max_num_scheduled_tokens
+        remaining = budget
+        t_in = 0.0
+        prefill_lens: list[int] = []
+        # Running requests are scheduled ahead of waiting ones. A running
+        # request that has not finished its prompt yet (chunked prefill of a
+        # long prompt — e.g. an 8k arxiv article at a 2048-token step budget)
+        # takes its next CHUNK out of the budget, not one decode token;
+        # counting it as decode made every chunk after the first look like a
+        # decode-only step (phase gate → 0 FT) and hid the prefill from the
+        # SLO prediction.
         for req in self.running:
             if getattr(req, "is_finetuning", False):
                 continue
+            left = req.num_tokens - req.num_computed_tokens
+            if left > 1 and req.num_output_placeholders == 0:
+                n = min(left, remaining)
+                if n > 0:
+                    prefill_lens.append(int(n))
+                    t_in += n
+                    remaining -= n
+                continue
             b_d += 1
             k += req.num_computed_tokens
-        budget = self.max_num_scheduled_tokens
-        remaining = max(0, budget - b_d)  # decode consumes ~1 token/req
-        t_in = 0.0
-        prefill_lens: list[int] = []
+            remaining -= 1  # decode consumes ~1 token/req
+        remaining = max(0, remaining)
         earliest_arrival: float | None = None
         for req in self.waiting:
             if earliest_arrival is None:
@@ -377,6 +394,12 @@ class FinetuneScheduler(AsyncScheduler):
         token_cap = buffer_cap
         if _prop_factor != -1 and has_prefill:
             token_cap = min(buffer_cap, int(feats.t_in * _prop_factor))
+        # The step's token budget (max_num_batched_tokens) is shared with
+        # inference, which the base scheduler serves first; FT admitted beyond
+        # what is left can never schedule this step.
+        budget_left = int(self.max_num_scheduled_tokens
+                          - feats.t_in - feats.b_d)
+        token_cap = min(token_cap, budget_left)
         if token_cap <= 0:
             return 0, []
 
@@ -571,6 +594,10 @@ class FinetuneScheduler(AsyncScheduler):
                 f"claimed={int(store.has_claimed())} "
                 f"buffer_fill={coord.fill_count}+{coord.reserved_fill}/"
                 f"{coord.capacity} pending_backward={coord.pending_backward} "
+                f"admission_open={coord.admission_open} "
+                f"ft_started={coord.ft_started} "
+                f"epoch_flush_pending={coord.epoch_flush_pending} "
+                f"next_ft_budget={coord.next_ft_budget()} "
                 f"— engine going idle (this is normal end-of-FT, NOT a hang)."
             )
             self._ft_exhausted_logged = True
@@ -884,6 +911,25 @@ class FinetuneScheduler(AsyncScheduler):
         # the store-API split these samples were silently lost.)
         if dropped_ft_samples:
             self._ft_injector.store.release_claimed(dropped_ft_samples)
+        # [fix 2026-09-10] note_injection above assumed every admitted FT
+        # token would schedule. When the base scheduler dropped some (or all)
+        # of them — the inference prefill chunk took the whole token budget —
+        # its "buffer can't grow" verdict (admission_open=False,
+        # epoch_flush_pending=True) was based on rows that never landed. With
+        # nothing in the buffer no backward can fire to reopen admission, so
+        # FT wedged for the rest of the run ("FT exhausted" with
+        # admission_open=False). Re-derive the verdict from the scheduled
+        # count, exactly as _rollback_ft_step does for a pre-empted step.
+        if admitted_now > 0:
+            _ft_sched_tokens = sum(output.num_scheduled_tokens.get(rid, 0)
+                                   for rid in scheduled_ft)
+            if _ft_sched_tokens < admitted_now:
+                self._coord.restore_admission(_admit_snap)
+                if _ft_sched_tokens > 0:
+                    _nxt = self._ft_injector.store.pop_next()
+                    self._coord.note_injection(
+                        _nxt.input_len if _nxt is not None else None,
+                        admitted_now=_ft_sched_tokens)
 
         # [async] Reserve the activation-buffer rows for the FT samples that
         # ACTUALLY scheduled this step, and stash their disjoint write offset for
@@ -916,6 +962,13 @@ class FinetuneScheduler(AsyncScheduler):
             output.finetune_backward_trigger = self._coord.take_trigger_cmd()
         # [M4.2] Per-step timing gate for the runner (see SchedulerOutput).
         output.finetune_record_timing = bool(self._coord.record_timing)
+        # Admission state for the worker's batch log (post-reserve, so an
+        # FT step's own rows count as in-flight). Truthful under TP, where the
+        # worker's coordinator mirror carries no buffer accounting.
+        _c = self._coord
+        output.finetune_admit_state = (
+            bool(_c.admission_open), bool(_c.pending_backward),
+            int(_c.fill_count + _c.reserved_fill), int(_c.capacity))
 
         # [Phase 4] Stamp the regime + predicted duration for THIS step now,
         # while all requests are still present and the dispatcher reflects the
@@ -1010,6 +1063,12 @@ class FinetuneScheduler(AsyncScheduler):
         # schedule() is undone (admission_open / epoch_flush_pending).
         snap = getattr(scheduler_output, "_ft_admit_snapshot", None)
         if snap is not None:
+            dprint(f"[ft-rollback] n_ft={len(ft_ids)} reserved={n_reserved} "
+                   f"samples={len(samples)} restore snap={snap} "
+                   f"(was admission_open={self._coord.admission_open} "
+                   f"flush={self._coord.epoch_flush_pending} "
+                   f"fill={self._coord.fill_count}+{self._coord.reserved_fill} "
+                   f"pending_bwd={self._coord.pending_backward})")
             self._coord.restore_admission(snap)
         # Clear the tier-C abort event so the next FT-only batch starts with
         # a clean signal — otherwise a stale "set" from this cycle would

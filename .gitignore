@@ -45,3 +45,6 @@ eval-tp/output/
 # ---- python envs ----
 .venv/
 venv/
+
+# ---- arxiv probe data (re-fetch with eval-arxiv/fetch_arxiv.py) ----
+eval-arxiv/data/

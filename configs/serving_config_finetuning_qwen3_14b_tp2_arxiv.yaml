@@ -1,0 +1,101 @@
+# arxiv long-context variant of serving_config_finetuning_qwen3_14b_tp2.yaml: max_model_len 16384.
+# DeltaServe-on-vLLM serving config — TP=2 co-serving finetuning (Qwen3-14B).
+#
+# Phase 8: the second trained family. Clone of serving_config_finetuning_llama3_tp2.yaml
+# with the Qwen3-14B base model + its toy adapters; the TP bring-up flags are the
+# same (see that file's header for why each is off under TP):
+#   - backward_cuda_graph        : ON — TP-safe since M5 (no collective is captured)
+#   - save_attn_qkv              : ON — exact for Qwen3 since the q/k save moved to the
+#                                 q_norm/k_norm INPUTS (raw projection outputs); the
+#                                 backward re-applies only the elementwise norm + RoPE.
+#   - save_attn_ctx              : ON (supported)
+#   - forward_interruptible      : ON — tier C is rank-symmetric under TP (shm arrival
+#                                 counter + a gloo MAX-reduce per layer boundary)
+#   - profile_on_launch          : ON since M4.2 (timing samples ride the TP relay)
+#
+# Memory (per 5090): ~14.8 GB weight shard + 1.5 GB all-gathered lm_head in the
+# backward child + activation buffers; gpu_memory_utilization starts at 0.80
+# to leave the child its fp32 logits / attention temporaries. Raise once the
+# first run reports headroom.
+#
+# Qwen3-14B-Base geometry: 40 layers, hidden 5120, 40 q / 8 kv heads (head_dim
+# 128), intermediate 17408, vocab 151936 (multiple of 64 → no vLLM padding),
+# untied lm_head. Launch with `python eval-tp/ft_bench_tp.py --family qwen3-14b`.
+
+finetune:
+  enable_finetuning: true
+  start_on_launch: false             # hold FT admission closed (M1: launch-only)
+  backward_mps_percentage: 0         # no MPS daemon on this box; the pause contract protects prefill
+  backward_run_ahead_boundaries: 2   # child CPU ≤2 _maybe_pause boundaries ahead of its GPU → a pause lands within ~3-6 ms (0 = unbounded)
+  finetuning_lora_path: ../adapters/qwen3-14b-toy-lora-ft
+  data_path: ../alpaca_1000.txt
+  max_saved_finetuning_tokens: 256
+  backward_sleep_seconds: 2.0
+  num_epochs: 20
+  learning_rate: 0.000005
+  weight_decay: 0.01
+  gamma: 0.9
+  backward_fp32: false
+  forward_interruptible: true        # tiers A/B (scheduler) + tier C rank-symmetric under TP
+  ft_only_admission_grace_ms: 2.0
+  fwd_token_throttle_enable: false
+  fwd_token_throttle: 200
+  backward_cuda_graph: true         # TP-safe since M5 (2-GPU gated; live A/B pending)
+  save_attn_qkv: true                # pre-norm q/k + v saved: skips the Q/K/V GEMM (exact for Qwen3)
+  save_attn_ctx: true                # attention context saved: skips the attention forward
+  save_resid_mid: true               # save post-attn residual: drops the forward-remat o all-reduce (7 → 6 collectives/layer) + the O-proj GEMM; +100 MB
+
+slo:
+  ttft_slo: 2                      # arxiv: an 8k prefill alone is ~1.5 s (chunked 2048), 16k ~3.1 s
+  avg_tbt_slo: 0.02
+  max_tbt_slo: 0.05
+  # M4.2: the runner's per-step timing samples and the profiling pass's
+  # record gate now ride the TP relay (ModelRunnerOutput.finetune_timing /
+  # SchedulerOutput.finetune_record_timing), so the launch-time profiling
+  # pass fits a real, TP-calibrated estimator and FT admission is SLO-gated
+  # under TP exactly as on a single GPU. Set false to fall back to the
+  # cold-start fixed buffer-cap budget (no SLO gate).
+  profile_on_launch: true
+  profile_num_repeats: 2
+  ft_tokens_admission_constrain_factor: -1
+  match_prefill_workload_factor: 0
+  decode_only_ft_safety_margin: 0.7
+
+debug:
+  print_weight_hash: false
+  print_activation_hash: false
+  print_scheduler_add: true
+  print_engine_batch_exec: true
+  print_engine_batch_done: false
+  print_engine_req_recv: false
+
+adapters:
+  lora_path_0: ../adapters/qwen3-14b-toy-lora
+
+lora:
+  enable_lora: true
+  max_loras: 2
+  max_lora_rank: 16
+
+server:
+  host: 127.0.0.1
+  port: 8000
+  rank_id: 0
+  # Single frontend for TP bring-up (fewer moving parts in the launch prints).
+  api_server_count: 1
+
+model:
+  model: Qwen/Qwen3-14B-Base
+  tokenizer_mode: auto
+  trust_remote_code: false
+  dtype: auto
+  max_model_len: 16384
+
+engine:
+  gpu_memory_utilization: 0.80          # first bring-up; see header
+  enforce_eager: false
+  disable_log_stats: true
+  max_num_batched_tokens: 4096   
+
+parallel:
+  tensor_parallel_size: 2            # <<< TP=2

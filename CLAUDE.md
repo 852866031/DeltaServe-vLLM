@@ -30,6 +30,7 @@ DeltaServe-vLLM/                    ← this repo root (where we write integrati
 ├── scripts/                        ← entry points: ft_experiment_{opt,llama3}.py, launch_deltaserve.py, …
 ├── eval/                           ← single-GPU eval: auto_benchmark.py, auto_plot*.py, pure_ft_bench.py
 ├── eval-tp/                        ← TP eval: launch_deltaserve.py, ft_bench_tp.py (per-TP logs, --kill-stale)
+├── eval-arxiv/                     ← long-context probe on ccdv/arxiv-summarization: fetch_arxiv.py, launch_arxiv.py, prefill_bench.py, trace_bench.py (0.4 rps replay), plot_arxiv.py (README has the numbers)
 ├── tests/                          ← standalone scripts (run with `python`, NOT pytest — not installed)
 ├── adapters/                       ← toy LoRA adapters (opt125m / llama3; inference + "-ft" FT target)
 ├── INTEGRATION_PROGRESS.md         ← plan + per-stage progress. Source of truth for *what* to build & *how far*.
@@ -272,6 +273,19 @@ Llama-3's 500000), fixed generically in `deltaserve/ft_meta.py:rope_theta_of`. T
 `DSERVE_TP_DIAG=1` remat error is now at bf16 noise and stable across cycles (was growing
 0.22 → 0.45), and `eval/pure_ft_bench.py` passes the 2.10 reference at cycle ~30 and keeps
 descending (863 cycles / 100 s, 2097 FT tok/s).
+
+**Long-context probe (2026-09-10, `eval-arxiv/`, Qwen3-14B TP=2, 16k context).** Prefill is
+linear at ~0.19 ms/token (8k = 1.54 s, 16k = 3.17 s), compute-bound (an 8192-token chunk saves
+1-2 % over 2048), concurrent prefills serialize, and co-serving adds 1-2 %. On this workload
+FT rides no inference prefill at all: a 2048-token chunk fills the step budget and any step
+with a decoding request fails the `max_tbt_slo` gate (the chunk alone is 0.38 s), so FT runs
+in idle gaps only (465 FT tok/s with 2.5 s gaps between 8k requests). **Fixed a wedge found
+there** (`ft_scheduler.py`): after a tier-C abort the re-schedule admitted FT next to a full
+2048-token chunk, `note_injection` closed admission, the base scheduler dropped the FT
+requests, and the flags were never restored — FT dead for the rest of the run
+(`FT exhausted … admission_open=False` at epoch 0). Now: running requests still prefilling
+count as their next chunk in the step features, FT admission is capped by the remaining
+token budget, and the flags are re-derived from what actually scheduled.
 
 Single-GPU levers still pending GPU A/B: `forward_interruptible`,
 `slo.coserving_admission_phase: both`, `finetune.match_prefill_workload_factor` vs
