@@ -263,6 +263,13 @@ class SchedulerOutput:
     # them), so the runner can drop their cached ``CachedRequestState`` /
     # input-batch slot instead of leaking one entry per FT injection.
     finetune_retired_req_ids: list[str] | None = None
+    # [DeltaServe] The scheduler-side coordinator's FT admission state when
+    # this step was built: (admission_open, pending_backward,
+    # fill_count + reserved_fill, capacity). The worker's `[batch …]` log line
+    # prints these — under TP the worker's own coordinator is a mirror whose
+    # buffer accounting is not maintained (saves are relayed to the
+    # scheduler), so reading it there always showed `buf=0/N`.
+    finetune_admit_state: tuple[bool, bool, int, int] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

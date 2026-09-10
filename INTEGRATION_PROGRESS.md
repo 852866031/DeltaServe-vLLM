@@ -1770,6 +1770,51 @@ Qwen3-14B TP=2 likewise — tables under Phase 7 "Validation 2026-09-08 (evening
 
 ---
 
+## Long-context (arxiv) probe — 2026-09-10 ✅
+
+Ramya Prabhu asked what a dense model does on long context (arxiv, ~8k-16k-token prompts,
+0.4 rps). Tooling + numbers in `eval-arxiv/` (README). Qwen3-14B TP=2, `max_model_len 16384`,
+real `ccdv/arxiv-summarization` articles truncated to N tokens, distinct article per request.
+
+| prompt tokens | inference (chunk 2048) | inference (chunk 8192) | co-serving |
+|---|---|---|---|
+| 2048 | 0.378 s | 0.378 s | 0.385 s |
+| 4096 | 0.756 s | 0.751 s | 0.762 s |
+| 8192 | 1.542 s | 1.521 s | 1.551 s |
+| 12288 | 2.366 s | 2.340 s | 2.376 s |
+| 16000 | 3.167 s | 3.100 s | 3.246 s |
+
+- Linear ~0.19 ms/token, compute-bound; chunk size is not the cost; concurrent prefills
+  serialize (4×8k at once → TTFT 1.6/3.5/5.0/6.2 s). Co-serving +1-2 %.
+- FT rides none of the 158 inference prefill chunks (budget full; `max_tbt_slo` gate fails
+  whenever a decode is in the step since the chunk alone is 0.38 s) → FT-only idle steps
+  carry 96.8 % of FT tokens; 465 FT tok/s with 2.5 s gaps between 8k requests. The
+  estimator predicts the chunks at actual/pred p50 1.007 / p90 1.10.
+- Memory at 0.80: KV 69k tokens inference-only, 57k with the backward children (~6 resident
+  8k requests). `ttft_slo` must be ≥ ~2-3 s for this workload; 0.4 s closes FT for good.
+- **Bug fixed** (`ft_scheduler.py`; found on the prefill-sweep runs, whose raw outputs were
+  not kept — only the 0.4 rps trace outputs live in `eval-arxiv/output/`): tier-C
+  abort → rollback OK → re-schedule admits FT next to a full 2048 chunk → `note_injection`
+  closes admission → base scheduler drops the FT requests (budget) → flags never restored →
+  `FT exhausted … admission_open=False epoch_flush_pending=True` at epoch 0, FT dead. Fixes:
+  running-but-prefilling requests count as their next chunk in `_current_step_features`;
+  admission capped by the remaining token budget; flags re-derived from the scheduled FT
+  tokens. Run 3: 0 exhaustions over 19 rollbacks. `tests/test_tp_timing_relay.py` 26/26 and
+  `tests/test_step_trace.py` 28/28 still pass.
+- **0.4 rps trace (`eval-arxiv/trace_bench.py`, 20 requests, 8k ± 512 prompt tokens, output =
+  abstract length, same seed both modes):** chunk 2048 → TTFT p50 1.98 s both modes, p90/max
+  2.91/3.17 inf-only vs 3.70/4.59 co; chunk 4096 → p50 1.67/1.69, p90/max 2.58/3.02 vs 4.93/5.07,
+  and the per-request max token gap doubles (405 → 780 ms, one chunk). The co-serving tail is
+  **KV capacity** in both configs (6–7 resident 8k requests fill the 57–60k-token cache the
+  backward children leave at 0.80 utilisation; the step trace shows a waiting request and no
+  prefill chunk with no FT/backward active), not contention. FT ran only while the system was
+  empty (93 % of steps decode-only, denied by `coserving_admission_phase: prefill`; chunks fill
+  the budget) → ~110 FT tok/s. Levers, not yet run: `gpu_memory_utilization ~0.88` / smaller
+  CUDA-graph capture set, `max_num_batched_tokens` 2304 (budget for FT), the `both` scheduler.
+  Ramya's own `prompt`/`output_tokens` file goes through the same script.
+
+---
+
 ## Top risks
 
 - **Forward-reimpl fidelity for the backward (open)** — the P3.3 per-layer recompute must

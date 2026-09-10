@@ -4052,12 +4052,18 @@ class GPUModelRunner(
         # backward is in flight, and the activation-buffer fill (committed +
         # reserved-in-flight) vs capacity.
         coord = getattr(self, "_ft_coordinator", None)
-        if coord is not None:
-            admit = "CLOSED" if (not coord.admission_open
-                                 or coord.pending_backward) else "OPEN"
-            bwd = " bwd" if coord.pending_backward else ""
-            buf = f"{coord.fill_count + coord.reserved_fill}/{coord.capacity}"
-            admit_str = f" | FT {admit}{bwd} buf={buf}"
+        _st = getattr(scheduler_output, "finetune_admit_state", None)
+        if _st is None and coord is not None:
+            # No stamp (non-FinetuneScheduler step): read the local coordinator.
+            # Under TP that mirror carries no buffer accounting — the stamped
+            # scheduler-side state above is the truthful source.
+            _st = (coord.admission_open, coord.pending_backward,
+                   coord.fill_count + coord.reserved_fill, coord.capacity)
+        if _st is not None:
+            _open, _pending, _fill, _cap = _st
+            admit = "CLOSED" if (not _open or _pending) else "OPEN"
+            bwd = " bwd" if _pending else ""
+            admit_str = f" | FT {admit}{bwd} buf={_fill}/{_cap}"
         else:
             admit_str = ""
         import time as _time
