@@ -394,6 +394,41 @@ class FinetuneConfig:
     0 restores the unbounded behaviour. No GPU idle as long as a boundary's
     GPU time exceeds its launch cost, which holds for every real model."""
 
+    def compute_hash(self) -> str:
+        """[mixed-fwd-cuda-graph] The finetuning fields that change the traced
+        forward: with ``graph_ft_batches`` the model's ``maybe_save`` call sites
+        trace to the save op (one per enabled save), without it they trace to
+        nothing — same source, different graph. vLLM's compile cache is keyed
+        on this hash (``VllmConfig.compute_hash``); without it a run with the
+        feature toggled loaded the other configuration's AOT-compiled graph
+        (KeyError on the marker buffer at best, silently missing saves at
+        worst)."""
+        import hashlib
+
+        factors = [
+            bool(self.enable_finetuning), bool(self.graph_ft_batches),
+            bool(self.save_activations), bool(self.save_attn_qkv),
+            bool(self.save_attn_ctx), bool(self.save_resid_mid),
+        ]
+        return hashlib.sha256(repr(factors).encode()).hexdigest()
+
+    graph_ft_batches: bool = False
+    """[mixed-fwd-cuda-graph] Let MIXED batches (inference requests + FT
+    samples) run vLLM's compiled forward and replay piecewise CUDA graphs
+    instead of the Python eager path. The activation saves then go through
+    the graph-capturable ``dserve_save_rows`` op (``deltaserve/ft_save_op.py``)
+    fed by persistent index tensors, and a second piecewise capture set keyed
+    ``has_ft`` is captured at startup. FT-ONLY batches stay eager (they are
+    the ones the mid-forward abort applies to). Requires a model family with
+    the save call sites (Qwen3); other families silently keep the eager path.
+    Off (default) is bit-identical to before."""
+
+    graph_ft_max_tokens: int = 512
+    """[mixed-fwd-cuda-graph] Largest padded batch size to capture the
+    ``has_ft`` piecewise graphs for (capped by the compilation config's
+    ``max_cudagraph_capture_size``). Mixed FT steps above it run the compiled
+    forward without a graph."""
+
     pause_until_prefill_done: bool = True
     """Keep the backward child paused until the inference prefill that paused
     it has actually COMPLETED on the GPU (default). ``False`` re-sets the GPU

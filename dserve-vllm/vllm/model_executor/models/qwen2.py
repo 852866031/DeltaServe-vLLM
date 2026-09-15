@@ -34,6 +34,7 @@ from torch import nn
 from transformers import Qwen2Config
 
 from vllm.compilation.decorators import support_torch_compile
+from vllm.deltaserve.ft_save_op import maybe_save  # [DeltaServe]
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -112,6 +113,7 @@ class Qwen2MLP(nn.Module):
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
+        maybe_save(self, "gate_up", gate_up)  # [DeltaServe] FT save (no-op unless installed)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
@@ -418,6 +420,7 @@ class Qwen2Model(nn.Module, EagleModelMixin):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
+        maybe_save(self, "final_in", hidden_states, residual)  # [DeltaServe]
         hidden_states, _ = self.norm(hidden_states, residual)
 
         if len(aux_hidden_states) > 0:

@@ -51,6 +51,7 @@ from vllm.v1.attention.backend import AttentionType
 from .interfaces import SupportsEagle, SupportsEagle3, SupportsLoRA, SupportsPP
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen2 import Qwen2Model
+from vllm.deltaserve.ft_save_op import maybe_save  # [DeltaServe]
 from .utils import AutoWeightsLoader, PPMissingLayer, extract_layer_index, maybe_prefix
 
 logger = init_logger(__name__)
@@ -149,6 +150,12 @@ class Qwen3Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # [DeltaServe] graph-capturable FT save: the raw projection outputs
+        # (pre q/k-norm — what the Qwen3 backward consumes) and v. No-ops
+        # unless the accumulator installed slots on this module.
+        maybe_save(self, "q", q)
+        maybe_save(self, "k", k)
+        maybe_save(self, "v", v)
         # Add qk-norm
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
         q_by_head = self.q_norm(q_by_head)
@@ -158,11 +165,16 @@ class Qwen3Attention(nn.Module):
         k = k_by_head.view(k.shape)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
+        maybe_save(self, "ctx", attn_output)  # [DeltaServe]
         output, _ = self.o_proj(attn_output)
         return output
 
 
 class Qwen3DecoderLayer(nn.Module):
+    # [DeltaServe] this family has the graph-capturable save call sites
+    # (deltaserve.ft_save_op.maybe_save) — see accumulate.install_save_points.
+    _dserve_save_points = True
+
     def __init__(
         self,
         config: Qwen3Config,
@@ -219,6 +231,9 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [DeltaServe] residual stream entering the layer (= hidden + residual;
+        # the fused add-norm below mutates ``residual`` in place, so gather first).
+        maybe_save(self, "layer_in", hidden_states, residual)
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -230,6 +245,8 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_states=hidden_states,
         )
 
+        # [DeltaServe] post-attention residual (the FFN input).
+        maybe_save(self, "resid_mid", hidden_states, residual)
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)

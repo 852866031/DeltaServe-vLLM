@@ -133,6 +133,15 @@ class ProfilingShapeGenerator:
             out.append(ProfileShape("coserve", inf_lens=[32],
                                     ft_lens=self._partition(self.ft_cap,
                                                             max(1, self.ft_cap // 64))))
+        # [mixed-fwd-cuda-graph] With the FT regime split (mixed batches
+        # graphed, FT-only eager) the EAGER regime needs FT-ONLY samples of
+        # its own; the mixed shapes above land in FT_MIXED.
+        from vllm.deltaserve.estimator import ft_mixed_split
+        if ft_mixed_split():
+            for ft in ft_levels:
+                out.append(ProfileShape(
+                    "coserve", inf_lens=[],
+                    ft_lens=self._partition(ft, max(1, ft // 64))))
         return out
 
     def _mixed_shapes(self) -> list[ProfileShape]:

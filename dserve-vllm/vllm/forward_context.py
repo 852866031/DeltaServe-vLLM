@@ -56,6 +56,12 @@ class BatchDescriptor:
     (like fused_moe_lora) whose grid size depends on num_active_loras
     to be properly captured.
     """
+    has_ft: bool = False
+    """
+    [DeltaServe] The batch carries finetuning samples next to inference
+    tokens and the activation-save op must be live in the graph: a separate
+    piecewise capture set (``finetune.graph_ft_batches``).
+    """
 
 
 def _compute_sp_num_tokens(
@@ -150,6 +156,10 @@ class ForwardContext:
     # If True, bypass the compiled model call, e.g. by using .forward() directly
     skip_compiled: bool = False
 
+    # [DeltaServe] Per-step state for the graph-capturable activation save
+    # (deltaserve.ft_save_op.FtSaveState) on mixed FT batches; None otherwise.
+    ft_save: Any = None
+
     # For torch.compile cold start times, we need to avoid hard-coding
     # any strings into the graph. Right now, the vllm.moe_forward
     # and vllm.moe_forward_shared custom operators hard-code strings into
@@ -211,6 +221,7 @@ def create_forward_context(
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     additional_kwargs: dict[str, Any] | None = None,
     skip_compiled: bool = False,
+    ft_save: Any = None,
 ):
     if vllm_config.compilation_config.fast_moe_cold_start:
         all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
@@ -228,6 +239,7 @@ def create_forward_context(
         ubatch_slices=ubatch_slices,
         skip_compiled=skip_compiled,
         additional_kwargs=additional_kwargs or {},
+        ft_save=ft_save,
     )
 
 
@@ -257,6 +269,7 @@ def set_forward_context(
     ubatch_slices: UBatchSlices | None = None,
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     skip_compiled: bool = False,
+    ft_save: Any = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -316,6 +329,7 @@ def set_forward_context(
         slot_mapping,
         additional_kwargs,
         skip_compiled,
+        ft_save,
     )
 
     try:

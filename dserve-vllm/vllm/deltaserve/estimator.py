@@ -79,8 +79,26 @@ REGIME_INF_PREFILL = "inf_prefill"
 REGIME_EAGER = "eager"
 REGIME_DECODE_ONLY = "decode_only"
 REGIME_DECODE_BWD = "decode_bwd"
+# [mixed-fwd-cuda-graph] FT samples next to inference tokens, replayed as a
+# has_ft CUDA graph (only exists when the split is on; otherwise such steps
+# are EAGER like every FT-carrying step).
+REGIME_FT_MIXED = "ft_mixed"
 REGIMES = (REGIME_INF_PREFILL, REGIME_EAGER, REGIME_DECODE_ONLY,
-           REGIME_DECODE_BWD)
+           REGIME_DECODE_BWD, REGIME_FT_MIXED)
+
+# Process-wide switch: split FT-carrying steps into EAGER (FT-only, eager)
+# and FT_MIXED (with inference, graphed). Set by the FT scheduler from
+# ``finetune.graph_ft_batches``; off keeps the single EAGER regime.
+_FT_MIXED_SPLIT = False
+
+
+def set_ft_mixed_split(enabled: bool) -> None:
+    global _FT_MIXED_SPLIT
+    _FT_MIXED_SPLIT = bool(enabled)
+
+
+def ft_mixed_split() -> bool:
+    return _FT_MIXED_SPLIT
 
 
 @dataclass
@@ -129,6 +147,8 @@ class StepFeatures:
     def regime(self) -> str:
         """Composition-derived regime classifier. Mutually exclusive."""
         if self.t_ft > 0:
+            if _FT_MIXED_SPLIT and (self.t_in > self.t_ft or self.b_d > 0):
+                return REGIME_FT_MIXED
             return REGIME_EAGER
         elif self.t_in > 0:
             return REGIME_INF_PREFILL
@@ -317,9 +337,12 @@ class MergedExecutionEstimator:
         # Cold-start fallback — try fitted regimes in priority order. The
         # contended-decode regime has no profiling-pass samples (no backward
         # runs then), so it borrows the clean decode fit until its first refit.
-        order = (REGIME_EAGER, REGIME_INF_PREFILL, REGIME_DECODE_ONLY)
+        order = (REGIME_EAGER, REGIME_FT_MIXED, REGIME_INF_PREFILL,
+                 REGIME_DECODE_ONLY)
         if regime == REGIME_DECODE_BWD:
             order = (REGIME_DECODE_ONLY,) + order
+        elif regime == REGIME_FT_MIXED:
+            order = (REGIME_EAGER,) + order   # same physics minus the graph
         for r in order:
             if self._params[r].is_fitted:
                 return r, self._params[r]
@@ -401,7 +424,7 @@ class MergedExecutionEstimator:
         if regime == REGIME_INF_PREFILL:
             # T_ft ≡ 0 within this regime → γ column dropped.
             return [f.s, f.t_in, f.b_d, f.k, 1.0]            # 5 cols
-        elif regime == REGIME_EAGER:
+        elif regime in (REGIME_EAGER, REGIME_FT_MIXED):
             # Full 6-column formula.
             return [f.s, f.t_in, f.t_ft, f.b_d, f.k, 1.0]    # 6 cols
         else:  # REGIME_DECODE_ONLY / REGIME_DECODE_BWD
@@ -418,7 +441,7 @@ class MergedExecutionEstimator:
             # Columns: [S, T_in, B_d, K, 1] → α, β, δ, ε, c. γ ≡ 0.
             alpha, beta, delta, epsilon, c = (float(v) for v in coef)
             gamma = 0.0
-        elif regime == REGIME_EAGER:
+        elif regime in (REGIME_EAGER, REGIME_FT_MIXED):
             # Columns: full [S, T_in, T_ft, B_d, K, 1].
             alpha, beta, gamma, delta, epsilon, c = (float(v) for v in coef)
         else:  # REGIME_DECODE_ONLY / REGIME_DECODE_BWD

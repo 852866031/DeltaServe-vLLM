@@ -601,6 +601,11 @@ class Worker(WorkerBase):
             save_resid_mid=bool(ft_cfg.save_resid_mid),
         )
         accumulator.register_hooks()
+        # [mixed-fwd-cuda-graph] mark the model's modules for the graph-
+        # capturable save op (before the first torch.compile trace, which
+        # happens at the profile run — the call sites must see the slots).
+        if ft_cfg.graph_ft_batches:
+            accumulator.install_save_points(model)
         ack = backward_process.share_activations(
             accumulator.buffers, print_hash=ft_cfg.print_activation_hash)
         dprint(f"shared activation buffers with backward process: {ack}")

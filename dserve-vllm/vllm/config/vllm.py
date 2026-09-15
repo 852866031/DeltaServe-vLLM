@@ -435,6 +435,10 @@ class VllmConfig:
             vllm_factors.append(self.lora_config.compute_hash())
         else:
             vllm_factors.append("None")
+        # [DeltaServe] the activation-save call sites trace differently with
+        # graph_ft_batches / the save flags (see FinetuneConfig.compute_hash).
+        _ftc = getattr(self, "finetune_config", None)
+        vllm_factors.append(_ftc.compute_hash() if _ftc is not None else "None")
         if self.speculative_config:
             vllm_factors.append(self.speculative_config.compute_hash())
         else:

@@ -195,8 +195,12 @@ class FinetuneAccumulator:
                                 and bool(self._post_ln_modules))
 
         # Pre-allocated buffers (plain torch.zeros — outside any CUDA-graph pool).
+        # [mixed-fwd-cuda-graph] One scratch row past max_saved: the
+        # fixed-shape save op writes the unused index slots there. Every
+        # consumer slices ``[:n]`` / ``[off:off+n]`` with n ≤ max_saved, so
+        # the extra row is invisible to the backward child and the hooks.
         def _buf(width=None):
-            return torch.zeros(self.max_saved, width or self.hidden_size,
+            return torch.zeros(self.max_saved + 1, width or self.hidden_size,
                                device=device, dtype=dtype)
 
         self.layer_in = [_buf() for _ in range(self.num_layers)]
@@ -248,6 +252,139 @@ class FinetuneAccumulator:
             self.buffers["attn_ctx"] = self.attn_ctx
         if self.resid_mid:
             self.buffers["resid_mid"] = self.resid_mid
+
+        # [mixed-fwd-cuda-graph] Persistent index tensors for the save op
+        # (fixed addresses — the has_ft graphs bake them in), a pinned ring
+        # for the per-step host→device refresh, and the slot → buffer table.
+        # ``install_save_points`` fills the table and marks the modules.
+        self.ft_src = torch.zeros(self.max_saved, device=device,
+                                  dtype=torch.int64)
+        self.ft_dst = torch.full((self.max_saved,), self.max_saved,
+                                 device=device, dtype=torch.int64)
+        self._idx_pin = torch.empty((4, 2, self.max_saved), dtype=torch.int64,
+                                    pin_memory=(torch.device(device).type == "cuda"))
+        self._idx_pin_pos = 0
+        self.op_bufs: list = []
+        self.op_ready = False
+        self._op_marker = None
+
+    # ─── [mixed-fwd-cuda-graph] graph-capturable save path ──────────────
+    # Slot layout per layer i: 7*i + {0: layer_in, 1: resid_mid, 2: gate_up,
+    # 3: q, 4: k, 5: v, 6: ctx}; final_in = 7*L. A disabled save leaves its
+    # slot None and the op returns without work for it.
+    _OP_NAMES = ("layer_in", "resid_mid", "gate_up", "q", "k", "v", "ctx")
+
+    def install_save_points(self, model) -> bool:
+        """Mark the model's modules with the slots the ``maybe_save`` call
+        sites read (``deltaserve.ft_save_op``). Returns True when the family
+        has the call sites (its decoder layer class carries
+        ``_dserve_save_points``); otherwise nothing is installed and mixed
+        batches keep the eager hook path."""
+        from vllm.deltaserve.ft_save_op import MARKER_ATTR, SLOT_ATTR
+
+        layers: dict[int, torch.nn.Module] = {}
+        attns: dict[int, torch.nn.Module] = {}
+        mlps: dict[int, torch.nn.Module] = {}
+        final_parent = None
+        final_name = None
+        for name, mod in model.named_modules():
+            m = re.search(r"layers\.(\d+)$", name)
+            if m is not None:
+                layers[int(m.group(1))] = mod
+                continue
+            m = re.search(r"layers\.(\d+)\.self_attn$", name)
+            if m is not None:
+                attns[int(m.group(1))] = mod
+                continue
+            m = re.search(r"layers\.(\d+)\.mlp$", name)
+            if m is not None:
+                mlps[int(m.group(1))] = mod
+                continue
+            if mod is self._final_norm_module:
+                final_name = name
+        if final_name is not None:
+            parent = final_name[: -len(_FINAL_NORM_SUFFIX)]
+            final_parent = model.get_submodule(parent) if parent else model
+        if not layers or not all(
+                getattr(type(layers[i]), "_dserve_save_points", False)
+                for i in layers):
+            dprint("[accumulate] model family has no graph save call sites — "
+                   "mixed FT batches stay on the eager hook path")
+            return False
+
+        L = self.num_layers
+        bufs: list = [None] * (7 * L + 1)
+        for i in range(L):
+            bufs[7 * i + 0] = self.layer_in[i]
+            if self.resid_mid:
+                bufs[7 * i + 1] = self.resid_mid[i]
+            if self.mlp_gate_up:
+                bufs[7 * i + 2] = self.mlp_gate_up[i]
+            if self.attn_qh:
+                bufs[7 * i + 3] = self.attn_qh[i]
+                bufs[7 * i + 4] = self.attn_kh[i]
+                bufs[7 * i + 5] = self.attn_vh[i]
+            if self.attn_ctx:
+                bufs[7 * i + 6] = self.attn_ctx[i]
+        if self.final_in is not None:
+            bufs[7 * L] = self.final_in
+        self.op_bufs = bufs
+        marker = torch.zeros(1, device=self.device, dtype=torch.int32)
+        self._op_marker = marker
+
+        def mark(mod, name, slot):
+            setattr(mod, SLOT_ATTR + name, int(slot))
+            if not hasattr(mod, MARKER_ATTR):
+                mod.register_buffer(MARKER_ATTR, marker, persistent=False)
+
+        for i in range(L):
+            if i in layers:
+                mark(layers[i], "layer_in", 7 * i + 0)
+                if self.resid_mid:
+                    mark(layers[i], "resid_mid", 7 * i + 1)
+            if i in mlps and self.mlp_gate_up:
+                mark(mlps[i], "gate_up", 7 * i + 2)
+            if i in attns:
+                if self.attn_qh:
+                    mark(attns[i], "q", 7 * i + 3)
+                    mark(attns[i], "k", 7 * i + 4)
+                    mark(attns[i], "v", 7 * i + 5)
+                if self.attn_ctx:
+                    mark(attns[i], "ctx", 7 * i + 6)
+        if final_parent is not None and self.final_in is not None:
+            mark(final_parent, "final_in", 7 * L)
+        self.op_ready = True
+        dprint(f"[accumulate] graph save op installed on {len(layers)} layers "
+               f"(+ final norm) — mixed FT batches may replay CUDA graphs")
+        return True
+
+    def capture_state(self):
+        """The ``ft_save`` context value for capturing / running a has_ft
+        graph: the persistent index tensors as they are (scratch-pointing
+        at capture) and the slot table."""
+        from vllm.deltaserve.ft_save_op import FtSaveState
+
+        return FtSaveState(src=self.ft_src, dst=self.ft_dst, bufs=self.op_bufs)
+
+    def arm_op_step(self, positions, num_ft: int, offset: int):
+        """Refresh the index tensors for this step: ``positions`` are the FT
+        rows in the flat batch (any order / interleaving), written to buffer
+        rows ``offset .. offset+n``; unused slots gather row 0 into the
+        scratch row. One pinned staging slot + one non-blocking H2D copy on
+        the current stream (ordered after the previous step's replay).
+        Returns the ``ft_save`` context value."""
+        n = min(int(num_ft), self.max_saved - int(offset))
+        slot = self._idx_pin_pos
+        self._idx_pin_pos = (slot + 1) % self._idx_pin.shape[0]
+        stage = self._idx_pin[slot]
+        stage[0].zero_()
+        stage[1].fill_(self.max_saved)
+        if n > 0:
+            stage[0, :n] = torch.as_tensor(positions[:n], dtype=torch.int64)
+            stage[1, :n] = torch.arange(offset, offset + n, dtype=torch.int64)
+        self.ft_src.copy_(stage[0], non_blocking=True)
+        self.ft_dst.copy_(stage[1], non_blocking=True)
+        return self.capture_state()
 
     def register_hooks(self) -> None:
         for layer, mod in self._layer_in_modules.items():
