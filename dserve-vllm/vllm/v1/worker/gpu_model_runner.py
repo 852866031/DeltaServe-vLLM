@@ -4547,12 +4547,17 @@ class GPUModelRunner(
             # [Phase 5] Yield the GPU to this forward if it carries prefill
             # tokens (TTFT-critical): pause the backward child for its duration.
             # Decode-only steps don't pause it (backward runs concurrently).
-            # Gate on pending_backward: only pause (and pay the post-forward
-            # event.synchronize() below) when a backward is ACTUALLY consuming
-            # the GPU. During the FT-accumulation phase no backward is running,
-            # so pausing + the blocking sync would stall the engine loop for
-            # nothing — that was the cause of the ~1.7s TTFT stall at the start
-            # of an inference burst.
+            # Gate on pending_backward unless ``pause_prefill_always``: with
+            # the gate, only steps issued while a backward is outstanding
+            # pause the child. Under TP the trigger rides the next
+            # SchedulerOutput and fires while the previous step is still on
+            # the GPU, so that in-flight prefill had decided "nothing to
+            # pause" and runs 2-3x against the fresh child — but the same
+            # unpaused window is where the child gets most of its cycle
+            # done when FT rides every prefill of a burst. Clearing the grant
+            # on every prefill (the flag) fixes those prefills and starves the
+            # child instead (cycles 150 → 600 ms, FT 2-3x lower, measured
+            # 2026-09-15). See FinetuneConfig.pause_prefill_always.
             _feats = getattr(scheduler_output, "_ft_step_features", None)
             # Pause reasons (OR-merged; same single set_pause caller so
             # there is no two-source race — see the design discussion in
@@ -4563,7 +4568,9 @@ class GPUModelRunner(
             #       matches the ``(total=N)`` field of the
             #       ``[deltaserve] [batch …]`` log:
             #           total = t_in (prefill incl. ft) + b_d (decode count)
-            if _feats is not None and coord.pending_backward:
+            if _feats is not None and (
+                    coord.pending_backward
+                    or self.vllm_config.finetune_config.pause_prefill_always):
                 _pause_prefill = _feats.t_in > 0
                 _ft_cfg = self.vllm_config.finetune_config
                 if _ft_cfg.fwd_token_throttle_enable:
