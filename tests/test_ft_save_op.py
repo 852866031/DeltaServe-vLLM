@@ -268,7 +268,29 @@ def test_accumulator_op_path_matches_hooks():
     C.check("second step keeps rows 4..8 from step 1", acc.layer_in[1][4:9].float(), ref.layer_in[1][4:9].float())
 
 
+def test_accumulate_final_padded():
+    """The post-forward final_hidden / ids save on a graph-PADDED output with
+    an interleaved (mask-path) FT layout — the nutanix crash of 2026-09-15."""
+    print("test_accumulate_final_padded:")
+    acc = FinetuneAccumulator(_Top().to(DEV).to(torch.bfloat16), S_MAX, D, DEV,
+                              torch.bfloat16, intermediate_size=INTER,
+                              q_size=HQ * HD, kv_size=HKV * HD)
+    n_unpadded, n_padded = 21, 24
+    hidden = torch.randn(n_padded, D, device=DEV, dtype=torch.bfloat16)
+    ids = torch.arange(n_padded, device=DEV)
+    mask = np.zeros(n_unpadded, dtype=bool)
+    pos = [1, 7, 15]
+    mask[pos] = True
+    acc.accumulate_final(hidden, ids, torch.from_numpy(mask).to(DEV), len(pos),
+                         offset=3, start=0, contiguous=False)
+    torch.cuda.synchronize()
+    C.check("final_hidden rows 3..5 = padded output at 1,7,15",
+            acc.final_hidden[3:6].float(), hidden[pos].float())
+    C.ok("ids follow the mask", acc.concat_input_ids[3:6].tolist() == pos)
+
+
 if __name__ == "__main__":
     test_capture_follows_index_contents()
     test_accumulator_op_path_matches_hooks()
+    test_accumulate_final_padded()
     C.finish()

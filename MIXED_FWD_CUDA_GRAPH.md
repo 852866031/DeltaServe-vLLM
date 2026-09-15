@@ -237,3 +237,14 @@ prefill, the child only runs in the decode-only windows, and the race had been g
 its first ~100 ms of each cycle unpaused. The flag ships **off**; turning it on is the
 right choice only once the backward has a deliberate GPU share during bursts (MPS, or a
 per-cycle unpaused budget, or pausing only when the prefill's TTFT slack is short).
+
+**Bug found on the rerun (2026-09-15, later): padded output vs unpadded mask.** The
+post-forward save of `final_hidden` / input ids (`accumulate_final`) indexed the model
+output with the FT boolean mask. Under a graph the output is padded to the capture size
+(192 rows for a 186-token batch) while the mask covers the unpadded batch → shape error →
+worker crash, 428 of 534 nutanix requests failed. Only the interleaved (mask) layout is
+affected; the contiguous slice path is immune, which is why tight and loose never hit it.
+Fixed by slicing to the mask's length before masking; `tests/test_ft_save_op.py` now
+covers it (30/30). Rerun: 534/534, 100 % TTFT, FT 420 → 487 tok/s, 376 mixed steps with
+60-token samples, no tracebacks. Fresh figures for all three traces are in
+`eval-tp/plots/` and `eval-tp/output/step_trace_*.png`.
