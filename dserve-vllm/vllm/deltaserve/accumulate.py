@@ -620,8 +620,13 @@ class FinetuneAccumulator:
             rows = hidden_states[start:start + num_ft]
             ids = input_ids_flat[start:start + num_ft]
         else:
-            rows = hidden_states[mask_gpu]
-            ids = input_ids_flat[mask_gpu]
+            # [mixed-fwd-cuda-graph] Under a CUDA graph the model output (and
+            # the persistent input-id buffer) is PADDED to the capture size;
+            # the mask covers the unpadded batch. Slice to the mask's length
+            # before masking (a no-op on eager steps).
+            n_mask = int(mask_gpu.shape[0])
+            rows = hidden_states[:n_mask][mask_gpu]
+            ids = input_ids_flat[:n_mask][mask_gpu]
         n = min(rows.shape[0], self.max_saved - offset)
         if n <= 0:
             return
