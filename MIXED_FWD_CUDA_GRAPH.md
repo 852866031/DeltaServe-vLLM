@@ -221,3 +221,19 @@ mixed FT batch and `eager` on every FT-only one; `ft_mixed` predicted to 1.1–1
 prediction with no backward flagged, both right after a mixed FT step (seq 938, 1270); the
 next-step-after-trigger contention seen last week now lands mid-burst more often. Rare (2 of
 25 clean prefills), noted for follow-up.
+
+**Follow-up: the unpaused step after a mixed FT step (2026-09-15, later).** Diagnosed as the
+TP trigger race: the relayed trigger fires while the previous step is still on the GPU, and
+that step decided "nothing to pause" before the backward existed. Under the eager path the
+buffer mostly filled in idle gaps; with FT riding bursts the trigger lands with a prefill
+in flight, and ~15 % of the steps following a mixed step ran > 1.4× (tight 26, loose 15,
+nutanix 89; the nutanix baseline already had 44). The fix — clear the grant on every
+prefill-carrying step, not only while a backward is outstanding
+(`finetune.pause_prefill_always`) — removes the slow *prefill* successors entirely (the
+slow *decode* successors are policy: decodes never pause), but backward cycles go from
+~150 ms to 540–630 ms median with maxima of 10–25 s and FT throughput drops 2–3× (tight
+400 → 168 tok/s, loose 739 → 132, nutanix 488 → 155): in a burst where FT rides every
+prefill, the child only runs in the decode-only windows, and the race had been giving it
+its first ~100 ms of each cycle unpaused. The flag ships **off**; turning it on is the
+right choice only once the backward has a deliberate GPU share during bursts (MPS, or a
+per-cycle unpaused budget, or pausing only when the prefill's TTFT slack is short).

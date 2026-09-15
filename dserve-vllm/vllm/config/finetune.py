@@ -429,6 +429,19 @@ class FinetuneConfig:
     ``max_cudagraph_capture_size``). Mixed FT steps above it run the compiled
     forward without a graph."""
 
+    pause_prefill_always: bool = False
+    """[pause] Clear the backward child's GPU grant on EVERY prefill-carrying
+    step, not only while a backward is outstanding. Closes the TP trigger
+    race (the relayed trigger fires while the previous step is still on the
+    GPU; that step decided "nothing to pause" and ran 2-3x against the fresh
+    child). Measured on Qwen3-14B TP=2 with mixed FT batches graphed: the
+    prefills after a mixed step are fixed (0 slow), but the child then only
+    runs in decode-only windows during bursts — backward cycles 150 → 540-630
+    ms median (max 10-25 s) and FT throughput 2-3x lower — because the race
+    had been giving the child its first ~100 ms of every cycle unpaused.
+    Off (default) keeps that behaviour; on protects the in-flight prefill at
+    the cost of FT throughput until the child has a deliberate GPU share."""
+
     pause_until_prefill_done: bool = True
     """Keep the backward child paused until the inference prefill that paused
     it has actually COMPLETED on the GPU (default). ``False`` re-sets the GPU
