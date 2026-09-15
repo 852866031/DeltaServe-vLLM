@@ -1648,6 +1648,21 @@ one; unchanged for now. The step trace records both `pred_raw` (model) and `pred
 
 ---
 
+## Branch `mixed-fwd-cuda-graph` — CUDA graphs for mixed FT batches (2026-09-15)
+
+Implemented, gated and measured; the design, results and costs are in
+`MIXED_FWD_CUDA_GRAPH.md` (root). Summary: the activation saves became a graph-capturable
+custom op (`deltaserve/ft_save_op.py`, fixed-shape gathers through persistent index
+tensors read from the forward context, kept alive by a marker mutation), Qwen3's layer code
+calls it at the seven save points, and mixed batches (inference + FT) dispatch into a
+second piecewise capture set keyed `has_ft`; FT-only batches stay eager (mid-forward
+abort). `finetune.graph_ft_batches` (off = bit-identical); the finetune graph flags are
+part of the torch.compile cache key. Qwen3-14B TP=2: FT +39 / +8 / +16 % (tight / loose /
+nutanix) at 100 % TTFT, the FT cost per mixed step 14 → 4–8 ms, worker host time 45 → 2 ms;
+paid for in TBT (the gate now fills to the 50 ms limit on 11× more steps: worst-TBT > 50 ms
+on 92 % of tight requests vs 12 %) and graph memory (+1.8 GiB, KV cache halved). Gates:
+`tests/test_ft_save_op.py` 28/28, CPU gates re-pass, 0.6B hook-vs-graph parity.
+
 ## Phase 8 — Qwen3 family + backward-service restructure ✅ (Qwen3-14B TP=2 GPU-validated; 0.6B smoke + Llama rope_theta re-check done 2026-09-08)
 
 **Goal.** Add `Qwen3ForCausalLM` (Qwen/Qwen3-14B-Base at TP=2 on the 2× 5090; Qwen/Qwen3-0.6B-Base

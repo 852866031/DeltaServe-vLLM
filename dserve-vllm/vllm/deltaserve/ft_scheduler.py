@@ -127,6 +127,13 @@ class FinetuneScheduler(AsyncScheduler):
         # budget but the estimator is still trained online.
         self._estimator = MergedExecutionEstimator()
         self._tracker = StepExecutionTracker()
+        # [mixed-fwd-cuda-graph] mixed FT batches replay graphs while FT-only
+        # batches stay eager → two different cost models; split the FT regime
+        # by composition only when the feature is on (off = bit-identical).
+        self._graph_ft_batches = bool(getattr(ft_cfg, "graph_ft_batches", False))
+        if self._graph_ft_batches:
+            from vllm.deltaserve.estimator import set_ft_mixed_split
+            set_ft_mixed_split(True)
         self._stats_csv_path = getattr(
             ft_cfg, "batch_prediction_stats_path", None)
         # [validate_estimator] Per-batch predicted-vs-actual append mode.
@@ -439,10 +446,12 @@ class FinetuneScheduler(AsyncScheduler):
                 prefill_lens=new_prefill_lens,
             )
 
-            # Predict the step cost if this sample were admitted (forces eager).
+            # Predict the step cost if this sample were admitted. The regime
+            # is composition-derived: EAGER (FT-only) or, when mixed FT batches
+            # replay graphs, FT_MIXED for a step that also carries inference.
             if self._estimator.is_ready:
                 t_with_ft = self._estimator.predict(
-                    hypothetical, regime=REGIME_EAGER)
+                    hypothetical, regime=hypothetical.regime())
                 # SLO checks on the hypothetical-with-FT prediction.
                 if feats.b_d > 0:
                     effective_tbt = self._max_tbt_slo * decode_only_margin
@@ -528,8 +537,14 @@ class FinetuneScheduler(AsyncScheduler):
                         total_tokens: int) -> bool:
         """Query vLLM's real CUDAGraph dispatcher (shared via the coordinator on
         single-GPU). Co-serve steps force eager; no dispatcher ⇒ eager."""
+        _mixed_graph = False
         if feats.has_ft:
-            return False
+            # [mixed-fwd-cuda-graph] a mixed batch may replay a has_ft graph;
+            # FT-only stays eager.
+            _mixed_graph = (self._graph_ft_batches
+                            and (feats.t_in > feats.t_ft or feats.b_d > 0))
+            if not _mixed_graph:
+                return False
         disp = self._coord.cudagraph_dispatcher
         if disp is None:
             return False
@@ -539,7 +554,8 @@ class FinetuneScheduler(AsyncScheduler):
             num_tokens=int(total_tokens),
             uniform_decode=uniform_decode,
             has_lora=has_lora,
-            num_active_loras=len(lora_ids))
+            num_active_loras=len(lora_ids),
+            has_ft=_mixed_graph)
         return mode != CUDAGraphMode.NONE
 
     def has_requests(self) -> bool:

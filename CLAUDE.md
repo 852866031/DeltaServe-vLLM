@@ -247,6 +247,15 @@ fp32/bf16, incl. the overflow fallback) and `tests/test_tp_trainer_graph_nccl.py
 yet:** the live graph-vs-eager A/B on the real models.
 → Full detail, invariants, and run commands in **"Tensor parallelism (Phase 7)"** below.
 
+**Branch `mixed-fwd-cuda-graph` (2026-09-15) — mixed FT batches replay CUDA graphs.**
+See `MIXED_FWD_CUDA_GRAPH.md`. `finetune.graph_ft_batches` (ON in the Qwen3 YAMLs on this
+branch): the saves go through `torch.ops.vllm.dserve_save_rows` (`deltaserve/ft_save_op.py`)
+and mixed batches dispatch into a `has_ft` piecewise capture set; FT-only stays eager. FT
++39 / +8 / +16 % on tight / loose / nutanix at 100 % TTFT, mixed-step FT cost 14 → 4–8 ms,
+but the TBT gate now fills to its limit (worst-TBT > 50 ms on 92 % of tight requests) and
+graph memory +1.8 GiB halves the KV cache. The finetune graph flags are in the compile
+cache key (toggling the feature recompiles). `eval-tp/compare_runs.py` prints the A/B.
+
 **Estimator validation under TP (2026-09-08, night) — done, Qwen3-14B TP=2.** The
 per-step trace (`finetune.step_trace_path`; `eval-tp/auto_benchmark_tp.py --step-trace`
 + `eval-tp/analyze_step_trace.py`) showed the predictor accurate for every step admission
@@ -417,9 +426,19 @@ Insertion points for DeltaServe pieces:
 
 ### Hard invariants / mismatches to design around (plan §2)
 
-1. **Any batch containing FT tokens runs eager.** Capturing side-effecting activation
-   copies inside a piecewise CUDA graph reintroduces the pool-aliasing NaN trap. This is
-   the same gate DeltaServe enforces at `lora_unordered_batch_mixed.py:171-177` (`not has_ft`).
+1. **FT-only batches run eager; mixed batches (inference + FT) may replay CUDA graphs
+   (branch `mixed-fwd-cuda-graph`, `finetune.graph_ft_batches`).** The original rule —
+   every FT-carrying batch eager, DeltaServe's `not has_ft` gate — existed because the
+   activation saves were Python hooks reading per-step state (positions, the reserved
+   offset), which a capture bakes in, and because saving into graph-pool memory caused
+   the pool-aliasing NaN trap. Mixed batches now save through
+   `torch.ops.vllm.dserve_save_rows` (`deltaserve/ft_save_op.py`): fixed-shape gathers
+   through persistent index tensors whose *contents* change per step, destination the
+   persistent IPC buffer, copy inside the replay — so neither problem can occur — and
+   dispatch into a second piecewise capture set keyed `has_ft`. FT-only batches keep the
+   eager hook path because the mid-forward abort is a Python exception between layers.
+   Only families with the `maybe_save` call sites (Qwen3) take the graph path; others
+   silently stay eager. Off → bit-identical to before.
 2. **FT samples are prefill-only.** They go through the forward once to produce
    activations, then the backward process consumes them — they must never enter the decode
    loop, hold KV past the step, or emit sampler output. Single-step-prefill-then-retire.

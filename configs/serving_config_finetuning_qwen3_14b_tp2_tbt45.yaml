@@ -49,7 +49,7 @@ finetune:
 slo:
   ttft_slo: 0.4
   avg_tbt_slo: 0.02
-  max_tbt_slo: 0.05
+  max_tbt_slo: 0.045                # [mixed-fwd-cuda-graph A/B] tighter TBT target to buy back the TBT cost of denser FT admission
   # M4.2: the runner's per-step timing samples and the profiling pass's
   # record gate now ride the TP relay (ModelRunnerOutput.finetune_timing /
   # SchedulerOutput.finetune_record_timing), so the launch-time profiling

@@ -139,6 +139,7 @@ class CudagraphDispatcher:
         uniform_decode: bool,
         has_lora: bool,
         num_active_loras: int = 0,
+        has_ft: bool = False,
     ) -> BatchDescriptor:
         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
         uniform_decode_query_len = self.uniform_decode_query_len
@@ -157,6 +158,7 @@ class CudagraphDispatcher:
             uniform=uniform_decode,
             has_lora=has_lora,
             num_active_loras=num_active_loras,
+            has_ft=has_ft,
         )
 
     def add_cudagraph_key(
@@ -205,6 +207,29 @@ class CudagraphDispatcher:
                 if cudagraph_mode.mixed_mode() == CUDAGraphMode.PIECEWISE:
                     batch_desc = replace(batch_desc, num_reqs=None, uniform=False)
                 self.add_cudagraph_key(cudagraph_mode.mixed_mode(), batch_desc)
+            # [DeltaServe / mixed-fwd-cuda-graph] A second PIECEWISE set keyed
+            # has_ft=True for mixed batches (inference + FT samples): same
+            # sizes up to finetune.graph_ft_max_tokens, LoRA cases with an
+            # adapter active (an FT batch always carries the FT adapter).
+            _ft_cfg = getattr(self.vllm_config, "finetune_config", None)
+            if (_ft_cfg is not None and getattr(_ft_cfg, "enable_finetuning", False)
+                    and getattr(_ft_cfg, "graph_ft_batches", False)
+                    and cudagraph_mode.mixed_mode() == CUDAGraphMode.PIECEWISE):
+                _ft_max = int(getattr(_ft_cfg, "graph_ft_max_tokens", 512))
+                _n = 0
+                for bs, num_active_loras in product(
+                    self.compilation_config.cudagraph_capture_sizes, lora_cases
+                ):
+                    if bs > _ft_max or num_active_loras <= 0:
+                        continue
+                    batch_desc = self._create_padded_batch_descriptor(
+                        bs, False, True, num_active_loras, has_ft=True
+                    )
+                    batch_desc = replace(batch_desc, num_reqs=None, uniform=False)
+                    self.add_cudagraph_key(CUDAGraphMode.PIECEWISE, batch_desc)
+                    _n += 1
+                logger.info("[deltaserve] has_ft piecewise cudagraph keys: %d "
+                            "(sizes <= %d)", _n, _ft_max)
 
         # if decode cudagraph mode is FULL, and we don't already have mixed
         # mode full cudagraphs then add them here.
@@ -244,6 +269,7 @@ class CudagraphDispatcher:
         num_active_loras: int = 0,
         valid_modes: AbstractSet[CUDAGraphMode] | None = None,
         invalid_modes: AbstractSet[CUDAGraphMode] | None = None,
+        has_ft: bool = False,
     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
         """
         Given conditions(e.g.,batch descriptor and if using piecewise only),
@@ -305,8 +331,12 @@ class CudagraphDispatcher:
 
         normalized_uniform = uniform_decode and self.cudagraph_mode.separate_routine()
         batch_desc = self._create_padded_batch_descriptor(
-            num_tokens, normalized_uniform, has_lora, effective_num_active_loras
+            num_tokens, normalized_uniform, has_lora, effective_num_active_loras,
+            has_ft=has_ft,
         )
+        # [DeltaServe] mixed FT batches only ever match the has_ft PIECEWISE set.
+        if has_ft:
+            allowed_modes = allowed_modes - {CUDAGraphMode.FULL}
 
         if CUDAGraphMode.FULL in allowed_modes:
             # check if key exists for full cudagraph

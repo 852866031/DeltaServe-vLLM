@@ -18,7 +18,7 @@ finetune:
   enable_finetuning: true
   start_on_launch: false             # hold FT admission closed until POST /start_finetuning
   backward_mps_percentage: 0         # no MPS daemon on this box; the pause contract protects prefill
-  graph_ft_batches: true             # [mixed-fwd-cuda-graph] mixed batches (inference + FT) replay has_ft CUDA graphs; FT-only stays eager
+  graph_ft_batches: false            # [mixed-fwd-cuda-graph] mixed batches (inference + FT) replay has_ft CUDA graphs; FT-only stays eager
   graph_ft_max_tokens: 512           # capture the has_ft set up to this padded size
   finetuning_lora_path: ../adapters/qwen3-0.6b-toy-lora-ft
   data_path: ../alpaca_1000.txt

@@ -3728,6 +3728,7 @@ class GPUModelRunner(
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        has_ft: bool = False,
     ) -> tuple[
         CUDAGraphMode,
         BatchDescriptor,
@@ -3766,6 +3767,7 @@ class GPUModelRunner(
                 num_active_loras=num_active_loras,
                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
+                has_ft=has_ft,
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
@@ -3974,6 +3976,8 @@ class GPUModelRunner(
         self._ft_sample_lens = []
         self._ft_start = 0
         self._ft_contiguous = False
+        self._ft_positions_np = None
+        self._ft_graph_step = False
         ft_ids = getattr(scheduler_output, "finetune_req_ids", None)
         if not ft_ids:
             return
@@ -4006,6 +4010,16 @@ class GPUModelRunner(
         self._ft_mask_gpu = torch.from_numpy(mask).to(
             self.device, non_blocking=True
         )
+        # [mixed-fwd-cuda-graph] A MIXED batch (inference tokens present) may
+        # run the compiled forward + has_ft graphs with the save op; FT-only
+        # batches keep the eager hook path (mid-forward abort). Decided here,
+        # before dispatch, from the config + the accumulator's readiness.
+        _acc = getattr(self, "_finetune_accumulator", None)
+        if (n < total and _acc is not None and getattr(_acc, "op_ready", False)
+                and self.vllm_config.finetune_config.graph_ft_batches
+                and self.vllm_config.finetune_config.save_activations):
+            self._ft_positions_np = np.flatnonzero(mask)
+            self._ft_graph_step = True
 
     def _log_finetuning_batch(self, scheduler_output: "SchedulerOutput",
                               cudagraph_mode) -> None:
@@ -4314,12 +4328,14 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
-                # [DeltaServe] any step with FT tokens MUST run eager (capturing
-                # side-effecting activation copies inside a CUDA graph triggers
-                # the pool-aliasing NaN trap).
-                force_eager=self._ft_has,
+                # [DeltaServe] a step with FT tokens runs eager (the activation
+                # hooks read per-step Python state) — unless it is a MIXED batch
+                # on the graph-capturable save path (mixed-fwd-cuda-graph), which
+                # dispatches into the has_ft piecewise set.
+                force_eager=self._ft_has and not self._ft_graph_step,
+                has_ft=self._ft_graph_step,
             )
-            if self._ft_has:
+            if self._ft_has and not self._ft_graph_step:
                 assert cudagraph_mode == CUDAGraphMode.NONE, (
                     "[deltaserve] FT step must be eager, got "
                     f"{cudagraph_mode}"
@@ -4466,10 +4482,17 @@ class GPUModelRunner(
             self._ft_offset = int(_stashed_off)
         else:
             self._ft_offset = coord.current_offset() if coord is not None else 0
+        _ft_save_ctx = None
         if self._ft_has and accumulator is not None and save_acts:
-            accumulator.begin_step(
-                self._ft_mask_gpu, self._ft_num, self._ft_offset,
-                start=self._ft_start, contiguous=self._ft_contiguous)
+            if self._ft_graph_step:
+                # Graph path: refresh the persistent index tensors; the hooks
+                # stay disarmed (they are inert inside the compiled forward).
+                _ft_save_ctx = accumulator.arm_op_step(
+                    self._ft_positions_np, self._ft_num, self._ft_offset)
+            else:
+                accumulator.begin_step(
+                    self._ft_mask_gpu, self._ft_num, self._ft_offset,
+                    start=self._ft_start, contiguous=self._ft_contiguous)
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -4642,9 +4665,12 @@ class GPUModelRunner(
                         batch_descriptor=batch_desc,
                         ubatch_slices=ubatch_slices_padded,
                         slot_mapping=slot_mappings,
-                        # [DeltaServe] bypass the compiled graph on FT steps so the
-                        # submodule forward hooks (Milestone 2) reliably fire.
-                        skip_compiled=has_encoder_input or self._ft_has,
+                        # [DeltaServe] bypass the compiled graph on eager FT steps
+                        # so the submodule forward hooks reliably fire; mixed
+                        # graph steps run compiled with the save op armed.
+                        skip_compiled=has_encoder_input
+                        or (self._ft_has and not self._ft_graph_step),
+                        ft_save=_ft_save_ctx,
                     ),
                     record_function_or_nullcontext("gpu_model_runner: forward"),
                     self.maybe_get_kv_connector_output(
@@ -6198,6 +6224,7 @@ class GPUModelRunner(
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        has_ft: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -6310,6 +6337,8 @@ class GPUModelRunner(
                 # `force_num_active_loras` is used for cudagraph capture; because we
                 # need to capture graphs for specific num_active_loras counts
                 force_num_active_loras=num_active_loras,
+                # [DeltaServe] capture / warm the has_ft piecewise set
+                has_ft=has_ft,
             )
         )
 
@@ -6468,6 +6497,11 @@ class GPUModelRunner(
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
                     slot_mapping=slot_mappings,
+                    # [DeltaServe] the save op must be live while a has_ft graph
+                    # is warmed / captured (index tensors point at scratch).
+                    ft_save=(self._finetune_accumulator.capture_state()
+                             if has_ft and getattr(self, "_finetune_accumulator", None)
+                             is not None else None),
                 ),
             ):
                 outputs = self.model(
@@ -7131,6 +7165,7 @@ class GPUModelRunner(
                 remove_lora=False,
                 num_active_loras=desc.num_active_loras,
                 profile_seq_lens=profile_seq_lens,
+                has_ft=desc.has_ft,
             )
         self._dummy_run(
             desc.num_tokens,
@@ -7142,6 +7177,7 @@ class GPUModelRunner(
             num_active_loras=desc.num_active_loras,
             is_graph_capturing=True,
             profile_seq_lens=profile_seq_lens,
+            has_ft=desc.has_ft,
         )
 
     def _capture_cudagraphs(

@@ -1,6 +1,7 @@
 # Branch `mixed-fwd-cuda-graph` — CUDA graphs for forward steps that carry finetuning samples
 
-Status: **design only, nothing implemented.** This file states what the branch is for, why
+Status: **implemented and gated (2026-09-15)** — see "Implementation status" at the end;
+the design below is what was built. This file states what the branch is for, why
 the current code cannot do it, the proposed way, what it is expected to buy and cost, and
 the order of work. Numbers are from the 2026-09-08 step traces on Qwen3-14B, two RTX 5090s
 (TP=2), no MPS — see INTEGRATION_PROGRESS.md, Phase 7, "Estimator validation under TP".
@@ -140,3 +141,83 @@ saved rows follow the contents, not the capture.
 Main risk: vLLM's compile wrapper freezes Python-side behaviour at trace time, so every
 per-step value must travel through the forward context or device buffers; a leaked Python
 value does not fail, it silently freezes.
+
+## Implementation status (2026-09-15)
+
+Built as designed, with two deviations found while implementing:
+
+- **Keeping the op alive.** In this torch build an output-less custom op with no
+  declared mutation is dead-code-eliminated by Dynamo and Inductor (`is_impure` is
+  mutation/effect based; vLLM's own `unified_kv_cache_update` survives only because its
+  dummy output feeds the attention op). The save op therefore declares a mutation on a
+  1-element `marker` buffer registered on the calling module — the same mechanism as
+  the attention op's `output` — while the real destination comes from the forward
+  context by slot id. Cost: one tiny in-place kernel per call.
+- **Where the residual sum is formed.** The hooks summed `hidden + residual` over the
+  whole batch before the fused add-norm; the op gathers both rows first and adds only
+  the `max_saved` rows.
+
+Gates: `tests/test_ft_save_op.py` 28/28 (a graph captured once writes the rows the
+index tensors name at replay, interleaved rows, a second offset, `ft_save=None`
+captures nothing; the accumulator's op path matches the hook path bit-for-bit on a fake
+vLLM-named model), the CPU gates (`test_accumulate_hooks` 153/153, `test_merged_estimator`
+57/57 incl. the `ft_mixed` split, relay 26/26, step trace 28/28), and the Qwen3-0.6B
+single-GPU co-serving smoke (tight trace, `DSERVE_TP_DIAG=1`): 339 mixed FT batches
+replayed `graph(PIECEWISE)`, all 331 FT-only batches eager, no tracebacks, loss
+4.40 → 1.71 over 669 cycles, `ft_mixed` predicted to 0.2 ms RMSE. Capture set on the
+0.6B: +51 `has_ft` piecewise graphs, 0.90 GiB total.
+
+## Results (2026-09-15, Qwen3-14B, TP=2, TTFT SLO 0.4 s, max-TBT 50 ms unless noted)
+
+Baseline = the same code with `graph_ft_batches: false` (the `tp` branch behaviour, runs of
+2026-09-08 night); "graphed" = this branch. Same traces, same SLOs, same stack otherwise.
+Per-step numbers from the step trace (`eval-tp/compare_runs.py`).
+
+| | tight (dense) | | loose | | Nutanix 600–800 s | |
+|---|---|---|---|---|---|---|
+| | baseline | graphed | baseline | graphed | baseline | graphed |
+| TTFT satisfaction | 100 % | 100 % | 100 % | 100 % | 100 % | 100 % |
+| TTFT p50 / p95 / p99 (ms) | 76 / 94 / 121 | 112 / 167 / 208 | 75 / 95 / 132 | 109 / 166 / 228 | 74 / 115 / 178 | 78 / 175 / 262 |
+| FT tok/s | 289 | **400 (+39 %)** | 685 | 739 (+8 %) | 420 | **488 (+16 %)** |
+| prefill steps carrying FT | 17 / 480 | **189 / 474** | — | 77 | 228 / 534 | 361 / 533 |
+| FT tokens per mixed step (p50) | 23 | 24 | — | — | 29 | **62** |
+| mixed step time (p50) | 49.6 ms | 46.8 ms | — | 48.4 ms | 47.9 ms | 46.6 ms |
+| FT cost above the same inference composition (p50) | 14.0 ms | **4.3 ms** | — | — | 14.4 ms | **8.4 ms** |
+| worker host time per mixed step | 45 ms | **2 ms** | 62 ms | 2 ms | 45 ms | 2 ms |
+| requests with worst-TBT > 50 ms | 57 / 480 | **442 / 480** | 60 / 240 | 196 / 240 | 188 / 534 | 383 / 534 |
+| avg-TBT p50 | 29 ms | 39 ms | 26 ms | 31 ms | 20 ms | 25 ms |
+| backward cycles in window | 54 | 76 | 125 | 136 | 319 | 371 |
+
+**What the mechanism delivered.** The marginal cost of putting FT samples into an inference
+step fell from ~14 ms to 4–8 ms (the eager penalty is gone; what remains is the samples'
+own compute plus the ~1–2 ms fixed-size save), and the worker CPU went from saturated
+(45–62 ms of Python per mixed step) to 2 ms. Because the admission gate sits at the 50 ms
+TBT limit, that headroom is spent immediately: 11× more prefill steps carry FT on tight,
+and on Nutanix each mixed step carries twice the FT tokens. FT throughput +39 / +8 / +16 %.
+
+**What it costs.** Exactly the trade the design note predicted, only sharper: every decoding
+request now rides ~47 ms mixed steps far more often, so avg TBT rises ~10 ms on tight and
+the worst-TBT > 50 ms count goes from 12 % to 92 % of requests. The gate admits up to a
+*predicted* 50 ms with the (inert, 0.2 %) safety margin, so steps at 47–50 ms predicted
+routinely measure 50–55 ms. TTFT stays at 100 % everywhere; medians move up toward the
+SLO as designed. Memory: the second capture set raised graph memory 4.99 → 6.81 GiB and
+halved the KV cache (59.7k → 32.1k tokens on 2048-token requests; still 15.7× concurrency,
+enough here). Startup: +63 s compile once (cached), +13 s capture.
+
+**Buying the TBT back.** Tight with `max_tbt_slo: 0.045`
+(`configs/serving_config_finetuning_qwen3_14b_tp2_tbt45.yaml`): FT 289 → 324 tok/s (+12 %),
+119 mixed steps at 43.7 ms, worst-TBT > 50 ms on 159 / 480 (was 442 with the 50 ms target,
+57 in the baseline), TTFT 100 %, p50 81 ms. The gate does exactly what its target says; a
+real safety margin (relative or absolute, see INTEGRATION_PROGRESS.md) would let the 50 ms
+target mean 50 ms measured.
+
+**Correctness.** Qwen3-0.6B single GPU, tight, hook path vs graph path with the
+rematerialization check on: loss cycle-for-cycle 4.402/4.403 → 3.576/3.566 → 2.327/2.325 →
+1.735/1.730, equal FT tokens (103k), remat errors at bf16 noise in both (the graph run's
+are lower), no tracebacks. Under TP the `[batch]` log shows `graph(PIECEWISE)` on every
+mixed FT batch and `eager` on every FT-only one; `ft_mixed` predicted to 1.1–1.5 ms RMSE.
+
+**Observed, not resolved.** Two inference-prefill steps on loose ran ~2.6–2.9× their
+prediction with no backward flagged, both right after a mixed FT step (seq 938, 1270); the
+next-step-after-trigger contention seen last week now lands mid-burst more often. Rare (2 of
+25 clean prefills), noted for follow-up.

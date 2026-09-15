@@ -18,6 +18,8 @@ import numpy as np
 from vllm.deltaserve.estimator import (
     REGIME_DECODE_BWD,
     REGIME_DECODE_ONLY,
+    REGIME_FT_MIXED,
+    set_ft_mixed_split,
     REGIME_EAGER,
     REGIME_INF_PREFILL,
     MergedExecutionEstimator,
@@ -383,7 +385,50 @@ def test_decode_bwd_regime():
     check(f"cold decode_bwd falls back to decode_only ({r})", r == REGIME_DECODE_ONLY)
 
 
+def test_ft_mixed_split():
+    print("test: ft_mixed regime split (mixed-fwd-cuda-graph)")
+    rng = np.random.default_rng(11)
+    mixed = StepFeatures(t_in=100, p=2, t_ft=36.0, b_d=3, k=300, prefill_lens=[64, 36])
+    ft_only = StepFeatures(t_in=64, p=1, t_ft=64.0, prefill_lens=[64])
+    ft_on_decode = StepFeatures(t_in=32, p=1, t_ft=32.0, b_d=4, k=500, prefill_lens=[32])
+    check("split off: mixed → EAGER", mixed.regime() == REGIME_EAGER)
+    set_ft_mixed_split(True)
+    try:
+        check("split on: mixed → FT_MIXED", mixed.regime() == REGIME_FT_MIXED)
+        check("split on: FT on decode → FT_MIXED", ft_on_decode.regime() == REGIME_FT_MIXED)
+        check("split on: FT-only stays EAGER", ft_only.regime() == REGIME_EAGER)
+        # Fit: FT-only samples at one cost, mixed samples at a cheaper one
+        # (the graph); each regime recovers its own constant.
+        est = MergedExecutionEstimator()
+        tr = StepExecutionTracker()
+        for _ in range(40):
+            f = make_eager_features(rng)          # has b_d → mixed under the split
+            tr.add(f, true_time_eager(f) - 0.012)  # 12 ms cheaper: graphed
+            g = StepFeatures(t_in=64 + rng.integers(0, 64), p=1, t_ft=0.0)
+            g.t_ft = g.t_in
+            g.prefill_lens = [int(g.t_in)]
+            tr.add(g, true_time_eager(g))
+        est.data_fit(tr)
+        check("both FT regimes fitted",
+              est._params[REGIME_FT_MIXED].is_fitted and est._params[REGIME_EAGER].is_fitted)
+        c_mixed = est._params[REGIME_FT_MIXED].c
+        check(f"ft_mixed constant is the graphed one ({c_mixed:.4f} ≈ {TRUE_EAGER['c'] - 0.012:.4f})",
+              abs(c_mixed - (TRUE_EAGER["c"] - 0.012)) < 2e-3)
+        # Cold FT_MIXED borrows EAGER (same physics minus the graph).
+        est2 = MergedExecutionEstimator(); tr2 = StepExecutionTracker()
+        for _ in range(20):
+            g = StepFeatures(t_in=64, p=1, t_ft=64.0, prefill_lens=[64])
+            tr2.add(g, true_time_eager(g))
+        est2.data_fit(tr2)
+        r, _ = est2._select(mixed)
+        check(f"cold ft_mixed falls back to eager ({r})", r == REGIME_EAGER)
+    finally:
+        set_ft_mixed_split(False)
+    check("split off again: mixed → EAGER", mixed.regime() == REGIME_EAGER)
+
+
 def main():
+    test_ft_mixed_split()
     test_decode_bwd_regime()
     test_recovery()
     test_prediction()

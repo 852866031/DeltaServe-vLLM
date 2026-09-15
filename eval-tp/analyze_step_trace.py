@@ -295,12 +295,12 @@ def report(steps: list[Step], results, t0: float | None, slo: float,
         out(f"  -- {reg}")
         out(acc_line("   backward in flight", [s for s in rs if s.pending_bwd]))
         out(acc_line("   no backward", [s for s in rs if s.pending_bwd is False]))
-        if reg in ("inf_prefill", "eager"):
+        if reg in ("inf_prefill", "eager", "ft_mixed"):
             out(acc_line("   child paused for this step",
                          [s for s in rs if s.paused_bwd]))
             out(acc_line("   bwd in flight, NOT paused",
                          [s for s in rs if s.pending_bwd and not s.paused_bwd]))
-        if reg == "eager":
+        if reg in ("eager", "ft_mixed"):
             out(acc_line("   FT-only (no inference)", [s for s in rs if s.ft_only]))
             out(acc_line("   co-serving (FT + inference)",
                          [s for s in rs if not s.ft_only]))
@@ -474,7 +474,7 @@ def report(steps: list[Step], results, t0: float | None, slo: float,
 # ─── plot (optional) ────────────────────────────────────────────────────────
 
 _SERIES = {"inf_prefill": "#2a78d6", "eager": "#eb6834", "decode_only": "#1baf7a",
-           "decode_bwd": "#eda100"}
+           "decode_bwd": "#eda100", "ft_mixed": "#e87ba4"}
 REGIMES = tuple(_SERIES)
 
 
@@ -546,14 +546,14 @@ def plot(steps: list[Step], results, t0, slo, window, out_png: str,
     ax = axes[2]
     for lab, col, sel in (("backward in flight", "#eb6834", lambda s: s.pending_bwd),
                           ("no backward", "#2a78d6", lambda s: s.pending_bwd is False)):
-        rs = sorted(s.ratio for s in win if sel(s) and s.regime in ("inf_prefill", "eager"))
+        rs = sorted(s.ratio for s in win if sel(s) and s.regime in ("inf_prefill", "eager", "ft_mixed"))
         if rs:
             ax.plot(rs, [i / len(rs) for i in range(len(rs))], color=col, lw=2,
                     label=f"{lab} (n={len(rs)}): median {pct(rs, .5):.2f}×, "
                           f"90th {pct(rs, .9):.2f}×, max {rs[-1]:.2f}×")
     ax.axvline(1.0, color="#9a9a94", lw=1, ls="--")
     ax.set_xlim(0.8, max(1.5, pct([s.ratio for s in win
-                                   if s.regime in ("inf_prefill", "eager")], .999) * 1.05))
+                                   if s.regime in ("inf_prefill", "eager", "ft_mixed")], .999) * 1.05))
     ax.set_xlabel("measured / predicted (prefill-carrying steps)")
     ax.set_ylabel("CDF"); ax.set_title("interference check")
     ax.legend(frameon=False, fontsize=8); ax.grid(True, which="both", color="#e6e6e2", lw=0.6)
