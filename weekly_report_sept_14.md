@@ -83,7 +83,7 @@ bf16 noise.
 
 ## 3. What it bought, and what it cost
 
-![Finetuning throughput, per-step finetuning cost, and token-gap violations, before and after](figures/weekly_sept_14/fig2_before_after.png)
+![Finetuning throughput and per-step finetuning cost, before and after](figures/weekly_sept_14/fig2_before_after.png)
 
 | | dense (tight) | | loose | | Nutanix 600–800 s | |
 |---|---|---|---|---|---|---|
