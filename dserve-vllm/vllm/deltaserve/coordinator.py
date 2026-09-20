@@ -558,6 +558,14 @@ class FinetuneCoordinator:
                         f"[rps_throttle] release: {_reason} → "
                         f"admission_open=True "
                         f"(held for {_held_for:.2f}s)")
+            if self.rps_throttle_active:
+                # Still engaged: re-assert the close every step. The other
+                # writers of ``admission_open`` run before this check in
+                # ``schedule()`` — in particular ``poll_backward`` reopens
+                # admission when a backward finishes — and without this a
+                # backward completing mid-burst let FT samples into the
+                # burst's prefill steps although the throttle was engaged.
+                self.admission_open = False
         else:
             # Idle → engage when load crosses close_rps.
             if cur_rps > close_rps:
