@@ -4098,7 +4098,7 @@ class GPUModelRunner(
         if _ftc.fwd_token_throttle_enable:
             _thr = int(_ftc.fwd_token_throttle)
             _inf_total = prefill + len(decode_kv)
-            _hit = _inf_total > _thr if _thr > 0 else False
+            _hit = _inf_total >= _thr if _thr > 0 else False
             throttle_part = (f" | fwd_throttle={_thr} "
                              f"inf_total={_inf_total} "
                              f"({'HIT' if _hit else 'ok'})")
@@ -4186,7 +4186,7 @@ class GPUModelRunner(
                     _idle_inf_prefill = (int(_idle_feats.t_in)
                                          - int(_idle_feats.t_ft))
                     _idle_total = _idle_inf_prefill + int(_idle_feats.b_d)
-                    _idle_release = _idle_total <= _idle_thr
+                    _idle_release = _idle_total < _idle_thr
             if _idle_release and _idle_coord is not None:
                 _idle_coord.gpu_resume_backward()
                 self._throttle_held = False
@@ -4242,6 +4242,27 @@ class GPUModelRunner(
                 _cmd_idle = getattr(
                     scheduler_output, "finetune_backward_trigger", None)
                 if _cmd_idle:
+                    # The trigger rides on the NEXT step's SchedulerOutput. If
+                    # that step carries inference work the pause rules below
+                    # protect (a prefill, or a throttle HIT), clear the grant
+                    # BEFORE the child is signalled: otherwise the child passes
+                    # its initial ``_maybe_pause`` with the grant still set and
+                    # runs its first segment against this step (measured at
+                    # TP=4: a burst's first prefill took 0.55-0.72 s, 18-29
+                    # requests queued behind it). The regular pause decision
+                    # later in this call owns the resume bookkeeping.
+                    _f_trig = getattr(
+                        scheduler_output, "_ft_step_features", None)
+                    if _f_trig is not None:
+                        _cfg_trig = self.vllm_config.finetune_config
+                        _inf_prefill_trig = int(_f_trig.t_in) - int(_f_trig.t_ft)
+                        _thr_trig = int(_cfg_trig.fwd_token_throttle)
+                        if _inf_prefill_trig > 0 or (
+                                _cfg_trig.fwd_token_throttle_enable
+                                and _thr_trig > 0
+                                and _inf_prefill_trig + int(_f_trig.b_d)
+                                >= _thr_trig):
+                            _ftc_idle.gpu_pause_backward()
                     _ftc_idle.execute_trigger(_cmd_idle)
                 # [M4.2] Idle (0-token) steps are how the engine keeps
                 # stepping while a backward is outstanding
@@ -4585,7 +4606,11 @@ class GPUModelRunner(
                         # from bwd contention) shouldn't fire for it.
                         _inf_prefill = int(_feats.t_in) - int(_feats.t_ft)
                         _total = _inf_prefill + int(_feats.b_d)
-                        _pause_throttle = _total > _throttle
+                        # ``>=``: with a threshold of 1 the throttle must also
+                        # cover the single-token decode step that follows a
+                        # burst's first prefill (it ran 0.26-0.30 s against a
+                        # fresh backward when only ``>`` was checked).
+                        _pause_throttle = _total >= _throttle
                 _pause_bwd = _pause_prefill or _pause_throttle
             # Cross-step throttle release: if a previous step left the
             # bwd paused for throttle reasons and this step's total has

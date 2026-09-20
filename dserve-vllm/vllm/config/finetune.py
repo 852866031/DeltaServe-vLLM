@@ -463,7 +463,7 @@ class FinetuneConfig:
     (default), pause decisions stay prefill-only (today's behaviour:
     pause when ``feats.t_in > 0`` and a backward is pending). When True,
     the pause condition is extended to ALSO fire when the current
-    inference batch's total token count exceeds ``fwd_token_throttle``
+    inference batch's total token count reaches ``fwd_token_throttle``
     — see that field for the math. The threshold is read every step,
     so toggling the bool at runtime takes effect on the next batch."""
 
@@ -473,7 +473,7 @@ class FinetuneConfig:
 
         pause = pending_backward and (
             feats.t_in > 0                           # today's rule
-            or (enable and total > fwd_token_throttle)   # new rule
+            or (enable and total >= fwd_token_throttle)  # new rule
         )
 
     where ``total = prefill + ft + len(decode_kv)`` — the same value
