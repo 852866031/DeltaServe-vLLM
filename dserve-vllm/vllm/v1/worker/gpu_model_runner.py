@@ -4162,10 +4162,15 @@ class GPUModelRunner(
         # is currently holding the pause — no-op for every other
         # configuration, so the early-return path is unchanged in the
         # common case.
+        # [pause_until_prefill_done] Poll the deferred re-grant on EVERY call,
+        # idle steps included: after the last prefill of a burst the engine
+        # may only issue 0-token steps, and a rank whose "prefill done" event
+        # had not fired yet would otherwise keep its grant cleared for good.
+        _resume_coord = getattr(self, "_ft_coordinator", None)
+        if _resume_coord is not None:
+            self._ft_maybe_resume_backward(_resume_coord)
         if getattr(self, "_throttle_held", False):
             _idle_coord = getattr(self, "_ft_coordinator", None)
-            if _idle_coord is not None:
-                self._ft_maybe_resume_backward(_idle_coord)
             _idle_feats = getattr(
                 scheduler_output, "_ft_step_features", None)
             _idle_cfg = self.vllm_config.finetune_config
@@ -4592,7 +4597,15 @@ class GPUModelRunner(
             if _feats is not None and (
                     coord.pending_backward
                     or self.vllm_config.finetune_config.pause_prefill_always):
-                _pause_prefill = _feats.t_in > 0
+                # INFERENCE prefill only: ``t_in`` includes the FT subset, and
+                # an FT-only step has no inference work to protect. With
+                # ``pause_prefill_always`` it used to clear the grant on every
+                # FT-only forward as well; the deferred re-grant (a CUDA event
+                # polled on later steps) then never happened on the ranks
+                # whose event had not fired before the engine went idle, the
+                # ranks disagreed on the grant and the next backward stalled
+                # at every boundary until FT was declared dead.
+                _pause_prefill = (int(_feats.t_in) - int(_feats.t_ft)) > 0
                 _ft_cfg = self.vllm_config.finetune_config
                 if _ft_cfg.fwd_token_throttle_enable:
                     _throttle = int(_ft_cfg.fwd_token_throttle)

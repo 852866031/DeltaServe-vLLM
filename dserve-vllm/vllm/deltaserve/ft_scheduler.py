@@ -737,7 +737,60 @@ class FinetuneScheduler(AsyncScheduler):
             at[0], at[1], at[2], at[3], at[4], at[5], at[6], at[7], at[8],
             pred_raw, predicted, None, None, pending, None, run_inf, waiting))
 
+    # ─── Estimator state carry-over (estimator_state_{save,load}_path) ────────
+    def save_estimator_state(self, path: str | None = None) -> str | None:
+        """Write the estimator state to ``path`` (explicit request, e.g. POST
+        /save_estimator_state) or to ``finetune.estimator_state_save_path``
+        (shutdown hooks; best effort and at most once, since a server that is
+        stopped by signalling its process group rarely gets that far)."""
+        if path is None:
+            path = getattr(self.vllm_config.finetune_config,
+                           "estimator_state_save_path", None)
+            if not path or getattr(self, "_estimator_state_saved", False):
+                return None
+        self._estimator_state_saved = True
+        import json
+        import os
+        state = {"version": 1,
+                 "estimator": self._estimator.export_state(),
+                 "tracker": self._tracker.export_state()}
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, path)       # never leave a half-written file behind
+        dprint(f"[estimator] state saved to {path}: "
+               f"{self._tracker.size()} samples, regimes fitted: "
+               + ",".join(r for r, p in self._estimator._params.items()
+                          if p.is_fitted))
+        return path
+
+    def load_estimator_state(self) -> bool:
+        path = getattr(self.vllm_config.finetune_config,
+                       "estimator_state_load_path", None)
+        if not path:
+            return False
+        import json
+        import os
+        if not os.path.isfile(path):
+            dprint(f"[estimator] estimator_state_load_path={path} does not "
+                   f"exist; starting from the launch-time profile")
+            return False
+        with open(path) as f:
+            state = json.load(f)
+        self._tracker.import_state(state["tracker"])
+        self._estimator.import_state(state["estimator"])
+        dprint(f"[estimator] state restored from {path}: "
+               f"{self._tracker.size()} samples, regimes fitted: "
+               + ",".join(r for r, p in self._estimator._params.items()
+                          if p.is_fitted))
+        return True
+
     def shutdown(self) -> None:
+        try:
+            self.save_estimator_state()
+        except Exception as e:
+            dprint(f"[ft-sched] estimator state save failed: {e}")
         # [Phase 4] Dump the predicted-vs-actual estimator stats before teardown.
         # Skipped in validate_estimator mode: the mode-"w" dump would clobber the
         # per-batch-appended estimator_validation CSV (which is a superset).

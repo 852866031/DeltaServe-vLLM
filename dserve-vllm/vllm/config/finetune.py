@@ -350,6 +350,19 @@ class FinetuneConfig:
     Analyse with ``eval-tp/analyze_step_trace.py``."""
 
     bwd_log_path: str | None = None
+
+    estimator_state_save_path: str | None = None
+    """[estimator] JSON file the SLO estimator's state (fitted per-regime
+    coefficients + the recorded step samples it refits from) is written to at
+    shutdown. Lets a long trace be replayed as separate runs — each run
+    continues from the estimator state the previous one ended with."""
+
+    estimator_state_load_path: str | None = None
+    """[estimator] JSON file written via ``estimator_state_save_path`` to
+    restore at launch. The launch-time profiling pass still runs (it also warms
+    up the FT paths), then the restored state REPLACES what it fitted — the
+    saved state already contains the profiling samples of the run it came
+    from. Ignored with a warning if the file does not exist (first part)."""
     """If set, append one row per completed backward to this CSV (timestamp,
     epoch, batch_idx, batch_tokens, batch_loss, total_processed_tokens) — the
     finetune-throughput log the eval harness (eval/auto_plot.py) reads. None
