@@ -64,6 +64,29 @@ async def stop_finetuning(raw_request: Request):
                         content={"stopped": ok})
 
 
+@router.post("/save_estimator_state")
+async def save_estimator_state(raw_request: Request):
+    """Write the SLO estimator's state (fitted coefficients + the recorded
+    step samples) to a JSON file NOW. Optional JSON body ``{"path": ...}``;
+    default is ``finetune.estimator_state_save_path``. A later launch restores
+    it with ``finetune.estimator_state_load_path`` — this is how a long trace
+    is replayed as separate runs with one continuous estimator. Call it before
+    stopping the server: the shutdown-time save is only best effort."""
+    try:
+        body = await raw_request.json()
+    except Exception:
+        body = {}
+    path = (body or {}).get("path")
+    try:
+        result = await engine_client(raw_request).engine_core.call_utility_async(
+            "deltaserve_save_estimator_state", path)
+    except Exception as e:
+        logger.exception("save_estimator_state failed")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    return JSONResponse(status_code=200 if result.get("saved") else 409,
+                        content=result)
+
+
 def attach_router(app: FastAPI):
     ft_cfg = getattr(app.state.args, "finetune_config", None)
     if ft_cfg is not None and getattr(ft_cfg, "enable_finetuning", False):

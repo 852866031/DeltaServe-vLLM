@@ -237,6 +237,43 @@ class StepExecutionTracker:
     def size(self) -> int:
         return len(self.durations)
 
+    # ---------------- state export / import ----------------
+    def export_state(self) -> dict:
+        """The recorded samples the estimator refits from (features, measured
+        duration, was_graph). Predictions and wall-clock stamps are
+        observability-only and are not carried over."""
+        return {
+            "max_steps": self.max_steps,
+            "last_refit_size": self._last_refit_size,
+            "samples": [
+                [f.t_in, f.p, f.t_ft, f.b_d, f.k,
+                 list(f.prefill_lens) if f.prefill_lens is not None else None,
+                 bool(f.bwd), dur, wg]
+                for f, dur, wg in zip(self.features, self.durations,
+                                      self.was_graph)
+            ],
+        }
+
+    def import_state(self, state: dict) -> None:
+        """Replace the recorded samples with an exported set."""
+        self.features, self.durations = [], []
+        self.predicted, self.was_graph, self.timestamps = [], [], []
+        now = time.time()
+        for t_in, p, t_ft, b_d, k, lens, bwd, dur, wg in state["samples"]:
+            self.features.append(StepFeatures(
+                t_in=t_in, p=p, t_ft=t_ft, b_d=b_d, k=k,
+                prefill_lens=lens, bwd=bwd))
+            self.durations.append(float(dur))
+            self.predicted.append(None)
+            self.was_graph.append(wg)
+            self.timestamps.append(now)
+        while len(self.durations) > self.max_steps:
+            self._drop(0)
+        # Keep the refit cadence of the run the state came from: the next
+        # refit fires REFIT_EVERY recorded steps after its last one.
+        self._last_refit_size = min(int(state.get("last_refit_size", 0)),
+                                    self.size())
+
     def check_refit(self) -> bool:
         """True once every REFIT_EVERY new recorded steps."""
         n = self.size()
@@ -302,6 +339,25 @@ class MergedExecutionEstimator:
     @property
     def is_ready(self) -> bool:
         return any(p.is_fitted for p in self._params.values())
+
+    # ---------------- state export / import ----------------
+    def export_state(self) -> dict:
+        """Fitted per-regime coefficients + RMSE (JSON-serializable)."""
+        return {
+            "ft_mixed_split": ft_mixed_split(),
+            "params": {r: {"alpha": p.alpha, "beta": p.beta, "gamma": p.gamma,
+                           "delta": p.delta, "epsilon": p.epsilon, "c": p.c}
+                       for r, p in self._params.items()},
+            "rmse": dict(self._rmse),
+        }
+
+    def import_state(self, state: dict) -> None:
+        """Restore exported coefficients. Regimes missing from the export
+        (e.g. a different ft_mixed_split setting) keep their current fit."""
+        for r, coefs in (state.get("params") or {}).items():
+            if r in self._params:
+                self._params[r] = StepParams(**coefs)
+                self._rmse[r] = (state.get("rmse") or {}).get(r)
 
     @property
     def fit_rmse(self) -> float | None:

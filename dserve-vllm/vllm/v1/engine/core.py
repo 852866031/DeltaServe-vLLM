@@ -596,6 +596,22 @@ class EngineCore:
             model_output = sample_future.result()
         self.scheduler.update_from_output(scheduler_output, model_output)
 
+    def deltaserve_save_estimator_state(self, path: str | None = None) -> dict:
+        """[estimator] Utility call behind POST /save_estimator_state: write
+        the SLO estimator's state now. ``path`` defaults to
+        ``finetune.estimator_state_save_path``."""
+        save = getattr(self.scheduler, "save_estimator_state", None)
+        if save is None:
+            return {"saved": False, "error": "finetuning is not enabled"}
+        path = path or getattr(self.vllm_config.finetune_config,
+                               "estimator_state_save_path", None)
+        if not path:
+            return {"saved": False, "error": "no path given and "
+                    "finetune.estimator_state_save_path is not set"}
+        save(path)
+        return {"saved": True, "path": path,
+                "samples": self.scheduler._tracker.size()}
+
     def profile_execution_model(self) -> None:
         """[Phase 4] Offline pass that seeds the SLO execution-time estimator.
 
@@ -608,7 +624,12 @@ class EngineCore:
         import random
 
         ft_cfg = self.vllm_config.finetune_config
-        if not ft_cfg.enable_finetuning or not ft_cfg.profile_on_launch:
+        if not ft_cfg.enable_finetuning:
+            return
+        if not ft_cfg.profile_on_launch:
+            # No profiling pass: a carried-over estimator state is all there is.
+            if hasattr(self.scheduler, "load_estimator_state"):
+                self.scheduler.load_estimator_state()
             return
         sched = self.scheduler
         # Only the FinetuneScheduler carries the estimator/tracker + hooks.
@@ -763,6 +784,13 @@ class EngineCore:
                 self.scheduler.reset_prefix_cache()
             except Exception:
                 pass
+            # [estimator_state_load_path] Continue from the state a previous
+            # run ended with: it replaces what this pass just fitted (the pass
+            # still ran, for its warm-up of the FT paths).
+            try:
+                sched.load_estimator_state()
+            except Exception as e:
+                dprint(f"[ft-profile] estimator state restore failed: {e}")
 
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
@@ -949,6 +977,16 @@ class EngineCore:
             self.abort_requests(request_ids)
 
     def shutdown(self):
+        # [estimator_state_save_path] Save the estimator state FIRST: tearing
+        # down the executor (TP workers + backward children) can outlast the
+        # grace period of whoever is stopping the server, and the scheduler's
+        # own shutdown hook only runs after it.
+        _save = getattr(self.scheduler, "save_estimator_state", None)
+        if _save is not None:
+            try:
+                _save()
+            except Exception as e:
+                logger.warning("estimator state save failed: %s", e)
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
@@ -1718,6 +1756,16 @@ class EngineCoreProc(EngineCore):
             shutdown_timeout = self.vllm_config.shutdown_timeout
 
             logger.info("Shutdown initiated (timeout=%d)", shutdown_timeout)
+            # [estimator_state_save_path] The earliest point of a shutdown:
+            # when the whole process group is signalled (the usual way a
+            # benchmark driver stops the server) this process is gone before
+            # ``shutdown()`` is reached.
+            _save_est = getattr(self.scheduler, "save_estimator_state", None)
+            if _save_est is not None:
+                try:
+                    _save_est()
+                except Exception as e:
+                    logger.warning("estimator state save failed: %s", e)
 
             if shutdown_timeout == 0:
                 num_requests = self.scheduler.get_num_unfinished_requests()
