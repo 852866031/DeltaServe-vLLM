@@ -13,9 +13,9 @@
 
 finetune:
   rps_throttle_close_time: 1.0
-  rps_throttle_window_s: 0.5
-  rps_throttle_open_rps: 30   
-  rps_throttle_close_rps: 40   
+  rps_throttle_window_s: 1.0   
+  rps_throttle_open_rps: 14   
+  rps_throttle_close_rps: 20   
   rps_throttle_enable: true
   enable_finetuning: true
   start_on_launch: false             # hold FT admission closed (M1: launch-only)
@@ -36,7 +36,7 @@ finetune:
   ft_only_admission_grace_ms: 2.0
   pause_prefill_always: true         # close the backward-start race on the first prefill of a burst
   fwd_token_throttle_enable: true
-  fwd_token_throttle: 128   
+  fwd_token_throttle: 64   
   backward_cuda_graph: true         # TP-safe since M5 (2-GPU gated; live A/B pending)
   save_attn_qkv: true                # pre-norm q/k + v saved: skips the Q/K/V GEMM (exact for Qwen3)
   save_attn_ctx: true                # attention context saved: skips the attention forward
@@ -44,8 +44,10 @@ finetune:
 
 slo:
   ttft_slo: 0.25
-  avg_tbt_slo: 0.02
-  max_tbt_slo: 0.05
+  # TBT targets are 2x the 14B ones: a pure Qwen3-32B decode step is already 20 ms and a mixed
+  # step with 25 fine-tuning tokens 48 ms, so max_tbt_slo 0.05 admitted almost no fine-tuning.
+  avg_tbt_slo: 0.04
+  max_tbt_slo: 0.10
   # M4.2: the runner's per-step timing samples and the profiling pass's
   # record gate now ride the TP relay (ModelRunnerOutput.finetune_timing /
   # SchedulerOutput.finetune_record_timing), so the launch-time profiling
@@ -54,7 +56,7 @@ slo:
   # cold-start fixed buffer-cap budget (no SLO gate).
   profile_on_launch: true
   profile_num_repeats: 2
-  ft_tokens_admission_constrain_factor: 0.5   
+  ft_tokens_admission_constrain_factor: 2.0   
   match_prefill_workload_factor: 0
   decode_only_ft_safety_margin: 0.7
 
@@ -89,7 +91,9 @@ model:
   max_model_len: 2048
 
 engine:
-  max_cudagraph_capture_size: 2048
+  # Qwen3-32B on 40 GB: the default capture list (one graph every 16 tokens) costs 11.8 GiB
+  # up to 1024 tokens and 17.9 GiB up to 2048; a sparse list keeps the 2048-token coverage.
+  compilation_config: '{"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 160, 192, 224, 256, 320, 384, 448, 512, 640, 768, 896, 1024, 1280, 1536, 1792, 2048], "max_cudagraph_capture_size": 2048}'
   gpu_memory_utilization: 0.80          # first bring-up; see header
   enforce_eager: false
   disable_log_stats: true
