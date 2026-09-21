@@ -628,6 +628,14 @@ class Worker(WorkerBase):
         # SchedulerOutput command) + poll_backward_relay, and reports both back
         # via ModelRunnerOutput; the scheduler owns the trigger decision + store.
         coordinator.relay_mode = tp_size > 1
+        # NOTE (known issue): under TP this worker-side coordinator keeps the
+        # default ft_started=True and the scheduler mirrors it on the first
+        # step, so finetune.start_on_launch=false does not hold admission
+        # closed. Initialising the flag from start_on_launch here is not
+        # enough: POST /start_finetuning only reaches the workers, and an idle
+        # engine produces no ModelRunnerOutput to relay the flag back, so
+        # fine-tuning would never start. A fix needs an EngineCore utility that
+        # flips the scheduler's coordinator directly.
         # [forward_interruptible / tier C] Wire the accumulator's per-layer
         # abort check to the coordinator's threading.Event. The hook does a
         # cheap None-check first, so this is zero-cost when the feature is

@@ -1174,6 +1174,9 @@ class FinetuneScheduler(AsyncScheduler):
             _started = getattr(model_runner_output, "finetune_ft_started", None)
             if _started is not None and _started and not self._coord.ft_started:
                 self._coord.start_finetuning()
+            elif _started is not None and not _started and self._coord.ft_started:
+                # POST /stop_finetuning only reaches the workers as well.
+                self._coord.stop_finetuning()
             # [M4.2] Timing samples the worker's CUDA-event ring completed:
             # push them into THIS coordinator so the next schedule() drains
             # them into the tracker / estimator exactly as on a single GPU.
