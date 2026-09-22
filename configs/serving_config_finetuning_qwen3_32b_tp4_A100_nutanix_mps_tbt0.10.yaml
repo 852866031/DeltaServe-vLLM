@@ -44,8 +44,10 @@ finetune:
 
 slo:
   ttft_slo: 0.25
-  avg_tbt_slo: 0.02
-  max_tbt_slo: 0.05
+  # TBT targets are 2x the 14B ones: a pure Qwen3-32B decode step is already 20 ms and a mixed
+  # step with 25 fine-tuning tokens 48 ms, so max_tbt_slo 0.05 admitted almost no fine-tuning.
+  avg_tbt_slo: 0.04
+  max_tbt_slo: 0.10
   # M4.2: the runner's per-step timing samples and the profiling pass's
   # record gate now ride the TP relay (ModelRunnerOutput.finetune_timing /
   # SchedulerOutput.finetune_record_timing), so the launch-time profiling
@@ -54,10 +56,9 @@ slo:
   # cold-start fixed buffer-cap budget (no SLO gate).
   profile_on_launch: true
   profile_num_repeats: 2
-  ft_tokens_admission_constrain_factor: -1    # off: the proportional cap forces admission_phase back to prefill
+  ft_tokens_admission_constrain_factor: 2.0   
   match_prefill_workload_factor: 0
-  decode_only_ft_safety_margin: 1.0   
-  coserving_admission_phase: both     # FT may also ride decode-only steps (SLO-gated by max_tbt_slo)
+  decode_only_ft_safety_margin: 0.7
 
 debug:
   print_weight_hash: false
