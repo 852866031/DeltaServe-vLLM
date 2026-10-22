@@ -97,6 +97,8 @@ def test_engine_config():
     check("finetune_config survives pickling",
           back.finetune_config.ttft_slo == 0.4)
 
+    import vllm.kernels  # noqa: F401  (registers the IR op providers the hash reads)
+
     h = on.compute_hash()
     check("an SLO knob does not change the compile hash",
           _config(_ft(ttft_slo=0.2)).compute_hash() == h)
