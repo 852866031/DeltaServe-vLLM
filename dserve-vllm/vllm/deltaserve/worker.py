@@ -24,6 +24,17 @@ from vllm.v1.worker.gpu_worker import Worker
 
 
 class DeltaServeWorker(Worker):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        if self.parallel_config.distributed_executor_backend == "mp":
+            # A worker process of its own (TP): arm before the model load, so a
+            # crashed EngineCore cannot leak it (and its share of the model) —
+            # nor, through it, the backward child. Under the uniproc executor
+            # this is the EngineCore process itself: left alone.
+            from vllm.deltaserve.backward_process import arm_parent_death_signal
+
+            arm_parent_death_signal(f"worker rank={self.rank}")
+
     def init_device(self):
         super().init_device()
         from vllm.deltaserve import dprint

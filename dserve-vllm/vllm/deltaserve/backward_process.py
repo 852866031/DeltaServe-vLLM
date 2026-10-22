@@ -24,6 +24,7 @@ the child inherits the constrained MPS partition; the parent (inference) keeps
 the full GPU. This mirrors DeltaServe exactly.
 """
 
+import contextlib
 import hashlib
 import os
 import re
@@ -140,6 +141,48 @@ def _summarize_weights(base: dict, ft: dict) -> dict:
     }
 
 
+def arm_parent_death_signal(who: str) -> None:
+    """SIGKILL this process when its parent dies (Linux; a no-op elsewhere).
+
+    Python reaps daemonic children only on a *clean* parent exit; a SIGKILL'd
+    parent (how a wedged or orphaned engine gets cleaned up) bypasses that and
+    would strand the process with its GPU memory — and, under TP, a rank of the
+    backward NCCL group (observed: orphans holding 14.7 GiB each wedged the next
+    run with a misleading out-of-memory error). Used by the TP workers (armed
+    before the model load) and by every backward child."""
+    import ctypes
+    import signal
+    import sys
+
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        PR_SET_PDEATHSIG = 1
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(
+            PR_SET_PDEATHSIG, signal.SIGKILL)
+    except Exception as e:  # noqa: BLE001 — never block startup on this
+        dprint(f"[{who}] could not arm PR_SET_PDEATHSIG: {e}")
+        return
+    if os.getppid() == 1:
+        dprint(f"[{who}] parent already gone at startup; exiting")
+        os._exit(1)
+
+
+@contextlib.contextmanager
+def _allow_children():
+    """Let a daemonic process (vLLM's TP workers are) start a child: Python
+    refuses that only to avoid orphans on exit, which the child's own
+    parent-death signal already rules out (and a daemonic child is still
+    terminated on the worker's clean exit)."""
+    cur = mp.current_process()
+    was = cur._config.get("daemon", False)
+    cur._config["daemon"] = False
+    try:
+        yield
+    finally:
+        cur._config["daemon"] = was
+
+
 class BackwardProcess:
     """Parent-side handle: spawns and talks to the backward stub process."""
 
@@ -172,16 +215,6 @@ class BackwardProcess:
 
         Returns the child's 'ready' handshake dict.
         """
-        if mp.current_process().daemon:
-            raise RuntimeError(
-                "[deltaserve] cannot spawn the backward process from a daemonic "
-                "process. Under the multiproc executor (TP>1) vLLM workers are "
-                "daemonic by default and Python forbids them from having "
-                "children. Phase 7/M1 makes the worker NON-daemonic when "
-                "enable_finetuning is set (see multiproc_executor.make_worker_"
-                "process). If you hit this, that gating did not take effect — "
-                "verify finetune_config.enable_finetuning reached the executor."
-            )
         dprint(
             f"[backward] BackwardProcess.start on {mp.current_process().name} "
             f"(daemon={mp.current_process().daemon}) → child device_index="
@@ -221,7 +254,8 @@ class BackwardProcess:
                    if self.mps_percentage > 0 else
                    "without MPS (time-sliced context; pause contract protects prefill)")
             )
-            self._proc.start()
+            with _allow_children():
+                self._proc.start()
         finally:
             # Restore parent env immediately so inference keeps the full GPU.
             _restore_env(_MPS_PERCENTAGE_ENV, prev_mps)
