@@ -79,7 +79,13 @@ def run_worker(mode: str) -> None:
         "top": [[{int(t): float(lp.logprob) for t, lp in pos.items()}
                  for pos in o.outputs[0].logprobs] for o in outs],
     }
-    print("__RESULT__" + json.dumps(result))
+    # A file, not stdout: the backward child's prints share the stream and can
+    # land in the middle of a long line.
+    out_path = os.environ.get("DSERVE_M1_RESULT")
+    if out_path:
+        with open(out_path, "w") as f:
+            json.dump(result, f)
+    print("__RESULT__ written")
 
 
 def _spawn(mode: str) -> dict:
@@ -87,17 +93,19 @@ def _spawn(mode: str) -> dict:
     env.setdefault("HF_HOME", "/mnt/storage/huggingface")
     env.setdefault("HF_HUB_OFFLINE", "1")
     env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+    import tempfile
+    result_path = tempfile.mktemp(suffix=f"_m1_{mode}.json")
+    env["DSERVE_M1_RESULT"] = result_path
     proc = subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), "--worker", mode],
         capture_output=True, text=True, env=env, timeout=600,
     )
-    line = next((ln for ln in proc.stdout.splitlines()
-                 if ln.startswith("__RESULT__")), None)
-    if line is None:
+    if not os.path.exists(result_path):
         print(proc.stdout[-2000:])
         print(proc.stderr[-2000:])
         raise RuntimeError(f"worker '{mode}' produced no result (see above)")
-    return json.loads(line[len("__RESULT__"):])
+    with open(result_path) as f:
+        return json.load(f)
 
 
 def main():
