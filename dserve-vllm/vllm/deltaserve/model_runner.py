@@ -83,6 +83,7 @@ class DeltaServeModelRunner(GPUModelRunner):
         self._ft_pending_abort = False
         self._throttle_held = False
         self._ft_resume_evt = None
+        self._ft_prefill_evt = None
         self._ft_capture_evt = None
         self._ft_timing_events: list | None = None
         self._ft_timing_owner: list = []
@@ -166,6 +167,17 @@ class DeltaServeModelRunner(GPUModelRunner):
                             cfg.fwd_token_throttle_enable and thr > 0
                             and inf_prefill + int(feats.b_d) >= thr):
                         coord.gpu_pause_backward()
+                # Under async scheduling the PREVIOUS step may still be on the
+                # GPU. If it carried an inference prefill, that prefill decided
+                # "nothing to pause" (no backward was pending yet) and would run
+                # against the fresh child: measured 1.5-4x slower prefills
+                # (114-156 ms for ~120 tokens) and a burst's TTFT tail past the
+                # SLO. Start the child paused and resume it when that prefill
+                # has completed (polled like pause_until_prefill_done).
+                evt = self._ft_prefill_evt
+                if evt is not None and not evt.query():
+                    coord.gpu_pause_backward()
+                    self._ft_resume_evt = evt
                 coord.execute_trigger(cmd)
 
     def _update_states(self, scheduler_output):
@@ -372,6 +384,14 @@ class DeltaServeModelRunner(GPUModelRunner):
 
     def _ft_timing_end(self, scheduler_output, coord, slot, ok, cudagraph_mode,
                        t_wall0, t_host0, pause_bwd, pause_throttle) -> None:
+        feats = getattr(scheduler_output, "_ft_step_features", None)
+        if (ok and coord.relay_mode and feats is not None
+                and int(feats.t_in) > int(feats.t_ft)):
+            # Completion of this step's inference prefill, for a backward
+            # trigger that arrives while it is still running (_ft_before_step).
+            evt = torch.cuda.Event()
+            evt.record()
+            self._ft_prefill_evt = evt
         if ok:
             # Record the end event (read RING steps later) and own the slot with
             # whether to record it — sampled now, so the warmup/recorded gate is
@@ -720,10 +740,12 @@ class DeltaServeModelRunner(GPUModelRunner):
         prefill that paused it has completed on the GPU (non-blocking event
         query). Called on every execute_model (incl. idle steps) and
         sample_tokens; a newer pause simply replaces the pending event."""
-        ev = getattr(self, "_ft_resume_evt", None)
+        ev = self._ft_resume_evt
         if ev is not None and ev.query():
             self._ft_resume_evt = None
-            coord.gpu_resume_backward()
+            # A sticky throttle pause is released by _ft_pause_decision only.
+            if not self._throttle_held:
+                coord.gpu_resume_backward()
 
     def _ft_abort_sentinel(self, coord, relay: bool = True):
         """[forward_interruptible / tier C] The empty output that tells the
