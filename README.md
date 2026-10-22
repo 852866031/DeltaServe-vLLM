@@ -34,7 +34,7 @@ DeltaServe-vLLM/
 ├── deltaserve-plugin/          ← the plugin package (pip name "deltaserve")
 │   ├── pyproject.toml          ← entry point vllm.general_plugins → deltaserve.plugin:register
 │   └── deltaserve/             ← all co-serving code
-├── vllm-upstream/              ← stock vLLM @ 117afeea4 (you clone it; not tracked here)
+├── vllm-upstream/              ← stock vLLM @ 117afeea4 (git submodule, pinned)
 ├── DeltaServe/                 ← read-only reference (original framework)
 ├── configs/                    ← serving YAMLs (finetune / throttles / slo / debug sections)
 ├── scripts/                    ← adapter tools, config converter, misc launchers
@@ -69,11 +69,10 @@ runtime is enough and FlashInfer ships prebuilt cubins for these archs.
 ### Steps
 
 ```bash
-# 1. Clone, plus stock vLLM at the commit the plugin is built against
-git clone https://github.com/<your-org>/DeltaServe-vLLM.git
+# 1. Clone, with stock vLLM at the pinned commit (the vllm-upstream submodule)
+git clone --recurse-submodules https://github.com/<your-org>/DeltaServe-vLLM.git
 cd DeltaServe-vLLM
-git clone https://github.com/vllm-project/vllm.git vllm-upstream
-git -C vllm-upstream checkout 117afeea4665367a3066c1df58d4082d07fcc946
+# (already cloned without it? run: git submodule update --init vllm-upstream)
 
 # 2. Fresh conda env
 conda create -n deltaserve python=3.12 -y
@@ -222,8 +221,7 @@ the wheel must exist at `https://wheels.vllm.ai/<sha>/cu130/vllm/metadata.json`.
 # Need uv for --torch-backend=auto (plain pip doesn't have this flag).
 pip install uv
 
-git clone https://github.com/vllm-project/vllm.git vllm-upstream
-git -C vllm-upstream checkout 117afeea4665367a3066c1df58d4082d07fcc946
+git submodule update --init vllm-upstream   # stock vLLM @ 117afeea4
 cd vllm-upstream
 VLLM_VERSION_OVERRIDE=0.21.1rc1.dev123+g117afeea4.precompiled \
     VLLM_PRECOMPILED_WHEEL_COMMIT=117afeea4665367a3066c1df58d4082d07fcc946 \
@@ -233,7 +231,8 @@ cd ..
 uv pip install --editable deltaserve-plugin --no-deps
 ```
 
-> **Moving to a newer vLLM** — check out the new commit in `vllm-upstream`,
+> **Moving to a newer vLLM** — check out the new commit in `vllm-upstream`
+> (and commit the submodule pointer),
 > reinstall with its SHA, and run `tests/run_all.sh`: the plugin depends only on
 > the vLLM APIs it imports and the methods `deltaserve/plugin.py` wraps.
 
@@ -451,7 +450,7 @@ latency / throughput / SLO figure.
 
 Compiled kernels (`*.so`) and model weights (`*.safetensors`, tokenizer
 blobs) are **gitignored**. After cloning you need to:
-1. Clone `vllm-upstream/` and install it plus the plugin
+1. `git submodule update --init vllm-upstream`, then install it plus the plugin
    ([Step 5](#step-5--install-vllm-precompiled-editable-and-the-plugin)).
 2. Re-run `scripts/init_adapters_llama3.py` to rebuild the adapter dirs.
 3. Then `python eval/auto_benchmark.py --co --loose`.

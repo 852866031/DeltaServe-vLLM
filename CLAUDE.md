@@ -25,7 +25,7 @@ DeltaServe-vLLM/                    ← this repo root
 ├── deltaserve-plugin/              ← OUR CODE: the vLLM plugin package (pip name "deltaserve")
 │   ├── pyproject.toml              ← entry point vllm.general_plugins → deltaserve.plugin:register
 │   └── deltaserve/                 ← all co-serving code (`import deltaserve`)
-├── vllm-upstream/                  ← STOCK vLLM @ 117afeea4 (git clone, untracked; precompiled .so copied in)
+├── vllm-upstream/                  ← STOCK vLLM @ 117afeea4 (git submodule, pinned; precompiled .so copied in, gitignored)
 ├── configs/                        ← serving YAMLs: finetune / throttles / slo / debug sections (+ configs/legacy/)
 ├── scripts/                        ← adapter tools, convert_config_layout.py, misc launchers
 ├── eval/                           ← single-GPU eval: auto_benchmark.py, auto_plot*.py, pure_ft_bench.py
