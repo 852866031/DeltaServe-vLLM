@@ -159,11 +159,6 @@ class Request:
         # True if this request is scheduled as a non-final prefill chunk.
         self.is_prefill_chunk = False
 
-        # [DeltaServe] True for injected finetuning samples (prefill-only, routed
-        # to the FT LoRA adapter, retired same step, never surfaced to the
-        # frontend). Set by the FT injector after construction.
-        self.is_finetuning = False
-
         # The number of NaNs in logits. A value greater than 0
         # indicates that the output is corrupted
         self.num_nans_in_logits = 0
