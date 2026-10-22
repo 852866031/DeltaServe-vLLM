@@ -445,9 +445,12 @@ class DeltaServeModelRunner(GPUModelRunner):
         dprint(f"[ft-abort] tier C: FT-only forward ({self._ft_num} tokens) "
                f"aborted at {where} for a late inference arrival")
         # sample_tokens (called by the engine under TP) returns the same
-        # sentinel from its no-state path when this is set.
+        # sentinel from its no-state path when this is set — that one carries
+        # the TP relay fields: the engine reads model output from the sample
+        # future, so relay fields here would be consumed (an ack taken) and
+        # then dropped. Without a sample_tokens call they ride the next output.
         self._ft_pending_abort = True
-        return self._ft_abort_sentinel(coord)
+        return self._ft_abort_sentinel(coord, relay=False)
 
     def sample_tokens(self, grammar_output):
         coord = self._ft_coordinator
@@ -722,14 +725,13 @@ class DeltaServeModelRunner(GPUModelRunner):
             self._ft_resume_evt = None
             coord.gpu_resume_backward()
 
-    def _ft_abort_sentinel(self, coord):
+    def _ft_abort_sentinel(self, coord, relay: bool = True):
         """[forward_interruptible / tier C] The empty output that tells the
-        engine to roll the FT-only step back. Carries the TP relay fields so
-        an outstanding backward ack is not delayed by the aborted step."""
-        from vllm.v1.outputs import ModelRunnerOutput
+        scheduler to roll the FT-only step back. With ``relay`` it carries the
+        TP relay fields so an outstanding backward ack is not delayed by the
+        aborted step."""
         out = ModelRunnerOutput(req_ids=[], req_id_to_index={})
-        out._ft_aborted = True
         out.finetune_aborted = True
-        if coord is not None and getattr(coord, "relay_mode", False):
+        if relay and coord is not None and coord.relay_mode:
             self._ft_fill_relay_fields(out, coord)
         return out
