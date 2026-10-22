@@ -19,29 +19,60 @@ estimator) and re-host it on vLLM's inference + LoRA + scheduling substrate."
 ## Directory layout
 
 ```
-DeltaServe-vLLM/                    ← this repo root (where we write integration code & this file)
+DeltaServe-vLLM/                    ← this repo root
 ├── DeltaServe/                     ← READ-ONLY reference. The original co-serving framework.
 │   └── CLAUDE.md                   ← authoritative DeltaServe architecture doc (read it)
-├── dserve-vllm/                    ← OUR CODING DIR + the published package source (name="dserve-vllm").
-│   ├── pyproject.toml              ← distribution name & `dserve-vllm` console script
-│   ├── vllm/                       ← inner Python package (still `import vllm`)
-│   └── AGENTS.md                   ← upstream vLLM contribution rules (mostly N/A — we're a research fork)
-├── configs/                        ← serving_config_finetuning_{opt,llama3,llama3_tp2}.yaml (DeltaServe-style YAML)
-├── scripts/                        ← entry points: ft_experiment_{opt,llama3}.py, launch_deltaserve.py, …
+├── deltaserve-plugin/              ← OUR CODE: the vLLM plugin package (pip name "deltaserve")
+│   ├── pyproject.toml              ← entry point vllm.general_plugins → deltaserve.plugin:register
+│   └── deltaserve/                 ← all co-serving code (`import deltaserve`)
+├── vllm-upstream/                  ← STOCK vLLM @ 117afeea4 (git clone, untracked; precompiled .so copied in)
+├── configs/                        ← serving YAMLs: finetune / throttles / slo / debug sections (+ configs/legacy/)
+├── scripts/                        ← adapter tools, convert_config_layout.py, misc launchers
 ├── eval/                           ← single-GPU eval: auto_benchmark.py, auto_plot*.py, pure_ft_bench.py
-├── eval-tp/                        ← TP eval: launch_deltaserve.py, ft_bench_tp.py (per-TP logs, --kill-stale)
-├── eval-arxiv/                     ← long-context probe on ccdv/arxiv-summarization: fetch_arxiv.py, launch_arxiv.py, prefill_bench.py, trace_bench.py (0.4 rps replay), plot_arxiv.py (README has the numbers)
-├── tests/                          ← standalone scripts (run with `python`, NOT pytest — not installed)
-├── adapters/                       ← toy LoRA adapters (opt125m / llama3; inference + "-ft" FT target)
-├── INTEGRATION_PROGRESS.md         ← plan + per-stage progress. Source of truth for *what* to build & *how far*.
-├── VLLM_FORK_CHANGES.md            ← every change vs upstream vLLM (navigate the fork)
+├── eval-tp/                        ← TP eval: launch_deltaserve.py, auto_benchmark_tp.py, ft_bench_tp.py, cleanup_validate.sh
+├── eval-arxiv/                     ← long-context probe on ccdv/arxiv-summarization (README has the numbers)
+├── tests/                          ← standalone scripts (run with `python`; tests/run_all.sh runs them all)
+├── adapters/                       ← toy LoRA adapters (llama3 / qwen3; inference + "-ft" FT target)
+├── INTEGRATION_PROGRESS.md         ← plan + per-stage progress (fork era; file paths there are historical)
+├── CLEANUP_LOG.md                  ← the 2026-10 fork → plugin restructure, step by step, with measurements
 └── README.md                       ← install guide (general + full RTX 5090 section)
 ```
 
 - **`DeltaServe/` is read-only** — reference for ideas and implementation details.
   Never edit it; use it to verify how a mechanism worked in the original.
-- **`dserve-vllm/` is where we write integration code.** It is a vendored fork of vLLM;
-  the distribution name + CLI are `dserve-vllm`, the Python import name is still `vllm`.
+- **`deltaserve-plugin/` is where we write code. vLLM itself is unmodified** —
+  never edit `vllm-upstream/`. If something seems to need a vLLM edit, find a seam
+  (subclass, wrapper on a small method, object-level trick) and add it to
+  `deltaserve/plugin.py`; never copy an upstream method body into the plugin.
+- **Env:** `deltaserve-plugin` conda env (`/mnt/storage/conda/envs/deltaserve-plugin`):
+  stock vLLM from `vllm-upstream/` + the plugin, both editable. The older
+  `dserve-vllm` env runs the pre-plugin fork (git history before the plugin commit).
+
+### How the plugin hooks into vLLM (2026-10)
+
+Co-serving is switched on per launch with
+`--additional-config '{"deltaserve": {...}}'` (the launchers build it from a YAML via
+`deltaserve.config_loader.finetune_cli_args`). `plugin.register` runs in every vLLM
+process (and on unpickling the config) and wires:
+
+| What | Seam |
+|---|---|
+| `FinetuneConfig` | parsed from `additional_config` into a `DeltaServeConfig` (compile-cache hash = graph-affecting settings only); `VllmConfig.finetune_config` property |
+| worker / scheduler / async defaults | `VllmConfig.__post_init__` wrapper → `engine_config.configure_vllm_config` (`worker_cls`, `scheduler_cls`) |
+| backward child, weight + activation + served-LoRA sharing | `worker.DeltaServeWorker` (subclass) |
+| FT mask, save arming, timing ring, backward pause, tier-C abort, relay | `model_runner.DeltaServeModelRunner` (the worker adopts the stock runner) — hooks on `_update_states`, `_prepare_inputs`, `_model_forward`, `execute_model`, `sample_tokens`, `_warmup_and_capture` |
+| `has_ft` CUDA-graph set | `cudagraph.FtCudagraphDispatcher` + `FtBatchDescriptor` (own class → own keys) |
+| FT-only graph abort | `CUDAGraphWrapper.__call__` wrapper: abort poll between piecewise segments |
+| activation save in graphs | the accumulator's hooks issue `torch.ops.vllm.dserve_save_rows` (traced by Dynamo) |
+| tiers A/B, abort roll-back, rps / recv bookkeeping | `ft_scheduler.FinetuneScheduler` (scheduler_cls) |
+| arrival signal, profiling pass, estimator save, input-thread ADD signal | `engine_core.EngineHooks`, via `EngineCore` / `EngineCoreProc` method wrappers |
+| relay data (TP) | attributes on `SchedulerOutput` / `ModelRunnerOutput` (pickled with them) |
+| TP workers spawning children | daemon check lifted around the child's `start()` |
+| HTTP routes | `register_vllm_serve_api_routers` wrapper → `deltaserve/api.py` |
+
+Fork-era docs (`INTEGRATION_PROGRESS.md`, `VLLM_FORK_CHANGES.md`, the phase notes
+below) name upstream files like `gpu_worker.py` / `gpu_model_runner.py` / `core.py`;
+that code now lives in the plugin modules in the table.
 
 ## Current status
 
@@ -304,13 +335,13 @@ Single-GPU levers still pending GPU A/B: `forward_interruptible`,
 Two living docs track the detail:
 
 - **`INTEGRATION_PROGRESS.md`** — plan + per-stage progress + how each step was verified.
-- **`VLLM_FORK_CHANGES.md`** — every change vs upstream vLLM (new files + edits),
-  with "what it does" / "used by". **Read this to navigate the fork.**
+- **`VLLM_FORK_CHANGES.md`** — the fork-era list of upstream edits (historical; vLLM is
+  stock now — see "How the plugin hooks into vLLM").
 
-All net-new code lives in **`dserve-vllm/vllm/deltaserve/`** (logging, config loader, backward
-process, per-model backward services in `bwd_services/`, `ft_meta.py` (the backward
-`meta` dict + `rope_theta_of`), finetuning store, FT injector, FT scheduler, activation
-accumulator, coordinator). Upstream edits are small and tagged `[DeltaServe]`.
+All code lives in **`deltaserve-plugin/deltaserve/`** (logging, config + loader, plugin,
+worker / runner / dispatcher subclasses, engine hooks, backward process, per-model
+backward services in `bwd_services/`, `ft_meta.py`, finetuning store, FT injector, FT
+scheduler, activation accumulator, coordinator).
 
 ```
 deltaserve/bwd_services/
@@ -467,9 +498,9 @@ Insertion points for DeltaServe pieces:
   graphs). Editable install via `VLLM_USE_PRECOMPILED=1`.
 - **RTX 5090 = Blackwell sm_120.** vLLM's precompiled kernels cover sm_120 (no full source
   build needed). FlashInfer JIT-compiles sm_120 kernels on first run (one-time). See
-  `README.md` for the exact CUDA-13.0-in-conda-env recipe — the env (`dserve-vllm`)
+  `README.md` for the exact CUDA-13.0-in-conda-env recipe — the env
   must own its `nvcc ≥ 12.9` or FlashInfer fails with a misleading "requires sm75" error.
-- **Setup uses conda** (`dserve-vllm` env), per `README.md`. vLLM's `AGENTS.md`
+- **Setup uses conda** (`deltaserve-plugin` env), per `README.md`. vLLM's `AGENTS.md`
   prescribes `uv`/`.venv` and strict upstream-PR rules — those are for upstream contributors;
   we are a research fork, so follow `README.md` for env management.
 - Models live in `HF_HOME=/mnt/storage/huggingface` (set `HF_HUB_OFFLINE=1`):
@@ -764,7 +795,7 @@ YAML is the source of truth for the base model (`model.model`) and the inference
 adapter (`adapters.lora_path_0`). `--config` / `--model` still override.
 
 - **Tests are standalone scripts — run with `python`, NOT pytest** (pytest is not
-  installed in the `dserve-vllm` env).
+  installed in the env).
 - `auto_benchmark_tp.py` is the TP counterpart of `eval/auto_benchmark.py`: it imports
   that file's replay / results-CSV / bwd-log-trim helpers and uses the family-aware
   launcher, so the measurement is identical. Modes `--loose`, `--tight`, `--nutanix`,
@@ -818,30 +849,30 @@ Llama-3 `rope_theta` DIAG and the Qwen3-0.6B single-GPU smoke are done. Next ses
 3. `DeltaServe/CLAUDE.md` — original architecture; co-serving contract; SFT backward.
 4. `README.md` — how to build/run on this machine.
 5. For Phase 1: `DeltaServe/dserve/server/router/model_infer/model_rpc.py:120-195`
-   (spawn + MPS + buffer share) and `dserve-vllm/vllm/v1/worker/gpu_worker.py`
-   (`Worker.__init__`, `init_device`, `load_model`) + `dserve-vllm/vllm/v1/engine/tensor_ipc.py`.
+   (spawn + MPS + buffer share) and `deltaserve-plugin/deltaserve/worker.py`
+   (`DeltaServeWorker.init_device`, `load_model`) + `deltaserve-plugin/deltaserve/backward_process.py`.
 6. For Phase 6 (`forward_interruptible`): the plan file
    `.claude/plans/can-you-make-a-elegant-cherny.md` for the end-to-end design +
    verification path; in-tree the integration points are
-   `dserve-vllm/vllm/deltaserve/coordinator.py` (`FTAborted`, abort event, snapshot/restore),
-   `dserve-vllm/vllm/deltaserve/finetuning_store.py` (3-phase claim/commit/release API),
-   `dserve-vllm/vllm/deltaserve/ft_scheduler.py:_rollback_ft_step`,
-   `dserve-vllm/vllm/deltaserve/accumulate.py` (hook abort check + slice fast path),
-   `dserve-vllm/vllm/v1/engine/core.py` (tiers A + B + sentinel routing), and
-   `dserve-vllm/vllm/v1/worker/gpu_model_runner.py` (tier C abort wrap + entry-time check).
+   `deltaserve-plugin/deltaserve/coordinator.py` (`FTAborted`, abort event, snapshot/restore),
+   `deltaserve-plugin/deltaserve/finetuning_store.py` (3-phase claim/commit/release API),
+   `deltaserve-plugin/deltaserve/ft_scheduler.py:_rollback_ft_step`,
+   `deltaserve-plugin/deltaserve/accumulate.py` (hook abort check + slice fast path),
+   `deltaserve-plugin/deltaserve/ft_scheduler.py` (`schedule` / `update_from_output`: tiers A + B + abort roll-back), and
+   `deltaserve-plugin/deltaserve/model_runner.py` (`_model_forward`: tier C abort + entry-time check).
 7. For Phase 7 (tensor parallelism): the **"Tensor parallelism (Phase 7)"** section above
    is self-contained — milestones + gates, the all-reduce table, the load-bearing
    invariants, open items, and run commands. In-tree the integration points are
-   `dserve-vllm/vllm/deltaserve/bwd_services/common/tp.py` (`lora_shard_slice`,
+   `deltaserve-plugin/deltaserve/bwd_services/common/tp.py` (`lora_shard_slice`,
    `init_backward_tp_group`, `reduce_partial`), the reduces in each family's
    `layer_forward`/`layer_backward` (`bwd_services/{llama3,qwen3}.py`), local dims in
-   `common/trainer.py:_build_state`, `dserve-vllm/vllm/v1/worker/gpu_worker.py`
+   `common/trainer.py:_build_state`, `deltaserve-plugin/deltaserve/worker.py`
    (`_maybe_share_finetuning_weights` tp geometry + `lm_head` all-gather;
    `_maybe_setup_finetuning_accumulator` local buffer widths),
-   `dserve-vllm/vllm/v1/executor/multiproc_executor.py` (non-daemon workers +
-   `_arm_parent_death_signal`), and the relay across
-   `dserve-vllm/vllm/deltaserve/{coordinator,ft_scheduler}.py` +
-   `dserve-vllm/vllm/v1/{core/sched/output.py,outputs.py,worker/gpu_model_runner.py}`.
+   `deltaserve-plugin/deltaserve/backward_process.py` (`arm_parent_death_signal`, the daemon lift at the
+   child's start), and the relay across
+   `deltaserve-plugin/deltaserve/{coordinator,ft_scheduler}.py` +
+   `deltaserve-plugin/deltaserve/model_runner.py` (attributes on SchedulerOutput / ModelRunnerOutput).
    `DeltaServe/dserve/server/router/model_infer/model_rpc.py:63-77` is the original
    per-rank NCCL init this mirrors.
 8. For Phase 8 (a second model family): read `bwd_services/common/family.py` (the
