@@ -154,11 +154,6 @@ class FinetuneConfig:
     cost: one [s_max, hidden] buffer per layer — ~64 MB at s_max=256 on
     Llama-3-8B (bf16 × 32 layers), ~100 MB on Qwen3-14B. Default off."""
 
-    backward_sleep_seconds: float = 2.0
-    """How long the (stub) backward process sleeps to simulate a backward pass
-    after it consumes + cleans the activation buffer. Larger = easier to observe
-    inference running while the backward is busy."""
-
     # --- Phase 4: SLO-aware admission + execution-time estimator ---
     ttft_slo: float = 1.0
     """Time-to-first-token SLO (seconds). The admission gate keeps the predicted

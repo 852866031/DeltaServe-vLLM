@@ -1,0 +1,100 @@
+# DeltaServe-vLLM serving config for the DeltaServe-Baselines comparison
+# (copy of DeltaServe-Baselines/deltaserve/configs/qwen3_14b_tp4.yaml with absolute paths):
+# Qwen3-32B, tensor parallel size 4 (4 x A100 40 GB).
+#
+# This is DeltaServe-vLLM's configs/serving_config_finetuning_qwen3_14b_tp2.yaml
+# with only the workload fields changed, so that it runs what LLMStation and
+# vLLM + torchtune run:
+#   - adapters: rank 8 / alpha 32, freshly initialized (deltaserve/make_adapter.py)
+#   - data_path: common/data/alpaca.txt;  learning_rate 3e-4 (AdamW, wd 0.01)
+#   - max_lora_rank 8, tensor_parallel_size 4
+# The base model (model.model) and the TP size are overridden by
+# common/auto_benchmark.py --system deltaserve (--model / -tp).
+
+finetune:
+  rps_throttle_close_time: 1.0
+  rps_throttle_window_s: 0.5
+  rps_throttle_open_rps: 2
+  rps_throttle_close_rps: 4
+  rps_throttle_enable: true
+  enable_finetuning: true
+  start_on_launch: false             # hold FT admission closed (M1: launch-only)
+  backward_mps_percentage: 0         # no MPS daemon on this box; the pause contract protects prefill
+  graph_ft_batches: true             # [mixed-fwd-cuda-graph] mixed batches (inference + FT) replay has_ft CUDA graphs; FT-only stays eager
+  graph_ft_max_tokens: 512           # capture the has_ft set up to this padded size
+  backward_run_ahead_boundaries: 2   # child CPU ≤2 _maybe_pause boundaries ahead of its GPU → a pause lands within ~3-6 ms (0 = unbounded)
+  finetuning_lora_path: /home/jiaxuan_chen/DeltaServe-Baselines/deltaserve/adapters/qwen3-32b-lora-r8-ft
+  data_path: /home/jiaxuan_chen/DeltaServe-Baselines/common/data/alpaca.txt
+  max_saved_finetuning_tokens: 512
+  backward_sleep_seconds: 2.0
+  num_epochs: 20
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  gamma: 0.9
+  backward_fp32: false
+  forward_interruptible: true        # tiers A/B (scheduler) + tier C rank-symmetric under TP
+  ft_only_admission_grace_ms: 2.0
+  pause_prefill_always: true         # close the backward-start race on the first prefill of a burst
+  fwd_token_throttle_enable: true
+  fwd_token_throttle: 1
+  backward_cuda_graph: true         # TP-safe since M5 (2-GPU gated; live A/B pending)
+  save_attn_qkv: true                # pre-norm q/k + v saved: skips the Q/K/V GEMM (exact for Qwen3)
+  save_attn_ctx: true                # attention context saved: skips the attention forward
+  save_resid_mid: true               # save post-attn residual: drops the forward-remat o all-reduce (7 → 6 collectives/layer) + the O-proj GEMM; +100 MB
+
+slo:
+  ttft_slo: 0.25
+  avg_tbt_slo: 0.02
+  max_tbt_slo: 0.05
+  # M4.2: the runner's per-step timing samples and the profiling pass's
+  # record gate now ride the TP relay (ModelRunnerOutput.finetune_timing /
+  # SchedulerOutput.finetune_record_timing), so the launch-time profiling
+  # pass fits a real, TP-calibrated estimator and FT admission is SLO-gated
+  # under TP exactly as on a single GPU. Set false to fall back to the
+  # cold-start fixed buffer-cap budget (no SLO gate).
+  profile_on_launch: true
+  profile_num_repeats: 2
+  ft_tokens_admission_constrain_factor: 0.25
+  match_prefill_workload_factor: 0
+  decode_only_ft_safety_margin: 0.7
+
+debug:
+  print_weight_hash: false
+  print_activation_hash: false
+  print_scheduler_add: true
+  print_engine_batch_exec: true
+  print_engine_batch_done: false
+  print_engine_req_recv: false
+
+adapters:
+  lora_path_0: /home/jiaxuan_chen/DeltaServe-Baselines/deltaserve/adapters/qwen3-32b-lora-r8
+
+lora:
+  enable_lora: true
+  max_loras: 2
+  max_lora_rank: 8
+
+server:
+  host: 127.0.0.1
+  port: 8000
+  rank_id: 0
+  # Single frontend for TP bring-up (fewer moving parts in the launch prints).
+  api_server_count: 1
+
+model:
+  model: /home/jiaxuan_chen/scratch/Qwen3-32B
+  tokenizer_mode: auto
+  trust_remote_code: false
+  dtype: auto
+  max_model_len: 2048
+
+engine:
+  # Qwen3-32B on 40 GB: the default capture list (one graph every 16 tokens) costs 11.8 GiB
+  # up to 1024 tokens and 17.9 GiB up to 2048; a sparse list keeps the 2048-token coverage.
+  compilation_config: '{"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 160, 192, 224, 256, 320, 384, 448, 512, 640, 768, 896, 1024, 1280, 1536, 1792, 2048], "max_cudagraph_capture_size": 2048}'
+  gpu_memory_utilization: 0.80          # first bring-up; see header
+  enforce_eager: false
+  disable_log_stats: true
+
+parallel:
+  tensor_parallel_size: 4

@@ -12,11 +12,6 @@
 # common/auto_benchmark.py --system deltaserve (--model / -tp).
 
 finetune:
-  rps_throttle_close_time: 1.0
-  rps_throttle_window_s: 0.5
-  rps_throttle_open_rps: 2
-  rps_throttle_close_rps: 4
-  rps_throttle_enable: true
   enable_finetuning: true
   start_on_launch: false             # hold FT admission closed (M1: launch-only)
   backward_mps_percentage: 0         # no MPS daemon on this box; the pause contract protects prefill
@@ -26,7 +21,6 @@ finetune:
   finetuning_lora_path: /home/jiaxuan_chen/DeltaServe-Baselines/deltaserve/adapters/qwen3-14b-lora-r8-ft
   data_path: /home/jiaxuan_chen/DeltaServe-Baselines/common/data/alpaca.txt
   max_saved_finetuning_tokens: 512
-  backward_sleep_seconds: 2.0
   num_epochs: 20
   learning_rate: 0.0003
   weight_decay: 0.01
@@ -35,12 +29,21 @@ finetune:
   forward_interruptible: true        # tiers A/B (scheduler) + tier C rank-symmetric under TP
   ft_only_admission_grace_ms: 2.0
   pause_prefill_always: true         # close the backward-start race on the first prefill of a burst
-  fwd_token_throttle_enable: true
-  fwd_token_throttle: 1
   backward_cuda_graph: true         # TP-safe since M5 (2-GPU gated; live A/B pending)
   save_attn_qkv: true                # pre-norm q/k + v saved: skips the Q/K/V GEMM (exact for Qwen3)
   save_attn_ctx: true                # attention context saved: skips the attention forward
   save_resid_mid: true               # save post-attn residual: drops the forward-remat o all-reduce (7 → 6 collectives/layer) + the O-proj GEMM; +100 MB
+
+throttles:
+  rps_throttle_close_time: 1.0
+  rps_throttle_window_s: 0.5
+  rps_throttle_open_rps: 2
+  rps_throttle_close_rps: 4
+  rps_throttle_enable: true
+  fwd_token_throttle_enable: true
+  fwd_token_throttle: 1
+  ft_tokens_admission_constrain_factor: 0.25
+  match_prefill_workload_factor: 0
 
 slo:
   ttft_slo: 0.25
@@ -54,8 +57,6 @@ slo:
   # cold-start fixed buffer-cap budget (no SLO gate).
   profile_on_launch: true
   profile_num_repeats: 2
-  ft_tokens_admission_constrain_factor: 0.25
-  match_prefill_workload_factor: 0
   decode_only_ft_safety_margin: 0.7
 
 debug:
