@@ -23,7 +23,6 @@ finetune:
   finetuning_lora_path: ../adapters/qwen3-0.6b-toy-lora-ft
   data_path: ../alpaca_1000.txt
   max_saved_finetuning_tokens: 256
-  backward_sleep_seconds: 2.0
   num_epochs: 20
   learning_rate: 0.000005
   weight_decay: 0.01
@@ -31,12 +30,16 @@ finetune:
   backward_fp32: false
   forward_interruptible: false       # off for bring-up
   ft_only_admission_grace_ms: 0
-  fwd_token_throttle_enable: false
-  fwd_token_throttle: 200
   backward_cuda_graph: false         # first run eager; A/B on afterwards
   save_attn_qkv: true                # pre-norm q/k + v saved: skips the Q/K/V GEMM (exact for Qwen3)
   save_attn_ctx: true
   save_resid_mid: true              # save post-attn residual; skip O-proj recompute (only RMSNorm in_ln is recomputed with all three saves)
+
+throttles:
+  fwd_token_throttle_enable: false
+  fwd_token_throttle: 200
+  ft_tokens_admission_constrain_factor: -1
+  match_prefill_workload_factor: 0
 
 slo:
   ttft_slo: 0.25
@@ -44,8 +47,6 @@ slo:
   max_tbt_slo: 0.05
   profile_on_launch: true
   profile_num_repeats: 2
-  ft_tokens_admission_constrain_factor: -1
-  match_prefill_workload_factor: 0
   decode_only_ft_safety_margin: 0.7
 
 debug:

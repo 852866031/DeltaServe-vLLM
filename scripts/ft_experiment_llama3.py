@@ -53,17 +53,6 @@ def _engine_cli_args(engine_kwargs: dict) -> list[str]:
     return args
 
 
-def _finetune_cli_args(finetune_section: dict) -> list[str]:
-    """Translate the finetune YAML section to nested --finetune-config.k=v flags."""
-    args: list[str] = []
-    for key, value in finetune_section.items():
-        if value is None:
-            continue
-        val = "true" if value is True else "false" if value is False else str(value)
-        args.append(f"--finetune-config.{key}={val}")
-    return args
-
-
 def _wait_for_health(base_url: str, timeout: float) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -121,7 +110,11 @@ def main():
     # `import vllm` resolves to the installed package, not the ./dserve-vllm dir.
     _strip = {str(_HERE), str(_ROOT)}
     sys.path[:] = [p for p in sys.path if os.path.abspath(p or ".") not in _strip]
-    from vllm.deltaserve.config_loader import load_yaml_config, split_config
+    from vllm.deltaserve.config_loader import (
+        finetune_cli_args,
+        load_yaml_config,
+        split_config,
+    )
 
     cfg = load_yaml_config(args.config)
     engine_kwargs, _, _ = split_config(cfg)
@@ -135,9 +128,7 @@ def main():
     vllm_bin = str(Path(sys.executable).parent / "dserve-vllm")
     cmd = [vllm_bin, "serve", args.model]
     cmd += _engine_cli_args(engine_kwargs)
-    cmd += _finetune_cli_args(cfg.get("finetune") or {})
-    cmd += _finetune_cli_args(cfg.get("debug") or {})
-    cmd += _finetune_cli_args(cfg.get("slo") or {})
+    cmd += finetune_cli_args(cfg)
     # Hold FT admission closed at launch so we can exercise POST
     # /start_finetuning below (profiling at launch is unaffected).
     cmd.append("--finetune-config.start_on_launch=false")

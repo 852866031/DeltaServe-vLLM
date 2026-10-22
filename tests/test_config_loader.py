@@ -55,11 +55,12 @@ def test_loads_and_maps():
     engine_args, extras = engine_args_from_yaml(_CONFIG)
 
     passthrough = ("server", "adapters")
-    special = ("finetune", "debug", "slo", *passthrough)  # slo folds into FinetuneConfig too
+    ft_sections = ("finetune", "throttles", "slo", "debug")
+    special = (*ft_sections, *passthrough)
 
-    # finetune + debug sections -> FinetuneConfig attributes (debug is folded in)
+    # the four finetune sections -> FinetuneConfig attributes (one flat config)
     ft = engine_args.finetune_config
-    for section in ("finetune", "debug"):
+    for section in ft_sections:
         for key, want in (raw.get(section) or {}).items():
             check(f"{section}.{key} -> FinetuneConfig.{key} == {want!r}",
                   getattr(ft, key, _MISSING) == want)
@@ -92,6 +93,33 @@ def test_loads_and_maps():
           Path(extras["adapters"]["lora_path_0"]).is_absolute())
 
 
+def test_layouts():
+    """Every config in configs/ loads to the same FinetuneConfig as its
+    pre-restructure copy in configs/legacy/ (the old layout still loads), and
+    every finetune key sits in its own section."""
+    green("section layout: configs/ vs configs/legacy/")
+    from vllm.deltaserve.config_loader import (
+        SECTION_OF,
+        finetune_kwargs,
+        load_yaml_config,
+        split_config,
+    )
+
+    legacy = _REPO / "configs" / "legacy"
+    for old in sorted(legacy.glob("*.yaml")):
+        new = _REPO / "configs" / old.name
+        a = load_yaml_config(old, verbose=False)
+        b = load_yaml_config(new, verbose=False)
+        _, fa, _ = split_config(a)
+        _, fb, _ = split_config(b)
+        check(f"{old.name}: same FinetuneConfig", fa == fb)
+        misplaced = [f"{sec}.{k}" for sec in ("finetune", "throttles", "slo", "debug")
+                     for k in (b.get(sec) or {}) if SECTION_OF.get(k) != sec]
+        check(f"{old.name}: every key in its section {misplaced or ''}", not misplaced)
+        check(f"{old.name}: retired keys dropped",
+              "backward_sleep_seconds" not in finetune_kwargs(b))
+
+
 def test_error_handling():
     green("error handling:")
     import tempfile
@@ -121,6 +149,16 @@ def test_error_handling():
     except ValueError:
         check("non-dict section raises", True)
 
+    # a key in two finetune sections -> clear ValueError
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+        f.write("finetune:\n  ttft_slo: 0.3\nslo:\n  ttft_slo: 0.4\n")
+        bad3 = f.name
+    try:
+        engine_args_from_yaml(bad3)
+        check("key in two finetune sections raises", False)
+    except ValueError:
+        check("key in two finetune sections raises", True)
+
     # missing file -> FileNotFoundError
     try:
         load_yaml_config("/nonexistent/deltaserve.yaml")
@@ -132,6 +170,7 @@ def test_error_handling():
 def main():
     green("=== DeltaServe YAML config loader ===")
     test_loads_and_maps()
+    test_layouts()
     test_error_handling()
     color = _RED if _failed else _GREEN
     print(f"\n{color}{_passed} passed, {_failed} failed{_RESET}")

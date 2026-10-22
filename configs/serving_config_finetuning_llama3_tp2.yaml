@@ -29,7 +29,6 @@ finetune:
   finetuning_lora_path: ../adapters/llama3-toy-lora-ft
   data_path: ../alpaca_1000.txt
   max_saved_finetuning_tokens: 256
-  backward_sleep_seconds: 2.0
   num_epochs: 20
   learning_rate: 0.000005
   weight_decay: 0.01
@@ -37,12 +36,16 @@ finetune:
   backward_fp32: false
   forward_interruptible: true        # tiers A/B (scheduler) + tier C rank-symmetric under TP
   ft_only_admission_grace_ms: 2.0
-  fwd_token_throttle_enable: false
-  fwd_token_throttle: 200
   backward_cuda_graph: true          # TP-safe since M5 (set false for the eager side of the A/B)
   save_attn_qkv: true                # post-RoPE q/k/v saved: skips the Q/K/V GEMM + RoPE (local-width since M2)
   save_attn_ctx: true                # attention context saved: skips the attention forward (local-width since M2)
   save_resid_mid: true               # save post-attn residual: drops the forward-remat o all-reduce (7 → 6 collectives/layer) + the O-proj GEMM; +64 MB
+
+throttles:
+  fwd_token_throttle_enable: false
+  fwd_token_throttle: 200
+  ft_tokens_admission_constrain_factor: -1
+  match_prefill_workload_factor: 0
 
 slo:
   ttft_slo: 0.25
@@ -56,8 +59,6 @@ slo:
   # cold-start fixed buffer-cap budget (no SLO gate).
   profile_on_launch: true
   profile_num_repeats: 2
-  ft_tokens_admission_constrain_factor: -1
-  match_prefill_workload_factor: 0
   decode_only_ft_safety_margin: 0.7
 
 debug:

@@ -183,16 +183,6 @@ def _engine_cli_args(engine_kwargs: dict) -> list[str]:
     return args
 
 
-def _finetune_cli_args(section: dict) -> list[str]:
-    args: list[str] = []
-    for key, value in (section or {}).items():
-        if value is None:
-            continue
-        val = "true" if value is True else "false" if value is False else str(value)
-        args.append(f"--finetune-config.{key}={val}")
-    return args
-
-
 def _load_yaml_cfg(config_path: Optional[str] = None) -> dict:
     """Load the finetuning YAML once, with the repo root stripped from
     ``sys.path`` so ``vllm`` resolves to the installed package (not any
@@ -215,12 +205,8 @@ def _phase_tag(cfg: dict) -> str:
     BothPhaseFinetuneScheduler that admits FT on any step composition.
     Unrecognized values are stringified verbatim — the scheduler-selection
     layer is authoritative on what's actually valid."""
-    phase = ((cfg.get("slo") or {})
-             .get("coserving_admission_phase"))
-    if phase is None:
-        phase = ((cfg.get("finetune") or {})
-                 .get("coserving_admission_phase"))
-    return str(phase or "prefill")
+    from vllm.deltaserve.config_loader import finetune_value
+    return str(finetune_value(cfg, "coserving_admission_phase") or "prefill")
 
 
 def _ft_factor_tag(cfg: dict) -> str:
@@ -228,15 +214,8 @@ def _ft_factor_tag(cfg: dict) -> str:
     safe suffix tag. ``-1`` (the disabled sentinel) becomes ``off`` so a
     no-cap run reads as ``..._factor_off`` instead of ``..._factor_-1.0``.
     Integer values render without a decimal; floats keep ``%g`` precision."""
-    factor = ((cfg.get("slo") or {})
-              .get("ft_tokens_admission_constrain_factor"))
-    if factor is None:
-        # Belt + suspenders: some YAMLs may put it under finetune instead.
-        factor = ((cfg.get("finetune") or {})
-                  .get("ft_tokens_admission_constrain_factor"))
-    if factor is None:
-        factor = -1.0
-    f = float(factor)
+    from vllm.deltaserve.config_loader import finetune_value
+    f = float(finetune_value(cfg, "ft_tokens_admission_constrain_factor", -1.0))
     if f == -1.0:
         return "off"
     if f.is_integer():
@@ -255,7 +234,7 @@ def build_server_cmd(co: bool, bwd_log_path: Optional[str],
     ``config_path`` overrides the default YAML — passed through from
     ``--config`` so the server gets the right finetune/slo knobs."""
     cfg = _load_yaml_cfg(config_path)
-    from vllm.deltaserve.config_loader import split_config
+    from vllm.deltaserve.config_loader import finetune_cli_args, split_config
     engine_kwargs, _, _ = split_config(cfg)
     engine_kwargs.pop("model", None)  # positional to `dserve-vllm serve`
 
@@ -265,11 +244,9 @@ def build_server_cmd(co: bool, bwd_log_path: Optional[str],
     # Serve the inference LoRA adapter by name (requests target it).
     cmd += ["--lora-modules", f"{_INFER_LORA_NAME}={_INFER_LORA_DIR}"]
     if co:
-        # Finetuning on: pass the finetune / slo / debug sections, plus the
+        # Finetuning on: pass the finetune / throttles / slo / debug sections, plus the
         # bwd-throughput log path.
-        cmd += _finetune_cli_args(cfg.get("finetune") or {})
-        cmd += _finetune_cli_args(cfg.get("debug") or {})
-        cmd += _finetune_cli_args(cfg.get("slo") or {})
+        cmd += finetune_cli_args(cfg)
         if bwd_log_path:
             cmd.append(f"--finetune-config.bwd_log_path={bwd_log_path}")
         # Hold FT admission closed at launch; the benchmark opens it via

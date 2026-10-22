@@ -21,7 +21,6 @@ finetune:
   # data_path: ../test_dataset.txt
   data_path: ../alpaca_1000.txt
   max_saved_finetuning_tokens: 600   # buffer capacity; ~2 inference steps to fill
-  backward_sleep_seconds: 2.0        # simulated backward duration (observe inference)
   num_epochs: 20
   learning_rate: 0.000005
   weight_decay: 0.01
@@ -34,6 +33,15 @@ finetune:
   # [deltaserve] [batch …] log) exceed the threshold. _enable
   # is the master switch so the threshold value can stay in
   backward_cuda_graph: true
+  save_attn_qkv: true
+  save_attn_ctx: true               # save attn ctx (o_proj input); skip attention-forward recompute in backward
+  save_resid_mid: true              # save post-attn residual; skip O-proj recompute (only RMSNorm in_ln is recomputed with all three saves)
+# SLO-aware FT admission + execution-time estimator (Phase 4).
+# Folded into FinetuneConfig by the loader. The estimator is profiled at launch
+# and refit online; FT tokens are admitted only while the predicted step time
+# keeps inference TTFT/TBT within these targets.
+
+throttles:
   # the YAML across A/B runs.
   fwd_token_throttle_enable: true
   fwd_token_throttle: 200
@@ -42,20 +50,6 @@ finetune:
   rps_throttle_open_rps: 19      # must be < close
   rps_throttle_window_s: 0.75      # 1-2s recommended
   rps_throttle_close_time: 0.5
-  save_attn_qkv: true
-  save_attn_ctx: true               # save attn ctx (o_proj input); skip attention-forward recompute in backward
-  save_resid_mid: true              # save post-attn residual; skip O-proj recompute (only RMSNorm in_ln is recomputed with all three saves)
-
-# SLO-aware FT admission + execution-time estimator (Phase 4).
-# Folded into FinetuneConfig by the loader. The estimator is profiled at launch
-# and refit online; FT tokens are admitted only while the predicted step time
-# keeps inference TTFT/TBT within these targets.
-slo:
-  ttft_slo: 0.2                      # time-to-first-token target (seconds)
-  avg_tbt_slo: 0.1                   # avg time-between-tokens target (seconds)
-  max_tbt_slo: 0.12                   # max single-step time while admitting FT (seconds)
-  profile_on_launch: true            # offline profiling pass before serving
-  profile_num_repeats: 2             # recorded passes per profiling shape
   # Cap FT tokens per step relative to that step's inference prefill tokens:
   # when >0 and prefill is present, admit at most prefill_tokens * factor FT
   # tokens (on top of the SLO + buffer caps). -1 disables (fill up to whatever
@@ -67,14 +61,21 @@ slo:
   # 1.0 reproduces the old `match_with_prefill_workload: true` behaviour;
   # >1 admits more aggressively; <1 more conservatively.
   match_prefill_workload_factor: 0
+
+slo:
+  ttft_slo: 0.2                      # time-to-first-token target (seconds)
+  avg_tbt_slo: 0.1                   # avg time-between-tokens target (seconds)
+  max_tbt_slo: 0.12                   # max single-step time while admitting FT (seconds)
+  profile_on_launch: true            # offline profiling pass before serving
+  profile_num_repeats: 2             # recorded passes per profiling shape
   # [unified-phase only] TBT-budget multiplier on decode-only steps when FT
   # is being considered for admission. Inert in this (prefill-only) config —
   # decode-only steps short-circuit to no FT regardless. Exposed here for
   # visibility; takes effect when the scheduler is switched to "both" via the
   # _both.yaml variant. See FinetuneConfig docstring for cold-start tuning.
   decode_only_ft_safety_margin: 0.8
-
 # Observability knobs (folded into FinetuneConfig by the loader).
+
 debug:
   print_weight_hash: false            # compare base/FT-adapter weight hashes at startup
   print_activation_hash: false         # runs Llama3BackwardService.verify_activations each cycle
@@ -82,13 +83,14 @@ debug:
   print_engine_batch_exec: true     
   print_engine_batch_done: false     # print each Engine.batch() call's batch size and contents
   print_engine_req_recv: false     # print each Engine request as it's received (before batching)
-
 # Inference LoRA adapter(s) served on vLLM's normal multi-LoRA path (applied
 # per-request by the caller; not the finetuning target).
+
 adapters:
   lora_path_0: ../adapters/llama3-toy-lora
 
 # vLLM LoRA enablement (these are EngineArgs fields -> passed straight through).
+
 lora:
   enable_lora: true
   max_loras: 2

@@ -91,16 +91,6 @@ def _engine_cli_args(engine_kwargs: dict) -> list[str]:
     return args
 
 
-def _finetune_cli_args(section: dict) -> list[str]:
-    args: list[str] = []
-    for key, value in (section or {}).items():
-        if value is None:
-            continue
-        val = "true" if value is True else "false" if value is False else str(value)
-        args.append(f"--finetune-config.{key}={val}")
-    return args
-
-
 def build_server_cmd(config_path: str, port: int, base_model: str | None = None,
                      tp_override: int | None = None, *,
                      family: str = DEFAULT_FAMILY,
@@ -124,7 +114,11 @@ def build_server_cmd(config_path: str, port: int, base_model: str | None = None,
     eval-tp/analyze_step_trace.py). ``api_server_count``
     overrides the YAML's ``server.api_server_count``."""
     _strip_repo_from_syspath()
-    from vllm.deltaserve.config_loader import load_yaml_config, split_config
+    from vllm.deltaserve.config_loader import (
+        finetune_cli_args,
+        load_yaml_config,
+        split_config,
+    )
 
     cfg = load_yaml_config(config_path)
     engine_kwargs, _, extras = split_config(cfg)
@@ -149,10 +143,8 @@ def build_server_cmd(config_path: str, port: int, base_model: str | None = None,
     cmd += _engine_cli_args(engine_kwargs)
     cmd += ["--lora-modules", f"{infer_lora_name}={infer_lora_dir}"]
     if co:
-        # Pass the finetune / debug / slo sections through as CLI flags.
-        cmd += _finetune_cli_args(cfg.get("finetune") or {})
-        cmd += _finetune_cli_args(cfg.get("debug") or {})
-        cmd += _finetune_cli_args(cfg.get("slo") or {})
+        # Pass the finetune / throttles / slo / debug sections through as CLI flags.
+        cmd += finetune_cli_args(cfg)
         if bwd_log_path:
             cmd.append(f"--finetune-config.bwd_log_path={bwd_log_path}")
         if step_trace_path:
