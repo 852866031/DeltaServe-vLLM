@@ -129,7 +129,7 @@ def test_gpu_runtime():
 
     repo = Path(__file__).resolve().parent.parent
     llm = LLM(_MODEL, enforce_eager=True, gpu_memory_utilization=0.5,
-              enable_lora=True, max_lora_rank=16,
+              enable_lora=True, max_loras=2, max_lora_rank=16,
               additional_config=_ft(
                   finetuning_lora_path=str(repo / "adapters/qwen3-0.6b-toy-lora-ft"),
                   data_path=str(repo / "alpaca_1000.txt")))
