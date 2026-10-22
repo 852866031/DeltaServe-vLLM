@@ -29,9 +29,9 @@ import torch.multiprocessing as mp
 sys.path[:] = [p for p in sys.path
                if os.path.abspath(p or ".") != os.path.dirname(os.path.abspath(__file__))]
 
-from vllm.deltaserve.bwd_services import llama3 as L  # noqa: E402
-from vllm.deltaserve.bwd_services.common.ops import rope_cos_sin  # noqa: E402
-from vllm.deltaserve.bwd_services.common.tp import lora_shard_slice  # noqa: E402
+from deltaserve.bwd_services import llama3 as L  # noqa: E402
+from deltaserve.bwd_services.common.ops import rope_cos_sin  # noqa: E402
+from deltaserve.bwd_services.common.tp import lora_shard_slice  # noqa: E402
 
 # Small Llama-ish geometry. Hq=4/Hkv=2 GQA, Hd=8 → D=32; TP=2 → local 2/1 heads.
 CFG = dict(Hq=4, Hkv=2, Hd=8, inter=64, r=4, eps=1e-5, scaling=2.0,

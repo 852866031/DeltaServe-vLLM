@@ -30,7 +30,7 @@ import bwd_harness as H  # noqa: E402
 sys.path[:] = [p for p in sys.path
                if os.path.abspath(p or ".") != os.path.dirname(os.path.abspath(__file__))]
 
-from vllm.deltaserve.accumulate import FinetuneAccumulator  # noqa: E402
+from deltaserve.accumulate import FinetuneAccumulator  # noqa: E402
 
 C = H.Checker(tol=1e-6)
 D, INTER, NL = 8, 12, 3
@@ -206,7 +206,7 @@ def test_abort_poll_boundary():
     TP that is where the rank-symmetric collective runs — and a True answer
     raises ``FTAborted`` at that layer, leaving the earlier layers' rows saved
     and the later ones untouched."""
-    from vllm.deltaserve.coordinator import FTAborted
+    from deltaserve.coordinator import FTAborted
     torch.manual_seed(1)
     model = FakeModel()
     acc = FinetuneAccumulator(model, max_saved=16, hidden_size=D, device="cpu",

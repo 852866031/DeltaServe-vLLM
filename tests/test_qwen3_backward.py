@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Gradcheck for the Qwen3 backward service (q/k-norm family).
 
-Validates the hand-derived gradients in ``vllm.deltaserve.bwd_services.qwen3``
+Validates the hand-derived gradients in ``deltaserve.bwd_services.qwen3``
 against autograd through the family's own functional ``layer_forward``:
 head (final norm + LM head) and one decoder layer including the per-head
 ``q_norm``/``k_norm`` between the projection and RoPE. Uses a geometry where
@@ -24,9 +24,9 @@ import bwd_harness as H  # noqa: E402
 sys.path[:] = [p for p in sys.path
                if os.path.abspath(p or ".") != os.path.dirname(os.path.abspath(__file__))]
 
-from vllm.deltaserve.bwd_services import llama3 as LL  # noqa: E402
-from vllm.deltaserve.bwd_services import qwen3 as Q  # noqa: E402
-from vllm.deltaserve.bwd_services.common.head import head_backward  # noqa: E402
+from deltaserve.bwd_services import llama3 as LL  # noqa: E402
+from deltaserve.bwd_services import qwen3 as Q  # noqa: E402
+from deltaserve.bwd_services.common.head import head_backward  # noqa: E402
 
 C = H.Checker(tol=1e-3)
 

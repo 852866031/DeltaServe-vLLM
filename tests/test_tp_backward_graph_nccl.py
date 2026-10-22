@@ -50,8 +50,8 @@ import bwd_harness as H  # noqa: E402
 sys.path[:] = [p for p in sys.path
                if os.path.abspath(p or ".") != os.path.dirname(os.path.abspath(__file__))]
 
-from vllm.deltaserve.bwd_services import llama3 as L  # noqa: E402
-from vllm.deltaserve.bwd_services import qwen3 as Q  # noqa: E402
+from deltaserve.bwd_services import llama3 as L  # noqa: E402
+from deltaserve.bwd_services import qwen3 as Q  # noqa: E402
 
 FAMILIES = {"llama3": L, "qwen3": Q}
 TP = 2
@@ -94,7 +94,7 @@ def _worker(rank, fam_name, mdt, wpath, outdir, port, saves="none"):
 def _worker_body(rank, fam_name, mdt, wpath, outdir, port, saves):
     save_rm = saves in ("rm", "all")
     save_all = saves == "all"
-    from vllm.deltaserve.bwd_services.common.graph import GraphedBackward
+    from deltaserve.bwd_services.common.graph import GraphedBackward
 
     fam_mod = FAMILIES[fam_name]
     FAM = fam_mod.LLAMA3 if fam_name == "llama3" else fam_mod.QWEN3

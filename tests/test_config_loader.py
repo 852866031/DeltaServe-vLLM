@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Test the DeltaServe YAML config loader (vllm.deltaserve.config_loader).
+"""Test the DeltaServe YAML config loader (deltaserve.config_loader).
 
 CPU-only: builds EngineArgs from the YAML but never loads a model.
 
@@ -47,7 +47,7 @@ def test_loads_and_maps():
     green(f"load + map: {_CONFIG.relative_to(_REPO)}")
     from pathlib import Path
 
-    from vllm.deltaserve.config_loader import engine_args_from_yaml, load_yaml_config
+    from deltaserve.config_loader import engine_args_from_yaml, load_yaml_config
 
     # Compare against the *loaded* config (load_yaml_config resolves relative
     # adapter paths to absolute) so the expectations match the loader contract.
@@ -98,7 +98,7 @@ def test_layouts():
     pre-restructure copy in configs/legacy/ (the old layout still loads), and
     every finetune key sits in its own section."""
     green("section layout: configs/ vs configs/legacy/")
-    from vllm.deltaserve.config_loader import (
+    from deltaserve.config_loader import (
         SECTION_OF,
         finetune_kwargs,
         load_yaml_config,
@@ -124,7 +124,7 @@ def test_error_handling():
     green("error handling:")
     import tempfile
 
-    from vllm.deltaserve.config_loader import (
+    from deltaserve.config_loader import (
         engine_args_from_yaml,
         load_yaml_config,
     )

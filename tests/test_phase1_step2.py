@@ -2,7 +2,7 @@
 """Phase 1 / Step 2 test: spawn the backward stub process + MPS env wrapping.
 
 CPU-only — the Phase-1 backward stub does not touch CUDA, so this runs without a
-GPU. It exercises vllm.deltaserve.backward_process.BackwardProcess directly
+GPU. It exercises deltaserve.backward_process.BackwardProcess directly
 (independent of the full vLLM worker), proving:
 
   - the child spawns and handshakes 'ready',
@@ -45,7 +45,7 @@ def check(name, cond):
 
 def main():
     green("=== Phase 1 / Step 2: backward stub spawn + MPS wrapping ===")
-    from vllm.deltaserve.backward_process import BackwardProcess
+    from deltaserve.backward_process import BackwardProcess
 
     # Record parent env up front so we can assert it's restored after spawn.
     prev_mps = os.environ.get(_MPS_ENV)

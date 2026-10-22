@@ -47,15 +47,15 @@ _RESET = "\033[0m" if _TTY else ""
 def run_worker(mode: str) -> None:
     """Build an LLM (FT on/off), greedy-generate the prompts, print token ids."""
     from vllm import LLM, SamplingParams
-    from vllm.config import FinetuneConfig
-    from vllm.deltaserve.config_loader import load_yaml_config, split_config
+
+    from deltaserve.config_loader import load_yaml_config, split_config
 
     engine_kwargs, ft_cfg, _ = split_config(load_yaml_config(str(_CONFIG)))
     # Eager in both runs: the comparison is about FT injection (KV, mask,
     # adapter routing, retire), not eager-vs-compiled numerics.
     engine_kwargs["enforce_eager"] = True
     enabled = mode == "ft"
-    ft = FinetuneConfig(
+    ft = dict(
         enable_finetuning=enabled,
         finetuning_lora_path=ft_cfg.finetuning_lora_path,
         data_path=ft_cfg.data_path,
@@ -64,7 +64,7 @@ def run_worker(mode: str) -> None:
         # enable the one-shot activation-hash check so the M2 test can observe it
         print_activation_hash=enabled,
     )
-    llm = LLM(**engine_kwargs, finetune_config=ft)
+    llm = LLM(**engine_kwargs, additional_config={"deltaserve": ft})
     # Real requests use the BASE model (no inference LoRA) — isolates the effect
     # of FT injection on ordinary inference.
     outs = llm.generate(

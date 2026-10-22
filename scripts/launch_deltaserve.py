@@ -3,7 +3,7 @@
 [deltaserve] startup prints (worker flag + backward process spawn).
 
 Analogue of DeltaServe's eval/llama3/launch_llama3.py, but it just feeds our
-YAML through vllm.deltaserve.config_loader into vLLM's offline LLM and runs one
+YAML through deltaserve.config_loader into vLLM's offline LLM and runs one
 generation. Prints to watch for during startup (green in a TTY):
 
     [deltaserve] Worker rank=0 ... enable_finetuning=True
@@ -50,7 +50,7 @@ def main():
                          "(no model load, no GPU)")
     args = ap.parse_args()
 
-    from vllm.deltaserve.config_loader import load_yaml_config, split_config
+    from deltaserve.config_loader import load_yaml_config, split_config
 
     cfg = load_yaml_config(args.config)
     engine_kwargs, finetune_config, extras = split_config(cfg)

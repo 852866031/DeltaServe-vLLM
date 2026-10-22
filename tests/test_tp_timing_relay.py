@@ -25,8 +25,8 @@ import bwd_harness as H  # noqa: E402
 sys.path[:] = [p for p in sys.path
                if os.path.abspath(p or ".") != os.path.dirname(os.path.abspath(__file__))]
 
-from vllm.deltaserve.coordinator import FinetuneCoordinator  # noqa: E402
-from vllm.deltaserve.estimator import (  # noqa: E402
+from deltaserve.coordinator import FinetuneCoordinator  # noqa: E402
+from deltaserve.estimator import (  # noqa: E402
     MIN_FIT_SAMPLES, REGIME_EAGER, REGIME_INF_PREFILL, MergedExecutionEstimator,
     StepExecutionTracker, StepFeatures)
 from vllm.v1.core.sched.output import SchedulerOutput  # noqa: E402

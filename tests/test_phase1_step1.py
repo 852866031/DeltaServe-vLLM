@@ -1,14 +1,13 @@
 #!/usr/bin/env python
-"""Phase 1 / Step 1 test: the --enable-finetuning config flag.
+"""Phase 1 / Step 1 test: the deltaserve plugin's config plumbing.
 
-Lightweight checks that the FinetuneConfig flag is plumbed end-to-end through
-vLLM's config system and CLI, all CPU-only (no model load).
+Co-serving is switched on through vLLM's ``additional_config``
+(``{"deltaserve": {...}}``); the plugin parses it into a ``FinetuneConfig``,
+selects the worker / scheduler classes and keys the compile cache on the
+graph-affecting settings only. CPU-only, no model load.
 
     python tests/test_phase1_step1.py          # CPU-only plumbing checks
-    python tests/test_phase1_step1.py --gpu     # also load opt-125m and show
-                                                # the worker's runtime print
-
-Run inside the `dserve-vllm` conda env (see README.md).
+    python tests/test_phase1_step1.py --gpu    # also load Qwen3-0.6B and generate
 Exits 0 if all checks pass, 1 otherwise.
 """
 
@@ -37,78 +36,108 @@ def check(name, cond):
         print(f"  {_RED}[FAIL]{_RESET} {name}")
 
 
+_MODEL = "Qwen/Qwen3-0.6B-Base"
+
+
+def _ft(**kw):
+    return {"deltaserve": {"enable_finetuning": True, **kw}}
+
+
+def test_plugin_registered():
+    green("plugin entry point:")
+    from importlib.metadata import entry_points
+
+    eps = {e.name: e.value for e in entry_points(group="vllm.general_plugins")}
+    check("vllm.general_plugins has deltaserve", "deltaserve" in eps)
+    check("points at deltaserve.plugin:register",
+          eps.get("deltaserve") == "deltaserve.plugin:register")
+
+
 def test_config_defaults():
     green("config defaults:")
-    from vllm.config import FinetuneConfig, VllmConfig
+    from deltaserve.config import FinetuneConfig
 
     check("FinetuneConfig() defaults enable_finetuning=False",
           FinetuneConfig().enable_finetuning is False)
     check("FinetuneConfig(enable_finetuning=True) honored",
           FinetuneConfig(enable_finetuning=True).enable_finetuning is True)
-    check("VllmConfig has 'finetune_config' field",
-          "finetune_config" in VllmConfig.__dataclass_fields__)
 
 
-def test_engine_args():
-    green("EngineArgs plumbing:")
-    from vllm.config import FinetuneConfig
+def _config(additional_config):
     from vllm.engine.arg_utils import EngineArgs
 
-    ea = EngineArgs(model="Qwen/Qwen3-0.6B-Base")
-    check("EngineArgs exposes finetune_config",
-          isinstance(ea.finetune_config, FinetuneConfig))
-    check("EngineArgs default enable_finetuning=False",
-          ea.finetune_config.enable_finetuning is False)
-    ea.finetune_config = FinetuneConfig(enable_finetuning=True)
-    check("EngineArgs setter honored",
-          ea.finetune_config.enable_finetuning is True)
+    return EngineArgs(model=_MODEL, additional_config=additional_config,
+                      enforce_eager=True).create_engine_config()
+
+
+def test_engine_config():
+    green("engine config via additional_config:")
+    import pickle
+
+    from deltaserve.plugin import DeltaServeConfig
+
+    off = _config({})
+    check("no deltaserve entry → finetuning off",
+          off.finetune_config.enable_finetuning is False)
+    check("no deltaserve entry → stock worker",
+          off.parallel_config.worker_cls != "deltaserve.worker.DeltaServeWorker")
+
+    on = _config(_ft(ttft_slo=0.4))
+    check("finetune_config parsed", on.finetune_config.enable_finetuning is True
+          and on.finetune_config.ttft_slo == 0.4)
+    check("additional_config is a DeltaServeConfig",
+          isinstance(on.additional_config, DeltaServeConfig))
+    check("worker_cls = DeltaServeWorker",
+          on.parallel_config.worker_cls == "deltaserve.worker.DeltaServeWorker")
+    check("scheduler_cls = FinetuneScheduler",
+          "FinetuneScheduler" in str(on.scheduler_config.scheduler_cls))
+    check("async scheduling defaults on", on.scheduler_config.async_scheduling)
+    check("v1 model runner", not on.use_v2_model_runner)
+    back = pickle.loads(pickle.dumps(on))
+    check("finetune_config survives pickling",
+          back.finetune_config.ttft_slo == 0.4)
+
+    h = on.compute_hash()
+    check("an SLO knob does not change the compile hash",
+          _config(_ft(ttft_slo=0.2)).compute_hash() == h)
+    check("graph_ft_batches does",
+          _config(_ft(ttft_slo=0.4, graph_ft_batches=True)).compute_hash() != h)
 
 
 def test_cli_parse():
-    green("CLI parsing (FlexibleArgumentParser):")
+    green("CLI parsing:")
+    import json
+
     from vllm.engine.arg_utils import EngineArgs
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-    p = FlexibleArgumentParser()
-    p = EngineArgs.add_cli_args(p)
-    ns = p.parse_args([
-        "--model", "Qwen/Qwen3-0.6B-Base",
-        "--finetune-config.enable_finetuning=true",
-    ])
+    p = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    ns = p.parse_args(["--model", _MODEL, "--additional-config",
+                       json.dumps(_ft())])
     ea = EngineArgs.from_cli_args(ns)
-    check("--finetune-config.enable_finetuning=true parsed True",
-          ea.finetune_config.enable_finetuning is True)
-
-    p2 = FlexibleArgumentParser()
-    p2 = EngineArgs.add_cli_args(p2)
-    ns2 = p2.parse_args(["--model", "Qwen/Qwen3-0.6B-Base"])
-    ea2 = EngineArgs.from_cli_args(ns2)
-    check("omitting the flag defaults to False",
-          ea2.finetune_config.enable_finetuning is False)
+    check("--additional-config carries the deltaserve entry",
+          ea.additional_config["deltaserve"]["enable_finetuning"] is True)
 
 
-def test_gpu_runtime_print():
-    green("GPU runtime print (loads Qwen/Qwen3-0.6B-Base):")
+def test_gpu_runtime():
+    green(f"GPU runtime (loads {_MODEL}):")
     from vllm import LLM
-    from vllm.config import FinetuneConfig
 
-    # Watch stdout for: [deltaserve] Worker ... enable_finetuning=True
-    llm = LLM("Qwen/Qwen3-0.6B-Base",
-              finetune_config=FinetuneConfig(enable_finetuning=True))
+    llm = LLM(_MODEL, additional_config=_ft(), enforce_eager=True,
+              gpu_memory_utilization=0.5)
     out = llm.generate("Hello")
-    check("LLM loaded and generated with enable_finetuning=True",
-          len(out) > 0)
-    print("  (scroll up for the [deltaserve] Worker ... line)")
+    check("LLM loaded and generated with finetuning on", len(out) > 0)
 
 
 def main():
     run_gpu = "--gpu" in sys.argv
-    green("=== Phase 1 / Step 1: --enable-finetuning flag ===")
+    green("=== Phase 1 / Step 1: plugin config plumbing ===")
+    test_plugin_registered()
     test_config_defaults()
-    test_engine_args()
+    test_engine_config()
     test_cli_parse()
     if run_gpu:
-        test_gpu_runtime_print()
+        test_gpu_runtime()
     else:
         print("(skipping GPU runtime check; pass --gpu to enable)")
 

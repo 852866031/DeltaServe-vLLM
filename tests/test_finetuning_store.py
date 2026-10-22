@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Test the finetuning sample store (vllm.deltaserve.finetuning_store).
+"""Test the finetuning sample store (deltaserve.finetuning_store).
 
 CPU-only: loads the real alpaca_1000.txt corpus with the Qwen3-0.6B tokenizer and
 checks load + length-bucketed selection + epoch marking. No GPU.
@@ -45,7 +45,7 @@ def main():
     green("=== Finetuning sample store ===")
     from transformers import AutoTokenizer
 
-    from vllm.deltaserve.finetuning_store import FinetuningStore
+    from deltaserve.finetuning_store import FinetuningStore
 
     tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B-Base")
     tokenize = lambda text: tok(text)["input_ids"]  # noqa: E731

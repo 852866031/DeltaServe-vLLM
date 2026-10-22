@@ -25,8 +25,8 @@ import bwd_harness as H  # noqa: E402
 sys.path[:] = [p for p in sys.path
                if os.path.abspath(p or ".") != os.path.dirname(os.path.abspath(__file__))]
 
-from vllm.deltaserve.accumulate import FinetuneAccumulator  # noqa: E402
-from vllm.deltaserve.ft_save_op import (  # noqa: E402
+from deltaserve.accumulate import FinetuneAccumulator  # noqa: E402
+from deltaserve.ft_save_op import (  # noqa: E402
     FtSaveState,
     active_state,
 )
