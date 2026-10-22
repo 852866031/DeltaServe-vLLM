@@ -1018,7 +1018,7 @@ class FinetuneScheduler(AsyncScheduler):
         scheduled_ft: set[str] = set()
         dropped_ft_samples: list = []   # released back to store below
         for req_id, req in list(self.requests.items()):
-            if not req.is_finetuning:
+            if not getattr(req, "is_finetuning", False):
                 continue
             if req_id in output.num_scheduled_tokens:
                 scheduled_ft.add(req_id)
