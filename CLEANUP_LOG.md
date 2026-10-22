@@ -58,7 +58,9 @@ previous step) undoes it. The files a step modified are also copied, pre-change,
 | 05 | EngineCore back to stock + 6 hooks; tiers A/B + abort roll-back in the scheduler | `d7cb8a5ef` | (with 07) | (with 07) | `engine/core.py` 562 → 24 lines; fixes a dropped relayed ack on TP aborts |
 | 06 | Relay data as `SchedulerOutput` / `ModelRunnerOutput` attributes; `Request.is_finetuning` attribute | `bb2239853`, `d7f917c76` | (with 07) | (with 07) | `outputs.py`, `sched/output.py`, `request.py` stock |
 | 07 | TP workers stay daemonic; the child spawn lifts the daemon check | `1dc691ff0` | M1 flaky (see below) | tight 481 / loose 884 FT tok/s; tight TTFT **98.75 %, p99 406 ms** (one burst behind a 156 ms unpaused prefill) | `multiproc_executor.py` stock; `tests/test_tp_no_orphans.py` added |
-| 08 | Save-point hooks issue the graph save op; TP trigger-race fix; M1 near-tie tolerance | `9c0791a9a`, `781ebdd89` | | | `qwen3.py`, `qwen2.py` stock |
+| 08 | Save-point hooks issue the graph save op; TP trigger-race fix; M1 near-tie tolerance | `9c0791a9a`, `781ebdd89` | 28/28 (incl. orphan gate 5/5) | tight 483 / 492 FT tok/s, TTFT 100 / 100 %, p99 222 / 200 ms, worst 229 / 228 ms (base 288 / 265); loose 879, p99 163 ms; 0 unpaused slow prefills (base 2 per run) | `qwen3.py`, `qwen2.py` stock |
+| 09 | `finetune.graph_ft_only_batches` (FT-only steps on the has_ft graphs, abort between segments) | `d30fb1ac4` | M1 / M2 pass | vs 08: FT-only step 67 → 59 ms (tight), 66 → 57 ms (loose); FT +0.2 / +3 %; TTFT 100 / 100 % | aborts land mid-forward (segment 25) on both ranks |
+| 10 | **nutanix-600-800** — baseline code vs current vs current + FT-only graphs | | | TTFT 100 / 100 / 100 %, p99 300 / 223 / 240 ms; FT 486 / 489 / 512 tok/s; avg TBT, E2E equal; worst-TBT p90 120 / 94 / 118 ms | FT-only graphs enabled in the Qwen3-14B TP=2 preset |
 
 ## Findings along the way
 
