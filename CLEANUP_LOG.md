@@ -49,4 +49,23 @@ previous step) undoes it. The files a step modified are also copied, pre-change,
 
 | # | Step | Commit | Tests | Quick perf | Notes |
 |---|---|---|---|---|---|
-| 00 | Baseline: branch, half timelines, `--out-dir`, runners | | | | |
+| 00 | Baseline: branch, half timelines, `--out-dir`, runners | `12b94aece` | 24/29 (5 stale, pre-existing) | tight-half 483 FT tok/s, TTFT 100 %, p50 116 ms · loose-half 860 tok/s, 100 %, p50 113 ms; repeat run within ±2 % FT, ±3 % TTFT p50, ±6 % p99 | baseline `00_base`, repeat `00_base_r2` |
+| 01 | Drop the OPT loss-only path; `final_hidden` save only for the hash check | `9b55401f3` | (with 02) | (with 02) | fixed the 5 stale tests; `ipc` protocol-only service for the IPC tests |
+| 02 | YAML sections finetune / throttles / slo / debug | `23beb40e9` | 27/29 → 02b | tight 470 / loose 872 FT tok/s (−2.6 / +1.3 %), TTFT 100 / 100 %, step + cycle times identical; p99 tail 266 / 245 ms is within the baseline's own tail spread (worst 288 ms) | 23 configs converted, originals in `configs/legacy/` load identically |
+| 02b | Tests follow 01 | `5c1da6017` | | | |
+| 03 | `DeltaServeWorker` subclass (worker_cls); engine defaults out of `VllmConfig` | `ee05384de` | (with 04) | (with 04) | `gpu_worker.py` stock |
+| 04 | `DeltaServeModelRunner` + `FtCudagraphDispatcher`; save op off `ForwardContext` | `80ab83411` | | | `gpu_model_runner.py`, `cudagraph_dispatcher.py`, `forward_context.py` stock |
+
+## Findings along the way
+
+- **Displaced decorators (step 04).** The in-tree runner edits had inserted new
+  methods directly under upstream's `@torch.inference_mode()` lines, so
+  `execute_model` / `sample_tokens` lost their decorators and two DeltaServe
+  helpers gained them. Harmless (the worker wraps both calls in
+  `inference_mode`), and gone now that the runner file is stock.
+- **Dead per-step work.** `EngineCore._maybe_log_batch_scheduled` classifies every
+  non-decode batch under `print_scheduler_add` and then prints nothing (its
+  `dprint` is commented out).
+- **Whole-buffer zeroing per backward cycle.** The child zeroes every activation
+  buffer in full after each cycle (~700 MB of memsets on Qwen3-14B at
+  `s_max=256`), though only rows `[:n]` were written.
