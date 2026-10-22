@@ -54,7 +54,11 @@ previous step) undoes it. The files a step modified are also copied, pre-change,
 | 02 | YAML sections finetune / throttles / slo / debug | `23beb40e9` | 27/29 → 02b | tight 470 / loose 872 FT tok/s (−2.6 / +1.3 %), TTFT 100 / 100 %, step + cycle times identical; p99 tail 266 / 245 ms is within the baseline's own tail spread (worst 288 ms) | 23 configs converted, originals in `configs/legacy/` load identically |
 | 02b | Tests follow 01 | `5c1da6017` | | | |
 | 03 | `DeltaServeWorker` subclass (worker_cls); engine defaults out of `VllmConfig` | `ee05384de` | (with 04) | (with 04) | `gpu_worker.py` stock |
-| 04 | `DeltaServeModelRunner` + `FtCudagraphDispatcher`; save op off `ForwardContext` | `80ab83411` | | | `gpu_model_runner.py`, `cudagraph_dispatcher.py`, `forward_context.py` stock |
+| 04 | `DeltaServeModelRunner` + `FtCudagraphDispatcher`; save op off `ForwardContext` | `80ab83411` | all pass | tight 482 / loose 872 FT tok/s, TTFT 100 / 100 %, p50 116 / 110, p99 220 / 256 ms; every step / cycle timing equal | `gpu_model_runner.py`, `cudagraph_dispatcher.py`, `forward_context.py` stock |
+| 05 | EngineCore back to stock + 6 hooks; tiers A/B + abort roll-back in the scheduler | `d7cb8a5ef` | (with 07) | (with 07) | `engine/core.py` 562 → 24 lines; fixes a dropped relayed ack on TP aborts |
+| 06 | Relay data as `SchedulerOutput` / `ModelRunnerOutput` attributes; `Request.is_finetuning` attribute | `bb2239853`, `d7f917c76` | (with 07) | (with 07) | `outputs.py`, `sched/output.py`, `request.py` stock |
+| 07 | TP workers stay daemonic; the child spawn lifts the daemon check | `1dc691ff0` | M1 flaky (see below) | tight 481 / loose 884 FT tok/s; tight TTFT **98.75 %, p99 406 ms** (one burst behind a 156 ms unpaused prefill) | `multiproc_executor.py` stock; `tests/test_tp_no_orphans.py` added |
+| 08 | Save-point hooks issue the graph save op; TP trigger-race fix; M1 near-tie tolerance | `9c0791a9a`, `781ebdd89` | | | `qwen3.py`, `qwen2.py` stock |
 
 ## Findings along the way
 
@@ -69,3 +73,19 @@ previous step) undoes it. The files a step modified are also copied, pre-change,
 - **Whole-buffer zeroing per backward cycle.** The child zeroes every activation
   buffer in full after each cycle (~700 MB of memsets on Qwen3-14B at
   `s_max=256`), though only rows `[:n]` were written.
+- **The TP trigger race was behind the step-07 tail.** Every run, the baseline
+  included, has 1–3 inference prefills at 114–156 ms (vs ~40 ms) with no backward
+  pending: the scheduler's trigger rides step N+1 while step N's prefill is still on
+  the GPU, and the fresh child time-slices against it. In 07 it hit the start of a
+  burst (5 requests 0.34–0.50 s). Fixed in 08: the runner records each inference
+  prefill's completion event, and a trigger that arrives before it fired starts the
+  child paused (resumed by the deferred-resume poll).
+- **M1 is flaky by construction.** FT admission timing changes the batch
+  composition and bf16 results depend on it; the same code passed and failed on
+  consecutive runs (divergence at a near-tie, "," vs "."). The test now accepts a
+  divergence only at a near-tie (logprob gap < 0.25 nats).
+- **`print_scheduler_add` prints nothing** (its line was commented out in May);
+  the flag is kept, the per-step work behind it is gone.
+- **FT-only steps are host-bound** (step trace: 62.6 ms host of a 66 ms step).
+  `finetune.graph_ft_only_batches` (off by default) replays them from the has_ft
+  graphs, with the tier-C abort polled between piecewise segments.
