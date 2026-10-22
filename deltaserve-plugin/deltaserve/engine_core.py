@@ -87,15 +87,16 @@ class EngineHooks:
         self.engine = engine
         self.arrival_signal = None
         ft = vllm_config.finetune_config
-        if (ft.forward_interruptible
+        if ft.pause_on_arrival or (
+                ft.forward_interruptible
                 and vllm_config.parallel_config.tensor_parallel_size > 1):
             import os
 
             from deltaserve.coordinator import FtArrivalSignal
             self.arrival_signal = FtArrivalSignal.create()
             os.environ[FtArrivalSignal.ENV] = self.arrival_signal.name
-            dprint("[deltaserve] forward_interruptible tier C under TP: arrival "
-                   f"signal {self.arrival_signal.name} (rank-symmetric abort)")
+            dprint(f"arrival signal {self.arrival_signal.name} (tier-C abort "
+                   "under TP / pause_on_arrival)")
         self._coord = None
 
     def _coordinator(self):
