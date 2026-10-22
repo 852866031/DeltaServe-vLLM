@@ -402,6 +402,20 @@ class FinetuneConfig:
     0 restores the unbounded behaviour. No GPU idle as long as a boundary's
     GPU time exceeds its launch cost, which holds for every real model."""
 
+    pause_on_arrival: bool = False
+    """[pause] The backward child yields the GPU as soon as an inference
+    request ARRIVES during a cycle, not only once its prefill is dispatched.
+    Without it, decode-only steps share the GPU with the child (by design) and
+    run 10-20x slower right after a cycle starts (17 → 180-330 ms on Qwen3-14B
+    TP=2); a request arriving then waits behind one or two of them before its
+    prefill can launch (nutanix: the same burst request at 388-419 ms, around
+    the 0.4 s TTFT SLO). With it the child pauses at its next boundary (the
+    run-ahead bound keeps that within a few ms) and resumes once the worker's
+    usual prefill pause for that request is over — or after 100 ms if no
+    prefill follows. Reads the engine's arrival counter (shared memory, bumped
+    by the input thread on every ADD); rank-symmetric under TP like every
+    pause."""
+
     def compute_hash(self) -> str:
         """[mixed-fwd-cuda-graph] The finetuning fields that change the traced
         forward: with ``graph_ft_batches`` the accumulator's save-point hooks

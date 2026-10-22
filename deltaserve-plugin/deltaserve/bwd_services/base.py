@@ -91,6 +91,14 @@ class BackwardService:
         self._run_ahead: int = -1
         self._boundary_events: list = []
         self._boundary_pos: int = 0
+        # [pause_on_arrival] The engine's arrival counter (attached on first
+        # use; None = feature off) and the per-arrival wait state: 0 idle,
+        # 1 an arrival is pending and the worker has not paused us for its
+        # prefill yet, 2 paused for it and waiting for the resume.
+        self._arrivals = -1
+        self._arr_seen = 0
+        self._arr_state = 0
+        self._arr_since = 0.0
         # [pause] Under TP the pause must be rank-symmetric (set by the
         # trainer to the children's gloo group): if one child blocks at
         # boundary i while the other has already issued the next residual
@@ -147,8 +155,10 @@ class BackwardService:
             return
         grp = self._pause_group
         if grp is None:
-            if not g.is_set():
-                g.wait(timeout=5.0)
+            if not g.is_set() or self._arrival_blocked(g):
+                deadline = time.monotonic() + 5.0
+                while not self._pause_poll(g) and time.monotonic() < deadline:
+                    pass
             return
         # Rank-symmetric (tp>1): every rank reaches every boundary, so the
         # ranks agree with a MAX all-reduce whether ANY grant is cleared and
@@ -157,17 +167,80 @@ class BackwardService:
         # The loop exit depends only on the reduced value (the deadline is
         # folded into it), so no rank can leave the loop alone.
         import torch.distributed as dist
-        flag = torch.tensor([0 if g.is_set() else 1], dtype=torch.int32)
+        blocked = not g.is_set() or self._arrival_blocked(g)
+        flag = torch.tensor([1 if blocked else 0], dtype=torch.int32)
         dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=grp)
         if not int(flag.item()):
             return
         deadline = time.monotonic() + 5.0
         while True:
-            mine = g.wait(timeout=0.002) or time.monotonic() > deadline
+            mine = self._pause_poll(g) or time.monotonic() > deadline
             flag = torch.tensor([1 if mine else 0], dtype=torch.int32)
             dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=grp)
             if int(flag.item()):
                 return
+
+    def _pause_poll(self, g) -> bool:
+        """One ~2 ms poll while blocked: True once this child may run (grant
+        set and no arrival pending). The arrival state is updated on every
+        poll so it sees the worker's pause (grant cleared) for the prefill."""
+        arrival = self._arrival_blocked(g)
+        if not g.is_set():
+            g.wait(timeout=0.002)
+            return False
+        if arrival:
+            time.sleep(0.002)
+            return False
+        return True
+
+    _ARRIVAL_WAIT_S = 0.1
+
+    def _arrival_blocked(self, g) -> bool:
+        """[pause_on_arrival] True while an inference request that arrived
+        during this cycle has not been served yet: from its arrival until the
+        worker's pause for its prefill has been released (or 100 ms passed
+        without such a pause — no prefill followed)."""
+        sig = self._arrivals
+        if sig == -1:
+            sig = None
+            meta = (self.shared or {}).get("meta") or {}
+            name = os.environ.get("DSERVE_FT_ARRIVAL_SHM")
+            if meta.get("pause_on_arrival") and name:
+                from deltaserve.coordinator import FtArrivalSignal
+                try:
+                    sig = FtArrivalSignal.attach(name)
+                    self._arr_seen = sig.read()
+                except Exception as e:  # noqa: BLE001
+                    dprint(f"[backward] pause_on_arrival off: {e}")
+                    sig = None
+            self._arrivals = sig
+        if sig is None:
+            return False
+        now = time.monotonic()
+        if self._arr_state == 0:
+            if sig.read() == self._arr_seen:
+                return False
+            self._arr_state, self._arr_since = 1, now
+        if self._arr_state == 1:
+            if not g.is_set():
+                self._arr_state = 2          # the worker paused us for it
+            elif now - self._arr_since > self._ARRIVAL_WAIT_S:
+                self._arr_state = 0          # no prefill followed
+                self._arr_seen = sig.read()
+                return False
+        if self._arr_state == 2 and g.is_set():
+            self._arr_state = 0              # its prefill is done
+            self._arr_seen = sig.read()
+            return False
+        return True
+
+    def _arrivals_reset(self) -> None:
+        """At a cycle's start: arrivals before it are not this cycle's to wait
+        for (the prefill pause covers any still to run)."""
+        sig = self._arrivals
+        if sig not in (None, -1):
+            self._arr_seen = sig.read()
+            self._arr_state = 0
 
     # -- per-model hooks ---------------------------------------------------
 
@@ -288,6 +361,7 @@ class BackwardService:
 
     def _handle_process_activations(self, conn, msg) -> None:
         """Buffer-full signal: run the backward, then clean the buffers."""
+        self._arrivals_reset()
         n = int(msg.get("n", 0))
         sample_lens = msg.get("sample_lens") or []
         epoch = int(msg.get("epoch", 0))
