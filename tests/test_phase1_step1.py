@@ -125,8 +125,14 @@ def test_gpu_runtime():
     green(f"GPU runtime (loads {_MODEL}):")
     from vllm import LLM
 
-    llm = LLM(_MODEL, additional_config=_ft(), enforce_eager=True,
-              gpu_memory_utilization=0.5)
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parent.parent
+    llm = LLM(_MODEL, enforce_eager=True, gpu_memory_utilization=0.5,
+              enable_lora=True, max_lora_rank=16,
+              additional_config=_ft(
+                  finetuning_lora_path=str(repo / "adapters/qwen3-0.6b-toy-lora-ft"),
+                  data_path=str(repo / "alpaca_1000.txt")))
     out = llm.generate("Hello")
     check("LLM loaded and generated with finetuning on", len(out) > 0)
 
