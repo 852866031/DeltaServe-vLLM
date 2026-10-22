@@ -1,14 +1,24 @@
 # DeltaServe-vLLM
 
-`dserve-vllm` re-hosts DeltaServe's LLM **co-serving** layer on top of vLLM's
+DeltaServe-vLLM re-hosts DeltaServe's LLM **co-serving** layer on top of vLLM's
 V1 engine: it interleaves a LoRA-SFT backward pass with ongoing inference on
 the same GPU (activation capture → backward subprocess → SLO-aware
 FT-admission scheduler), while keeping vLLM's production multi-LoRA batching
 and multi-process engine as the substrate.
 
-The Python distribution name and CLI are both `dserve-vllm`; internally it
-still imports as `vllm` (it is a vendored fork of `vllm-project/vllm`), so
-existing vLLM code and notebooks keep working.
+It is a **vLLM plugin** (`deltaserve`, in `deltaserve-plugin/`) on top of
+**unmodified** vLLM at
+[`117afeea4`](https://github.com/vllm-project/vllm/commit/117afeea4)
+(`0.21.1rc1.dev123`). Co-serving is switched on per launch through vLLM's own
+`additional_config`; without it the server is plain vLLM:
+
+```bash
+vllm serve <model> --enable-lora ... \
+    --additional-config '{"deltaserve": {"enable_finetuning": true, ...}}'
+```
+
+The launchers (`eval-tp/launch_deltaserve.py`, `eval*/auto_benchmark*.py`)
+build that from a serving YAML (`configs/`).
 
 > **On an RTX 5090?** Skip the general guide and jump straight to
 > [**RTX 5090 (Blackwell, sm_120)**](#rtx-5090-blackwell-sm_120). The 5090
@@ -21,21 +31,24 @@ existing vLLM code and notebooks keep working.
 
 ```
 DeltaServe-vLLM/
-├── dserve-vllm/                ← the package source (vendored vLLM fork)
-│   ├── pyproject.toml          ← name = "dserve-vllm", CLI = "dserve-vllm"
-│   └── vllm/deltaserve/        ← DeltaServe co-serving code (new)
+├── deltaserve-plugin/          ← the plugin package (pip name "deltaserve")
+│   ├── pyproject.toml          ← entry point vllm.general_plugins → deltaserve.plugin:register
+│   └── deltaserve/             ← all co-serving code
+├── vllm-upstream/              ← stock vLLM @ 117afeea4 (you clone it; not tracked here)
 ├── DeltaServe/                 ← read-only reference (original framework)
-├── configs/                    ← serving_config_finetuning_{llama3,opt}.yaml
-├── scripts/                    ← ft_experiment_{llama3,opt}.py, launch_deltaserve.py
-├── eval/                       ← auto_benchmark.py + timelines + plotting
+├── configs/                    ← serving YAMLs (finetune / throttles / slo / debug sections)
+├── scripts/                    ← adapter tools, config converter, misc launchers
+├── eval/, eval-tp/, eval-arxiv/ ← benchmarks, timelines, plotting
 ├── adapters/                   ← toy LoRA adapters
-└── tests/
+└── tests/                      ← standalone test scripts (tests/run_all.sh runs all)
 ```
 
 Read after install:
 - `CLAUDE.md` — architecture, box mapping, build/precision rules, current status.
 - `INTEGRATION_PROGRESS.md` — phased plan + per-stage progress.
-- `VLLM_FORK_CHANGES.md` — every change vs upstream vLLM (navigate the fork).
+- `deltaserve-plugin/deltaserve/plugin.py` — every point where the plugin hooks
+  into vLLM (the docstring lists them).
+- `CLEANUP_LOG.md` — the fork → plugin restructure, step by step, with measurements.
 
 ---
 
@@ -56,73 +69,47 @@ runtime is enough and FlashInfer ships prebuilt cubins for these archs.
 ### Steps
 
 ```bash
-# 1. Clone
+# 1. Clone, plus stock vLLM at the commit the plugin is built against
 git clone https://github.com/<your-org>/DeltaServe-vLLM.git
 cd DeltaServe-vLLM
+git clone https://github.com/vllm-project/vllm.git vllm-upstream
+git -C vllm-upstream checkout 117afeea4665367a3066c1df58d4082d07fcc946
 
 # 2. Fresh conda env
-conda create -n dserve-vllm python=3.12 -y
-conda activate dserve-vllm
+conda create -n deltaserve python=3.12 -y
+conda activate deltaserve
 
 # 3. Install uv (lets us use --torch-backend=auto to pick the matching
-#    torch wheel for your detected CUDA — saves you from hand-picking an
-#    index URL). Skip if you already have it.
+#    torch wheel for your detected CUDA). Skip if you already have it.
 pip install uv
 
-# 4. Editable install of the dserve-vllm package (precompiled wheel path —
-#    fast, no full CUDA source build needed). Three env vars pin the install:
-#    - VLLM_PRECOMPILED_WHEEL_COMMIT pins the `.so` files to the upstream
-#      vLLM commit this fork was vendored from (without it, git merge-base
-#      can't find a base commit because our main shares no history with
-#      vllm-project/vllm:main, and the install falls back to a nightly wheel
-#      that may have ABI-incompatible vllm._C symbols).
-#    - VLLM_VERSION_OVERRIDE pins the package version string. setuptools-scm
-#      can't derive one (no tags in this repo, no shared history with
-#      upstream's tags); without the override the install errors. The value
-#      below matches what `pip show vllm` reported on this fork before the
-#      package rename.
-#    - VLLM_USE_PRECOMPILED=1 enables the wheel-grafting code path.
-cd dserve-vllm
+# 4. Editable install of vLLM with its precompiled kernels (no CUDA source
+#    build). VLLM_PRECOMPILED_WHEEL_COMMIT pins the .so files to this commit;
+#    VLLM_VERSION_OVERRIDE pins the version string the precompiled path uses.
+cd vllm-upstream
 VLLM_VERSION_OVERRIDE=0.21.1rc1.dev123+g117afeea4.precompiled \
     VLLM_PRECOMPILED_WHEEL_COMMIT=117afeea4665367a3066c1df58d4082d07fcc946 \
     VLLM_USE_PRECOMPILED=1 \
     uv pip install --editable . --torch-backend=auto
 cd ..
+
+# 5. The plugin (pure Python; registers itself with vLLM)
+uv pip install --editable deltaserve-plugin --no-deps
 ```
 
-> **Tip — persist the env vars** so you don't have to retype them on the next
-> install (and so any subprocess you spawn in this env inherits them):
-> ```bash
-> conda env config vars set \
->     VLLM_VERSION_OVERRIDE=0.21.1rc1.dev123+g117afeea4.precompiled \
->     VLLM_PRECOMPILED_WHEEL_COMMIT=117afeea4665367a3066c1df58d4082d07fcc946 \
->     VLLM_USE_PRECOMPILED=1
-> conda activate dserve-vllm   # reactivate to apply
-> ```
-> After this, the install command collapses to:
-> `uv pip install --editable . --torch-backend=auto`.
-
 > **Without `uv`** — plain `pip` does not support `--torch-backend`, so install
-> torch from the right index first, then do the editable install without the
-> flag:
-> ```bash
-> # pick the index that matches your CUDA major version:
-> #   CUDA 12.x → cu128    CUDA 13.x → cu130
-> pip install torch --index-url https://download.pytorch.org/whl/cu128
-> cd dserve-vllm
-> VLLM_VERSION_OVERRIDE=0.21.1rc1.dev123+g117afeea4.precompiled \
->     VLLM_PRECOMPILED_WHEEL_COMMIT=117afeea4665367a3066c1df58d4082d07fcc946 \
->     VLLM_USE_PRECOMPILED=1 \
->     pip install --editable .
-> cd ..
-> ```
+> torch from the right index first (CUDA 12.x → `cu128`, 13.x → `cu130`), then
+> run step 4 with `pip install --editable .` and step 5 with
+> `pip install --editable deltaserve-plugin --no-deps`.
 
 ### Sanity check (no GPU work)
 
 ```bash
 python -c "import torch; print('torch', torch.__version__, '| cuda', torch.version.cuda)"
 python -c "import torch; print('device cap', torch.cuda.get_device_capability())"
-dserve-vllm --help          # CLI registered? Should print vLLM subcommands.
+python -c "import importlib.metadata as m; print([e.value for e in m.entry_points(group='vllm.general_plugins')])"
+# expect 'deltaserve.plugin:register' in the list
+python tests/test_phase1_step1.py   # plugin wiring (CPU only)
 ```
 
 ### Smoke test (tiny model on GPU)
@@ -179,8 +166,8 @@ cd DeltaServe-vLLM
 ### Step 2 — Create the conda environment
 
 ```bash
-conda create -n dserve-vllm python=3.12 -y
-conda activate dserve-vllm
+conda create -n deltaserve python=3.12 -y
+conda activate deltaserve
 ```
 
 ### Step 3 — Install CUDA 13.0 toolkit *inside the env* (provides nvcc 13.0)
@@ -217,75 +204,38 @@ that single check is what prevents the whole "sm75" cascade.
 > **To avoid retyping each shell**, persist them to the env instead:
 > ```bash
 > conda env config vars set CUDA_HOME=$CONDA_PREFIX LIBRARY_PATH=$CONDA_PREFIX/lib/stubs
-> conda activate dserve-vllm   # reactivate to apply
+> conda activate deltaserve   # reactivate to apply
 > ```
 > (PATH precedence still needs the `export PATH=...; hash -r` line if a
 > system CUDA is prepended in your `~/.bashrc`.)
 
-### Step 5 — Install dserve-vllm (precompiled, editable)
+### Step 5 — Install vLLM (precompiled, editable) and the plugin
 
-Installs the package with vLLM's precompiled kernels (which already cover
-sm_120), pulls **torch cu130 (CUDA 13.0)** via `--torch-backend=auto`, and
-brings the pinned `flashinfer-python` as a dependency. **No full source
-compile.**
-
-Three env vars pin the install (same as the
-[general install](#installation--general-most-gpus); see that section for the
-full rationale):
-
-- **`VLLM_VERSION_OVERRIDE`** — pins the package version string. setuptools-scm
-  can't derive one for this repo (no tags, no shared history with upstream's
-  tags), so without the override the install errors. The value below matches
-  what `pip show vllm` reported on this fork before the package rename.
-- **`VLLM_PRECOMPILED_WHEEL_COMMIT`** — pins the `.so` files to the upstream
-  vLLM commit this fork was vendored from
-  ([`117afeea4`](https://github.com/vllm-project/vllm/commit/117afeea4)).
-  Without it the install falls back to a nightly wheel with possibly
-  ABI-incompatible `vllm._C` symbols.
-- **`VLLM_USE_PRECOMPILED=1`** — enables the wheel-grafting code path (no
-  full source build).
+Installs stock vLLM at the pinned commit with its precompiled kernels (which
+already cover sm_120), pulls **torch cu130 (CUDA 13.0)** via
+`--torch-backend=auto`, and brings the pinned `flashinfer-python` as a
+dependency. **No full source compile.** `VLLM_PRECOMPILED_WHEEL_COMMIT` pins the
+`.so` files to [`117afeea4`](https://github.com/vllm-project/vllm/commit/117afeea4);
+the wheel must exist at `https://wheels.vllm.ai/<sha>/cu130/vllm/metadata.json`.
 
 ```bash
 # Need uv for --torch-backend=auto (plain pip doesn't have this flag).
 pip install uv
 
-cd dserve-vllm
+git clone https://github.com/vllm-project/vllm.git vllm-upstream
+git -C vllm-upstream checkout 117afeea4665367a3066c1df58d4082d07fcc946
+cd vllm-upstream
 VLLM_VERSION_OVERRIDE=0.21.1rc1.dev123+g117afeea4.precompiled \
     VLLM_PRECOMPILED_WHEEL_COMMIT=117afeea4665367a3066c1df58d4082d07fcc946 \
     VLLM_USE_PRECOMPILED=1 \
     uv pip install --editable . --torch-backend=auto
 cd ..
+uv pip install --editable deltaserve-plugin --no-deps
 ```
 
-> **Tip — persist the env vars** so you don't have to retype them on the next
-> install:
-> ```bash
-> conda env config vars set \
->     VLLM_VERSION_OVERRIDE=0.21.1rc1.dev123+g117afeea4.precompiled \
->     VLLM_PRECOMPILED_WHEEL_COMMIT=117afeea4665367a3066c1df58d4082d07fcc946 \
->     VLLM_USE_PRECOMPILED=1
-> conda activate dserve-vllm   # reactivate to apply
-> ```
-> After this, the install command collapses to:
-> `uv pip install --editable . --torch-backend=auto`.
-
-> **Without `uv`** — install torch cu130 from PyTorch's index first, then do
-> the editable install without `--torch-backend`:
-> ```bash
-> pip install torch --index-url https://download.pytorch.org/whl/cu130
-> cd dserve-vllm
-> VLLM_VERSION_OVERRIDE=0.21.1rc1.dev123+g117afeea4.precompiled \
->     VLLM_PRECOMPILED_WHEEL_COMMIT=117afeea4665367a3066c1df58d4082d07fcc946 \
->     VLLM_USE_PRECOMPILED=1 \
->     pip install --editable .
-> cd ..
-> ```
-
-> **If you bump the vendoring base** — get the new 40-char SHA from
-> `git log --all --grep "vendored fork"` (or whichever commit you rebased on)
-> and update the env var above. The wheel must exist at
-> `https://wheels.vllm.ai/<sha>/cu130/vllm/metadata.json` — a quick
-> `curl -I` will confirm.
+> **Moving to a newer vLLM** — check out the new commit in `vllm-upstream`,
+> reinstall with its SHA, and run `tests/run_all.sh`: the plugin depends only on
+> the vLLM APIs it imports and the methods `deltaserve/plugin.py` wraps.
 
 Post-install sanity (no GPU work):
 
@@ -294,7 +244,7 @@ python -c "import torch; print('torch', torch.__version__, '| cuda', torch.versi
 # expect e.g.: torch 2.11.0+cu130 | cuda 13.0
 python -c "import torch; print('cap', torch.cuda.get_device_capability())"
 # expect: cap (12, 0)
-dserve-vllm --help          # CLI registered
+python tests/test_phase1_step1.py   # plugin wiring (CPU only)
 ```
 
 ### Step 6 — Smoke test (tiny model, triggers the one-time FlashInfer JIT)
@@ -364,7 +314,7 @@ backend per detected GPU; let it.
 ## Running the experiments
 
 The headline eval is `eval/auto_benchmark.py` — a timeline-replay benchmark
-that launches a `dserve-vllm serve` server with a Llama-3 base + two LoRA
+that launches a `vllm serve` server (with the deltaserve plugin) with a Llama-3 base + two LoRA
 adapters and measures TTFT / TBT / FT throughput under a recorded inference
 load. To run it you first need the two adapter directories that the eval's
 finetuning YAML references.
@@ -381,10 +331,10 @@ saves it to **two** sibling directories that the eval expects:
 | `adapters/llama3-toy-lora-ft` | The **finetuning** target — same weights at init time. During co-serving, DeltaServe's backward subprocess keeps training this one further; inference is unaffected because the served adapter is the other dir. |
 
 The script is committed (`scripts/init_adapters_llama3.py`), so you only need
-to run it. From the repo root, inside the `dserve-vllm` conda env:
+to run it. From the repo root, inside the conda env:
 
 ```bash
-# One-time: install the training-side deps that aren't in dserve-vllm's own
+# One-time: install the training-side deps that aren't in the env's own
 # requirements. peft + datasets are needed by init_adapters_llama3.py to
 # train the adapter; pandas + matplotlib are needed later by the eval
 # plotter (eval/auto_plot.py).
@@ -429,7 +379,7 @@ python scripts/init_adapters_qwen3.py --size 0.6b
 
 `eval/auto_benchmark.py` does the following end-to-end, in one invocation:
 
-1. **Spawns the server** — `dserve-vllm serve meta-llama/Meta-Llama-3-8B`
+1. **Spawns the server** — `vllm serve meta-llama/Meta-Llama-3-8B`
    with the eval YAML (`configs/serving_config_finetuning_llama3.yaml`), the
    inference LoRA module wired in by name, and (under `--co`) the
    FinetuneConfig + SLO section that enable co-serving. Server logs stream
@@ -501,7 +451,7 @@ latency / throughput / SLO figure.
 
 Compiled kernels (`*.so`) and model weights (`*.safetensors`, tokenizer
 blobs) are **gitignored**. After cloning you need to:
-1. Reinstall the package (`VLLM_USE_PRECOMPILED=1 uv pip install -e .` from
-   `dserve-vllm/`, with the env vars from [Step 5](#step-5--install-dserve-vllm-precompiled-editable)).
+1. Clone `vllm-upstream/` and install it plus the plugin
+   ([Step 5](#step-5--install-vllm-precompiled-editable-and-the-plugin)).
 2. Re-run `scripts/init_adapters_llama3.py` to rebuild the adapter dirs.
 3. Then `python eval/auto_benchmark.py --co --loose`.
