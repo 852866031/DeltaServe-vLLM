@@ -1,10 +1,10 @@
 #!/usr/bin/env python
-"""Launch a `dserve-vllm serve` HTTP server from a DeltaServe YAML — the minimal
+"""Launch a `vllm serve` HTTP server from a DeltaServe YAML — the minimal
 "just start the server" harness for the TP work (Phase 7).
 
 Unlike scripts/launch_deltaserve.py (which runs the OFFLINE `LLM` API and does
 one generation), this starts the real HTTP server the same way eval/auto_benchmark.py
-does (`dserve-vllm serve …` built from the YAML), streams its logs to this
+does (`vllm serve …` built from the YAML), streams its logs to this
 terminal, waits for /health, and then idles until Ctrl-C. It exists so we can
 watch the process-launch prints under tensor parallelism:
 
@@ -99,7 +99,7 @@ def build_server_cmd(config_path: str, port: int, base_model: str | None = None,
                      bwd_log_path: str | None = None,
                      step_trace_path: str | None = None,
                      api_server_count: int | None = None) -> LaunchSpec:
-    """Build the `dserve-vllm serve` command from a DeltaServe YAML.
+    """Build the `vllm serve` command from a DeltaServe YAML.
 
     Mirrors eval/auto_benchmark.build_server_cmd. The base model defaults to
     the YAML's ``model.model`` and the inference adapter to the YAML's
@@ -114,7 +114,7 @@ def build_server_cmd(config_path: str, port: int, base_model: str | None = None,
     eval-tp/analyze_step_trace.py). ``api_server_count``
     overrides the YAML's ``server.api_server_count``."""
     _strip_repo_from_syspath()
-    from vllm.deltaserve.config_loader import (
+    from deltaserve.config_loader import (
         finetune_cli_args,
         load_yaml_config,
         split_config,
@@ -122,7 +122,7 @@ def build_server_cmd(config_path: str, port: int, base_model: str | None = None,
 
     cfg = load_yaml_config(config_path)
     engine_kwargs, _, extras = split_config(cfg)
-    yaml_model = engine_kwargs.pop("model", None)  # positional to `dserve-vllm serve`
+    yaml_model = engine_kwargs.pop("model", None)  # positional to `vllm serve`
     base_model = base_model or yaml_model
     if not base_model:
         raise SystemExit(f"[launch-tp] no base model: pass --model or set "
@@ -138,17 +138,14 @@ def build_server_cmd(config_path: str, port: int, base_model: str | None = None,
     infer_lora_name = Path(infer_lora_dir).name
     served_name = served_name or family
 
-    vllm_bin = str(Path(sys.executable).parent / "dserve-vllm")
+    vllm_bin = str(Path(sys.executable).parent / "vllm")
     cmd = [vllm_bin, "serve", base_model]
     cmd += _engine_cli_args(engine_kwargs)
     cmd += ["--lora-modules", f"{infer_lora_name}={infer_lora_dir}"]
     if co:
         # Pass the finetune / throttles / slo / debug sections through as CLI flags.
-        cmd += finetune_cli_args(cfg)
-        if bwd_log_path:
-            cmd.append(f"--finetune-config.bwd_log_path={bwd_log_path}")
-        if step_trace_path:
-            cmd.append(f"--finetune-config.step_trace_path={step_trace_path}")
+        cmd += finetune_cli_args(cfg, bwd_log_path=bwd_log_path,
+                                 step_trace_path=step_trace_path)
     cmd += ["--host", "127.0.0.1", "--port", str(port),
             "--served-model-name", served_name]
     if api_server_count is None:

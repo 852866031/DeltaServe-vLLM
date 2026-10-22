@@ -20,13 +20,13 @@ from pathlib import Path
 import yaml
 
 _ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_ROOT / "dserve-vllm"))
+sys.path.insert(0, str(_ROOT / "deltaserve-plugin"))
 
 
 def _sections_table():
     # Read the tables from config_loader's source (importing it would pull in vLLM).
     import ast
-    src = (_ROOT / "dserve-vllm/vllm/deltaserve/config_loader.py").read_text()
+    src = (_ROOT / "deltaserve-plugin/deltaserve/config_loader.py").read_text()
     tables = {}
     for node in ast.parse(src).body:
         if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) \

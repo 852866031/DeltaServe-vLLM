@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """Test the three-regime composition-based execution-time estimator
-(vllm.deltaserve.estimator).
+(deltaserve.estimator).
 
 CPU-only, no model: synthesizes step durations from known per-regime
 coefficients, fits, and asserts coefficient recovery + per-regime prediction
@@ -15,7 +15,7 @@ import sys
 
 import numpy as np
 
-from vllm.deltaserve.estimator import (
+from deltaserve.estimator import (
     REGIME_DECODE_BWD,
     REGIME_DECODE_ONLY,
     REGIME_FT_MIXED,

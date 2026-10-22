@@ -21,11 +21,11 @@ import bwd_harness as H  # noqa: E402
 sys.path[:] = [p for p in sys.path
                if os.path.abspath(p or ".") != os.path.dirname(os.path.abspath(__file__))]
 
-from vllm.deltaserve.coordinator import FinetuneCoordinator  # noqa: E402
-from vllm.deltaserve.estimator import (  # noqa: E402
+from deltaserve.coordinator import FinetuneCoordinator  # noqa: E402
+from deltaserve.estimator import (  # noqa: E402
     MergedExecutionEstimator, StepExecutionTracker, StepFeatures)
-from vllm.deltaserve.ft_scheduler import FinetuneScheduler  # noqa: E402
-from vllm.deltaserve.step_trace import COLUMNS, StepTraceWriter  # noqa: E402
+from deltaserve.ft_scheduler import FinetuneScheduler  # noqa: E402
+from deltaserve.step_trace import COLUMNS, StepTraceWriter  # noqa: E402
 
 C = H.Checker(tol=1e-9)
 

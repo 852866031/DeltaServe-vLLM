@@ -23,9 +23,9 @@ import torch.nn.functional as F
 sys.path[:] = [p for p in sys.path
                if os.path.abspath(p or ".") != os.path.dirname(os.path.abspath(__file__))]
 
-from vllm.deltaserve.bwd_services import llama3 as L  # noqa: E402
-from vllm.deltaserve.bwd_services.common.ops import rmsnorm, rope_cos_sin  # noqa: E402
-from vllm.deltaserve.bwd_services.llama3 import Llama3BackwardService  # noqa: E402
+from deltaserve.bwd_services import llama3 as L  # noqa: E402
+from deltaserve.bwd_services.common.ops import rmsnorm, rope_cos_sin  # noqa: E402
+from deltaserve.bwd_services.llama3 import Llama3BackwardService  # noqa: E402
 
 # Small synthetic Llama with enough capacity to overfit a few fixed sequences.
 D, NL, Hq, Hkv, Hd, INTER, VOCAB, R = 64, 2, 4, 2, 16, 128, 32, 8

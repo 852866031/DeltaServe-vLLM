@@ -24,8 +24,8 @@ import bwd_harness as H  # noqa: E402
 sys.path[:] = [p for p in sys.path
                if os.path.abspath(p or ".") != os.path.dirname(os.path.abspath(__file__))]
 
-from vllm.deltaserve.bwd_services import qwen3 as Q  # noqa: E402
-from vllm.deltaserve.bwd_services.common.graph import GraphedBackward  # noqa: E402
+from deltaserve.bwd_services import qwen3 as Q  # noqa: E402
+from deltaserve.bwd_services.common.graph import GraphedBackward  # noqa: E402
 
 if not torch.cuda.is_available():
     print("CUDA not available — skipping Qwen3 graphed-backward parity test")

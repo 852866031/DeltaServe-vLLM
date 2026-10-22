@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Test the offline profiling shape generator (vllm.deltaserve).
+"""Test the offline profiling shape generator (deltaserve).
 
 CPU-only, no model: checks the generated shapes respect the token/length caps
 and cover every regime the merged estimator needs. No GPU.
@@ -9,7 +9,7 @@ and cover every regime the merged estimator needs. No GPU.
 
 import sys
 
-from vllm.deltaserve.profiling_batch_generator import ProfilingShapeGenerator
+from deltaserve.profiling_batch_generator import ProfilingShapeGenerator
 
 _passed = 0
 _failed = 0

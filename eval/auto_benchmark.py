@@ -4,7 +4,7 @@
 Port of DeltaServe/eval/llama3/auto_benchmark.py adapted to the vLLM OpenAI
 server:
 
-- Launches `dserve-vllm serve` (Llama-3-8B + the inference LoRA adapter,
+- Launches `vllm serve` (Llama-3-8B + the inference LoRA adapter,
   finetuning enabled when --co) in its own process group; streams server logs
   live.
 - Waits for /health, then (under --co) POSTs /start_finetuning so the
@@ -169,7 +169,7 @@ def detect_gpu_subdir() -> str:
 
 
 # ----------------------------------------------------------------------
-# Server launch (dserve-vllm serve, from the YAML — mirrors ft_experiment_llama3.py)
+# Server launch (vllm serve, from the YAML — mirrors ft_experiment_llama3.py)
 # ----------------------------------------------------------------------
 def _engine_cli_args(engine_kwargs: dict) -> list[str]:
     args: list[str] = []
@@ -195,7 +195,7 @@ def _load_yaml_cfg(config_path: Optional[str] = None) -> dict:
     ``--config`` CLI arg to A/B different scheduler variants."""
     sys.path[:] = [p for p in sys.path
                    if os.path.abspath(p or ".") not in {str(_HERE), str(_ROOT)}]
-    from vllm.deltaserve.config_loader import load_yaml_config
+    from deltaserve.config_loader import load_yaml_config
     return load_yaml_config(str(config_path or _CONFIG_DEFAULT))
 
 
@@ -205,7 +205,7 @@ def _phase_tag(cfg: dict) -> str:
     BothPhaseFinetuneScheduler that admits FT on any step composition.
     Unrecognized values are stringified verbatim — the scheduler-selection
     layer is authoritative on what's actually valid."""
-    from vllm.deltaserve.config_loader import finetune_value
+    from deltaserve.config_loader import finetune_value
     return str(finetune_value(cfg, "coserving_admission_phase") or "prefill")
 
 
@@ -214,7 +214,7 @@ def _ft_factor_tag(cfg: dict) -> str:
     safe suffix tag. ``-1`` (the disabled sentinel) becomes ``off`` so a
     no-cap run reads as ``..._factor_off`` instead of ``..._factor_-1.0``.
     Integer values render without a decimal; floats keep ``%g`` precision."""
-    from vllm.deltaserve.config_loader import finetune_value
+    from deltaserve.config_loader import finetune_value
     f = float(finetune_value(cfg, "ft_tokens_admission_constrain_factor", -1.0))
     if f == -1.0:
         return "off"
@@ -227,18 +227,18 @@ def build_server_cmd(co: bool, bwd_log_path: Optional[str],
                      api_server_count: Optional[int] = None,
                      base_model: str = _BASE_MODEL_DEFAULT,
                      config_path: Optional[str] = None) -> list[str]:
-    """Build the `dserve-vllm serve` command. Imports config_loader with the
+    """Build the `vllm serve` command. Imports config_loader with the
     repo root stripped from sys.path so `vllm` resolves to the installed
     package, not any source-tree copy.
 
     ``config_path`` overrides the default YAML — passed through from
     ``--config`` so the server gets the right finetune/slo knobs."""
     cfg = _load_yaml_cfg(config_path)
-    from vllm.deltaserve.config_loader import finetune_cli_args, split_config
+    from deltaserve.config_loader import finetune_cli_args, split_config
     engine_kwargs, _, _ = split_config(cfg)
-    engine_kwargs.pop("model", None)  # positional to `dserve-vllm serve`
+    engine_kwargs.pop("model", None)  # positional to `vllm serve`
 
-    vllm_bin = str(Path(sys.executable).parent / "dserve-vllm")
+    vllm_bin = str(Path(sys.executable).parent / "vllm")
     cmd = [vllm_bin, "serve", base_model]
     cmd += _engine_cli_args(engine_kwargs)
     # Serve the inference LoRA adapter by name (requests target it).
@@ -246,16 +246,14 @@ def build_server_cmd(co: bool, bwd_log_path: Optional[str],
     if co:
         # Finetuning on: pass the finetune / throttles / slo / debug sections, plus the
         # bwd-throughput log path.
-        cmd += finetune_cli_args(cfg)
-        if bwd_log_path:
-            cmd.append(f"--finetune-config.bwd_log_path={bwd_log_path}")
         # Hold FT admission closed at launch; the benchmark opens it via
         # POST /start_finetuning right before warmup so FT and inference
         # share warmup. (Profiling at launch is unaffected — it injects
         # FT directly.) The bwd_log trim at end-of-run drops any backward
         # rows that fired during warmup so the published log still
         # matches the recorded inference timeline.
-        cmd.append("--finetune-config.start_on_launch=false")
+        cmd += finetune_cli_args(cfg, bwd_log_path=bwd_log_path,
+                                 start_on_launch=False)
     # else: finetune sections omitted -> enable_finetuning defaults False.
     cmd += ["--host", "127.0.0.1", "--port", str(_PORT),
             "--served-model-name", _SERVED_NAME]

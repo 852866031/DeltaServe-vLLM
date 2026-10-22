@@ -23,7 +23,7 @@ import bwd_harness as H  # noqa: E402
 sys.path[:] = [p for p in sys.path
                if os.path.abspath(p or ".") != os.path.dirname(os.path.abspath(__file__))]
 
-from vllm.deltaserve.bwd_services.qwen3 import Qwen3BackwardService  # noqa: E402
+from deltaserve.bwd_services.qwen3 import Qwen3BackwardService  # noqa: E402
 
 
 def main():

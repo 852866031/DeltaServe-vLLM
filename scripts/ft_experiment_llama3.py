@@ -110,7 +110,7 @@ def main():
     # `import vllm` resolves to the installed package, not the ./dserve-vllm dir.
     _strip = {str(_HERE), str(_ROOT)}
     sys.path[:] = [p for p in sys.path if os.path.abspath(p or ".") not in _strip]
-    from vllm.deltaserve.config_loader import (
+    from deltaserve.config_loader import (
         finetune_cli_args,
         load_yaml_config,
         split_config,
@@ -118,20 +118,19 @@ def main():
 
     cfg = load_yaml_config(args.config)
     engine_kwargs, _, _ = split_config(cfg)
-    engine_kwargs.pop("model", None)  # model is a positional arg to `dserve-vllm serve`
+    engine_kwargs.pop("model", None)  # model is a positional arg to `vllm serve`
 
-    # Use the `dserve-vllm` console script (`dserve-vllm serve <model>`), NOT
+    # Use the `vllm` console script (`vllm serve <model>`), NOT
     # `python -m vllm.entrypoints.openai.api_server`: the latter triggers a
     # circular import (api_server -> arg_utils -> `from vllm import SamplingParams`
     # before vllm/__init__ finishes). The console script imports in the right
     # order, and its bin dir on sys.path[0] avoids any source-tree shadowing.
-    vllm_bin = str(Path(sys.executable).parent / "dserve-vllm")
+    vllm_bin = str(Path(sys.executable).parent / "vllm")
     cmd = [vllm_bin, "serve", args.model]
     cmd += _engine_cli_args(engine_kwargs)
-    cmd += finetune_cli_args(cfg)
     # Hold FT admission closed at launch so we can exercise POST
     # /start_finetuning below (profiling at launch is unaffected).
-    cmd.append("--finetune-config.start_on_launch=false")
+    cmd += finetune_cli_args(cfg, start_on_launch=False)
     cmd += ["--host", args.host, "--port", str(args.port),
             "--served-model-name", _SERVED_NAME]
 

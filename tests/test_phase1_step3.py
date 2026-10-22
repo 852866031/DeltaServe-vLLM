@@ -51,7 +51,7 @@ def main():
         print(f"{_RED}CUDA not available — this test needs a GPU.{_RESET}")
         sys.exit(1)
 
-    from vllm.deltaserve.backward_process import BackwardProcess
+    from deltaserve.backward_process import BackwardProcess
 
     dev = "cuda:0"
     torch.manual_seed(0)

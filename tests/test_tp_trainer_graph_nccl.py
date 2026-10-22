@@ -50,9 +50,9 @@ import bwd_harness as H  # noqa: E402
 sys.path[:] = [p for p in sys.path
                if os.path.abspath(p or ".") != os.path.dirname(os.path.abspath(__file__))]
 
-from vllm.deltaserve.bwd_services.common.ops import rmsnorm, rope_cos_sin  # noqa: E402
-from vllm.deltaserve.bwd_services.llama3 import Llama3BackwardService  # noqa: E402
-from vllm.deltaserve.bwd_services.qwen3 import Qwen3BackwardService  # noqa: E402
+from deltaserve.bwd_services.common.ops import rmsnorm, rope_cos_sin  # noqa: E402
+from deltaserve.bwd_services.llama3 import Llama3BackwardService  # noqa: E402
+from deltaserve.bwd_services.qwen3 import Qwen3BackwardService  # noqa: E402
 
 SERVICES = {"llama3": Llama3BackwardService, "qwen3": Qwen3BackwardService}
 TP = 2
@@ -320,7 +320,7 @@ def run_family(fam_name, port, C):
                                        full["ids"].to(device))
     # The clip must actually fire on this model for the symmetric-clip check
     # to mean anything: peek at the per-layer norm of one more step.
-    from vllm.deltaserve.bwd_services.common.tp import clip_layers_symmetric_
+    from deltaserve.bwd_services.common.tp import clip_layers_symmetric_
     n = sum(SEQ_LENS); b_start = [0, 6]
     acts = remat_activations(ref_svc, full["embed"].to(device), full["ids"].to(device),
                              SEQ_LENS, b_start)

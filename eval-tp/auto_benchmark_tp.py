@@ -92,7 +92,7 @@ def _load_cfg(path: str) -> dict:
     """The serving YAML (for the factor / phase output tags)."""
     sys.path[:] = [p for p in sys.path
                    if os.path.abspath(p or ".") not in {str(_HERE), str(_ROOT), str(_EVAL)}]
-    from vllm.deltaserve.config_loader import load_yaml_config
+    from deltaserve.config_loader import load_yaml_config
     return load_yaml_config(path)
 
 

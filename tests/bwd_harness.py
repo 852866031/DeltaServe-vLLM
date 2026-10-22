@@ -19,8 +19,8 @@ import sys
 import torch
 import torch.nn.functional as F
 
-from vllm.deltaserve.bwd_services.common.ops import rmsnorm, rope_cos_sin
-from vllm.deltaserve.bwd_services.common.tp import lora_shard_slice
+from deltaserve.bwd_services.common.ops import rmsnorm, rope_cos_sin
+from deltaserve.bwd_services.common.tp import lora_shard_slice
 
 LORA_KEYS = ("qA", "qB", "kA", "kB", "vA", "vB", "oA", "oB")
 

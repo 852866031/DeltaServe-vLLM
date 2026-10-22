@@ -27,8 +27,8 @@ import torch
 sys.path[:] = [p for p in sys.path
                if os.path.abspath(p or ".") != os.path.dirname(os.path.abspath(__file__))]
 
-from vllm.deltaserve.bwd_services import llama3 as L  # noqa: E402
-from vllm.deltaserve.bwd_services.common.tp import lora_shard_slice  # noqa: E402
+from deltaserve.bwd_services import llama3 as L  # noqa: E402
+from deltaserve.bwd_services.common.tp import lora_shard_slice  # noqa: E402
 
 _passed = 0
 _failed = 0

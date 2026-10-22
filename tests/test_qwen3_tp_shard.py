@@ -22,7 +22,7 @@ import bwd_harness as H  # noqa: E402
 sys.path[:] = [p for p in sys.path
                if os.path.abspath(p or ".") != os.path.dirname(os.path.abspath(__file__))]
 
-from vllm.deltaserve.bwd_services.common.tp import lora_shard_slice  # noqa: E402
+from deltaserve.bwd_services.common.tp import lora_shard_slice  # noqa: E402
 
 C = H.Checker(tol=0.0)
 

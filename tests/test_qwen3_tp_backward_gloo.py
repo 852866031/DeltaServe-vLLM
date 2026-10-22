@@ -23,7 +23,7 @@ import bwd_harness as H  # noqa: E402
 sys.path[:] = [p for p in sys.path
                if os.path.abspath(p or ".") != os.path.dirname(os.path.abspath(__file__))]
 
-from vllm.deltaserve.bwd_services import qwen3 as Q  # noqa: E402
+from deltaserve.bwd_services import qwen3 as Q  # noqa: E402
 
 # Hq=4/Hkv=2 GQA, Hd=8 → attention width 32; residual width 24 (≠ 32).
 CFG = dict(hidden=24, Hq=4, Hkv=2, Hd=8, inter=64, r=4, eps=1e-6, scaling=2.0,

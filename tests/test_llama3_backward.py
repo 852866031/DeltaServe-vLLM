@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Correctness gate for the llama3 manual LoRA backward (Phase 3).
 
-Validates the hand-derived gradients in `vllm.deltaserve.bwd_services.llama3`
+Validates the hand-derived gradients in `deltaserve.bwd_services.llama3`
 against `torch.autograd` on tiny synthetic fp32 shapes (CPU, no GPU / no 8B):
 
   - head_backward      vs autograd of the LM-head + final-norm + per-sample CE loss
@@ -23,9 +23,9 @@ import torch
 sys.path[:] = [p for p in sys.path
                if os.path.abspath(p or ".") != os.path.dirname(os.path.abspath(__file__))]
 
-from vllm.deltaserve.bwd_services import llama3 as L  # noqa: E402
-from vllm.deltaserve.bwd_services.common.head import head_backward  # noqa: E402
-from vllm.deltaserve.bwd_services.common.ops import rmsnorm, rope_cos_sin  # noqa: E402
+from deltaserve.bwd_services import llama3 as L  # noqa: E402
+from deltaserve.bwd_services.common.head import head_backward  # noqa: E402
+from deltaserve.bwd_services.common.ops import rmsnorm, rope_cos_sin  # noqa: E402
 
 _TOL = 1e-3
 _passed = 0

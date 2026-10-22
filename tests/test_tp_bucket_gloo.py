@@ -87,7 +87,7 @@ def run_family(fam_name, C):
                              T.make_meta(fam_name, tp_size=1, tp_rank=0, port=0,
                                          graph=False), torch.device("cpu"))
     ref_losses, ref_masters, _ = T.train(ref_svc, full["embed"], full["ids"])
-    from vllm.deltaserve.bwd_services.common.tp import clip_layers_symmetric_
+    from deltaserve.bwd_services.common.tp import clip_layers_symmetric_
     n = sum(T.SEQ_LENS); b_start = [0, T.SEQ_LENS[0]]
     acts = T.remat_activations(ref_svc, full["embed"], full["ids"], T.SEQ_LENS, b_start)
     ref_svc.process_backward(acts, T.SEQ_LENS, n, epoch=0)
