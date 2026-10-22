@@ -17,6 +17,8 @@ Timelines come from eval/timelines/5090/ (the board's request-rate envelope):
 
     --loose            timeline_loose.csv
     --tight            timeline_tight.csv
+    --loose-half       timeline_loose_half.csv  (first half, t < 26 s: quick checks)
+    --tight-half       timeline_tight_half.csv  (first half, t < 26 s: quick checks)
     --nutanix          timeline_nutanix.csv
     --nutanix-600-800  timeline_nutanix_original_600-800.csv (the 600-800 s slice
                        of the original Nutanix trace)
@@ -79,6 +81,8 @@ TIMELINES_DIR = _EVAL / "timelines" / "5090"
 MODES = {
     "loose": "timeline_loose.csv",
     "tight": "timeline_tight.csv",
+    "loose-half": "timeline_loose_half.csv",
+    "tight-half": "timeline_tight_half.csv",
     "nutanix": "timeline_nutanix.csv",
     "nutanix-600-800": "timeline_nutanix_original_600-800.csv",
 }
@@ -138,8 +142,14 @@ async def main() -> int:
     ap.add_argument("--kill-stale", action="store_true",
                     help="Kill leftover GPU-resident processes from a previous run "
                          "instead of refusing to launch.")
+    ap.add_argument("--out-dir", default=None,
+                    help="Write the outputs here instead of eval-tp/output/ "
+                         "(e.g. one directory per validation run).")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
+    global OUTPUT_DIR
+    if args.out_dir:
+        OUTPUT_DIR = Path(args.out_dir).resolve()
 
     chosen = [m for m in MODES if getattr(args, f"mode_{m.replace('-', '_')}")]
     if len(chosen) > 1:
