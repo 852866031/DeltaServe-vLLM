@@ -1,5 +1,11 @@
 # DeltaServe fork — changes from plain vLLM
 
+> **Historical (fork era, up to 2026-10).** DeltaServe no longer modifies vLLM: it is a
+> plugin (`deltaserve-plugin/`) on stock vLLM @ `117afeea4`. Each upstream edit below now
+> lives in a plugin module — see "How the plugin hooks into vLLM" in `CLAUDE.md` and the
+> step-by-step move in `CLEANUP_LOG.md`. Kept for navigating the git history.
+
+
 Every change we make to the vendored vLLM source tree (the `vllm/` Python
 package, which lives under `dserve-vllm/vllm/` from the repo root), organized
 by stage. This is the "what did we touch and why" manifest;
