@@ -54,7 +54,7 @@ def test_engine_args():
     from vllm.config import FinetuneConfig
     from vllm.engine.arg_utils import EngineArgs
 
-    ea = EngineArgs(model="facebook/opt-125m")
+    ea = EngineArgs(model="Qwen/Qwen3-0.6B-Base")
     check("EngineArgs exposes finetune_config",
           isinstance(ea.finetune_config, FinetuneConfig))
     check("EngineArgs default enable_finetuning=False",
@@ -72,7 +72,7 @@ def test_cli_parse():
     p = FlexibleArgumentParser()
     p = EngineArgs.add_cli_args(p)
     ns = p.parse_args([
-        "--model", "facebook/opt-125m",
+        "--model", "Qwen/Qwen3-0.6B-Base",
         "--finetune-config.enable_finetuning=true",
     ])
     ea = EngineArgs.from_cli_args(ns)
@@ -81,19 +81,19 @@ def test_cli_parse():
 
     p2 = FlexibleArgumentParser()
     p2 = EngineArgs.add_cli_args(p2)
-    ns2 = p2.parse_args(["--model", "facebook/opt-125m"])
+    ns2 = p2.parse_args(["--model", "Qwen/Qwen3-0.6B-Base"])
     ea2 = EngineArgs.from_cli_args(ns2)
     check("omitting the flag defaults to False",
           ea2.finetune_config.enable_finetuning is False)
 
 
 def test_gpu_runtime_print():
-    green("GPU runtime print (loads facebook/opt-125m):")
+    green("GPU runtime print (loads Qwen/Qwen3-0.6B-Base):")
     from vllm import LLM
     from vllm.config import FinetuneConfig
 
     # Watch stdout for: [deltaserve] Worker ... enable_finetuning=True
-    llm = LLM("facebook/opt-125m",
+    llm = LLM("Qwen/Qwen3-0.6B-Base",
               finetune_config=FinetuneConfig(enable_finetuning=True))
     out = llm.generate("Hello")
     check("LLM loaded and generated with enable_finetuning=True",

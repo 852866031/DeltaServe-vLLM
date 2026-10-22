@@ -51,7 +51,6 @@ class LoraSftTrainerService(BackwardService):
     """Backward child that trains the FT LoRA adapter for one model family."""
 
     family: Family = None  # set by the per-family subclass
-    is_trainer = True
 
     def __init__(self, device_index: int) -> None:
         super().__init__(device_index)

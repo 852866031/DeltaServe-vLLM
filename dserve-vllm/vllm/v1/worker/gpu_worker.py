@@ -453,8 +453,8 @@ class Worker(WorkerBase):
                 )
 
         # Resolve the LM-head weight + trim/scale info the backward process needs
-        # to reconstruct logits. opt-125m / Llama tie word embeddings, so the
-        # LM-head weight appears under the embedding param name; fall back to that
+        # to reconstruct logits. Models that tie word embeddings (Qwen3-0.6B) have
+        # the LM-head weight under the embedding param name; fall back to that
         # when there is no separate "lm_head.weight".
         hf_config = self.model_config.hf_config
         # With enable_lora vLLM wraps LoRA-capable modules, so a parameter can
@@ -599,6 +599,8 @@ class Worker(WorkerBase):
             attn_qkv_pre_transform=saved_qkv_pre_transform(arch),
             save_attn_ctx=bool(ft_cfg.save_attn_ctx),
             save_resid_mid=bool(ft_cfg.save_resid_mid),
+            # Only the print_activation_hash check reads the post-norm output.
+            save_final_hidden=bool(ft_cfg.print_activation_hash),
         )
         accumulator.register_hooks()
         # [mixed-fwd-cuda-graph] mark the model's modules for the graph-
@@ -621,7 +623,6 @@ class Worker(WorkerBase):
         # co-serving the SLO gate caps FT tokens once the estimator is warm.
         coordinator = get_coordinator(capacity=cap, per_step_budget=cap)
         coordinator.backward_process = backward_process
-        coordinator.backward_sleep_s = float(ft_cfg.backward_sleep_seconds)
         # [DeltaServe] Phase 7 / M4.1: under TP>1 this worker-side coordinator is
         # a DIFFERENT process from the EngineCore scheduler. Relay mode makes it
         # a thin executor: the runner calls execute_trigger (on a relayed
@@ -679,18 +680,12 @@ class Worker(WorkerBase):
     def _maybe_share_ft_served_lora(self) -> None:
         """Pre-load + pin the FT LoRA adapter and share vLLM's served LoRA stacked
         buffers (CUDA-IPC) with the backward process so the trainer publishes updated
-        weights straight into the tensors inference reads. Trainer families only
-        (``bwd_services.registry.is_trainer``)."""
+        weights straight into the tensors inference reads."""
         import re
 
         backward_process = getattr(self, "backward_process", None)
         if backward_process is None:
             return
-        arch = (self.model_config.hf_config.architectures or [None])[0]
-        from vllm.deltaserve.bwd_services import is_trainer
-
-        if not is_trainer(arch):
-            return  # loss-only services (opt) never publish weights
 
         from vllm.deltaserve import dprint
         from vllm.deltaserve.ft_injector import FT_LORA_INT_ID

@@ -15,7 +15,7 @@ Usage (inside the dserve-vllm conda env, with the CUDA env from
 README.md exported):
 
     HF_HUB_OFFLINE=1 python launch_deltaserve.py
-    HF_HUB_OFFLINE=1 python launch_deltaserve.py --model facebook/opt-125m   # fast
+    HF_HUB_OFFLINE=1 python launch_deltaserve.py --model Qwen/Qwen3-0.6B   # fast
     python launch_deltaserve.py --dry-run                                    # CPU-only, no model load
 """
 
@@ -42,7 +42,7 @@ def main():
     ap.add_argument("--config", default=str(_DEFAULT_CONFIG),
                     help="DeltaServe YAML config (default: configs/serving_config_finetuning_llama3.yaml)")
     ap.add_argument("--model", default=None,
-                    help="override model dir/id from the YAML (e.g. facebook/opt-125m)")
+                    help="override model dir/id from the YAML (e.g. Qwen/Qwen3-0.6B)")
     ap.add_argument("--prompt", default="The capital of France is")
     ap.add_argument("--max-tokens", type=int, default=32)
     ap.add_argument("--dry-run", action="store_true",

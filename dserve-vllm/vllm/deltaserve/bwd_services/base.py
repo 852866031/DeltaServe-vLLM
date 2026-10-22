@@ -11,11 +11,10 @@ runs its recv/dispatch loop.
 ``BackwardService`` owns the pipe protocol shared by all models: the ``ready``
 handshake, ping/shutdown, the CUDA-IPC ``share_weights`` / ``share_activations``
 mappings (held to keep the IPC views alive), the hash debug commands, and
-``process_activations`` (the buffer-full signal). On that signal it computes the
-loss + logit gradient via the model-specific ``compute_loss_and_grad`` BEFORE
-cleaning the buffers, then keeps the existing clean + sleep + done-response so
-the co-serving cycle/timing is preserved. The real LoRA backward + optimizer is
-a later Phase-3 slice.
+``process_activations`` (the buffer-full signal). On that signal it runs the
+subclass's ``process_backward`` (the LoRA backward + optimizer step, see
+``common/trainer.py``) BEFORE cleaning the buffers, then sends the done-response
+that reopens FT admission.
 """
 
 import math
@@ -23,7 +22,6 @@ import os
 import time
 
 import torch
-import torch.nn.functional as F
 
 from vllm.deltaserve import dprint, mark_backward_process
 from vllm.deltaserve.backward_process import (
@@ -97,20 +95,11 @@ def service_main(conn, mps_percentage: int, device_index: int,
 class BackwardService:
     """Base class: the model-agnostic backward recv/dispatch loop."""
 
-    # True for services that actually train (optimizer.step) — they own the
-    # GPU for the whole pass, so the lifecycle skips the simulated sleep. A
-    # class attribute so the registry can answer ``is_trainer(arch)`` without
-    # instantiating the service.
-    is_trainer: bool = False
-
     def __init__(self, device_index: int) -> None:
         self.device_index = int(device_index)
         # Hold onto shared weights/activations so the IPC mappings stay alive.
         self.shared: dict = {"base": None, "ft": None, "meta": {}}
         self.activations: dict | None = None
-        # dLoss/dLogits from the most recent backward cycle — stashed for the
-        # next slice (LoRA backward + optimizer). Not piped to the parent.
-        self.last_logit_grad: torch.Tensor | None = None
         # Run verify_activations each cycle (set from share_activations print_hash).
         self._verify = False
         # Current FT epoch (for per-epoch StepLR in trainer subclasses).
@@ -165,6 +154,8 @@ class BackwardService:
         if depth < 0:
             meta = (self.shared or {}).get("meta") or {}
             depth = int(meta.get("backward_run_ahead_boundaries", 0) or 0)
+            if not torch.cuda.is_available():
+                depth = 0   # CPU (gloo tests): no device queue to bound
             self._run_ahead = depth
             if depth > 0:
                 self._boundary_events = [
@@ -207,99 +198,16 @@ class BackwardService:
 
     # -- per-model hooks ---------------------------------------------------
 
-    def compute_loss_and_grad(self, activations: dict, sample_lens: list[int],
-                              n: int):
-        """Return (loss: float, n_valid: int, logit_grad: Tensor) for n rows.
-
-        Reconstructs full logits from the saved pre-LM-head hidden states + the
-        shared LM-head weight, computes next-token cross-entropy against
-        ``concat_input_ids`` (shift-by-1 per sample), and the CE gradient w.r.t.
-        the logits. Overridden per model (typically via ``_logit_loss_and_grad``)."""
-        raise NotImplementedError
-
     def process_backward(self, activations: dict, sample_lens: list[int],
                          n: int, epoch: int):
-        """One backward cycle. Default = loss-only (no optimizer): compute the loss
-        + logit gradient and stash the latter. Trainer subclasses (llama3) override
-        to run the full manual LoRA backward + optimizer/scheduler step. Returns
-        (loss: float, n_valid: int)."""
-        loss, n_valid, grad = self.compute_loss_and_grad(activations, sample_lens, n)
-        self.last_logit_grad = grad
-        return loss, n_valid
+        """One backward cycle over the first ``n`` buffered rows (LoRA backward
+        + optimizer/scheduler step). Returns (loss: float, n_valid: int)."""
+        raise NotImplementedError
 
     def verify_activations(self, activations: dict, n: int) -> None:
         """Optional per-model check that the captured activations are correct.
         Default no-op; subclasses log assertions (gated on the debug flag)."""
         return None
-
-    # -- shared loss helper ------------------------------------------------
-
-    def _logit_loss_and_grad(self, final_hidden, ids, sample_lens: list[int]):
-        """Logits = final_hidden @ lm_head.T (fp32, trimmed); per-sample shift-by-1
-        next-token CE loss + CE logit gradient. Shared by all model services.
-
-        ``final_hidden`` is the post-final-norm hidden states ([n, hidden]);
-        ``ids`` the matching input ids ([n]); ``sample_lens`` the per-sample token
-        counts (summing to n). Returns (loss: float, n_valid: int, grad: Tensor).
-        """
-        meta = self.shared["meta"]
-        lm_head_key = meta.get("lm_head_key")
-        base = self.shared["base"] or {}
-        if lm_head_key is None or lm_head_key not in base:
-            raise KeyError(
-                f"LM-head weight key {lm_head_key!r} not in shared base weights")
-
-        # Logits = final_hidden @ lm_head.T, in **fp32** — DeltaServe's precision
-        # rule (SFT_service.py:264 logits.float(), :320 lm_head_weight_.float()):
-        # a bf16 matmul + softmax over the ~128k vocab loses real precision and
-        # corrupts the loss/grad. To avoid materializing the whole [vocab, D] LM
-        # head in fp32 at once (~2 GiB for Llama-3 — and the backward process only
-        # has the GPU memory the inference engine's gpu_memory_utilization left
-        # free), compute the fp32 logits in vocab chunks, upcasting one weight
-        # slice at a time. Exact fp32 numerics, bounded peak memory.
-        weight = base[lm_head_key]                              # [vocab_pad, D]
-        hidden = final_hidden.float()                          # [n, D] fp32
-        vocab_size = meta.get("vocab_size")
-        vocab = int(vocab_size) if vocab_size is not None else weight.shape[0]
-        logits = hidden.new_empty((hidden.shape[0], vocab))    # fp32 [n, vocab]
-        chunk = 16384
-        for c in range(0, vocab, chunk):
-            e = min(c + chunk, vocab)
-            logits[:, c:e] = hidden @ weight[c:e].float().t()
-
-        logit_scale = float(meta.get("logit_scale", 1.0) or 1.0)
-        if logit_scale != 1.0:
-            logits = logits * logit_scale
-
-        ids = ids.long()                                        # [n]
-
-        # Per-sample shift-by-1: position i predicts token i+1 within the sample.
-        preds: list[torch.Tensor] = []
-        targets: list[torch.Tensor] = []
-        start = 0
-        for length in sample_lens:
-            length = int(length)
-            if length >= 2:
-                end = start + length
-                preds.append(logits[start:end - 1])             # [L-1, vocab]
-                targets.append(ids[start + 1:end])              # [L-1]
-            start += length
-
-        if not preds:
-            return 0.0, 0, logits.new_zeros((0, logits.shape[-1]))
-
-        pred_cat = torch.cat(preds, dim=0)                      # [N_valid, vocab]
-        tgt_cat = torch.cat(targets, dim=0)                     # [N_valid]
-        n_valid = int(tgt_cat.shape[0])
-
-        loss = F.cross_entropy(pred_cat, tgt_cat, reduction="sum") / n_valid
-
-        # CE gradient w.r.t. logits (softmax − one-hot), normalized over tokens.
-        probs = torch.softmax(pred_cat, dim=-1)                 # [N_valid, vocab]
-        probs[torch.arange(n_valid, device=probs.device), tgt_cat] -= 1.0
-        probs /= n_valid
-
-        return float(loss.item()), n_valid, probs
 
     # -- loop --------------------------------------------------------------
 
@@ -406,10 +314,8 @@ class BackwardService:
         conn.send({"event": "activations_received", "num_layers": nlayers})
 
     def _handle_process_activations(self, conn, msg) -> None:
-        """Buffer-full signal: run the backward (loss-only or full train), then
-        clean the buffers (+ sleep only for the loss-only/simulated path)."""
+        """Buffer-full signal: run the backward, then clean the buffers."""
         n = int(msg.get("n", 0))
-        sleep_s = float(msg.get("sleep_s", 2.0))
         sample_lens = msg.get("sample_lens") or []
         epoch = int(msg.get("epoch", 0))
         # Announce the start of a backward cycle. Reports the per-cycle
@@ -451,7 +357,7 @@ class BackwardService:
         # the buffers zeroed, or weights/state not built).
         can_compute = (
             n > 0 and self.activations is not None
-            and self.activations.get("final_hidden") is not None
+            and self.activations.get("concat_input_ids") is not None
             and bool(sample_lens)
         )
         if can_compute:
@@ -496,9 +402,7 @@ class BackwardService:
                 f"no data / save_activations off)"
             )
 
-        # Clean the shared buffers. Trainers did the real GPU work already; the
-        # loss-only/simulated path sleeps to make the co-serving cycle observable.
-        # The single torch.cuda.synchronize() below covers BOTH the backward (via
+        # Clean the shared buffers. The single torch.cuda.synchronize() below covers BOTH the backward (via
         # the recorded events) and the zero-fill — the previous code had a sync
         # right after process_backward + another sync after the zero-loop.
         if self.activations:
@@ -554,7 +458,5 @@ class BackwardService:
                     f"learning rate or disable FT to recover."
                 )
 
-        if not self.is_trainer:
-            time.sleep(sleep_s)
         conn.send({"event": "activations_processed", "n": n, "loss": loss})
         #dprint("[backward] cleaned; sent done response")

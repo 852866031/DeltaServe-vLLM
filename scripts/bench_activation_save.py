@@ -13,7 +13,6 @@ matmuls (attention qkv/o + MLP) at the same token count — and prints the save
 overhead as a % of that. The proxy omits attention softmax / norms, so the real
 forward is larger and the true % is LOWER than printed (this is an upper bound).
 
-    python bench_activation_save.py --preset opt125m
     python bench_activation_save.py --preset llama3-8b
 """
 
@@ -23,8 +22,6 @@ import torch
 
 # (layers, hidden, [per-layer matmuls as (k_in, n_out)])
 _PRESETS = {
-    # OPT-125m: qkv 768->2304, o 768->768, fc1 768->3072, fc2 3072->768
-    "opt125m": (12, 768, [(768, 2304), (768, 768), (768, 3072), (3072, 768)]),
     # Llama-3-8B: GQA qkv 4096->6144, o 4096->4096, gate/up 4096->14336, down 14336->4096
     "llama3-8b": (32, 4096, [(4096, 6144), (4096, 4096),
                              (4096, 14336), (4096, 14336), (14336, 4096)]),
@@ -33,7 +30,7 @@ _PRESETS = {
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--preset", choices=list(_PRESETS), default="opt125m")
+    ap.add_argument("--preset", choices=list(_PRESETS), default="llama3-8b")
     ap.add_argument("--total-tokens", type=int, default=262)
     ap.add_argument("--ft-tokens", type=int, default=256)
     ap.add_argument("--max-saved", type=int, default=512)

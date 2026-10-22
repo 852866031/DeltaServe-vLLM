@@ -25,6 +25,10 @@ import sys
 import tempfile
 import traceback
 
+# CPU-only by design: with a GPU visible the backward group picks NCCL, and the
+# trainer's CPU tensors then have no backend to reduce on.
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp

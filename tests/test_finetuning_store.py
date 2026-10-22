@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Test the finetuning sample store (vllm.deltaserve.finetuning_store).
 
-CPU-only: loads the real alpaca_1000.txt corpus with the opt-125m tokenizer and
+CPU-only: loads the real alpaca_1000.txt corpus with the Qwen3-0.6B tokenizer and
 checks load + length-bucketed selection + epoch marking. No GPU.
 
     python tests/test_finetuning_store.py
@@ -47,14 +47,17 @@ def main():
 
     from vllm.deltaserve.finetuning_store import FinetuningStore
 
-    tok = AutoTokenizer.from_pretrained("facebook/opt-125m")
+    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B-Base")
     tokenize = lambda text: tok(text)["input_ids"]  # noqa: E731
 
     green("load:")
     store = FinetuningStore(str(_CORPUS), tokenize, adapter="ft",
                             total_epochs=2, max_saved_finetuning_tokens=256)
     n = store.load()
-    check("loaded 1000 samples", n == 1000 and len(store) == 1000)
+    # Samples longer than max_saved_finetuning_tokens are dropped at load.
+    check("loaded the corpus", n > 0 and len(store) == n)
+    check("no loaded sample exceeds the buffer",
+          max(x.input_len for x in store.samples) <= 256)
     check("total tokens > 0", store.total_tokens_in_memory > 0)
     check("samples carry the adapter tag", store.samples[0].adapter == "ft")
     check("input_len matches token count",
@@ -76,17 +79,27 @@ def main():
     check("returns None when budget below the shortest sample",
           store.pop_best_under(too_small) is None)
 
-    green("confirmed_trained marks + removes from buckets:")
+    green("claim / release / commit (3-phase API):")
+    check("claim removes one sample from the pool", store.claim([s]) == 1)
+    check("claimed sample no longer returned",
+          store.pop_best_under(budget).request_id != s.request_id)
+    check("has_claimed while in flight", store.has_claimed())
+    check("advance_epoch refuses with a claimed sample", not store.advance_epoch())
+    check("release returns it to the pool", store.release_claimed([s]) == 1)
+    check("released sample back in its length bucket",
+          any(store.samples[i].request_id == s.request_id
+              for i in store.len_buckets.get(s.input_len, ())))
     before = sum(not t for t in store.trained)
-    marked = store.confirmed_trained([s])
-    after = sum(not t for t in store.trained)
-    check("marked exactly one", marked == 1 and before - after == 1)
-    check("trained sample no longer returned",
-          store.pop_best_under(budget, exclude=[]).request_id != s.request_id)
+    store.claim([s])
+    check("commit marks exactly one trained",
+          store.commit_claimed([s]) == 1
+          and before - sum(not t for t in store.trained) == 1)
+    check("nothing left claimed", not store.has_claimed())
 
     green("epochs (total_epochs=2 -> two advances succeed, third fails):")
-    # exhaust by marking everything, then advance_epoch resets
-    store.confirmed_trained(list(store.samples))
+    # exhaust by training everything, then advance_epoch resets
+    store.claim(list(store.samples))
+    store.commit_claimed(list(store.samples))
     check("store empty after marking all", not store.has_next())
     check("advance_epoch #1 -> True (epoch 0->1)", store.advance_epoch() is True)
     check("store refilled after advance_epoch", store.has_next())
