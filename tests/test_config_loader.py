@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
-_CONFIG = _REPO / "configs" / "serving_config_finetuning_opt.yaml"
+_CONFIG = _REPO / "configs" / "serving_config_finetuning_qwen3_0.6b.yaml"
 
 _passed = 0
 _failed = 0

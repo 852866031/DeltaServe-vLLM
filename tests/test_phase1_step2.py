@@ -51,7 +51,8 @@ def main():
     prev_mps = os.environ.get(_MPS_ENV)
     prev_max_conn = os.environ.get(_MAX_CONN_ENV)
 
-    bp = BackwardProcess(mps_percentage=_TEST_PCT, device_index=0)
+    bp = BackwardProcess(mps_percentage=_TEST_PCT, device_index=0,
+                         service_name="ipc")
     ready = bp.start()
 
     green("spawn + handshake:")

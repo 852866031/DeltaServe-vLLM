@@ -112,7 +112,7 @@ class _FakeChild:
     def set_corpus_meta(self, total):
         self.sent.append(("set_corpus_meta", int(total)))
 
-    def notify_buffer_full(self, n, sleep_s=2.0, sample_lens=None, epoch=0):
+    def notify_buffer_full(self, n, sample_lens=None, epoch=0):
         self.sent.append(("process_activations", int(n)))
 
     def poll_response(self):
@@ -172,7 +172,6 @@ def test_corpus_meta_relay():
     print("test_corpus_meta_relay (scheduler total → trigger → worker child, once):")
     sched = _coord(True)
     sched.corpus_total_tokens = 123456      # what FinetuneScheduler stores
-    sched.backward_sleep_s = 0.0
     # Two triggers from the scheduler side (buffer-full twice).
     cmds = []
     for _ in range(2):

@@ -7,21 +7,22 @@
 
 During an FT step (forced eager), we accumulate the FT-token rows of the
 **residual stream** into pre-allocated, fixed-size GPU buffers at an accumulating
-offset, plus the FT-token pre-LM-head hidden states + their input ids:
+offset, plus the FT-token input ids:
 
 - ``layer_in[i]``  — the residual stream *entering* transformer layer i (the input
   to ``layers.{i}.input_layernorm``). This is exactly what a per-layer manual /
   autograd backward recomputes one layer from, so it is the backward-useful capture.
 - ``final_in``     — the residual stream entering the final norm (input to
   ``model.norm``); = the residual output of the last layer.
-- ``final_hidden`` — the post-final-norm hidden states (model forward output); used
-  by the backward process to reconstruct logits for the loss.
+- ``final_hidden`` — the post-final-norm hidden states (model forward output). Only
+  allocated with ``save_final_hidden`` (the ``print_activation_hash`` debug check
+  compares it against RMSNorm(final_in)); the trainer itself reads ``final_in``.
 - ``concat_input_ids`` — the FT-token input ids (labels, shifted per-sample downstream).
 - ``mlp_gate_up[i]`` — the ``mlp.gate_up_proj`` output ([n, 2*intermediate] = gate||up)
   per layer. The MLP is frozen + the widest matmul in the layer, so saving its
   pre-activations lets the backward skip recomputing the gate_up matmul (memory-for-
   compute: ~940 MB at n=512, but removes the layer's biggest recompute). Captured with
-  a forward (post) hook; absent on models without ``mlp.gate_up_proj`` (e.g. opt).
+  a forward (post) hook; absent on models without ``mlp.gate_up_proj``.
 
 The residual-stream values are captured with **forward_pre_hooks**: vLLM's Llama
 uses the fused add-norm pattern, so ``input_layernorm`` / ``model.norm`` are called
@@ -33,10 +34,6 @@ hook computes the sum and copies the masked rows immediately.
 Capture is gated on the runner's finetune_mask (set via begin_step) so hooks are
 no-ops off FT steps. Buffers live outside any CUDA-graph pool and are shared
 zero-copy with the backward process.
-
-Models without the fused add-norm pattern (e.g. opt) have no ``input_layernorm`` /
-``model.norm`` modules, so no layer-input hooks register and only
-``final_hidden`` + ``concat_input_ids`` are captured (the opt loss path).
 """
 
 import re
@@ -69,7 +66,8 @@ class FinetuneAccumulator:
                  save_attn_qkv: bool = False,
                  save_attn_ctx: bool = False,
                  save_resid_mid: bool = False,
-                 attn_qkv_pre_transform: bool = False) -> None:
+                 attn_qkv_pre_transform: bool = False,
+                 save_final_hidden: bool = False) -> None:
         self.max_saved = int(max_saved)
         self.hidden_size = int(hidden_size)
         self.intermediate_size = int(intermediate_size) if intermediate_size else 0
@@ -131,7 +129,7 @@ class FinetuneAccumulator:
         self._abort_poll = None
 
         # Discover capture points by module name:
-        #   layers.{i}.input_layernorm -> layer_in[i]   (auto-detected; absent on opt)
+        #   layers.{i}.input_layernorm -> layer_in[i]
         #   model.norm                 -> final_in
         #   layers.{i}.mlp.gate_up_proj -> mlp_gate_up[i] (frozen MLP pre-activation)
         #   layers.{i}.self_attn.attn  -> attn_qh/kh/vh[i] (post-RoPE q,k,v: feature-gated)
@@ -205,7 +203,7 @@ class FinetuneAccumulator:
 
         self.layer_in = [_buf() for _ in range(self.num_layers)]
         self.final_in = _buf() if self._final_norm_module is not None else None
-        self.final_hidden = _buf()
+        self.final_hidden = _buf() if save_final_hidden else None
         self.concat_input_ids = torch.zeros(self.max_saved, device=device,
                                             dtype=torch.int64)
         self.mlp_gate_up = ([_buf(2 * self.intermediate_size)
@@ -234,10 +232,9 @@ class FinetuneAccumulator:
         # like layer_in. Only allocated when save_resid_mid is on.
         self.resid_mid = ([_buf() for _ in range(self.num_layers)]
                           if self._save_resid_mid else [])
-        self.buffers = {
-            "final_hidden": self.final_hidden,
-            "concat_input_ids": self.concat_input_ids,
-        }
+        self.buffers = {"concat_input_ids": self.concat_input_ids}
+        if self.final_hidden is not None:
+            self.buffers["final_hidden"] = self.final_hidden
         if self.layer_in:
             self.buffers["layer_in"] = self.layer_in
         if self.final_in is not None:
@@ -630,7 +627,8 @@ class FinetuneAccumulator:
         n = min(rows.shape[0], self.max_saved - offset)
         if n <= 0:
             return
-        self.final_hidden[offset:offset + n].copy_(rows[:n].to(self.dtype))
+        if self.final_hidden is not None:
+            self.final_hidden[offset:offset + n].copy_(rows[:n].to(self.dtype))
         self.concat_input_ids[offset:offset + n].copy_(ids[:n].to(torch.int64))
 
     def end_step(self) -> None:
@@ -663,7 +661,8 @@ class FinetuneAccumulator:
             buf[off:off + n].zero_()
         if self.final_in is not None:
             self.final_in[off:off + n].zero_()
-        self.final_hidden[off:off + n].zero_()
+        if self.final_hidden is not None:
+            self.final_hidden[off:off + n].zero_()
         self.concat_input_ids[off:off + n].zero_()
         for buf in self.mlp_gate_up:
             buf[off:off + n].zero_()

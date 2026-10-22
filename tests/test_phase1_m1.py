@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
-_CONFIG = _REPO / "configs" / "serving_config_finetuning_opt.yaml"
+_CONFIG = _REPO / "configs" / "serving_config_finetuning_qwen3_0.6b.yaml"
 _PROMPTS = [
     "The capital of France is",
     "Water boils at a temperature of",
@@ -46,7 +46,9 @@ def run_worker(mode: str) -> None:
     from vllm.deltaserve.config_loader import load_yaml_config, split_config
 
     engine_kwargs, ft_cfg, _ = split_config(load_yaml_config(str(_CONFIG)))
-    engine_kwargs["model"] = "facebook/opt-125m"
+    # Eager in both runs: the comparison is about FT injection (KV, mask,
+    # adapter routing, retire), not eager-vs-compiled numerics.
+    engine_kwargs["enforce_eager"] = True
     enabled = mode == "ft"
     ft = FinetuneConfig(
         enable_finetuning=enabled,

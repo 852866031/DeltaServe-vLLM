@@ -366,7 +366,6 @@ class FinetuneCoordinator:
         self.epoch_flush_pending = False
         self.min_sample_len = 1            # set by the scheduler from the store
         self.backward_process = None       # set by the worker
-        self.backward_sleep_s = 2.0        # set by the worker from config
         # Current FT corpus epoch (set each step by the scheduler from the store);
         # forwarded to the backward process so it can StepLR per epoch.
         self.current_epoch = 0
@@ -784,7 +783,7 @@ class FinetuneCoordinator:
             else:
                 torch.cuda.synchronize()
             self.backward_process.notify_buffer_full(
-                self.fill_count, self.backward_sleep_s, list(self.sample_lens),
+                self.fill_count, list(self.sample_lens),
                 epoch=self.current_epoch)
         elif self.relay_mode:
             # [M4.1] Scheduler-side coordinator under TP: no local handle. Stash
@@ -795,7 +794,6 @@ class FinetuneCoordinator:
                 "n": int(self.fill_count),
                 "sample_lens": list(self.sample_lens),
                 "epoch": int(self.current_epoch),
-                "sleep_s": float(self.backward_sleep_s),
                 # One int per trigger; the worker forwards it to its child once.
                 "total_tokens_per_epoch": int(self.corpus_total_tokens),
             }
@@ -963,7 +961,7 @@ class FinetuneCoordinator:
             torch.cuda.synchronize()
         self.pending_backward = True
         self.backward_process.notify_buffer_full(
-            int(cmd.get("n", 0)), self.backward_sleep_s,
+            int(cmd.get("n", 0)),
             list(cmd.get("sample_lens", [])), epoch=int(cmd.get("epoch", 0)))
 
     def poll_backward_relay(self) -> dict | None:

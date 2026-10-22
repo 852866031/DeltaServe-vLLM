@@ -9,6 +9,8 @@
 set -u
 R=$(cd "$(dirname "$0")/.." && pwd)
 PY=${PY:-/mnt/storage/conda/envs/dserve-vllm/bin/python}
+export HF_HOME=${HF_HOME:-/mnt/storage/huggingface} HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
+export VLLM_USE_FLASHINFER_SAMPLER=${VLLM_USE_FLASHINFER_SAMPLER:-0}
 OUT=${1:?usage: tests/run_all.sh <out_dir> [glob]}
 GLOB=${2:-test_*.py}
 mkdir -p "$OUT"

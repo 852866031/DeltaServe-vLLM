@@ -8,7 +8,7 @@ alongside inference: spawning it (with the child-only MPS partition), the pipe
 protocol, and the CUDA-IPC sharing of base/FT weights + activation buffers. The
 *child* side (the recv loop + the per-model SFT math) lives in
 ``vllm/deltaserve/bwd_services/`` — ``base.py`` holds the model-agnostic loop and
-``opt.py`` etc. hold the per-model compute. ``start()`` imports the child entry
+the family modules (``llama3.py``, ``qwen3.py``) the per-model compute. ``start()`` imports the child entry
 point lazily so this module can stay free of a bwd_services import cycle.
 
 The analogue in DeltaServe is the backward service spawned from
@@ -144,11 +144,11 @@ class BackwardProcess:
     """Parent-side handle: spawns and talks to the backward stub process."""
 
     def __init__(self, mps_percentage: int = 10, device_index: int = 0,
-                 service_name: str = "OPTForCausalLM"):
+                 service_name: str = "LlamaForCausalLM"):
         self.mps_percentage = int(mps_percentage)
         self.device_index = int(device_index)
         # Selects the per-model child service in bwd_services/ (e.g. the model's
-        # HF architecture string "OPTForCausalLM").
+        # HF architecture string "Qwen3ForCausalLM").
         self.service_name = str(service_name)
         # spawn (not fork): CUDA-safe and matches vLLM's start method, so the
         # later CUDA-IPC buffer sharing (Step 3) works the same way.
@@ -274,8 +274,8 @@ class BackwardProcess:
 
         Sent ONCE; the child maps the same memory, so subsequent in-place writes
         by the worker's accumulation hooks are visible to the child zero-copy.
-        `buffers` = {"attn_out": [t,...], "ffn_out": [t,...], "final_hidden": t,
-        "concat_input_ids": t}.
+        `buffers` = the accumulator's ``buffers`` dict (per-layer lists +
+        ``final_in`` / ``concat_input_ids`` tensors).
         """
         for value in buffers.values():
             if isinstance(value, list):
@@ -328,14 +328,14 @@ class BackwardProcess:
         except (BrokenPipeError, OSError, EOFError, ValueError) as e:
             dprint(f"[backward] set_corpus_meta skipped (child gone): {e}")
 
-    def notify_buffer_full(self, n: int, sleep_s: float = 2.0,
+    def notify_buffer_full(self, n: int,
                            sample_lens: list[int] | None = None,
                            epoch: int = 0) -> None:
         """Signal the child that the activation buffer is full (ASYNC, no wait).
 
-        The child computes the loss + logit gradient over the captured rows,
-        then cleans the buffer + sleeps `sleep_s`, then sends a response that the
-        coordinator picks up via poll_response(). ``sample_lens`` are the
+        The child runs the LoRA backward + optimizer step over the captured rows,
+        cleans the buffer, then sends a response that the coordinator picks up
+        via poll_response(). ``sample_lens`` are the
         per-FT-sample token counts (in buffer-write order) so the child can split
         the flat buffers into samples and shift-by-1 for next-token targets.
         """
@@ -347,7 +347,6 @@ class BackwardProcess:
         try:
             self._conn.send({
                 "cmd": "process_activations", "n": int(n),
-                "sleep_s": float(sleep_s),
                 "sample_lens": list(sample_lens or []), "epoch": int(epoch),
             })
         except (BrokenPipeError, OSError, EOFError, ValueError) as e:

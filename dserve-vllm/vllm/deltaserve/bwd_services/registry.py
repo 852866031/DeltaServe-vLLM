@@ -20,9 +20,8 @@ _SERVICES: dict[str, str] = {
     # Qwen3 (trainer)
     "Qwen3ForCausalLM": "vllm.deltaserve.bwd_services.qwen3:Qwen3BackwardService",
     "qwen3": "vllm.deltaserve.bwd_services.qwen3:Qwen3BackwardService",
-    # OPT (loss-only reference path)
-    "OPTForCausalLM": "vllm.deltaserve.bwd_services.opt:OPTBackwardService",
-    "opt": "vllm.deltaserve.bwd_services.opt:OPTBackwardService",
+    # Protocol only (pipe + CUDA-IPC sharing, no training): the IPC tests.
+    "ipc": "vllm.deltaserve.bwd_services.base:BackwardService",
 }
 
 
@@ -40,15 +39,6 @@ def get_service(name: str):
             f"{', '.join(supported_names())}")
     module_name, _, class_name = target.partition(":")
     return getattr(importlib.import_module(module_name), class_name)
-
-
-def is_trainer(name: str) -> bool:
-    """True if the family actually trains (publishes LoRA weights back into
-    the served slot); False for loss-only services and unknown names."""
-    try:
-        return bool(getattr(get_service(name), "is_trainer", False))
-    except NotImplementedError:
-        return False
 
 
 def get_family(name: str):

@@ -65,11 +65,11 @@ def main():
     want_ft_numel = sum(t.numel() for t in ft_state.values())
     parent_ft_checksum = _checksum(ft_state)
 
-    bp = BackwardProcess(mps_percentage=10, device_index=0)
+    bp = BackwardProcess(mps_percentage=10, device_index=0, service_name="ipc")
     bp.start()
 
     green("share + summary:")
-    summary = bp.share_weights(base_state, ft_state)
+    summary = bp.share_weights(base_state, ft_state, print_hash=True)
     check("event=weights_received", summary.get("event") == "weights_received")
     check("base tensor count matches", summary.get("base_num") == len(base_state))
     check("base numel matches", summary.get("base_numel") == want_base_numel)
