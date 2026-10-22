@@ -178,7 +178,9 @@ def main():
     out.finetune_aborted = True
     back = pickle.loads(pickle.dumps(out))
     C.ok("ModelRunnerOutput.finetune_aborted survives pickle", back.finetune_aborted is True)
-    C.ok("default is False", ModelRunnerOutput(req_ids=[], req_id_to_index={}).finetune_aborted is False)
+    C.ok("absent on an ordinary output",
+         not getattr(ModelRunnerOutput(req_ids=[], req_id_to_index={}),
+                     "finetune_aborted", False))
     C.finish()
 
 

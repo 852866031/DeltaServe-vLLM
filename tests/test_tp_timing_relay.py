@@ -61,7 +61,8 @@ def test_timing_round_trip():
     # sample_tokens: drain onto the output; the executor pickles it across.
     out = ModelRunnerOutput(req_ids=[], req_id_to_index={}, sampled_token_ids=[],
                             logprobs=None, prompt_logprobs_dict={}, pooler_output=[])
-    C.ok("ModelRunnerOutput.finetune_timing defaults None", out.finetune_timing is None)
+    C.ok("ModelRunnerOutput carries no finetune_timing by default",
+         getattr(out, "finetune_timing", None) is None)
     out.finetune_timing = worker.drain_completed_samples() or None
     C.ok("worker queue drained", not worker._completed_samples)
     wire = pickle.loads(pickle.dumps(out, protocol=pickle.HIGHEST_PROTOCOL))
@@ -89,7 +90,8 @@ def test_timing_round_trip():
 def test_record_timing_gate():
     print("test_record_timing_gate (SchedulerOutput.finetune_record_timing):")
     so = SchedulerOutput.make_empty()
-    C.ok("defaults to True (record)", so.finetune_record_timing is True)
+    C.ok("absent = record (the runner's default)",
+         getattr(so, "finetune_record_timing", True) is True)
     so.finetune_record_timing = False
     wire = pickle.loads(pickle.dumps(so))
     C.ok("False survives the broadcast pickle", wire.finetune_record_timing is False)

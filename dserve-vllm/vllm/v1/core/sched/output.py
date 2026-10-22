@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -239,37 +239,6 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
-
-    # [DeltaServe] req_ids of injected finetuning samples scheduled this step.
-    # The model runner uses these to build the per-token finetune_mask and to
-    # force the step eager. Empty for ordinary inference steps.
-    finetune_req_ids: set[str] = field(default_factory=set)
-
-    # [DeltaServe] Phase 7 / M4.1: TP backward-trigger command. Under TP>1 the
-    # scheduler can't reach the per-rank backward child (the IPC handle lives on
-    # the worker), so when it decides to fire a backward it puts the cycle params
-    # {n, sample_lens, epoch, sleep_s} here. Broadcast to every worker (lock-step)
-    # → each fires its own child. None on ordinary steps / TP=1.
-    finetune_backward_trigger: dict | None = None
-
-    # [DeltaServe] Phase 7 / M4.2: whether the runner should record this step's
-    # measured duration for the SLO estimator. Stamped per step from the
-    # scheduler-side coordinator's ``record_timing`` (False during the profiling
-    # pass's warmup shapes) so the gate reaches the worker under TP, where the
-    # worker's own coordinator never sees the scheduler's flag.
-    finetune_record_timing: bool = True
-    # [DeltaServe] FT requests retired by the scheduler since the previous
-    # step (they never enter ``finished_req_ids`` — the frontend must not see
-    # them), so the runner can drop their cached ``CachedRequestState`` /
-    # input-batch slot instead of leaking one entry per FT injection.
-    finetune_retired_req_ids: list[str] | None = None
-    # [DeltaServe] The scheduler-side coordinator's FT admission state when
-    # this step was built: (admission_open, pending_backward,
-    # fill_count + reserved_fill, capacity). The worker's `[batch …]` log line
-    # prints these — under TP the worker's own coordinator is a mirror whose
-    # buffer accounting is not maintained (saves are relayed to the
-    # scheduler), so reading it there always showed `buf=0/N`.
-    finetune_admit_state: tuple[bool, bool, int, int] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

@@ -878,7 +878,7 @@ class FinetuneScheduler(AsyncScheduler):
 
     @staticmethod
     def _is_ft_only(output: SchedulerOutput) -> bool:
-        ft_ids = output.finetune_req_ids
+        ft_ids = getattr(output, "finetune_req_ids", None)
         return bool(ft_ids) and output.total_num_scheduled_tokens > 0 and (
             len(ft_ids) == len(output.num_scheduled_tokens))
 
@@ -1236,7 +1236,7 @@ class FinetuneScheduler(AsyncScheduler):
         # WITHOUT touching finished_req_ids (so the frontend never sees them).
         # Once removed from self.requests, the base loop's `request is None`
         # check skips them — no EngineCoreOutput is built.
-        for req_id in scheduler_output.finetune_req_ids:
+        for req_id in getattr(scheduler_output, "finetune_req_ids", ()):
             req = self.requests.get(req_id)
             if req is None:
                 continue
@@ -1262,7 +1262,7 @@ class FinetuneScheduler(AsyncScheduler):
         total = scheduler_output.total_num_scheduled_tokens
         if total == 0:
             return
-        ft_ids = scheduler_output.finetune_req_ids
+        ft_ids = getattr(scheduler_output, "finetune_req_ids", ())
         new_ids = {r.req_id for r in scheduler_output.scheduled_new_reqs}
         ft = prefill = 0
         for rid, nt in scheduler_output.num_scheduled_tokens.items():
