@@ -28,6 +28,9 @@ class DeltaServeWorker(Worker):
         super().init_device()
         from vllm.deltaserve import dprint
         from vllm.deltaserve.backward_process import BackwardProcess
+        from vllm.deltaserve.model_runner import DeltaServeModelRunner
+
+        DeltaServeModelRunner.adopt(self.model_runner)
 
         ft_cfg = self.vllm_config.finetune_config
         arch = self.model_config.hf_config.architectures[0]
