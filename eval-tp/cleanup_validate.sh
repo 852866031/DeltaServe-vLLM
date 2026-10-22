@@ -11,7 +11,7 @@
 # eval-tp/output/cleanup/$BASE (default 00_base) when that run exists.
 set -u
 R=$(cd "$(dirname "$0")/.." && pwd)
-PY=${PY:-/mnt/storage/conda/envs/dserve-vllm/bin/python}
+PY=${PY:-/mnt/storage/conda/envs/deltaserve-plugin/bin/python}
 TAG=${1:?usage: cleanup_validate.sh <tag> [mode ...]}; shift
 MODES=("$@"); [ ${#MODES[@]} -eq 0 ] && MODES=(tight-half loose-half)
 BASE=${BASE:-00_base}
