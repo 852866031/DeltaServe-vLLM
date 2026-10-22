@@ -29,7 +29,6 @@ from vllm.deltaserve.accumulate import FinetuneAccumulator  # noqa: E402
 from vllm.deltaserve.ft_save_op import (  # noqa: E402
     FtSaveState,
     active_state,
-    maybe_save,
 )
 
 C = H.Checker(tol=1e-6)
@@ -124,10 +123,7 @@ class _Attn(nn.Module):
     def forward(self, h):
         qkv = self.qkv_proj(h)
         q, k, v = qkv.split([HQ * HD, HKV * HD, HKV * HD], dim=-1)
-        maybe_save(self, "q", q); maybe_save(self, "k", k); maybe_save(self, "v", v)
-        ctx = self.attn(q, k, v)
-        maybe_save(self, "ctx", ctx)
-        return ctx
+        return self.attn(q, k, v)
 
 
 class _Mlp(nn.Module):
@@ -138,13 +134,10 @@ class _Mlp(nn.Module):
 
     def forward(self, x):
         gu = self.gate_up_proj(x)
-        maybe_save(self, "gate_up", gu)
         return self.down_proj(gu[:, :INTER] * gu[:, INTER:])
 
 
 class _Layer(nn.Module):
-    _dserve_save_points = True
-
     def __init__(self):
         super().__init__()
         self.input_layernorm = _AddNorm()
@@ -153,14 +146,12 @@ class _Layer(nn.Module):
         self.mlp = _Mlp()
 
     def forward(self, h, residual):
-        maybe_save(self, "layer_in", h, residual)
         if residual is None:
             residual = h
             h, _ = self.input_layernorm(h)
         else:
             h, residual = self.input_layernorm(h, residual)
         h = self.self_attn(h)
-        maybe_save(self, "resid_mid", h, residual)
         h, residual = self.post_attention_layernorm(h, residual)
         return self.mlp(h), residual
 
@@ -175,7 +166,6 @@ class _Model(nn.Module):
         residual = None
         for layer in self.layers:
             h, residual = layer(h, residual)
-        maybe_save(self, "final_in", h, residual)
         out, _ = self.norm(h, residual)
         return out
 
@@ -222,7 +212,8 @@ def test_accumulator_op_path_matches_hooks():
                               intermediate_size=INTER, q_size=HQ * HD, kv_size=HKV * HD,
                               save_attn_qkv=True, save_attn_ctx=True, save_resid_mid=True,
                               attn_qkv_pre_transform=False)
-    C.ok("install_save_points on a family with call sites", acc.install_save_points(model))
+    acc.register_hooks()
+    C.ok("install_save_points (hooks issue the op)", acc.install_save_points(model))
     C.ok("slot table has 7L+1 entries", len(acc.op_bufs) == 7 * NL + 1)
     s = torch.cuda.Stream()
     with torch.cuda.stream(s):

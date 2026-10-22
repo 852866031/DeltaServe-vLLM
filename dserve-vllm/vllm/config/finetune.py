@@ -404,7 +404,7 @@ class FinetuneConfig:
 
     def compute_hash(self) -> str:
         """[mixed-fwd-cuda-graph] The finetuning fields that change the traced
-        forward: with ``graph_ft_batches`` the model's ``maybe_save`` call sites
+        forward: with ``graph_ft_batches`` the accumulator's save-point hooks
         trace to the save op (one per enabled save), without it they trace to
         nothing — same source, different graph. vLLM's compile cache is keyed
         on this hash (``VllmConfig.compute_hash``); without it a run with the
