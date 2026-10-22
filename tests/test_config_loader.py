@@ -58,8 +58,10 @@ def test_loads_and_maps():
     ft_sections = ("finetune", "throttles", "slo", "debug")
     special = (*ft_sections, *passthrough)
 
-    # the four finetune sections -> FinetuneConfig attributes (one flat config)
-    ft = engine_args.finetune_config
+    # the four finetune sections -> one flat FinetuneConfig, carried to vLLM in
+    # additional_config["deltaserve"]
+    from deltaserve.config import FinetuneConfig
+    ft = FinetuneConfig(**engine_args.additional_config["deltaserve"])
     for section in ft_sections:
         for key, want in (raw.get(section) or {}).items():
             check(f"{section}.{key} -> FinetuneConfig.{key} == {want!r}",
