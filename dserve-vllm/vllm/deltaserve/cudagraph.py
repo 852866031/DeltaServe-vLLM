@@ -19,6 +19,7 @@ calls into ``_determine_batch_execution_and_padding`` carry no FT argument).
 """
 
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from itertools import product
 
@@ -104,3 +105,40 @@ class FtCudagraphDispatcher(CudagraphDispatcher):
             tl.graph = False
         logger.info("[deltaserve] has_ft piecewise cudagraph keys: %d "
                     "(sizes <= %d)", n, ft_max)
+
+
+# ─── between-segment poll for abortable FT-only graph steps ─────────────────
+# A piecewise CUDA graph forward replays one segment per layer from Python
+# (CUDAGraphWrapper.__call__), with attention in between. While an FT-only
+# step runs from those graphs, ``_SEGMENT_POLL`` is the tier-C abort poll: it
+# runs before every segment and raises FTAborted to leave the forward.
+_SEGMENT_POLL = None
+
+
+def install_segment_poll() -> None:
+    """Wrap CUDAGraphWrapper.__call__ once per process. Outside an FT-only
+    graph step the wrapper costs one global read per segment."""
+    from vllm.compilation.cuda_graph import CUDAGraphWrapper
+
+    if getattr(CUDAGraphWrapper, "_dserve_segment_poll", False):
+        return
+    call = CUDAGraphWrapper.__call__
+
+    def __call__(self, *args, **kwargs):
+        poll = _SEGMENT_POLL
+        if poll is not None:
+            poll()
+        return call(self, *args, **kwargs)
+
+    CUDAGraphWrapper.__call__ = __call__
+    CUDAGraphWrapper._dserve_segment_poll = True
+
+
+@contextmanager
+def segment_poll(poll):
+    global _SEGMENT_POLL
+    prev, _SEGMENT_POLL = _SEGMENT_POLL, poll
+    try:
+        yield
+    finally:
+        _SEGMENT_POLL = prev

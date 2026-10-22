@@ -555,9 +555,10 @@ class FinetuneScheduler(AsyncScheduler):
         _mixed_graph = False
         if feats.has_ft:
             # [mixed-fwd-cuda-graph] a mixed batch may replay a has_ft graph;
-            # FT-only stays eager.
-            _mixed_graph = (self._graph_ft_batches
-                            and (feats.t_in > feats.t_ft or feats.b_d > 0))
+            # FT-only too with graph_ft_only_batches, else it stays eager.
+            _mixed_graph = self._graph_ft_batches and (
+                feats.t_in > feats.t_ft or feats.b_d > 0
+                or self.vllm_config.finetune_config.graph_ft_only_batches)
             if not _mixed_graph:
                 return False
         disp = self._coord.cudagraph_dispatcher
