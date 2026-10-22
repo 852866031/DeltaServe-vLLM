@@ -62,6 +62,9 @@ previous step) undoes it. The files a step modified are also copied, pre-change,
 | 09 | `finetune.graph_ft_only_batches` (FT-only steps on the has_ft graphs, abort between segments) | `d30fb1ac4` | M1 / M2 pass | vs 08: FT-only step 67 → 59 ms (tight), 66 → 57 ms (loose); FT +0.2 / +3 %; TTFT 100 / 100 % | aborts land mid-forward (segment 25) on both ranks |
 | 10 | **nutanix-600-800** — baseline code vs current vs current + FT-only graphs | | | TTFT 100 / 100 / 100 %, p99 300 / 223 / 240 ms; FT 486 / 489 / 512 tok/s; avg TBT, E2E equal; worst-TBT p90 120 / 94 / 118 ms | FT-only graphs enabled in the Qwen3-14B TP=2 preset |
 
+| A | **Plugin**: `deltaserve-plugin/` on stock vLLM (`vllm-upstream/` @117afeea4), new env `deltaserve-plugin` | `d832ceb35` … | 28/28 + step1 17/17 (incl. GPU) | vs the fork with the same config: tight 494 / loose 908 FT tok/s (484 / 905), TTFT 100 / 100 %; nutanix 99.81 % (one request at 419 ms — the same burst request the baseline served at 388 ms), FT 508 | vLLM unmodified |
+| 11 | `finetune.pause_on_arrival` (child yields when a request arrives during a cycle), ON in the preset | `7d9ee67c5` | `test_pause_on_arrival` 12/12; TP gates pass | nutanix ×2: TTFT 100 / 100 %, p95 166 → 90 / 90 ms, p99 270 → 100 / 99 ms, FT −1.7 / −1.4 %; tight p99 171 → 138, loose 177 → 134 ms (FT −0.6 / −1.3 %) | removes the decode-contention tail |
+
 ## Findings along the way
 
 - **Displaced decorators (step 04).** The in-tree runner edits had inserted new
@@ -91,3 +94,9 @@ previous step) undoes it. The files a step modified are also copied, pre-change,
 - **FT-only steps are host-bound** (step trace: 62.6 ms host of a 66 ms step).
   `finetune.graph_ft_only_batches` (off by default) replays them from the has_ft
   graphs, with the tier-C abort polled between piecewise segments.
+- **The remaining TTFT tail was decode contention right after a cycle starts.**
+  Decode-only steps share the GPU with the child by design and ran 180–330 ms
+  (vs 17) at the start of a backward cycle; a request arriving then queued behind
+  one or two of them — the same nutanix burst request at 388 ms (baseline) and
+  419 ms (plugin run). `pause_on_arrival` makes the child yield at its next
+  boundary when a request arrives; the tail is gone (p99 ~100 ms).
