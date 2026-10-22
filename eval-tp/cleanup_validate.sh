@@ -4,6 +4,7 @@
 #   eval-tp/cleanup_validate.sh <tag> [mode ...]          (default modes: tight-half loose-half)
 #   BASE=00_base eval-tp/cleanup_validate.sh 05_worker nutanix-600-800
 #   CO=0 eval-tp/cleanup_validate.sh 00_base_inf tight-half loose-half   (inference-only)
+#   CONFIG=configs/<variant>.yaml eval-tp/cleanup_validate.sh <tag>      (A/B a YAML variant)
 #
 # Runs the Qwen3-14B TP=2 co-serving timeline replay for each mode, sequentially,
 # into eval-tp/output/cleanup/<tag>/, then prints compare_runs.py against
@@ -19,6 +20,7 @@ FAMILY=${FAMILY:-qwen3-14b}
 OUT=$R/eval-tp/output/cleanup/$TAG
 mkdir -p "$OUT"
 COFLAG=(); [ "$CO" = 1 ] && COFLAG=(--co --step-trace)
+[ -n "${CONFIG:-}" ] && COFLAG+=(--config "$R/$CONFIG")
 for m in "${MODES[@]}"; do
   echo "[validate] $TAG / $m  ($(date +%T))"
   "$PY" "$R/eval-tp/auto_benchmark_tp.py" --family "$FAMILY" --tp 2 "--$m" \
