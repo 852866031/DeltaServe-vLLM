@@ -274,7 +274,8 @@ def test_accumulate_final_padded():
     print("test_accumulate_final_padded:")
     acc = FinetuneAccumulator(_Top().to(DEV).to(torch.bfloat16), S_MAX, D, DEV,
                               torch.bfloat16, intermediate_size=INTER,
-                              q_size=HQ * HD, kv_size=HKV * HD)
+                              q_size=HQ * HD, kv_size=HKV * HD,
+                              save_final_hidden=True)
     n_unpadded, n_padded = 21, 24
     hidden = torch.randn(n_padded, D, device=DEV, dtype=torch.bfloat16)
     ids = torch.arange(n_padded, device=DEV)

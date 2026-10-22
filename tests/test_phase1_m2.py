@@ -53,11 +53,11 @@ def main():
 
     print(f"{_GREEN}=== Milestone 2: FT activation accumulation (cross-process hash) ==={_RESET}")
     check("accumulation hooks registered + buffers allocated",
-          "[accumulate] hooks on" in out)
+          "[accumulate] residual-stream pre-hooks on" in out)
     check("activation buffers shared with backward process",
           "activations_received" in out)
-    check("FT accumulation ran (buffer filled at least once)",
-          "[coord] buffer FULL" in out)
+    check("FT accumulation ran (a full buffer triggered the backward)",
+          "[backward] start: n=" in out)
     check("activation hashes parent==child: True",
           "[accumulate] activation hashes parent==child: True" in out)
     check("no hash mismatch anywhere",
