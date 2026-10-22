@@ -437,6 +437,15 @@ class FinetuneConfig:
     ``max_cudagraph_capture_size``). Mixed FT steps above it run the compiled
     forward without a graph."""
 
+    graph_ft_only_batches: bool = False
+    """FT-ONLY steps (no inference tokens) replay the same ``has_ft`` graphs as
+    mixed steps instead of running eager, where they are host-bound (~63 ms of
+    dispatch for a ~66 ms step on Qwen3-14B TP=2). Requires ``graph_ft_batches``.
+    With ``forward_interruptible`` the tier-C abort still lands mid-forward: the
+    abort poll runs between the piecewise graph segments (one per layer) and the
+    poller's launch-ahead bound keeps the CPU within a few layers of the GPU, so
+    a decision reflects GPU progress."""
+
     pause_prefill_always: bool = False
     """[pause] Clear the backward child's GPU grant on EVERY prefill-carrying
     step, not only while a backward is outstanding. Closes the TP trigger

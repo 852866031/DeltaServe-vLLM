@@ -33,7 +33,12 @@ import torch
 
 from vllm.config import CUDAGraphMode
 from vllm.deltaserve import dprint
-from vllm.deltaserve.cudagraph import FtBatchDescriptor, FtCudagraphDispatcher
+from vllm.deltaserve.cudagraph import (
+    FtBatchDescriptor,
+    FtCudagraphDispatcher,
+    install_segment_poll,
+    segment_poll,
+)
 from vllm.deltaserve.ft_save_op import active_state
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import get_forward_context
@@ -59,6 +64,8 @@ class DeltaServeModelRunner(GPUModelRunner):
         runner.__class__ = cls
         runner.cudagraph_dispatcher.__class__ = FtCudagraphDispatcher
         runner._ds_init()
+        if runner.vllm_config.finetune_config.graph_ft_only_batches:
+            install_segment_poll()
         return runner
 
     def _ds_init(self) -> None:
@@ -282,8 +289,15 @@ class DeltaServeModelRunner(GPUModelRunner):
         try:
             if aborted is None:
                 from vllm.deltaserve.coordinator import FTAborted
+                poll = None
+                if ft_only and self._ft_graph_step and poller is not None:
+                    # Graph step: the hooks are inactive inside the compiled
+                    # forward, so the abort poll runs between graph segments.
+                    def poll():
+                        if poller.hook_check(True):
+                            raise FTAborted()
                 try:
-                    with active_state(save_state):
+                    with active_state(save_state), segment_poll(poll):
                         model_output = super()._model_forward(*args, **kwargs)
                 except FTAborted:
                     # Raised by an activation hook on a late arrival.
@@ -574,9 +588,10 @@ class DeltaServeModelRunner(GPUModelRunner):
         # batches keep the eager hook path (mid-forward abort). Decided here,
         # before dispatch, from the config + the accumulator's readiness.
         _acc = getattr(self, "_finetune_accumulator", None)
-        if (n < total and _acc is not None and getattr(_acc, "op_ready", False)
-                and self.vllm_config.finetune_config.graph_ft_batches
-                and self.vllm_config.finetune_config.save_activations):
+        _cfg = self.vllm_config.finetune_config
+        if ((n < total or _cfg.graph_ft_only_batches)
+                and _acc is not None and getattr(_acc, "op_ready", False)
+                and _cfg.graph_ft_batches and _cfg.save_activations):
             self._ft_positions_np = np.flatnonzero(mask)
             self._ft_graph_step = True
 

@@ -56,7 +56,7 @@ FINETUNE_SECTIONS: dict[str, tuple[str, ...]] = {
         "backward_cuda_graph_attn_bn_max", "backward_cuda_graph_attn_l_max",
         "backward_run_ahead_boundaries", "save_activations", "save_attn_qkv",
         "save_attn_ctx", "save_resid_mid", "graph_ft_batches",
-        "graph_ft_max_tokens", "forward_interruptible",
+        "graph_ft_max_tokens", "graph_ft_only_batches", "forward_interruptible",
         "ft_only_admission_grace_ms", "pause_prefill_always",
         "pause_until_prefill_done",
     ),
