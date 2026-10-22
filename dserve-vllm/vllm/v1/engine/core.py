@@ -88,15 +88,6 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
-def _ft_output_aborted(output) -> bool:
-    """[forward_interruptible / tier C] Whether ``output`` is the runner's
-    aborted-FT-only-forward sentinel. The dataclass field survives the
-    worker → engine hop under TP; the dynamic attribute is the in-process
-    (tp=1) marker."""
-    return bool(getattr(output, "finetune_aborted", False)
-                or getattr(output, "_ft_aborted", False))
-
-
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
@@ -123,21 +114,11 @@ class EngineCore:
 
         self.log_stats = log_stats
 
-        # [forward_interruptible / tier C under TP] The workers are separate
-        # processes, so the tp=1 abort Event cannot reach them. Create the
-        # shared-memory arrival counter BEFORE the executor spawns the
-        # workers and hand its name over via the environment they inherit.
-        self._ft_arrival_signal = None
-        _ftc = getattr(vllm_config, "finetune_config", None)
-        if (_ftc is not None and getattr(_ftc, "enable_finetuning", False)
-                and getattr(_ftc, "forward_interruptible", False)
-                and vllm_config.parallel_config.tensor_parallel_size > 1):
-            from vllm.deltaserve import dprint
-            from vllm.deltaserve.coordinator import FtArrivalSignal
-            self._ft_arrival_signal = FtArrivalSignal.create()
-            os.environ[FtArrivalSignal.ENV] = self._ft_arrival_signal.name
-            dprint("[deltaserve] forward_interruptible tier C under TP: arrival "
-                   f"signal {self._ft_arrival_signal.name} (rank-symmetric abort)")
+        # [DeltaServe] co-serving engine hooks (None unless finetuning is on);
+        # created before the executor spawns the workers.
+        from vllm.deltaserve.engine_core import attach_engine_hooks
+
+        self._ds = attach_engine_hooks(self, vllm_config)
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
@@ -459,16 +440,6 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
-        # [forward_interruptible / tier B] If a request landed between the
-        # prior drain and now and the just-built batch is FT-only, undo it
-        # and re-schedule so the late arrival rides this step.
-        _rb = self._maybe_rollback_ft_for_late_arrival(scheduler_output)
-        if _rb is not None:
-            scheduler_output = _rb
-        # [DeltaServe] log the moment the scheduler emits a non-decode-only
-        # batch (about to be handed to the executor). Pairs with [batch ...]
-        # (host launch) and [batch-done] (GPU completion) for a 3-point view.
-        self._maybe_log_batch_scheduled(scheduler_output)
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -479,21 +450,6 @@ class EngineCore:
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
 
-        # [DeltaServe] mark the point at which the host knows this batch's
-        # forward is done (future.result() above unblocks on GPU completion
-        # under async). Pairs with the [batch ...] launch log so you can see
-        # actual GPU wall time per scheduled batch. No new sync — the .result()
-        # above already blocked.
-        self._maybe_log_batch_done(scheduler_output)
-
-        # [forward_interruptible / tier C] The runner returns an empty
-        # sentinel ModelRunnerOutput with ``_ft_aborted=True`` when a hook
-        # bailed the forward mid-flight. Roll back the FT scheduling and
-        # skip update_from_output (the output has no real per-request data).
-        if _ft_output_aborted(model_output):
-            self.scheduler._rollback_ft_step(scheduler_output)
-            return {}, False
-
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
@@ -502,295 +458,6 @@ class EngineCore:
         )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
-
-    def _classify_batch_for_log(
-        self, scheduler_output
-    ) -> tuple[int, int, int] | None:
-        """[DeltaServe] Decode-only / zero-token gate shared by [batch-sched]
-        and [batch-done]. Returns (total, prefill, ft) if the batch should be
-        logged, or None for zero-token / decode-only batches (matches the
-        launch-side [batch ...] gate in
-        gpu_model_runner._log_finetuning_batch). Callers MUST check their own
-        per-print flag before invoking — this only does the per-batch shape
-        check, not the config gate, so the hot path is one bool load when the
-        flag is off."""
-        total = scheduler_output.total_num_scheduled_tokens
-        if total == 0:
-            return None  # empty step (FT closed + no inference) — nothing ran
-        ft_ids = getattr(scheduler_output, "finetune_req_ids", set())
-        new_ids = {r.req_id for r in scheduler_output.scheduled_new_reqs}
-        ft = 0
-        prefill = 0
-        for rid, nt in scheduler_output.num_scheduled_tokens.items():
-            if rid in ft_ids:
-                ft += nt
-            elif rid in new_ids or nt > 1:
-                prefill += nt
-        if prefill == 0 and ft == 0:
-            return None  # decode-only — match the [batch ...] log's gate
-        return total, prefill, ft
-
-    def _maybe_log_batch_scheduled(self, scheduler_output) -> None:
-        """[DeltaServe] One-line log right after schedule() returns a
-        non-decode-only batch. Gated on ``print_scheduler_add`` (or the
-        ``print_step_mode`` master switch). Useful for measuring host-side
-        prep time (gap to [batch]) and scheduling cadence under async
-        pipelining (multiple [batch-sched] before the first [batch-done] =
-        schedule(N+1) overlapping forward(N))."""
-        _ftc = self.vllm_config.finetune_config
-        # Hot-path early-out: one attribute load + short-circuit OR. No
-        # classify / string-format / time call when both flags are off.
-        if not (_ftc.print_scheduler_add or _ftc.print_step_mode):
-            return
-        cls = self._classify_batch_for_log(scheduler_output)
-        if cls is None:
-            return
-        total, _prefill, ft = cls
-        import time as _t
-        from vllm.deltaserve import dprint
-        _ts = _t.strftime("%H:%M:%S") + f".{int((_t.time() % 1) * 1000):03d}"
-        #dprint(f"[batch-sched {_ts}] total={total} ft={ft}")
-
-    def _maybe_log_batch_done(self, scheduler_output) -> None:
-        """[DeltaServe] One-line log right after future.result() unblocks on
-        GPU completion. Gated on ``print_engine_batch_done`` (or
-        ``print_step_mode``). Total/ft match [batch-sched] and [batch] so the
-        three correlate by (total, ft)."""
-        _ftc = self.vllm_config.finetune_config
-        if not (_ftc.print_engine_batch_done or _ftc.print_step_mode):
-            return
-        cls = self._classify_batch_for_log(scheduler_output)
-        if cls is None:
-            return
-        total, _prefill, ft = cls
-        import time as _t
-        from vllm.deltaserve import dprint
-        _ts = _t.strftime("%H:%M:%S") + f".{int((_t.time() % 1) * 1000):03d}"
-        dprint(f"[batch-done {_ts}] total={total} ft={ft}")
-
-    def _profiling_step(self) -> None:
-        """One synchronous schedule→execute→update step for the launch profiler.
-
-        Unlike `step()`, this materializes the model output via `sample_tokens`,
-        so it works whether or not async scheduling is enabled (under async,
-        `execute_model` returns a deferred AsyncModelRunnerOutput that must be
-        resolved by `sample_tokens`). The profiler always drives one step at a
-        time — no pipelining — so reserve/commit reconciles within each step.
-        """
-        if not self.scheduler.has_requests():
-            return
-        scheduler_output = self.scheduler.schedule()
-        exec_future = self.model_executor.execute_model(
-            scheduler_output, non_block=True)
-        if scheduler_output.total_num_scheduled_tokens == 0:
-            model_output = exec_future.result()
-        else:
-            # Materialize via the non_block future's .result(): under async that
-            # is an AsyncOutputFuture whose result() calls get_output() to turn
-            # the deferred AsyncModelRunnerOutput into a real ModelRunnerOutput
-            # (matches step_with_batch_queue). A plain sample_tokens() call would
-            # hand back the unresolved async wrapper.
-            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-            sample_future = self.model_executor.sample_tokens(
-                grammar_output, non_block=True)
-            model_output = sample_future.result()
-        self.scheduler.update_from_output(scheduler_output, model_output)
-
-    def deltaserve_save_estimator_state(self, path: str | None = None) -> dict:
-        """[estimator] Utility call behind POST /save_estimator_state: write
-        the SLO estimator's state now. ``path`` defaults to
-        ``finetune.estimator_state_save_path``."""
-        save = getattr(self.scheduler, "save_estimator_state", None)
-        if save is None:
-            return {"saved": False, "error": "finetuning is not enabled"}
-        path = path or getattr(self.vllm_config.finetune_config,
-                               "estimator_state_save_path", None)
-        if not path:
-            return {"saved": False, "error": "no path given and "
-                    "finetune.estimator_state_save_path is not set"}
-        save(path)
-        return {"saved": True, "path": path,
-                "samples": self.scheduler._tracker.size()}
-
-    def profile_execution_model(self) -> None:
-        """[Phase 4] Offline pass that seeds the SLO execution-time estimator.
-
-        Runs synthetic batches through the live FinetuneScheduler before serving
-        starts, recording realized (features, GPU-timed duration) per step and
-        fitting the merged estimator. The scheduler's own per-step recording
-        (Part C) does the bookkeeping; here we just drive controlled shapes and
-        discard their outputs (no frontend is consuming yet).
-        """
-        import random
-
-        ft_cfg = self.vllm_config.finetune_config
-        if not ft_cfg.enable_finetuning:
-            return
-        if not ft_cfg.profile_on_launch:
-            # No profiling pass: a carried-over estimator state is all there is.
-            if hasattr(self.scheduler, "load_estimator_state"):
-                self.scheduler.load_estimator_state()
-            return
-        sched = self.scheduler
-        # Only the FinetuneScheduler carries the estimator/tracker + hooks.
-        if not hasattr(sched, "_estimator"):
-            return
-        coord = sched._coord
-
-        from vllm.deltaserve import dprint
-        from vllm.deltaserve.profiling_batch_generator import (
-            ProfilingShapeGenerator,
-        )
-
-        try:
-            vocab = self.vllm_config.model_config.get_vocab_size()
-        except Exception:
-            vocab = 1000
-        vocab = max(16, min(int(vocab), 30000))
-        rng = random.Random(1234)
-
-        def rand_ids(n: int) -> list[int]:
-            return [rng.randint(1, vocab - 1) for _ in range(max(1, n))]
-
-        gen = ProfilingShapeGenerator(
-            batch_max_tokens=self.vllm_config.scheduler_config.max_num_batched_tokens,
-            max_saved_finetuning_tokens=ft_cfg.max_saved_finetuning_tokens,
-            max_req_len=self.vllm_config.model_config.max_model_len,
-        )
-        warmup, recorded = gen.prepare()
-        n_repeats = max(1, ft_cfg.profile_num_repeats)
-        total_shapes = len(warmup) + n_repeats * len(recorded)
-        dprint(f"[ft-profile] starting: {len(warmup)} warmup + "
-               f"{len(recorded)} recorded shapes x {n_repeats}")
-
-        from tqdm import tqdm
-        pbar = tqdm(total=total_shapes, desc="[ft-profile]", unit="shape",
-                    dynamic_ncols=True)
-
-        # Save + neutralize state that must not fire during profiling.
-        saved_bp = coord.backward_process
-        coord.backward_process = None
-        sched._profiling_mode = True
-        coord.profiling = True
-
-        def reset_coord():
-            coord.fill_count = 0
-            coord.reserved_fill = 0
-            coord.sample_lens = []
-            coord.admission_open = True
-            coord.pending_backward = False
-            coord.epoch_flush_pending = False
-
-        def run_shape(shape) -> None:
-            if shape.kind == "prefill":
-                for L in shape.inf_lens:
-                    sched.enqueue_profiling_request(
-                        sched.new_profiling_request(rand_ids(L), 1, is_ft=False))
-                self._profiling_step()
-            elif shape.kind == "coserve":
-                for L in shape.inf_lens:
-                    sched.enqueue_profiling_request(
-                        sched.new_profiling_request(rand_ids(L), 1, is_ft=False))
-                for L in shape.ft_lens:
-                    sched.enqueue_profiling_request(
-                        sched.new_profiling_request(rand_ids(L), 1, is_ft=True))
-                self._profiling_step()
-            elif shape.kind == "decode":
-                for L in shape.inf_lens:
-                    sched.enqueue_profiling_request(
-                        sched.new_profiling_request(
-                            rand_ids(L), 1 + shape.n_decode, is_ft=False))
-                if shape.ft_lens:
-                    # FT-on-decode: prefill inf reqs (wave 1), then inject FT
-                    # alongside the first decode step → the recorded step
-                    # carries (T_in=0, B_d>0, K>0, T_ft>0) — the EAGER regime
-                    # shape required by the unified-phase scheduler.
-                    self._profiling_step()  # wave-1 prefill
-                    for L in shape.ft_lens:
-                        sched.enqueue_profiling_request(
-                            sched.new_profiling_request(
-                                rand_ids(L), 1, is_ft=True))
-                    self._profiling_step()  # wave-1 decode + FT (recorded shape)
-                    # Drain remaining decode steps (one already consumed above).
-                    for _ in range(max(0, shape.n_decode - 1)):
-                        self._profiling_step()
-                else:
-                    for _ in range(1 + shape.n_decode):
-                        self._profiling_step()
-            elif shape.kind == "mixed":
-                for L in shape.inf_lens:
-                    sched.enqueue_profiling_request(
-                        sched.new_profiling_request(
-                            rand_ids(L), 1 + shape.n_decode, is_ft=False))
-                self._profiling_step()  # wave-1 prefill
-                for L in shape.mix_lens:
-                    sched.enqueue_profiling_request(
-                        sched.new_profiling_request(rand_ids(L), 1, is_ft=False))
-                # Optional FT alongside wave-2 prefill — gives the EAGER
-                # regime ``(T_in>0, B_d>0, K>0, T_ft>0)`` shape data.
-                for L in shape.ft_lens:
-                    sched.enqueue_profiling_request(
-                        sched.new_profiling_request(
-                            rand_ids(L), 1, is_ft=True))
-                self._profiling_step()  # wave-1 decode + wave-2 prefill (mixed) [+ FT]
-                # drain the rest
-                for _ in range(shape.n_decode):
-                    self._profiling_step()
-            # Clean up any leftover synthetic requests. Prefix-cache hits are
-            # avoided by using distinct random token ids per request, so no
-            # per-shape cache reset is needed (it floods the log + the bar).
-            sched.purge_profiling_requests()
-            # Clear the activation-buffer accounting after EVERY shape so the
-            # next shape starts with an empty buffer — otherwise FT rows from
-            # earlier shapes accumulate and the buffer-full gate would throttle
-            # later co-serve shapes (and shift their write offsets). The backward
-            # is detached, so nothing consumes the buffer during profiling.
-            reset_coord()
-
-        try:
-            # Warmup: don't record (the runner's deferred timer reads this gate
-            # at forward time, so warmup samples are never pushed to the tracker).
-            coord.record_timing = False
-            for shape in warmup:
-                run_shape(shape)
-                pbar.update(1)
-            coord.record_timing = True
-            pbar.set_description("[ft-profile] recording")
-            for _ in range(n_repeats):
-                for shape in recorded:
-                    run_shape(shape)
-                    pbar.update(1)
-            # Final drain of the coordinator queue into the tracker (samples
-            # pushed during the last step, after that step's schedule() drain).
-            # The last few steps' events may still sit in the runner's ring and
-            # are dropped — negligible against the full sweep.
-            for feats, dur, wg, pred, *_ in coord.drain_completed_samples():
-                if dur > 0:
-                    sched._tracker.add(feats, dur, predicted=pred, was_graph=wg)
-            sched._estimator.data_fit(sched._tracker)
-            dprint(f"[ft-profile] done: {sched._tracker.size()} samples | "
-                   f"eager_rmse={sched._estimator.eager_rmse} "
-                   f"graph_rmse={sched._estimator.graph_rmse}")
-        finally:
-            pbar.close()
-            sched._profiling_mode = False
-            coord.record_timing = True
-            coord.profiling = False
-            coord.backward_process = saved_bp
-            reset_coord()
-            sched.purge_profiling_requests()
-            # Single prefix-cache reset so live serving starts clean.
-            try:
-                self.scheduler.reset_prefix_cache()
-            except Exception:
-                pass
-            # [estimator_state_load_path] Continue from the state a previous
-            # run ended with: it replaces what this pass just fitted (the pass
-            # still ran, for its warm-up of the FT paths).
-            try:
-                sched.load_estimator_state()
-            except Exception as e:
-                dprint(f"[ft-profile] estimator state restore failed: {e}")
 
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
@@ -831,17 +498,6 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
-            # [forward_interruptible / tier B] Pre-empt an FT-only batch if a
-            # late inference arrival landed before kernels are launched.
-            _rb = self._maybe_rollback_ft_for_late_arrival(scheduler_output)
-            if _rb is not None:
-                scheduler_output = _rb
-            # [DeltaServe] log the moment the scheduler emits a non-decode-only
-            # batch. Under step_with_batch_queue this fires BEFORE the prior
-            # batch's [batch-done] when pipelining is overlapping schedule(N+1)
-            # with forward(N); that ordering is the visible signal that async
-            # scheduling is working.
-            self._maybe_log_batch_scheduled(scheduler_output)
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -851,16 +507,6 @@ class EngineCore:
 
             if self.is_pooling_model or not model_executed:
                 # No sampling required (no requests scheduled).
-                future = cast(Future[ModelRunnerOutput], exec_future)
-            elif exec_future.done() and _ft_output_aborted(exec_future.result()):
-                # [forward_interruptible / tier C] Entry-time abort path:
-                # the runner returned its sentinel ModelRunnerOutput WITHOUT
-                # setting execute_model_state, so calling sample_tokens here
-                # would return None (gpu_model_runner.sample_tokens early-
-                # exits on missing state) and trip the "unexpected error"
-                # check at the bottom of this function. Route the sentinel
-                # straight through as the batch_queue future; the abort
-                # handler after pop() will see _ft_aborted and roll back.
                 future = cast(Future[ModelRunnerOutput], exec_future)
             else:
                 if not scheduler_output.pending_structured_output_tokens:
@@ -908,37 +554,12 @@ class EngineCore:
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
 
-        # [DeltaServe] this batch's forward is now known done (future.result()
-        # above unblocked on GPU completion). Pairs with the launch-side
-        # [batch ...] log so per-batch GPU latency is visible. Under
-        # step_with_batch_queue this fires for the OLDEST in-flight batch, so
-        # the log order matches the queue pop order, not the schedule order.
-        self._maybe_log_batch_done(scheduler_output)
-
-        # [forward_interruptible / tier C] Rollback if the runner bailed the
-        # forward mid-flight. The output sentinel has no real per-request
-        # data, so skip update_from_output. Don't return early — the
-        # deferred-sampling path below applies to the NEXT batch (which may
-        # be a real inference batch with structured output / spec decode),
-        # so falling through with empty engine_core_outputs is correct.
-        # Under TP the sentinel arrives on the execute_model future (rank 0's
-        # response) while sample_tokens returns its own sentinel — check both.
-        _aborted = _ft_output_aborted(model_output)
-        if not _aborted and exec_model_fut is not None and exec_model_fut.done():
-            try:
-                _aborted = _ft_output_aborted(exec_model_fut.result())
-            except Exception:  # noqa: BLE001 — a failed forward surfaces elsewhere
-                _aborted = False
-        if _aborted:
-            self.scheduler._rollback_ft_step(scheduler_output)
-            engine_core_outputs: dict[int, EngineCoreOutputs] = {}
-        else:
-            # Before processing the model output, process any aborts that
-            # happened during the model execution.
-            self._process_aborts_queue()
-            engine_core_outputs = self.scheduler.update_from_output(
-                scheduler_output, model_output
-            )
+        # Before processing the model output, process any aborts that happened
+        # during the model execution.
+        self._process_aborts_queue()
+        engine_core_outputs = self.scheduler.update_from_output(
+            scheduler_output, model_output
+        )
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -976,26 +597,23 @@ class EngineCore:
             # More efficient to abort all as a single batch.
             self.abort_requests(request_ids)
 
+    def deltaserve_save_estimator_state(self, path: str | None = None) -> dict:
+        """[DeltaServe] Utility behind POST /save_estimator_state."""
+        from vllm.deltaserve.engine_core import save_estimator_state
+
+        return save_estimator_state(self, path)
+
     def shutdown(self):
-        # [estimator_state_save_path] Save the estimator state FIRST: tearing
-        # down the executor (TP workers + backward children) can outlast the
-        # grace period of whoever is stopping the server, and the scheduler's
-        # own shutdown hook only runs after it.
-        _save = getattr(self.scheduler, "save_estimator_state", None)
-        if _save is not None:
-            try:
-                _save()
-            except Exception as e:
-                logger.warning("estimator state save failed: %s", e)
+        ds = getattr(self, "_ds", None)  # [DeltaServe]
+        if ds is not None:
+            ds.on_shutdown()
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
         if self.scheduler:
             self.scheduler.shutdown()
-        _sig = getattr(self, "_ft_arrival_signal", None)
-        if _sig is not None:
-            _sig.close()
-            self._ft_arrival_signal = None
+        if ds is not None:
+            ds.after_shutdown()
 
         # Undo the gc.freeze() from __init__ so that the objects allocated
         # during engine startup (model weights, KV caches, etc.) become
@@ -1303,14 +921,6 @@ class EngineCoreProc(EngineCore):
                 internal_dp_balancing,
             )
 
-            # [forward_interruptible / tier C] Cache the coordinator handle
-            # for the input thread so it can set the abort event on ADD
-            # without an attribute walk through the scheduler. None when
-            # finetuning is off (the cheap-gate check in process_input_sockets
-            # then short-circuits on the None check alone).
-            self._ft_coord_handle = getattr(
-                self.scheduler, "_coord", None)
-
             # Background Threads and Queues for IO. These enable us to
             # overlap ZMQ socket IO with GPU since they release the GIL,
             # and to overlap some serialization/deserialization with the
@@ -1556,10 +1166,8 @@ class EngineCoreProc(EngineCore):
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
 
-            # [Phase 4] Seed the SLO execution-time estimator with an offline
-            # profiling pass before serving (no-op unless co-serving + enabled).
-            engine_core.profile_execution_model()
-
+            if engine_core._ds is not None:  # [DeltaServe] profiling pass etc.
+                engine_core._ds.before_busy_loop()
             engine_core.run_busy_loop()
 
         except SystemExit:
@@ -1636,94 +1244,8 @@ class EngineCoreProc(EngineCore):
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
 
-    def _maybe_rollback_ft_for_late_arrival(self, scheduler_output):
-        """[forward_interruptible / tier B] If ``schedule()`` produced an
-        FT-only batch AND a request landed on ``input_queue`` in the window
-        between the prior drain and now, abandon the FT batch, admit the
-        arrival(s), and re-call ``schedule()`` so the inference request can
-        ride the upcoming step instead of waiting through an FT-only
-        forward. Bounded to one retry — if the re-scheduled batch is also
-        FT-only (e.g. the arrival was an ABORT), we proceed with it.
-
-        Returns the new ``SchedulerOutput`` on rollback, or None if no
-        rollback fired (caller uses the original output). Fast-exit when
-        ``forward_interruptible`` is off or the batch isn't FT-only.
-        """
-        _ftc = getattr(self.vllm_config, "finetune_config", None)
-        if _ftc is None or not _ftc.forward_interruptible:
-            return None
-        total = scheduler_output.total_num_scheduled_tokens
-        if total == 0:
-            return None
-        ft_ids = getattr(scheduler_output, "finetune_req_ids", None)
-        # FT-only iff every scheduled request id is in finetune_req_ids
-        # (length match is the cheap form of that check — a non-FT request
-        # in the batch wouldn't be in finetune_req_ids).
-        if not ft_ids or len(ft_ids) != len(
-                scheduler_output.num_scheduled_tokens):
-            return None
-        if self.input_queue.empty():
-            return None
-        # Roll back the FT scheduling so the samples / KV / admission flags
-        # look like schedule() never ran.
-        sched = self.scheduler
-        if not hasattr(sched, "_rollback_ft_step"):
-            return None  # not a FinetuneScheduler — defensive
-        sched._rollback_ft_step(scheduler_output)
-        # Drain everything that landed (may include the ABORT that prompted
-        # the trip too — _handle_client_request is the right entry point
-        # for all request types).
-        while True:
-            try:
-                req = self.input_queue.get_nowait()
-            except queue.Empty:
-                break
-            self._handle_client_request(*req)
-        # Re-schedule with the new requests visible.
-        return sched.schedule()
-
-    def _maybe_ft_only_grace_poll(self) -> None:
-        """[forward_interruptible / tier A] When the next schedule() call
-        would produce an FT-only batch, briefly block on ``input_queue`` to
-        catch inference arrivals that landed in the gap between the previous
-        drain and now. On hit, drain any siblings non-blockingly so a burst
-        of co-arriving requests all ride the same upcoming batch. Adds a
-        bounded wait only when (a) the feature is on, (b) a grace window is
-        configured, and (c) the scheduler reports no inference is queued —
-        so inference-bearing steps and the default (feature off) path are
-        unaffected.
-
-        Cheap fast-exit when off: one attribute load and a short-circuit OR.
-        """
-        _ftc = getattr(self.vllm_config, "finetune_config", None)
-        if _ftc is None or not _ftc.forward_interruptible:
-            return
-        grace_s = _ftc.ft_only_admission_grace_ms / 1000.0
-        if grace_s <= 0:
-            return
-        sched = self.scheduler
-        if not getattr(sched, "would_step_be_ft_only", lambda: False)():
-            return
-        try:
-            req = self.input_queue.get(timeout=grace_s)
-        except queue.Empty:
-            return
-        self._handle_client_request(*req)
-        # Drain any siblings that landed during the wait (burst arrivals).
-        while True:
-            try:
-                req = self.input_queue.get_nowait()
-            except queue.Empty:
-                break
-            self._handle_client_request(*req)
-
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
-
-        # [forward_interruptible / tier A] If the next step would be FT-only,
-        # briefly wait on the input queue for inference arrivals so they can
-        # ride this step instead of waiting through an FT-only forward.
-        self._maybe_ft_only_grace_poll()
 
         # Step the engine core.
         outputs, model_executed = self.step_fn()
@@ -1756,16 +1278,8 @@ class EngineCoreProc(EngineCore):
             shutdown_timeout = self.vllm_config.shutdown_timeout
 
             logger.info("Shutdown initiated (timeout=%d)", shutdown_timeout)
-            # [estimator_state_save_path] The earliest point of a shutdown:
-            # when the whole process group is signalled (the usual way a
-            # benchmark driver stops the server) this process is gone before
-            # ``shutdown()`` is reached.
-            _save_est = getattr(self.scheduler, "save_estimator_state", None)
-            if _save_est is not None:
-                try:
-                    _save_est()
-                except Exception as e:
-                    logger.warning("estimator state save failed: %s", e)
+            if self._ds is not None:  # [DeltaServe] before the process is gone
+                self._ds.save_estimator_state()
 
             if shutdown_timeout == 0:
                 num_requests = self.scheduler.get_num_unfinished_requests()
@@ -1804,32 +1318,6 @@ class EngineCoreProc(EngineCore):
             req, request_wave = request
             if self._reject_add_in_shutdown(req):
                 return
-            _ftc = getattr(self.vllm_config, "finetune_config", None)
-            # [rps_throttle] Stamp the arrival on the coordinator's
-            # sliding-window tracker so the FT scheduler's per-step
-            # check_rps_throttle() sees a current rate. Cheap (single
-            # deque.append); always safe to call — the tracker exists
-            # from coordinator-init time. Gated on the enable flag so
-            # disabled runs pay nothing beyond one bool check.
-            if _ftc is not None and _ftc.rps_throttle_enable:
-                _coord = getattr(self.scheduler, "_coord", None)
-                if _coord is not None:
-                    import time as _t
-                    _coord.rps_tracker.note_arrival(_t.monotonic())
-            if _ftc is not None and (
-                    _ftc.print_engine_req_recv or _ftc.print_step_mode):
-                # Scheduler-side request counter (shared via the coordinator
-                # singleton) — drives the runner's "log every batch" mode.
-                _coord = getattr(self.scheduler, "_coord", None)
-                _n = "?"
-                if _coord is not None:
-                    _coord.inf_req_count += 1
-                    _n = _coord.inf_req_count
-                import time as _t
-                from vllm.deltaserve import dprint
-                _ts = _t.strftime("%H:%M:%S") + f".{int((_t.time() % 1) * 1000):03d}"
-                dprint(f"[engine-recv {_ts}] #{_n} ADD req="
-                       f"{getattr(req, 'request_id', '?')}")
             self.add_request(req, request_wave)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
@@ -2018,23 +1506,9 @@ class EngineCoreProc(EngineCore):
 
                     # Push to input queue for core busy loop.
                     self.input_queue.put_nowait((request_type, request))
-
-                    # [forward_interruptible / tier C] Signal a mid-forward
-                    # abort if an inference ADD landed while an FT-only batch
-                    # is on the GPU. Cheap fast-exit when ft_only_in_flight
-                    # is False (typical case — no FT-only forward running):
-                    # one attribute load on the cached coord handle. Set on
-                    # the coordinator (shared with the main thread via the
-                    # process-wide singleton in deltaserve.coordinator).
-                    if request_type == EngineCoreRequestType.ADD:
-                        _coord = getattr(self, "_ft_coord_handle", None)
-                        if _coord is not None and _coord.ft_only_in_flight:
-                            _coord.ft_abort_event.set()
-                        # [tier C under TP] the workers poll this counter at
-                        # every layer boundary of an FT-only forward.
-                        _sig = getattr(self, "_ft_arrival_signal", None)
-                        if _sig is not None:
-                            _sig.bump()
+                    if (self._ds is not None
+                            and request_type == EngineCoreRequestType.ADD):
+                        self._ds.on_input_add()  # [DeltaServe] FT abort signal
 
     def process_output_sockets(
         self, output_paths: list[str], coord_output_path: str | None, engine_index: int

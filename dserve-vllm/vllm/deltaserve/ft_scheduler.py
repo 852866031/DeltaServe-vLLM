@@ -10,7 +10,13 @@ update_from_output BEFORE the base loop runs — so they never produce an
 EngineCoreOutput and are invisible to the frontend.
 
 Selected via scheduler_config.scheduler_cls when finetune.enable_finetuning is
-set (wired in VllmConfig.__post_init__).
+set (``deltaserve/engine_config.py``).
+
+With ``forward_interruptible`` it also pre-empts FT-only steps for inference
+arrivals on the engine's input queue (``set_engine_inputs``): tier A waits a
+short grace window before building an FT-only step, tier B rolls a freshly
+built FT-only step back when a request landed meanwhile, and an FT-only forward
+the runner aborted (tier C) is rolled back in ``update_from_output``.
 """
 
 import csv
@@ -34,6 +40,11 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
+
+
+def _ts() -> str:
+    """Wall-clock HH:MM:SS.mmm for the one-line logs."""
+    return time.strftime("%H:%M:%S") + f".{int((time.time() % 1) * 1000):03d}"
 
 
 class FinetuneScheduler(AsyncScheduler):
@@ -181,6 +192,10 @@ class FinetuneScheduler(AsyncScheduler):
         # atomically per admit. Inert when factor=0 — the counter still
         # increments via the else branch but no trigger ever fires.
         self._unspent_prefill: int = 0
+
+        # [forward_interruptible] The engine's input queue (tiers A / B); set by
+        # the engine hooks before the busy loop. None = no pre-emption.
+        self._engine_inputs = None
 
         dprint(
             f"[ft-sched] FinetuneScheduler active | capacity={capacity} "
@@ -844,7 +859,52 @@ class FinetuneScheduler(AsyncScheduler):
         if leftover:
             self.waiting.remove_requests(leftover)
 
+    def set_engine_inputs(self, inputs) -> None:
+        self._engine_inputs = inputs
+
+    def add_request(self, request) -> None:
+        ftc = self.vllm_config.finetune_config
+        if ftc.rps_throttle_enable:
+            # [rps_throttle] Stamp the arrival on the sliding-window tracker so
+            # check_rps_throttle() sees a current rate.
+            self._coord.rps_tracker.note_arrival(time.monotonic())
+        if ftc.print_engine_req_recv or ftc.print_step_mode:
+            # Scheduler-side request counter — drives the runner's "log every
+            # batch" mode.
+            self._coord.inf_req_count += 1
+            dprint(f"[engine-recv {_ts()}] #{self._coord.inf_req_count} ADD "
+                   f"req={getattr(request, 'request_id', '?')}")
+        super().add_request(request)
+
+    @staticmethod
+    def _is_ft_only(output: SchedulerOutput) -> bool:
+        ft_ids = output.finetune_req_ids
+        return bool(ft_ids) and output.total_num_scheduled_tokens > 0 and (
+            len(ft_ids) == len(output.num_scheduled_tokens))
+
     def schedule(self) -> SchedulerOutput:
+        inputs = self._engine_inputs
+        interruptible = (inputs is not None and not self._profiling_mode
+                         and self.vllm_config.finetune_config.forward_interruptible)
+        if interruptible:
+            # [tier A] The step about to be built would be FT-only: wait briefly
+            # for an inference arrival so it rides this step instead of queuing
+            # behind an FT-only forward.
+            grace_s = self.vllm_config.finetune_config.ft_only_admission_grace_ms / 1e3
+            if grace_s > 0 and self.would_step_be_ft_only():
+                inputs.poll(grace_s)
+        output = self._schedule_step()
+        if interruptible and self._is_ft_only(output) and inputs.pending():
+            # [tier B] A request landed after the drain: undo the FT-only step,
+            # admit the arrival(s) and schedule once more (bounded to one retry;
+            # if that step is FT-only too, e.g. the arrival was an ABORT, it
+            # runs).
+            self._rollback_ft_step(output)
+            inputs.drain()
+            output = self._schedule_step()
+        return output
+
+    def _schedule_step(self) -> SchedulerOutput:
         # [Phase 4] Drain step durations the runner finished timing (deferred
         # CUDA-event ring) into the tracker. Pairs each step's features (stamped
         # at schedule) with its measured duration (read a few steps later).
@@ -1161,6 +1221,59 @@ class FinetuneScheduler(AsyncScheduler):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict:
+        self._maybe_log_batch_done(scheduler_output)
+        if getattr(model_runner_output, "finetune_aborted", False):
+            # [forward_interruptible / tier C] The runner abandoned this FT-only
+            # forward: undo its FT scheduling (the output carries no per-request
+            # data), THEN apply the relay fields it carries, so a backward ack
+            # is not lost and is not undone by the admission restore.
+            self._rollback_ft_step(scheduler_output)
+            self._apply_relay(model_runner_output)
+            return {}
+        self._apply_relay(model_runner_output)
+
+        # Retire FT requests BEFORE the base loop: free their KV the same step
+        # WITHOUT touching finished_req_ids (so the frontend never sees them).
+        # Once removed from self.requests, the base loop's `request is None`
+        # check skips them — no EngineCoreOutput is built.
+        for req_id in scheduler_output.finetune_req_ids:
+            req = self.requests.get(req_id)
+            if req is None:
+                continue
+            req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+            if req in self.running:
+                self.running.remove(req)
+            self._free_blocks(req)
+            self._ft_retired_pending.append(req_id)
+
+        # NOTE: estimator samples are recorded in schedule() by draining the
+        # coordinator's completed-sample queue — the runner times each step with
+        # a deferred CUDA-event ring, so the duration isn't known here (it lands
+        # a few steps later, off the hot path).
+        return super().update_from_output(scheduler_output, model_runner_output)
+
+    def _maybe_log_batch_done(self, scheduler_output) -> None:
+        """``print_engine_batch_done``: one line when a non-decode-only batch's
+        output arrives (its forward is done). Total/ft match the runner's
+        ``[batch ...]`` launch line, so the two correlate by (total, ft)."""
+        ftc = self.vllm_config.finetune_config
+        if not (ftc.print_engine_batch_done or ftc.print_step_mode):
+            return
+        total = scheduler_output.total_num_scheduled_tokens
+        if total == 0:
+            return
+        ft_ids = scheduler_output.finetune_req_ids
+        new_ids = {r.req_id for r in scheduler_output.scheduled_new_reqs}
+        ft = prefill = 0
+        for rid, nt in scheduler_output.num_scheduled_tokens.items():
+            if rid in ft_ids:
+                ft += nt
+            elif rid in new_ids or nt > 1:
+                prefill += nt
+        if prefill or ft:
+            dprint(f"[batch-done {_ts()}] total={total} ft={ft}")
+
+    def _apply_relay(self, model_runner_output) -> None:
         # [DeltaServe] Phase 7 / M4.1 (TP): apply the worker's relayed backward
         # signals to this scheduler-side coordinator (which owns the store +
         # admission but not the per-rank backward_process IPC handle). Apply the
@@ -1191,22 +1304,3 @@ class FinetuneScheduler(AsyncScheduler):
             if _saved:
                 self._coord.apply_relayed_saved(_saved[0], _saved[1])
 
-        # Retire FT requests BEFORE the base loop: free their KV the same step
-        # WITHOUT touching finished_req_ids (so the frontend never sees them).
-        # Once removed from self.requests, the base loop's `request is None`
-        # check skips them — no EngineCoreOutput is built.
-        for req_id in scheduler_output.finetune_req_ids:
-            req = self.requests.get(req_id)
-            if req is None:
-                continue
-            req.status = RequestStatus.FINISHED_LENGTH_CAPPED
-            if req in self.running:
-                self.running.remove(req)
-            self._free_blocks(req)
-            self._ft_retired_pending.append(req_id)
-
-        # NOTE: estimator samples are recorded in schedule() by draining the
-        # coordinator's completed-sample queue — the runner times each step with
-        # a deferred CUDA-event ring, so the duration isn't known here (it lands
-        # a few steps later, off the hot path).
-        return super().update_from_output(scheduler_output, model_runner_output)
