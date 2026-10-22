@@ -100,3 +100,11 @@ previous step) undoes it. The files a step modified are also copied, pre-change,
   one or two of them — the same nutanix burst request at 388 ms (baseline) and
   419 ms (plugin run). `pause_on_arrival` makes the child yield at its next
   boundary when a request arrives; the tail is gone (p99 ~100 ms).
+- **FT tok/s in the table above is over-counted, equally for every run.**
+  `compare_runs.py` divided all backward tokens in the log by the request window,
+  including cycles from the 5 s idle lead-in and after the last request (~1/3 too
+  high on the half timelines, ~1/5 on nutanix). Fixed to count in-window cycles
+  only. In-window, baseline → final: tight 297 → 295, loose 550 → 579 (+5 %),
+  nutanix 391 → 401 tok/s (+2.5 %). Relative comparisons in the table hold.
+  Figures: `eval-tp/plots/cleanup_compare_{summary,distributions}.png`
+  (`eval-tp/plot_cleanup_compare.py`).

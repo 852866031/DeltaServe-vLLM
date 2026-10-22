@@ -43,7 +43,12 @@ def load(dirpath: str, suffix: str, ttft_slo: float, tbt_slo: float) -> dict:
     w0 = t0 + min(float(r["t_rel_s"]) for r in res)
     w1 = t0 + max(float(r["t_rel_s"]) + float(r["latency_s"]) for r in res)
     out["window_s"] = w1 - w0
-    bwd = list(csv.DictReader(open(d / f"bwd_log{suffix}.csv")))
+    # Only backward cycles that finished inside the request window: the log
+    # also holds cycles from the idle lead-in before the first request and
+    # after the last one, which would inflate tok/s (by ~1/3 on the half
+    # timelines).
+    bwd = [r for r in csv.DictReader(open(d / f"bwd_log{suffix}.csv"))
+           if w0 <= dt.datetime.fromisoformat(r["timestamp"]).timestamp() <= w1]
     toks = sum(int(r["batch_tokens"]) for r in bwd)
     out["bwd_cycles"] = len(bwd)
     out["ft_tokens"] = toks
