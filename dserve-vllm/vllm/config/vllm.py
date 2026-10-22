@@ -822,57 +822,10 @@ class VllmConfig:
         # To give each torch profile run a unique instance name.
         self.instance_id = f"{time.time_ns()}"
 
-        # [DeltaServe] When co-serving is enabled, use the FT-injecting scheduler.
-        # Async (pipelined) scheduling is now supported: FinetuneScheduler
-        # subclasses AsyncScheduler, and the coordinator reserves activation-buffer
-        # rows at injection (committed + reserved ≤ capacity, disjoint per-step
-        # write offsets) so a step scheduled before the previous one's forward
-        # completes can't overflow or overlap the buffer. Default it ON; an
-        # explicit user override (True/False) is respected.
-        if self.finetune_config.enable_finetuning:
-            if self.scheduler_config.scheduler_cls is None:
-                # Phase-aware scheduler choice. ``coserving_admission_phase``
-                # = "prefill" (default) keeps today's prefill-only FT
-                # admission; "both" picks the sibling scheduler that allows
-                # FT on any step (prefill / decode / mixed / idle) under
-                # the SLO estimator's gate. The proportional cap
-                # ft_tokens_admission_constrain_factor is defined relative
-                # to prefill tokens, so it's incompatible with decode-only
-                # admission — soft-fall to "prefill" with a warning if both
-                # are set.
-                phase = getattr(self.finetune_config,
-                                "coserving_admission_phase", "prefill")
-                cap_factor = float(getattr(
-                    self.finetune_config,
-                    "ft_tokens_admission_constrain_factor", -1.0))
-                if phase == "both" and cap_factor != -1.0:
-                    logger.warning(
-                        "[deltaserve] coserving_admission_phase='both' is "
-                        "incompatible with ft_tokens_admission_constrain_factor"
-                        "=%s (must be -1); forcing 'prefill'.", cap_factor)
-                    phase = "prefill"
-                if phase == "both":
-                    self.scheduler_config.scheduler_cls = (
-                        "vllm.deltaserve.ft_scheduler_both."
-                        "BothPhaseFinetuneScheduler"
-                    )
-                else:
-                    self.scheduler_config.scheduler_cls = (
-                        "vllm.deltaserve.ft_scheduler.FinetuneScheduler"
-                    )
-            if getattr(self.finetune_config, "validate_estimator", False):
-                # Estimator-validation mode needs deterministic per-batch
-                # actuals: under async, schedule(N+1) runs before forward(N)
-                # completes, so the deferred CUDA-event ring's "previous slot"
-                # may not be settled. Force sync (override an explicit True).
-                if self.scheduler_config.async_scheduling:
-                    logger.info(
-                        "[deltaserve] validate_estimator=True — forcing "
-                        "async_scheduling OFF for accurate per-batch "
-                        "estimator validation.")
-                self.scheduler_config.async_scheduling = False
-            elif self.scheduler_config.async_scheduling is None:
-                self.scheduler_config.async_scheduling = True
+        # [DeltaServe] co-serving worker / scheduler / async defaults.
+        from vllm.deltaserve.engine_config import configure_vllm_config
+
+        configure_vllm_config(self)
 
         if self.performance_mode != "balanced":
             logger.info_once("Performance mode set to '%s'.", self.performance_mode)
