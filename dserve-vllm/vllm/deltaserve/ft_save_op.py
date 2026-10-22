@@ -14,13 +14,14 @@ eager. This module is the graph-native replacement for **mixed** batches
   add-norm's residual sum) through a persistent *source-index* tensor and
   writes them into the accumulator buffer for ``slot`` through a persistent
   *destination-index* tensor. Both index tensors, and the buffer table, are
-  read from the forward context (``ForwardContext.ft_save``), never from the
-  graph: the FT rows' positions and the reserved offset are the CONTENTS of
-  the index tensors, refreshed before each step. Unused slots gather row 0
-  into a scratch row past ``max_saved``.
+  read from the step's ``FtSaveState`` (``active_state()``, set by the model
+  runner around the forward / the has_ft captures), never from the graph: the
+  FT rows' positions and the reserved offset are the CONTENTS of the index
+  tensors, refreshed before each step. Unused slots gather row 0 into a
+  scratch row past ``max_saved``.
 * Inside vLLM's compiled forward the op is opaque to Dynamo, so its Python
-  branch on ``ft_save`` runs at *capture* time: the plain graphs (captured
-  with ``ft_save = None``) contain no kernels for it, the ``has_ft`` graphs
+  branch on the active state runs at *capture* time: the plain graphs
+  (captured with no active state) contain no kernels for it, the ``has_ft`` graphs
   contain the gathers with the persistent addresses baked in, and the
   compiled-but-uncaptured path evaluates the branch every step.
 * ``marker`` is a 1-element buffer on the calling module declared as
@@ -35,6 +36,7 @@ a slot on the module — i.e. in every non-finetuning deployment.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
@@ -44,23 +46,32 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 @dataclass
 class FtSaveState:
-    """What the op reads from the forward context on a mixed FT step."""
+    """What the op reads on a mixed FT step (or while capturing a has_ft graph)."""
 
     src: torch.Tensor           # int64 [max_saved]: rows of x to gather
     dst: torch.Tensor           # int64 [max_saved]: rows of the buffer to write
     bufs: list                  # slot -> buffer [max_saved + 1, width] or None
 
 
+# The state of the forward in flight; None outside a mixed FT forward / has_ft
+# capture. The model runs on one thread per worker process.
+_ACTIVE: FtSaveState | None = None
+
+
+@contextmanager
+def active_state(state: FtSaveState | None):
+    """Make ``state`` what the op reads for the duration of the block."""
+    global _ACTIVE
+    prev, _ACTIVE = _ACTIVE, state
+    try:
+        yield
+    finally:
+        _ACTIVE = prev
+
+
 def _dserve_save_rows(x: torch.Tensor, r: torch.Tensor | None,
                       marker: torch.Tensor, slot: int) -> None:
-    from vllm.forward_context import (
-        get_forward_context,
-        is_forward_context_available,
-    )
-
-    if not is_forward_context_available():
-        return
-    fs = get_forward_context().ft_save
+    fs = _ACTIVE
     if fs is None:
         return
     buf = fs.bufs[slot] if slot < len(fs.bufs) else None

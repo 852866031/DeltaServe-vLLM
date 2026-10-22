@@ -1130,16 +1130,6 @@ class GPUModelRunner(
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
-        # [DeltaServe] FT requests retire scheduler-side without entering
-        # finished_req_ids (the frontend must never see them); drop their
-        # cached state here so ``self.requests`` does not grow by one entry
-        # per FT injection. Same removals as the finished path above, so the
-        # condense() below covers them.
-        for req_id in (getattr(scheduler_output, "finetune_retired_req_ids", None) or ()):
-            if self.requests.pop(req_id, None) is not None:
-                self.num_prompt_logprobs.pop(req_id, None)
-            if req_id in self.input_batch.req_id_to_index:
-                self.input_batch.remove_request(req_id)
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
@@ -3728,7 +3718,6 @@ class GPUModelRunner(
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
-        has_ft: bool = False,
     ) -> tuple[
         CUDAGraphMode,
         BatchDescriptor,
@@ -3767,7 +3756,6 @@ class GPUModelRunner(
                 num_active_loras=num_active_loras,
                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
-                has_ft=has_ft,
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
@@ -3949,193 +3937,6 @@ class GPUModelRunner(
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
     @torch.inference_mode()
-    def _build_finetune_mask(
-        self,
-        scheduler_output: "SchedulerOutput",
-        req_ids: list[str],
-        num_scheduled_tokens_np: np.ndarray,
-    ) -> None:
-        """[DeltaServe] Build the per-token finetune_mask in flat-batch order.
-
-        Sets self._ft_has (bool, no device sync) and self._ft_mask_gpu (bool
-        tensor [total_num_scheduled_tokens] or None). Token spans come from the
-        InputBatch request order (req_ids) + the per-request scheduled-token
-        counts — NOT scheduler-dict order.
-
-        Also computes (self._ft_start, self._ft_contiguous) for the slice-
-        based fast path in the accumulator: if all FT-True positions form a
-        single uninterrupted span, hooks can use ``val[start:start+n]``
-        instead of ``val[mask]`` (saves the index_select kernel + gather
-        allocation per layer). Contiguity isn't guaranteed by vLLM (an FT
-        request can fill a freed inference slot mid-batch), so the mask is
-        kept as the fallback path.
-        """
-        self._ft_has = False
-        self._ft_mask_gpu = None
-        self._ft_num = 0
-        self._ft_sample_lens = []
-        self._ft_start = 0
-        self._ft_contiguous = False
-        self._ft_positions_np = None
-        self._ft_graph_step = False
-        ft_ids = getattr(scheduler_output, "finetune_req_ids", None)
-        if not ft_ids:
-            return
-        total = int(num_scheduled_tokens_np.sum())
-        cu = np.concatenate(([0], np.cumsum(num_scheduled_tokens_np))).astype(np.int64)
-        mask = np.zeros(total, dtype=bool)
-        sample_lens: list[int] = []
-        ft_first = -1
-        ft_last = -1
-        for i, req_id in enumerate(req_ids):
-            if req_id in ft_ids:
-                mask[cu[i]:cu[i + 1]] = True
-                # req_ids order == the order rows appear in hidden_states[mask],
-                # so these per-sample lengths line up with the buffer writes.
-                sample_lens.append(int(cu[i + 1] - cu[i]))
-                if ft_first < 0:
-                    ft_first = int(cu[i])
-                ft_last = int(cu[i + 1])  # exclusive end
-        n = int(mask.sum())
-        if n == 0:
-            return
-        self._ft_has = True
-        self._ft_num = n
-        self._ft_sample_lens = sample_lens
-        # Slice-path metadata: span is [ft_first, ft_last). Contiguous iff the
-        # span's length equals the total FT token count (no inference rows
-        # interleaved within the span).
-        self._ft_start = ft_first
-        self._ft_contiguous = (ft_last - ft_first) == n
-        self._ft_mask_gpu = torch.from_numpy(mask).to(
-            self.device, non_blocking=True
-        )
-        # [mixed-fwd-cuda-graph] A MIXED batch (inference tokens present) may
-        # run the compiled forward + has_ft graphs with the save op; FT-only
-        # batches keep the eager hook path (mid-forward abort). Decided here,
-        # before dispatch, from the config + the accumulator's readiness.
-        _acc = getattr(self, "_finetune_accumulator", None)
-        if (n < total and _acc is not None and getattr(_acc, "op_ready", False)
-                and self.vllm_config.finetune_config.graph_ft_batches
-                and self.vllm_config.finetune_config.save_activations):
-            self._ft_positions_np = np.flatnonzero(mask)
-            self._ft_graph_step = True
-
-    def _log_finetuning_batch(self, scheduler_output: "SchedulerOutput",
-                              cudagraph_mode) -> None:
-        """[DeltaServe] Print this batch's shape — prefill/ft token counts and the
-        per-sample KV-cache size (context length) of each decoding request — plus
-        whether it actually ran a CUDA graph (from the real dispatch decision).
-        Gated on ``print_engine_batch_exec`` (or the ``print_step_mode`` master
-        switch); skipped for decode-only batches."""
-        _ftc = self.vllm_config.finetune_config
-        # Hot-path early-out: one attribute load + short-circuit OR before any
-        # per-batch accounting below.
-        if not (_ftc.print_engine_batch_exec or _ftc.print_step_mode):
-            return
-        _coord = getattr(self, "_ft_coordinator", None)
-        if _coord is not None and getattr(_coord, "profiling", False):
-            return  # offline profiling: a progress bar is shown instead
-        ft_ids = getattr(scheduler_output, "finetune_req_ids", set())
-        new_ids = {r.req_id for r in scheduler_output.scheduled_new_reqs}
-        cached = scheduler_output.scheduled_cached_reqs
-        computed = dict(zip(cached.req_ids, cached.num_computed_tokens))
-        prefill = ft = 0
-        decode_kv: list[int] = []
-        for req_id, nt in scheduler_output.num_scheduled_tokens.items():
-            if req_id in ft_ids:
-                ft += nt
-            elif req_id in new_ids or nt > 1:  # new / chunked prefill
-                prefill += nt
-            else:  # single-token running req = decode; KV size = context length
-                decode_kv.append(computed.get(req_id, 0) + nt)
-        if prefill == 0 and ft == 0:
-            return  # decode-only batch: not interesting, skip
-        from vllm.deltaserve import dprint
-
-        eager = cudagraph_mode == CUDAGraphMode.NONE
-        mode = "eager" if eager else f"graph({getattr(cudagraph_mode, 'name', cudagraph_mode)})"
-        total = prefill + ft + len(decode_kv)
-        # Scheduler occupancy when this batch was built (stamped by the
-        # FinetuneScheduler): running (incl. in-flight FT awaiting retire),
-        # running_inf (inference-only subset), and waiting.
-        run = getattr(scheduler_output, "_ft_running", -1)
-        run_inf = getattr(scheduler_output, "_ft_running_inf", -1)
-        wait = getattr(scheduler_output, "_ft_waiting", -1)
-        # FT admission state from the coordinator: OPEN/CLOSED, whether a
-        # backward is in flight, and the activation-buffer fill (committed +
-        # reserved-in-flight) vs capacity.
-        coord = getattr(self, "_ft_coordinator", None)
-        _st = getattr(scheduler_output, "finetune_admit_state", None)
-        if _st is None and coord is not None:
-            # No stamp (non-FinetuneScheduler step): read the local coordinator.
-            # Under TP that mirror carries no buffer accounting — the stamped
-            # scheduler-side state above is the truthful source.
-            _st = (coord.admission_open, coord.pending_backward,
-                   coord.fill_count + coord.reserved_fill, coord.capacity)
-        if _st is not None:
-            _open, _pending, _fill, _cap = _st
-            admit = "CLOSED" if (not _open or _pending) else "OPEN"
-            bwd = " bwd" if _pending else ""
-            admit_str = f" | FT {admit}{bwd} buf={_fill}/{_cap}"
-        else:
-            admit_str = ""
-        import time as _time
-        ts = _time.strftime("%H:%M:%S") + f".{int((_time.time() % 1) * 1000):03d}"
-        # Elapsed since FT admission opened (POST /start_finetuning); t=0 until set.
-        ft_t0 = getattr(coord, "ft_start_time", None) if coord is not None else None
-        elapsed = (_time.monotonic() - ft_t0) if ft_t0 is not None else 0.0
-        # Surface the fwd-token-throttle state in the batch log when the
-        # feature is enabled: makes "bwd looks stalled" easy to diagnose.
-        # The HIT decision uses INFERENCE-ONLY tokens (prefill + decode,
-        # excluding FT) — matching the actual throttle in execute_model
-        # — because an FT-only batch has no inference work to protect
-        # the bwd from, so the throttle shouldn't fire for it. The
-        # displayed ``(total=N)`` field above still shows the full
-        # batch count for context; the throttle line shows the
-        # inf-only total it compared against.
-        throttle_part = ""
-        if _ftc.fwd_token_throttle_enable:
-            _thr = int(_ftc.fwd_token_throttle)
-            _inf_total = prefill + len(decode_kv)
-            _hit = _inf_total >= _thr if _thr > 0 else False
-            throttle_part = (f" | fwd_throttle={_thr} "
-                             f"inf_total={_inf_total} "
-                             f"({'HIT' if _hit else 'ok'})")
-        dprint(
-            f"[batch {ts} t={elapsed:+.3f}s] prefill={prefill} ft={ft} "
-            f"decode={decode_kv} (total={total}) | {mode} | running={run} "
-            f"(inf={run_inf}) waiting={wait}{admit_str}{throttle_part}"
-        )
-
-    def _maybe_verify_ft_accumulation(self) -> None:
-        """[DeltaServe] One-shot: hash the accumulated FT activation buffers on
-        the parent and compare to the backward process's mapped view (zero-copy).
-        """
-        if getattr(self, "_ft_accum_verified", True):
-            return
-        if not self.vllm_config.finetune_config.print_activation_hash:
-            self._ft_accum_verified = True
-            return
-        backward = getattr(self, "_backward_process", None)
-        accumulator = getattr(self, "_finetune_accumulator", None)
-        if backward is None or accumulator is None:
-            return
-        from vllm.deltaserve import dprint
-        from vllm.deltaserve.backward_process import (
-            activation_hash_report,
-            print_hash_report,
-        )
-
-        torch.cuda.synchronize()  # ensure writes are visible cross-process
-        n = self._ft_num
-        parent = activation_hash_report(accumulator.buffers, n)
-        print_hash_report(parent, "parent")
-        child = backward.hash_activations(n)
-        dprint(f"[accumulate] activation hashes parent==child: {parent == child} "
-               f"(n={n} FT tokens)")
-        self._ft_accum_verified = True
-
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -4149,55 +3950,6 @@ class GPUModelRunner(
 
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
-
-        # [fwd_token_throttle] Idle-release safety net. ``execute_model``
-        # early-returns ~40 lines down when num_scheduled_tokens == 0
-        # (no inference in queue, no FT admitted), which is *exactly*
-        # the state we reach after a workload burst ends with the
-        # throttle still holding the bwd paused. Without releasing
-        # here, the cross-step release block further down never runs,
-        # the bwd cycle stays mid-pause, ``pending_backward`` stays
-        # True, the engine keeps stepping into the same 0-token early
-        # return, and the FT deadlocks. Fires only when the throttle
-        # is currently holding the pause — no-op for every other
-        # configuration, so the early-return path is unchanged in the
-        # common case.
-        # [pause_until_prefill_done] Poll the deferred re-grant on EVERY call,
-        # idle steps included: after the last prefill of a burst the engine
-        # may only issue 0-token steps, and a rank whose "prefill done" event
-        # had not fired yet would otherwise keep its grant cleared for good.
-        _resume_coord = getattr(self, "_ft_coordinator", None)
-        if _resume_coord is not None:
-            self._ft_maybe_resume_backward(_resume_coord)
-        if getattr(self, "_throttle_held", False):
-            _idle_coord = getattr(self, "_ft_coordinator", None)
-            _idle_feats = getattr(
-                scheduler_output, "_ft_step_features", None)
-            _idle_cfg = self.vllm_config.finetune_config
-            # Re-evaluate the throttle condition for THIS step. The
-            # release condition mirrors the in-step cross-step block:
-            # release whenever the throttle isn't (re-)engaged. An
-            # empty/no-feats step trivially satisfies that — there's
-            # nothing inference-side to protect from.
-            _idle_release = True
-            if (_idle_feats is not None
-                    and _idle_cfg.fwd_token_throttle_enable):
-                _idle_thr = int(_idle_cfg.fwd_token_throttle)
-                if _idle_thr > 0:
-                    # INFERENCE-only total (mirrors the engage-side
-                    # decision a few hundred lines below): inf_prefill
-                    # + decode_count. FT tokens excluded so an FT-only
-                    # step doesn't keep the bwd paused.
-                    _idle_inf_prefill = (int(_idle_feats.t_in)
-                                         - int(_idle_feats.t_ft))
-                    _idle_total = _idle_inf_prefill + int(_idle_feats.b_d)
-                    _idle_release = _idle_total < _idle_thr
-            if _idle_release and _idle_coord is not None:
-                _idle_coord.gpu_resume_backward()
-                self._throttle_held = False
-                # Mirror to coord for the scheduler's pre-pause check
-                # in ``_trigger_backward``.
-                _idle_coord.fwd_throttle_active = False
 
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
@@ -4237,56 +3989,6 @@ class GPUModelRunner(
                     self._execute_mm_encoder(scheduler_output)
                     return make_empty_encoder_model_runner_output(scheduler_output)
 
-            # [DeltaServe] Phase 7 / M4.1 (TP): fire a relayed backward trigger
-            # even on an idle (0-token) step so a buffer-full / epoch-flush
-            # trigger the scheduler emitted isn't dropped at the early return
-            # below. Only the IPC send happens here; the ack is polled on the
-            # next forward step (nothing to admit while idle anyway).
-            _ftc_idle = getattr(self, "_ft_coordinator", None)
-            if _ftc_idle is not None and getattr(_ftc_idle, "relay_mode", False):
-                _cmd_idle = getattr(
-                    scheduler_output, "finetune_backward_trigger", None)
-                if _cmd_idle:
-                    # The trigger rides on the NEXT step's SchedulerOutput. If
-                    # that step carries inference work the pause rules below
-                    # protect (a prefill, or a throttle HIT), clear the grant
-                    # BEFORE the child is signalled: otherwise the child passes
-                    # its initial ``_maybe_pause`` with the grant still set and
-                    # runs its first segment against this step (measured at
-                    # TP=4: a burst's first prefill took 0.55-0.72 s, 18-29
-                    # requests queued behind it). The regular pause decision
-                    # later in this call owns the resume bookkeeping.
-                    _f_trig = getattr(
-                        scheduler_output, "_ft_step_features", None)
-                    if _f_trig is not None:
-                        _cfg_trig = self.vllm_config.finetune_config
-                        _inf_prefill_trig = int(_f_trig.t_in) - int(_f_trig.t_ft)
-                        _thr_trig = int(_cfg_trig.fwd_token_throttle)
-                        if _inf_prefill_trig > 0 or (
-                                _cfg_trig.fwd_token_throttle_enable
-                                and _thr_trig > 0
-                                and _inf_prefill_trig + int(_f_trig.b_d)
-                                >= _thr_trig):
-                            _ftc_idle.gpu_pause_backward()
-                    _ftc_idle.execute_trigger(_cmd_idle)
-                # [M4.2] Idle (0-token) steps are how the engine keeps
-                # stepping while a backward is outstanding
-                # (FinetuneScheduler.has_requests), and this early return is
-                # the output the scheduler sees for them (sample_tokens is
-                # not reached). Relay the ack + timing here too — otherwise
-                # the ack only arrives with the next inference batch and FT
-                # stalls through every idle valley. All ranks take this path
-                # in lock-step, so the ack's all-reduce is safe.
-                if not num_scheduled_tokens and not has_kv_transfer_group():
-                    # A private copy: the shared EMPTY sentinel must not be
-                    # mutated. (``copy`` of the module-level constant rather
-                    # than naming the class here — execute_model imports
-                    # ``ModelRunnerOutput`` locally further down, which would
-                    # make the name unbound at this point.)
-                    _idle_out = copy(EMPTY_MODEL_RUNNER_OUTPUT)
-                    self._ft_fill_relay_fields(_idle_out, _ftc_idle)
-                    return _idle_out
-
             if not num_scheduled_tokens:
                 if (
                     self.parallel_config.distributed_executor_backend
@@ -4319,13 +4021,6 @@ class GPUModelRunner(
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
-            # [DeltaServe] Build the per-token finetune_mask (True for injected
-            # FT-sample tokens, in flat-batch order). Sets self._ft_has /
-            # self._ft_mask_gpu; gates force_eager (below) and activation
-            # capture (Milestone 2).
-            self._build_finetune_mask(scheduler_output, req_ids,
-                                      num_scheduled_tokens_np)
-
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,
@@ -4354,22 +4049,7 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
-                # [DeltaServe] a step with FT tokens runs eager (the activation
-                # hooks read per-step Python state) — unless it is a MIXED batch
-                # on the graph-capturable save path (mixed-fwd-cuda-graph), which
-                # dispatches into the has_ft piecewise set.
-                force_eager=self._ft_has and not self._ft_graph_step,
-                has_ft=self._ft_graph_step,
             )
-            if self._ft_has and not self._ft_graph_step:
-                assert cudagraph_mode == CUDAGraphMode.NONE, (
-                    "[deltaserve] FT step must be eager, got "
-                    f"{cudagraph_mode}"
-                )
-            # [DeltaServe] readable per-batch log: shape (prefill/ft/decode) plus
-            # whether THIS step actually ran a CUDA graph (from the real dispatch
-            # decision, not inferred from has_ft).
-            self._log_finetuning_batch(scheduler_output, cudagraph_mode)
 
             logger.debug(
                 "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -4494,340 +4174,36 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
-        # [DeltaServe] arm the accumulation hooks for this step (no-op off FT
-        # steps). The write offset is the disjoint, per-step offset the scheduler
-        # reserved for this step (async-safe); fall back to the coordinator's
-        # current offset (profiling / no reservation).
-        accumulator = getattr(self, "_finetune_accumulator", None)
-        coord = getattr(self, "_ft_coordinator", None)
-        # [M4.1] reset the per-step TP relay stash (set in the FT capture block).
-        self._ft_relay_saved = None
-        save_acts = self.vllm_config.finetune_config.save_activations
-        _stashed_off = getattr(scheduler_output, "_ft_write_offset", None)
-        if _stashed_off is not None:
-            self._ft_offset = int(_stashed_off)
-        else:
-            self._ft_offset = coord.current_offset() if coord is not None else 0
-        _ft_save_ctx = None
-        if self._ft_has and accumulator is not None and save_acts:
-            if self._ft_graph_step:
-                # Graph path: refresh the persistent index tensors; the hooks
-                # stay disarmed (they are inert inside the compiled forward).
-                _ft_save_ctx = accumulator.arm_op_step(
-                    self._ft_positions_np, self._ft_num, self._ft_offset)
-            else:
-                accumulator.begin_step(
-                    self._ft_mask_gpu, self._ft_num, self._ft_offset,
-                    start=self._ft_start, contiguous=self._ft_contiguous)
-
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
-        # [Phase 4] GPU-accurate per-step timing for the SLO estimator, via a
-        # ring of CUDA-event pairs so we never synchronize on the hot path:
-        # each step records start/end events into a ring slot, and we read the
-        # elapsed time of the slot's PREVIOUS occupant (RING steps old, hence
-        # already complete → non-blocking). This keeps async pipelining intact
-        # (a per-step synchronize would serialize the forward and defeat it).
-        _ft_time_step = coord is not None
-        _pause_bwd = False
-        _pause_throttle = False
-        _ft_slot = -1
-        _ft_t_wall0 = 0.0
-        _ft_t_host0 = 0.0
-        if _ft_time_step:
-            if getattr(self, "_ft_timing_events", None) is None:
-                _RING = 4  # > batch-queue depth (2) so a reused slot is settled
-                self._ft_timing_events = [
-                    (torch.cuda.Event(enable_timing=True),
-                     torch.cuda.Event(enable_timing=True)) for _ in range(_RING)]
-                self._ft_timing_owner: list = [None] * _RING
-                self._ft_timing_pos = 0
-            # Share vLLM's real cudagraph dispatcher with the scheduler (same
-            # process on single-GPU) so it can query graph eligibility directly.
-            if coord.cudagraph_dispatcher is None:
-                coord.cudagraph_dispatcher = self.cudagraph_dispatcher
-            _ft_slot = self._ft_timing_pos
-            _start_evt, _end_evt = self._ft_timing_events[_ft_slot]
-            # Drain this slot's previous occupant (RING steps ago → complete):
-            # push its (features, measured duration) to the coordinator queue,
-            # which the scheduler drains into the estimator tracker. Decoupled
-            # from update_from_output because the duration is only known now.
-            _prev = self._ft_timing_owner[_ft_slot]
-            if _prev is not None and _end_evt.query():
-                _prev_sched, _prev_rec, _prev_graph, _prev_extra = _prev
-                _prev_feats = getattr(_prev_sched, "_ft_step_features", None)
-                if _prev_rec and _prev_feats is not None:
-                    # was_graph = the CUDA-graph mode the runner actually used
-                    # (recorded at forward time), not the scheduler's guess —
-                    # the scheduler cannot see the dispatcher under TP.
-                    coord.push_sample(
-                        _prev_feats,
-                        _start_evt.elapsed_time(_end_evt) / 1000.0,
-                        _prev_graph,
-                        getattr(_prev_sched, "_ft_step_predicted", None),
-                        _prev_extra)
-            self._ft_timing_owner[_ft_slot] = None
-            # [Phase 5] Yield the GPU to this forward if it carries prefill
-            # tokens (TTFT-critical): pause the backward child for its duration.
-            # Decode-only steps don't pause it (backward runs concurrently).
-            # Gate on pending_backward unless ``pause_prefill_always``: with
-            # the gate, only steps issued while a backward is outstanding
-            # pause the child. Under TP the trigger rides the next
-            # SchedulerOutput and fires while the previous step is still on
-            # the GPU, so that in-flight prefill had decided "nothing to
-            # pause" and runs 2-3x against the fresh child — but the same
-            # unpaused window is where the child gets most of its cycle
-            # done when FT rides every prefill of a burst. Clearing the grant
-            # on every prefill (the flag) fixes those prefills and starves the
-            # child instead (cycles 150 → 600 ms, FT 2-3x lower, measured
-            # 2026-09-15). See FinetuneConfig.pause_prefill_always.
-            _feats = getattr(scheduler_output, "_ft_step_features", None)
-            # Pause reasons (OR-merged; same single set_pause caller so
-            # there is no two-source race — see the design discussion in
-            # the project history):
-            #   (1) prefill present (today's rule, TTFT-critical)
-            #   (2) fwd-token throttle: this step's total tokens
-            #       exceed the configured threshold. ``total`` here
-            #       matches the ``(total=N)`` field of the
-            #       ``[deltaserve] [batch …]`` log:
-            #           total = t_in (prefill incl. ft) + b_d (decode count)
-            if _feats is not None and (
-                    coord.pending_backward
-                    or self.vllm_config.finetune_config.pause_prefill_always):
-                # INFERENCE prefill only: ``t_in`` includes the FT subset, and
-                # an FT-only step has no inference work to protect. With
-                # ``pause_prefill_always`` it used to clear the grant on every
-                # FT-only forward as well; the deferred re-grant (a CUDA event
-                # polled on later steps) then never happened on the ranks
-                # whose event had not fired before the engine went idle, the
-                # ranks disagreed on the grant and the next backward stalled
-                # at every boundary until FT was declared dead.
-                _pause_prefill = (int(_feats.t_in) - int(_feats.t_ft)) > 0
-                _ft_cfg = self.vllm_config.finetune_config
-                if _ft_cfg.fwd_token_throttle_enable:
-                    _throttle = int(_ft_cfg.fwd_token_throttle)
-                    if _throttle > 0:
-                        # INFERENCE-only total = inf_prefill + decode count.
-                        # ``t_in`` includes the FT subset, so subtract
-                        # ``t_ft`` to isolate the inference prefill. FT
-                        # tokens are NOT counted: an FT-only batch has
-                        # zero inference work competing for the GPU, so
-                        # the throttle (which exists to protect inference
-                        # from bwd contention) shouldn't fire for it.
-                        _inf_prefill = int(_feats.t_in) - int(_feats.t_ft)
-                        _total = _inf_prefill + int(_feats.b_d)
-                        # ``>=``: with a threshold of 1 the throttle must also
-                        # cover the single-token decode step that follows a
-                        # burst's first prefill (it ran 0.26-0.30 s against a
-                        # fresh backward when only ``>`` was checked).
-                        _pause_throttle = _total >= _throttle
-                _pause_bwd = _pause_prefill or _pause_throttle
-            # Cross-step throttle release: if a previous step left the
-            # bwd paused for throttle reasons and this step's total has
-            # dropped back at-or-below the threshold (so _pause_throttle
-            # is False), release the held pause now. Tracked via
-            # ``self._throttle_held``; prefill releases itself via the
-            # after-forward path below, so this flag only follows the
-            # throttle source.
-            if getattr(self, "_throttle_held", False) and not _pause_throttle:
-                coord.gpu_resume_backward()
-                self._throttle_held = False
-                # Mirror to coord for the scheduler's pre-pause check
-                # in ``_trigger_backward``.
-                coord.fwd_throttle_active = False
-            if _pause_bwd:
-                coord.gpu_pause_backward()
-                # Remember whether the THROTTLE is the reason we're
-                # paused so the after-forward gate below can skip the
-                # resume (sticky pause across consecutive heavy steps).
-                self._throttle_held = _pause_throttle
-                # Mirror to coord. The scheduler reads this in
-                # _trigger_backward to decide whether to pre-pause
-                # the bwd before signaling it to start.
-                coord.fwd_throttle_active = _pause_throttle
-            # [step_trace] host-side clocks bracketing the forward dispatch
-            # (two clock reads; the trace joins them by the stamped seq).
-            _ft_t_wall0 = time.time()
-            _ft_t_host0 = time.perf_counter()
-            _start_evt.record()
-        # [forward_interruptible / tier C] Arm the per-layer abort path if
-        # this is a pure FT-only forward (any inference present would suffer
-        # from a mid-forward abort, so we never abort co-serve batches). The
-        # gate is cheap: one bool check on self._ft_has + an arithmetic
-        # equality + the config flag.
-        _ft_only_run = bool(
-            self._ft_has
-            and coord is not None
-            and self.vllm_config.finetune_config.forward_interruptible
-            and self._ft_num == num_tokens_unpadded
-        )
-        _ft_aborted = False
-        _ft_abort_where = ""
-        # A previous abort's pending marker for sample_tokens is consumed by
-        # any new execute_model call (tp=1 routes the sentinel around
-        # sample_tokens entirely, so the marker must not leak to a later
-        # idle step).
-        self._ft_pending_abort = False
-        _poller = getattr(coord, "ft_abort_poller", None) if coord is not None else None
-        if (_poller is not None and not _ft_only_run and self._ft_has is not None
-                and num_tokens_unpadded > 0):
-            # [tier C under TP] An inference-bearing batch: every arrival so
-            # far has been scheduled — stop counting them as pending.
-            _poller.note_served()
-        if _ft_only_run:
-            # Pipeline-depth-2 contamination: a prior FT-only batch already
-            # tripped the abort flag, but THIS batch was scheduled before
-            # the flag was set. Bail at entry — no kernels queued, full
-            # forward saved. Under TP the entry decision is the poller's
-            # rank-symmetric one (every rank bails or none does).
-            if _poller is not None:
-                _ft_aborted = _poller.entry()
-            elif coord.ft_abort_event.is_set():
-                _ft_aborted = True
-            if _ft_aborted:
-                _ft_abort_where = "entry"
-            else:
-                # Mark the live FT-only forward so the input thread starts
-                # signalling, and ensure the hook's check sees a clean event.
-                coord.ft_only_in_flight = True
-
-        _forward_ok = False
-        try:
-            if _ft_aborted:
-                # Entry-time abort: skip the forward entirely.
-                model_output = None
-            else:
-                with (
-                    set_forward_context(
-                        attn_metadata,
-                        self.vllm_config,
-                        num_tokens=num_tokens_padded,
-                        num_tokens_across_dp=num_tokens_across_dp,
-                        cudagraph_runtime_mode=cudagraph_mode,
-                        batch_descriptor=batch_desc,
-                        ubatch_slices=ubatch_slices_padded,
-                        slot_mapping=slot_mappings,
-                        # [DeltaServe] bypass the compiled graph on eager FT steps
-                        # so the submodule forward hooks reliably fire; mixed
-                        # graph steps run compiled with the save op armed.
-                        skip_compiled=has_encoder_input
-                        or (self._ft_has and not self._ft_graph_step),
-                        ft_save=_ft_save_ctx,
-                    ),
-                    record_function_or_nullcontext("gpu_model_runner: forward"),
-                    self.maybe_get_kv_connector_output(
-                        scheduler_output,
-                        defer_finalize=defer_kv_connector_finalize,
-                    ) as kv_connector_output,
-                ):
-                    try:
-                        model_output = self._model_forward(
-                            input_ids=input_ids,
-                            positions=positions,
-                            intermediate_tensors=intermediate_tensors,
-                            inputs_embeds=inputs_embeds,
-                            **model_kwargs,
-                        )
-                    except Exception as _e:
-                        # Mid-forward abort fired from an activation hook
-                        # (raised FTAborted). Only catch that one — anything
-                        # else is a real error.
-                        from vllm.deltaserve.coordinator import FTAborted
-                        if isinstance(_e, FTAborted):
-                            _ft_aborted = True
-                            _ft_abort_where = (
-                                f"layer {_poller.layer_calls}"
-                                if _poller is not None else "mid-forward")
-                            model_output = None
-                        else:
-                            raise
-            _forward_ok = not _ft_aborted
-        finally:
-            # [Phase 4] Record the end event into the ring slot (no synchronize
-            # — the duration is read RING steps later, off the hot path). Only
-            # commit the slot on a clean forward so a failed step isn't drained.
-            if _ft_time_step and _forward_ok:
-                _start_evt, _end_evt = self._ft_timing_events[_ft_slot]
-                _end_evt.record()
-                # Own the slot with this step's output + whether to record it
-                # (sampled now, at forward time, so the warmup/recorded gate is
-                # correct even though the duration is read RING steps later).
-                # [M4.2] The record gate rides SchedulerOutput (the scheduler
-                # coordinator's flag; the worker's own is never toggled under
-                # TP) — falls back to the local flag for outputs without it.
-                self._ft_timing_owner[_ft_slot] = (
-                    scheduler_output,
-                    bool(getattr(scheduler_output, "finetune_record_timing",
-                                 coord.record_timing)),
-                    bool(cudagraph_mode is not None
-                         and cudagraph_mode != CUDAGraphMode.NONE),
-                    # [step_trace] (seq, t_exec wall, host dispatch s, paused)
-                    (getattr(scheduler_output, "_ft_step_seq", None),
-                     _ft_t_wall0, time.perf_counter() - _ft_t_host0,
-                     _pause_bwd))
-                self._ft_timing_pos = (_ft_slot + 1) % len(self._ft_timing_events)
-            # [Phase 5] Return the GPU to the backward child after enqueuing the
-            # prefill forward. Fire-and-forget (just sets the mp.Event grant) —
-            # no host synchronize. The pause is advisory: worst case the
-            # backward's next layer interleaves with the prefill's tail kernels
-            # (MPS time-slices anyway), which is fine and far cheaper than
-            # blocking the engine loop on the forward's completion. In `finally`
-            # so a failed forward can't leave the backward stalled.
-            # Skip the resume when the throttle is the reason for pause
-            # (or one of the reasons): the throttle is "sticky" — it
-            # holds the bwd paused across consecutive heavy steps and
-            # is released only by the cross-step block above, on the
-            # first step whose total dropped at-or-below the threshold.
-            # Releasing here would let the bwd briefly run between
-            # heavy steps, defeating the throttle's intent.
-            if _pause_bwd and not _pause_throttle:
-                if (_forward_ok and
-                        self.vllm_config.finetune_config.pause_until_prefill_done):
-                    # Keep the child paused until this prefill has COMPLETED
-                    # on the GPU: record an event behind the forward and
-                    # resume when it has fired (``_ft_maybe_resume_backward``
-                    # on the next execute_model / sample_tokens; the 5 s cap
-                    # in the child's _maybe_pause bounds any missed resume).
-                    _ev = torch.cuda.Event()
-                    _ev.record()
-                    self._ft_resume_evt = _ev
-                else:
-                    coord.gpu_resume_backward()
-            # [forward_interruptible / tier C] Always clear the live-FT-only
-            # marker — even on aborted / failed forwards — so the input
-            # thread stops trying to set the abort event for future batches.
-            # accumulator.end_step() resets _active so a subsequent inference
-            # batch's hooks are no-ops; without this the next batch could
-            # see stale _active=True from the bailed-out FT step and try to
-            # copy garbage rows.
-            if _ft_only_run and coord is not None:
-                coord.ft_only_in_flight = False
-                if _poller is not None:
-                    _poller.finish()
-            if _ft_aborted and accumulator is not None:
-                accumulator.end_step()
-
-        # [forward_interruptible / tier C] On abort the post-forward path
-        # (logits, sampling, final-hidden capture, KV-connector wait) is
-        # invalid because model_output is None — short-circuit with a
-        # sentinel empty output flagged for the engine to roll back. Also
-        # zero the partial-write tail at this batch's offset so a debugger
-        # / hash check sees a clean buffer; the backward already wouldn't
-        # read these rows (fill_count guards), but zeroing keeps the state
-        # easy to reason about and is cheap.
-        if _ft_aborted:
-            if accumulator is not None:
-                accumulator.zero_offset_range(self._ft_offset, self._ft_num)
-            from vllm.deltaserve import dprint
-            dprint(f"[ft-abort] tier C: FT-only forward ({self._ft_num} tokens) "
-                   f"aborted at {_ft_abort_where} for a late inference arrival")
-            # sample_tokens (called by the engine under TP) returns the same
-            # sentinel from its no-state path when this is set.
-            self._ft_pending_abort = True
-            return self._ft_abort_sentinel(coord)
+        with (
+            set_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens_padded,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=cudagraph_mode,
+                batch_descriptor=batch_desc,
+                ubatch_slices=ubatch_slices_padded,
+                slot_mapping=slot_mappings,
+                skip_compiled=has_encoder_input,
+            ),
+            record_function_or_nullcontext("gpu_model_runner: forward"),
+            self.maybe_get_kv_connector_output(
+                scheduler_output,
+                defer_finalize=defer_kv_connector_finalize,
+            ) as kv_connector_output,
+        ):
+            model_output = self._model_forward(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **model_kwargs,
+            )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4855,52 +4231,6 @@ class GPUModelRunner(
                         num_scheduled_tokens_np,
                         kv_connector_output,
                     )
-
-                # [DeltaServe] capture FT-token pre-LM-head hidden states + ids,
-                # then end the step and (once) verify the capture cross-process.
-                if self._ft_has and accumulator is not None:
-                    if save_acts:
-                        total = self._ft_mask_gpu.numel()
-                        accumulator.accumulate_final(
-                            hidden_states,
-                            self.input_ids.gpu[:total],
-                            self._ft_mask_gpu,
-                            self._ft_num,
-                            self._ft_offset,
-                            start=self._ft_start,
-                            contiguous=self._ft_contiguous,
-                        )
-                        accumulator.end_step()
-                        self._maybe_verify_ft_accumulation()
-                        # [DeltaServe] Mark completion of THIS step's FT
-                        # activation writes with a lightweight event. The
-                        # backward trigger waits on this (coordinator) instead
-                        # of a full-device torch.cuda.synchronize(): it only
-                        # needs the capture copies visible to the backward
-                        # process, not the entire GPU queue drained — so an
-                        # unrelated in-flight forward doesn't get waited on.
-                        evt = getattr(self, "_ft_capture_evt", None)
-                        if evt is None:
-                            evt = torch.cuda.Event()
-                            self._ft_capture_evt = evt
-                        evt.record()
-                        if coord is not None:
-                            coord.capture_done_evt = evt
-                    # advance the coordinator either way so the admission /
-                    # backward cycle is identical for the save-on/off A/B.
-                    # record_capture commits the rows + fires the buffer-full /
-                    # epoch-flush backward triggers once in-flight saves settle.
-                    if coord is not None:
-                        if getattr(coord, "relay_mode", False):
-                            # [DeltaServe] Phase 7 / M4.1 (TP): don't self-trigger
-                            # on the worker coordinator — relay this step's saved
-                            # counts to the EngineCore scheduler, which owns the
-                            # trigger decision (it has the corpus/min_sample_len).
-                            self._ft_relay_saved = (
-                                int(self._ft_num), list(self._ft_sample_lens))
-                        else:
-                            coord.record_capture(
-                                self._ft_num, self._ft_sample_lens)
 
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
@@ -4956,83 +4286,10 @@ class GPUModelRunner(
         return None
 
     @torch.inference_mode
-    def _ft_relay_backward_done(self, coord) -> dict | None:
-        """[DeltaServe] Phase 7 / M4.2: the backward ack to relay this step, or
-        None. Only ``output_rank``'s output reaches the scheduler, so an ack is
-        handed over only once EVERY rank's child is done: each rank polls its
-        own child, the ranks MIN-all-reduce a "mine is done" flag over the TP
-        group's CPU (gloo) group — no GPU sync, and only while a backward is
-        outstanding — and all take their ack on the same step."""
-        if not coord.relay_backward_outstanding():
-            return None
-        mine = coord.poll_own_backward_ack()
-        from vllm.distributed.parallel_state import get_tp_group
-
-        tp = get_tp_group()
-        if tp.world_size > 1:
-            flag = torch.tensor([1 if mine else 0], dtype=torch.int32)
-            torch.distributed.all_reduce(
-                flag, op=torch.distributed.ReduceOp.MIN, group=tp.cpu_group)
-            all_done = bool(flag.item())
-        else:
-            all_done = mine
-        return coord.take_relay_ack() if all_done else None
-
-    def _ft_fill_relay_fields(self, output, coord) -> None:
-        """[DeltaServe] Phase 7: set the worker → scheduler relay fields on
-        ``output`` (called on every step's output under TP — from
-        ``sample_tokens`` for real batches and from ``execute_model``'s idle
-        early return for 0-token steps)."""
-        output.finetune_backward_done = self._ft_relay_backward_done(coord)
-        output.finetune_saved = getattr(self, "_ft_relay_saved", None)
-        self._ft_relay_saved = None
-        # Mirror ft_started (set on THIS worker coord by the
-        # deltaserve_start_finetuning collective_rpc) so the EngineCore
-        # scheduler coord — a separate process under TP — opens admission.
-        output.finetune_ft_started = bool(coord.ft_started)
-        # [M4.2] Relay the timing samples the CUDA-event ring completed
-        # (pushed to THIS worker coord in execute_model). Drained every step,
-        # so the worker-side queue stays bounded.
-        _samples = coord.drain_completed_samples()
-        output.finetune_timing = _samples or None
-
-    def _ft_maybe_resume_backward(self, coord) -> None:
-        """[pause_until_prefill_done] Resume the backward child once the
-        prefill that paused it has completed on the GPU (non-blocking event
-        query). Called on every execute_model (incl. idle steps) and
-        sample_tokens; a newer pause simply replaces the pending event."""
-        ev = getattr(self, "_ft_resume_evt", None)
-        if ev is not None and ev.query():
-            self._ft_resume_evt = None
-            coord.gpu_resume_backward()
-
-    def _ft_abort_sentinel(self, coord):
-        """[forward_interruptible / tier C] The empty output that tells the
-        engine to roll the FT-only step back. Carries the TP relay fields so
-        an outstanding backward ack is not delayed by the aborted step."""
-        from vllm.v1.outputs import ModelRunnerOutput
-        out = ModelRunnerOutput(req_ids=[], req_id_to_index={})
-        out._ft_aborted = True
-        out.finetune_aborted = True
-        if coord is not None and getattr(coord, "relay_mode", False):
-            self._ft_fill_relay_fields(out, coord)
-        return out
-
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
-        _rc = getattr(self, "_ft_coordinator", None)
-        if _rc is not None:
-            self._ft_maybe_resume_backward(_rc)
         if self.execute_model_state is None:
-            if getattr(self, "_ft_pending_abort", False):
-                # [forward_interruptible / tier C under TP] execute_model
-                # returned the abort sentinel without leaving sampling state;
-                # the engine still calls sample_tokens (its execute future was
-                # not resolved at dispatch time), so answer with the sentinel
-                # rather than None (which the engine treats as a failure).
-                self._ft_pending_abort = False
-                return self._ft_abort_sentinel(getattr(self, "_ft_coordinator", None))
             kv_connector_output = self.kv_connector_output
             self.kv_connector_output = None
             # receive sampled token ids from the last PP rank.
@@ -5239,17 +4496,6 @@ class GPUModelRunner(
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
             )
-
-        # [DeltaServe] Phase 7 / M4.1 (TP): relay this rank's backward ack +
-        # saved-counts back to the EngineCore scheduler. NOTE: this runs in
-        # sample_tokens (a different method than execute_model), so the
-        # coordinator is fetched locally here — execute_trigger already fired in
-        # execute_model's per-step block. The same ``output`` is returned by the
-        # sync path AND wrapped by AsyncGPUModelRunnerOutput, so setting the
-        # fields here covers both. Inert for tp=1 (relay_mode False).
-        _coord_relay = getattr(self, "_ft_coordinator", None)
-        if _coord_relay is not None and getattr(_coord_relay, "relay_mode", False):
-            self._ft_fill_relay_fields(output, _coord_relay)
 
         if not self.use_async_scheduling:
             if self.routed_experts_initialized:
@@ -6269,7 +5515,6 @@ class GPUModelRunner(
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
-        has_ft: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -6382,8 +5627,6 @@ class GPUModelRunner(
                 # `force_num_active_loras` is used for cudagraph capture; because we
                 # need to capture graphs for specific num_active_loras counts
                 force_num_active_loras=num_active_loras,
-                # [DeltaServe] capture / warm the has_ft piecewise set
-                has_ft=has_ft,
             )
         )
 
@@ -6542,11 +5785,6 @@ class GPUModelRunner(
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
                     slot_mapping=slot_mappings,
-                    # [DeltaServe] the save op must be live while a has_ft graph
-                    # is warmed / captured (index tensors point at scratch).
-                    ft_save=(self._finetune_accumulator.capture_state()
-                             if has_ft and getattr(self, "_finetune_accumulator", None)
-                             is not None else None),
                 ),
             ):
                 outputs = self.model(
@@ -7210,7 +6448,6 @@ class GPUModelRunner(
                 remove_lora=False,
                 num_active_loras=desc.num_active_loras,
                 profile_seq_lens=profile_seq_lens,
-                has_ft=desc.has_ft,
             )
         self._dummy_run(
             desc.num_tokens,
@@ -7222,7 +6459,6 @@ class GPUModelRunner(
             num_active_loras=desc.num_active_loras,
             is_graph_capturing=True,
             profile_seq_lens=profile_seq_lens,
-            has_ft=desc.has_ft,
         )
 
     def _capture_cudagraphs(

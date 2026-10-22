@@ -356,8 +356,8 @@ class FinetuneAccumulator:
         return True
 
     def capture_state(self):
-        """The ``ft_save`` context value for capturing / running a has_ft
-        graph: the persistent index tensors as they are (scratch-pointing
+        """The save-op state (``ft_save_op.active_state``) for capturing /
+        running a has_ft graph: the persistent index tensors as they are (scratch-pointing
         at capture) and the slot table."""
         from vllm.deltaserve.ft_save_op import FtSaveState
 
@@ -369,7 +369,7 @@ class FinetuneAccumulator:
         rows ``offset .. offset+n``; unused slots gather row 0 into the
         scratch row. One pinned staging slot + one non-blocking H2D copy on
         the current stream (ordered after the previous step's replay).
-        Returns the ``ft_save`` context value."""
+        Returns the save-op state for the step."""
         n = min(int(num_ft), self.max_saved - int(offset))
         slot = self._idx_pin_pos
         self._idx_pin_pos = (slot + 1) % self._idx_pin.shape[0]

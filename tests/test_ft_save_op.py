@@ -4,7 +4,7 @@
 GPU (one device). Exercises ``torch.ops.vllm.dserve_save_rows`` the way the
 has_ft piecewise graphs use it: capture once with the persistent index
 tensors, then replay with DIFFERENT index contents and check the saved rows
-follow the contents, not the capture. Also: a capture with ``ft_save=None``
+follow the contents, not the capture. Also: a capture with no active state
 records no work, interleaved FT rows, the residual sum, the scratch row, and
 ``FinetuneAccumulator.arm_op_step`` end to end on a fake vLLM-named model
 that carries the call sites.
@@ -26,18 +26,16 @@ sys.path[:] = [p for p in sys.path
                if os.path.abspath(p or ".") != os.path.dirname(os.path.abspath(__file__))]
 
 from vllm.deltaserve.accumulate import FinetuneAccumulator  # noqa: E402
-from vllm.deltaserve.ft_save_op import FtSaveState, maybe_save  # noqa: E402
-from vllm.forward_context import ForwardContext, override_forward_context  # noqa: E402
+from vllm.deltaserve.ft_save_op import (  # noqa: E402
+    FtSaveState,
+    active_state,
+    maybe_save,
+)
 
 C = H.Checker(tol=1e-6)
 DEV = torch.device("cuda")
 D, INTER, NL, S_MAX = 8, 12, 2, 16
 HQ, HKV, HD = 2, 1, 4
-
-
-def _ctx(ft_save):
-    return ForwardContext(no_compile_layers={}, attn_metadata={}, slot_mapping={},
-                          ft_save=ft_save)
 
 
 def test_capture_follows_index_contents():
@@ -55,7 +53,7 @@ def test_capture_follows_index_contents():
         torch.ops.vllm.dserve_save_rows(x, r, marker, slot)
 
     s = torch.cuda.Stream()
-    with override_forward_context(_ctx(state)), torch.cuda.stream(s):
+    with active_state(state), torch.cuda.stream(s):
         for _ in range(2):
             run(0)
         g = torch.cuda.CUDAGraph()
@@ -86,22 +84,22 @@ def test_capture_follows_index_contents():
     C.ok("replay 2: earlier rows 5..7 not rewritten", float(buf[5:8].abs().sum()) == 0.0)
     C.ok("scratch row absorbs the unused slots", True)
 
-    # Disabled slot (None buffer) and a capture with ft_save=None: no work.
+    # Disabled slot (None buffer) and a capture with no active state: no work.
     buf.zero_()
-    with override_forward_context(_ctx(state)):
+    with active_state(state):
         run(1)
     torch.cuda.synchronize()
     C.ok("None slot: nothing written", float(buf.abs().sum()) == 0.0)
-    with override_forward_context(_ctx(None)), torch.cuda.stream(s):
+    with active_state(None), torch.cuda.stream(s):
         g0 = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g0, stream=s):
             run(0)
     torch.cuda.synchronize()
     buf.zero_()
-    with override_forward_context(_ctx(state)):
+    with active_state(state):
         g0.replay()
     torch.cuda.synchronize()
-    C.ok("graph captured with ft_save=None replays to nothing", float(buf.abs().sum()) == 0.0)
+    C.ok("graph captured with no active state replays to nothing", float(buf.abs().sum()) == 0.0)
 
 
 class _AddNorm(nn.Module):
@@ -210,7 +208,7 @@ def test_accumulator_op_path_matches_hooks():
     mask = np.zeros(n_tok, dtype=bool)
     pos = [2, 9, 10, 17, 23]
     mask[pos] = True
-    with override_forward_context(_ctx(None)):
+    with active_state(None):
         ref.begin_step(torch.from_numpy(mask).to(DEV), len(pos), offset=4, start=0,
                        contiguous=False)
         model(x)
@@ -228,7 +226,7 @@ def test_accumulator_op_path_matches_hooks():
     C.ok("slot table has 7L+1 entries", len(acc.op_bufs) == 7 * NL + 1)
     s = torch.cuda.Stream()
     with torch.cuda.stream(s):
-        with override_forward_context(_ctx(acc.capture_state())):
+        with active_state(acc.capture_state()):
             for _ in range(2):
                 model(x)
             g = torch.cuda.CUDAGraph()
@@ -239,7 +237,7 @@ def test_accumulator_op_path_matches_hooks():
          all(float(b[:S_MAX].abs().sum()) == 0.0 for b in acc.op_bufs if b is not None))
     with torch.cuda.stream(s):
         st = acc.arm_op_step(np.array(pos), len(pos), 4)
-        with override_forward_context(_ctx(st)):
+        with active_state(st):
             g.replay()
     torch.cuda.synchronize()
     for i in range(NL):
@@ -254,14 +252,14 @@ def test_accumulator_op_path_matches_hooks():
     # Second step at another offset with other rows, same graph.
     pos2 = [0, 5]
     mask2 = np.zeros(n_tok, dtype=bool); mask2[pos2] = True
-    with override_forward_context(_ctx(None)):
+    with active_state(None):
         ref.register_hooks()
         ref.begin_step(torch.from_numpy(mask2).to(DEV), 2, offset=9, contiguous=False)
         model(x)
         ref.end_step()
     with torch.cuda.stream(s):
         st = acc.arm_op_step(np.array(pos2), 2, 9)
-        with override_forward_context(_ctx(st)):
+        with active_state(st):
             g.replay()
     torch.cuda.synchronize()
     C.check("second step, layer_in[1] rows 9..10", acc.layer_in[1][9:11].float(), ref.layer_in[1][9:11].float())
