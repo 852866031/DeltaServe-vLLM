@@ -41,6 +41,7 @@ import re
 import torch
 
 from vllm.deltaserve import dprint
+from vllm.deltaserve.ft_save_op import MARKER_ATTR
 
 _LAYER_IN_SUFFIX = "input_layernorm"  # residual stream entering each layer
 _FINAL_NORM_SUFFIX = ".norm"          # final norm (input = pre-final-norm residual)
@@ -263,6 +264,7 @@ class FinetuneAccumulator:
         self._idx_pin_pos = 0
         self.op_bufs: list = []
         self.op_ready = False
+        self._hooked_modules: list = []
         self._op_marker = None
 
     # ─── [mixed-fwd-cuda-graph] graph-capturable save path ──────────────
@@ -272,44 +274,18 @@ class FinetuneAccumulator:
     _OP_NAMES = ("layer_in", "resid_mid", "gate_up", "q", "k", "v", "ctx")
 
     def install_save_points(self, model) -> bool:
-        """Mark the model's modules with the slots the ``maybe_save`` call
-        sites read (``deltaserve.ft_save_op``). Returns True when the family
-        has the call sites (its decoder layer class carries
-        ``_dserve_save_points``); otherwise nothing is installed and mixed
-        batches keep the eager hook path."""
-        from vllm.deltaserve.ft_save_op import MARKER_ATTR, SLOT_ATTR
-
-        layers: dict[int, torch.nn.Module] = {}
-        attns: dict[int, torch.nn.Module] = {}
-        mlps: dict[int, torch.nn.Module] = {}
-        final_parent = None
-        final_name = None
-        for name, mod in model.named_modules():
-            m = re.search(r"layers\.(\d+)$", name)
-            if m is not None:
-                layers[int(m.group(1))] = mod
-                continue
-            m = re.search(r"layers\.(\d+)\.self_attn$", name)
-            if m is not None:
-                attns[int(m.group(1))] = mod
-                continue
-            m = re.search(r"layers\.(\d+)\.mlp$", name)
-            if m is not None:
-                mlps[int(m.group(1))] = mod
-                continue
-            if mod is self._final_norm_module:
-                final_name = name
-        if final_name is not None:
-            parent = final_name[: -len(_FINAL_NORM_SUFFIX)]
-            final_parent = model.get_submodule(parent) if parent else model
-        if not layers or not all(
-                getattr(type(layers[i]), "_dserve_save_points", False)
-                for i in layers):
-            dprint("[accumulate] model family has no graph save call sites — "
-                   "mixed FT batches stay on the eager hook path")
-            return False
-
+        """Arm the graph-capturable save path: build the slot → buffer table
+        and give every hooked module the marker buffer the op declares as
+        mutated. The hooks themselves issue the op (in their inactive branch,
+        which is the one Dynamo traces into the compiled forward), so the model
+        code carries no call sites. Returns False — mixed batches keep the eager
+        hook path — when a save point's module is missing."""
         L = self.num_layers
+        if not L or len(self._layer_in_modules) != L or (
+                self._final_norm_module is None):
+            dprint("[accumulate] incomplete save points — mixed FT batches "
+                   "stay on the eager hook path")
+            return False
         bufs: list = [None] * (7 * L + 1)
         for i in range(L):
             bufs[7 * i + 0] = self.layer_in[i]
@@ -326,33 +302,16 @@ class FinetuneAccumulator:
         if self.final_in is not None:
             bufs[7 * L] = self.final_in
         self.op_bufs = bufs
+        from vllm.deltaserve.ft_save_op import MARKER_ATTR
+
         marker = torch.zeros(1, device=self.device, dtype=torch.int32)
         self._op_marker = marker
-
-        def mark(mod, name, slot):
-            setattr(mod, SLOT_ATTR + name, int(slot))
+        for mod in self._hooked_modules:
             if not hasattr(mod, MARKER_ATTR):
                 mod.register_buffer(MARKER_ATTR, marker, persistent=False)
-
-        for i in range(L):
-            if i in layers:
-                mark(layers[i], "layer_in", 7 * i + 0)
-                if self.resid_mid:
-                    mark(layers[i], "resid_mid", 7 * i + 1)
-            if i in mlps and self.mlp_gate_up:
-                mark(mlps[i], "gate_up", 7 * i + 2)
-            if i in attns:
-                if self.attn_qh:
-                    mark(attns[i], "q", 7 * i + 3)
-                    mark(attns[i], "k", 7 * i + 4)
-                    mark(attns[i], "v", 7 * i + 5)
-                if self.attn_ctx:
-                    mark(attns[i], "ctx", 7 * i + 6)
-        if final_parent is not None and self.final_in is not None:
-            mark(final_parent, "final_in", 7 * L)
         self.op_ready = True
-        dprint(f"[accumulate] graph save op installed on {len(layers)} layers "
-               f"(+ final norm) — mixed FT batches may replay CUDA graphs")
+        dprint(f"[accumulate] graph save op armed on {L} layers (+ final norm) "
+               f"— mixed FT batches may replay CUDA graphs")
         return True
 
     def capture_state(self):
@@ -384,52 +343,58 @@ class FinetuneAccumulator:
         return self.capture_state()
 
     def register_hooks(self) -> None:
+        """One hook per save point. On an eager FT step (``begin_step`` armed)
+        a hook copies the FT rows itself; otherwise — in particular while
+        Dynamo traces the compiled forward — it issues the graph-capturable
+        save op for its slot (``install_save_points``), which is a no-op unless
+        a save state is active (mixed FT step / has_ft capture)."""
+        L = self.num_layers
+        hooked = self._hooked_modules = []
+
+        def pre(mod, hook):
+            hooked.append(mod)
+            self._handles.append(mod.register_forward_pre_hook(hook))
+
+        def post(mod, hook):
+            hooked.append(mod)
+            self._handles.append(mod.register_forward_hook(hook))
+
         for layer, mod in self._layer_in_modules.items():
-            self._handles.append(
-                mod.register_forward_pre_hook(
-                    self._make_pre_hook(self.layer_in[layer], boundary=True)))
+            pre(mod, self._make_pre_hook(self.layer_in[layer], 7 * layer + 0,
+                                         boundary=True))
         if self._final_norm_module is not None:
-            self._handles.append(
-                self._final_norm_module.register_forward_pre_hook(
-                    self._make_pre_hook(self.final_in)))
+            pre(self._final_norm_module, self._make_pre_hook(self.final_in, 7 * L))
         if self._save_gate_up:
             for layer, mod in self._gate_up_modules.items():
-                self._handles.append(
-                    mod.register_forward_hook(
-                        self._make_out_hook(self.mlp_gate_up[layer])))
+                post(mod, self._make_out_hook(self.mlp_gate_up[layer],
+                                              7 * layer + 2))
         if self._save_attn_qkv and not self._attn_qkv_pre_transform:
             for layer, mod in self._self_attn_attn_modules.items():
-                self._handles.append(
-                    mod.register_forward_pre_hook(
-                        self._make_attn_qkv_pre_hook(
-                            self.attn_qh[layer],
-                            self.attn_kh[layer],
-                            self.attn_vh[layer])))
+                pre(mod, self._make_attn_qkv_pre_hook(
+                    self.attn_qh[layer], self.attn_kh[layer],
+                    self.attn_vh[layer], 7 * layer + 3))
         elif self._save_attn_qkv:
             # Pre-transform: q from q_norm's input, k from k_norm's input
             # (raw projection outputs, [n, H, Hd] views → flattened), v from
             # the attn pre-hook's third arg (no transform on v).
             for layer, mod in self._q_norm_modules.items():
-                self._handles.append(mod.register_forward_pre_hook(
-                    self._make_arg_pre_hook(self.attn_qh[layer], 0)))
+                pre(mod, self._make_arg_pre_hook(self.attn_qh[layer], 0,
+                                                 7 * layer + 3))
             for layer, mod in self._k_norm_modules.items():
-                self._handles.append(mod.register_forward_pre_hook(
-                    self._make_arg_pre_hook(self.attn_kh[layer], 0)))
+                pre(mod, self._make_arg_pre_hook(self.attn_kh[layer], 0,
+                                                 7 * layer + 4))
             for layer, mod in self._self_attn_attn_modules.items():
-                self._handles.append(mod.register_forward_pre_hook(
-                    self._make_arg_pre_hook(self.attn_vh[layer], 2)))
+                pre(mod, self._make_arg_pre_hook(self.attn_vh[layer], 2,
+                                                 7 * layer + 5))
         if self._save_attn_ctx:
             for layer, mod in self._self_attn_attn_modules.items():
-                self._handles.append(
-                    mod.register_forward_hook(
-                        self._make_attn_ctx_out_hook(self.attn_ctx[layer])))
+                post(mod, self._make_attn_ctx_out_hook(self.attn_ctx[layer],
+                                                       7 * layer + 6))
         if self._save_resid_mid:
             # post_attention_layernorm(o, residual): the residual entering it
             # is o + residual = resid_mid — the same pre-hook as layer_in.
             for layer, mod in self._post_ln_modules.items():
-                self._handles.append(
-                    mod.register_forward_pre_hook(
-                        self._make_pre_hook(self.resid_mid[layer])))
+                pre(mod, self._make_pre_hook(self.resid_mid[layer], 7 * layer + 1))
         dprint(
             f"[accumulate] residual-stream pre-hooks on "
             f"{len(self._layer_in_modules)} input_layernorm + "
@@ -447,9 +412,19 @@ class FinetuneAccumulator:
             f"{'/resid_mid' if self._save_resid_mid else ''})"
         )
 
-    def _make_pre_hook(self, buf, boundary: bool = False):
+    def _op(self, module, slot: int, x, r=None) -> None:
+        """The inactive-branch save: the graph-capturable op for ``slot``."""
+        if self.op_ready:
+            torch.ops.vllm.dserve_save_rows(x, r, getattr(module, MARKER_ATTR),
+                                            slot)
+
+    def _make_pre_hook(self, buf, slot: int, boundary: bool = False):
         def pre_hook(module, args):
-            if not self._active or self._cur_n == 0:
+            if not self._active:
+                self._op(module, slot, args[0],
+                         args[1] if len(args) >= 2 else None)
+                return
+            if self._cur_n == 0:
                 return
             # Fused add-norm: args = (hidden,) for layer 0, else (hidden, residual).
             # Residual stream entering the module = hidden (+ residual). Compute +
@@ -481,13 +456,18 @@ class FinetuneAccumulator:
 
         return pre_hook
 
-    def _make_attn_qkv_pre_hook(self, qh_buf, kh_buf, vh_buf):
+    def _make_attn_qkv_pre_hook(self, qh_buf, kh_buf, vh_buf, slot: int):
         """Hook fires on ``self_attn.attn(q, k, v)`` — q, k are POST-RoPE, v
         is straight from the qkv_proj split. q/k/v are flat ``[n_total, ...]``
         in the same row order as the rest of the batch, so we gather FT rows
-        via the same contiguous-or-mask path as the residual-stream hooks."""
+        via the same contiguous-or-mask path as the residual-stream hooks.
+        ``slot`` is q's; k and v follow."""
         def pre_hook(module, args):
-            if not self._active or self._cur_n == 0:
+            if not self._active:
+                for j in range(3):
+                    self._op(module, slot + j, args[j])
+                return
+            if self._cur_n == 0:
                 return
             # args = (q, k, v); q/k post-RoPE, all flat in batch-row order.
             q, k, v = args[0], args[1], args[2]
@@ -513,12 +493,16 @@ class FinetuneAccumulator:
 
         return pre_hook
 
-    def _make_arg_pre_hook(self, buf, arg_index: int):
+    def _make_arg_pre_hook(self, buf, arg_index: int, slot: int):
         """Pre-hook saving the FT rows of ``args[arg_index]`` (flattened to
         ``[n, -1]``) — the pre-transform q/k (``q_norm``/``k_norm`` input,
         a ``[n, H, Hd]`` view) and v (``self_attn.attn`` third arg)."""
         def pre_hook(module, args):
-            if not self._active or self._cur_n == 0:
+            if not self._active:
+                t = args[arg_index]
+                self._op(module, slot, t.reshape(t.shape[0], -1))
+                return
+            if self._cur_n == 0:
                 return
             t = args[arg_index]
             if self._cur_contiguous:
@@ -536,15 +520,18 @@ class FinetuneAccumulator:
 
         return pre_hook
 
-    def _make_attn_ctx_out_hook(self, ctx_buf):
+    def _make_attn_ctx_out_hook(self, ctx_buf, slot: int):
         """Hook fires AFTER ``self_attn.attn(q, k, v)`` — its output is the
         attention context (the o_proj input), flat ``[n_total, q_size]`` in
         batch-row order. Saved so the backward can skip the attention-forward
         recompute. Flattened defensively in case the op returns [n, H, Hd]."""
         def out_hook(module, inputs, output):
-            if not self._active or self._cur_n == 0:
-                return
             out = output[0] if isinstance(output, tuple) else output
+            if not self._active:
+                self._op(module, slot, out.reshape(out.shape[0], -1))
+                return
+            if self._cur_n == 0:
+                return
             if self._cur_contiguous:
                 rows = out[self._cur_start:self._cur_start + self._cur_n]
             else:
@@ -562,11 +549,14 @@ class FinetuneAccumulator:
 
         return out_hook
 
-    def _make_out_hook(self, buf):
+    def _make_out_hook(self, buf, slot: int):
         def out_hook(module, inputs, output):
-            if not self._active or self._cur_n == 0:
-                return
             out = output[0] if isinstance(output, tuple) else output
+            if not self._active:
+                self._op(module, slot, out)
+                return
+            if self._cur_n == 0:
+                return
             if self._cur_contiguous:
                 rows = out[self._cur_start:self._cur_start + self._cur_n]
             else:

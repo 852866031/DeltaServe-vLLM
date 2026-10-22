@@ -276,7 +276,7 @@ class DeltaServeWorker(Worker):
         accumulator.register_hooks()
         # [mixed-fwd-cuda-graph] mark the model's modules for the graph-
         # capturable save op (before the first torch.compile trace, which
-        # happens at the profile run — the call sites must see the slots).
+        # happens at the profile run — the hooks must see the armed op).
         if ft_cfg.graph_ft_batches:
             accumulator.install_save_points(model)
         ack = backward_process.share_activations(
