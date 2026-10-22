@@ -5,7 +5,9 @@ Runs two GPU subprocesses on the SAME prompts (greedy, no inference LoRA):
   - baseline: enable_finetuning=False  (no FT injection)
   - ft-on:    enable_finetuning=True   (FT samples injected as prefill-only,
               routed to the FT adapter, retired same step)
-and asserts the real-request output token ids are byte-identical. This catches:
+and asserts the real-request outputs agree: identical, or diverging only where
+the two top candidates are a near-tie (bf16 results depend on the batch they ran
+in, and FT samples change the batch composition). This catches:
 FT output leaking to the frontend, FT KV corrupting real requests, mask
 misalignment routing real tokens through the FT adapter, and force-eager drift.
 It also confirms the FT-on engine terminates (no hang) and returns exactly one
@@ -32,6 +34,9 @@ _PROMPTS = [
     "Once upon a time, there was a",
 ]
 _MAX_TOKENS = 32
+# A divergence is numerical noise when the two runs' choices were this close (in
+# the FT-on run's own logprobs); an FT leak would derail the output outright.
+_TIE_NATS = 0.25
 
 _TTY = sys.stdout.isatty()
 _GREEN = "\033[92m" if _TTY else ""
@@ -63,12 +68,16 @@ def run_worker(mode: str) -> None:
     # Real requests use the BASE model (no inference LoRA) — isolates the effect
     # of FT injection on ordinary inference.
     outs = llm.generate(
-        _PROMPTS, SamplingParams(temperature=0.0, max_tokens=_MAX_TOKENS)
+        _PROMPTS,
+        SamplingParams(temperature=0.0, max_tokens=_MAX_TOKENS, logprobs=5),
     )
     result = {
         "mode": mode,
         "num_outputs": len(outs),
         "token_ids": [list(o.outputs[0].token_ids) for o in outs],
+        # per position: {token_id: logprob} of the top candidates
+        "top": [[{int(t): float(lp.logprob) for t, lp in pos.items()}
+                 for pos in o.outputs[0].logprobs] for o in outs],
     }
     print("__RESULT__" + json.dumps(result))
 
@@ -115,12 +124,16 @@ def main():
           baseline["num_outputs"] == len(_PROMPTS))
     check("ft-on returned one output per prompt (engine terminated, no FT leak)",
           fton["num_outputs"] == len(_PROMPTS))
-    identical = baseline["token_ids"] == fton["token_ids"]
-    check("real-request output token ids byte-identical (FT vs baseline)", identical)
-    if not identical:
-        for i, (b, f) in enumerate(zip(baseline["token_ids"], fton["token_ids"])):
-            if b != f:
-                print(f"    prompt[{i}] baseline={b}\n             ft      ={f}")
+    for i, (b, f) in enumerate(zip(baseline["token_ids"], fton["token_ids"])):
+        if b == f:
+            check(f"prompt[{i}]: identical output", True)
+            continue
+        j = next(k for k in range(min(len(b), len(f))) if b[k] != f[k])
+        top = fton["top"][i][j]
+        gap = top.get(f[j], 0.0) - top.get(b[j], float("-inf"))
+        check(f"prompt[{i}]: diverges at token {j} on a near-tie "
+              f"(logprob gap {gap:.3f} < {_TIE_NATS})", gap < _TIE_NATS)
+        print(f"    baseline={b}\n    ft      ={f}")
 
     color = _RED if failed else _GREEN
     print(f"\n{color}{passed} passed, {failed} failed{_RESET}")
