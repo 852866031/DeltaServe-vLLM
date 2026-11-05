@@ -65,7 +65,7 @@ import aiohttp
 _HERE = Path(__file__).resolve().parent          # eval/
 _ROOT = _HERE.parent                             # repo root (DeltaServe-vLLM/)
 # Per-GPU timelines/ root. The 5090 keeps its local in-repo timelines
-# (``eval/timelines/5090/``) — they were generated against that board's
+# (``data/timelines/5090/``) — they were generated against that board's
 # request-rate envelope. The A100 board reuses the *shared* base
 # timelines that live at the evaluation project root
 # (``<eval>/timelines/base/``), which is the single source of truth used
@@ -75,16 +75,16 @@ _ROOT = _HERE.parent                             # repo root (DeltaServe-vLLM/)
 # board, drop a new entry here.
 _EVAL_ROOT = _ROOT.parent                        # <…>/evaluation/
 _TIMELINES_DIRS = {
-    "5090": _HERE / "timelines" / "5090",
+    "5090": _ROOT / "data" / "timelines" / "5090",
     "A100": _EVAL_ROOT / "timelines" / "base",
 }
 
 
 def resolve_timelines_dir(gpu: str) -> Path:
     """Pick the timelines/ subdir for ``gpu``. Falls back to the
-    in-repo ``eval/timelines/<gpu>/`` layout for unknown boards so a
+    in-repo ``data/timelines/<gpu>/`` layout for unknown boards so a
     future hardware addition doesn't crash at parse-time."""
-    return _TIMELINES_DIRS.get(gpu, _HERE / "timelines" / gpu)
+    return _TIMELINES_DIRS.get(gpu, _ROOT / "data" / "timelines" / gpu)
 
 # Map ``(--timeline-gpu, --scheduler)`` → the serving YAML that selects
 # that scheduler at engine init (via ``slo.coserving_admission_phase``).
@@ -609,7 +609,7 @@ async def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--timeline_csv", default=None,
                     help="Schedule CSV. Default per --timeline-gpu: "
-                         "5090 → eval/timelines/5090/timeline_live.csv, "
+                         "5090 → data/timelines/5090/timeline_live.csv, "
                          "A100 → <eval>/timelines/base/timeline_live.csv "
                          "(shared with the cross-system pipeline).")
     ap.add_argument("--timeline-gpu", default=gpu_default, choices=["5090", "A100"],

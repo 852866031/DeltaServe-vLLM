@@ -13,7 +13,7 @@ YAML-derived base model + inference adapter, ``--tp`` override) and
 ft_bench_tp.py (the stale-process pre-flight). The replay / CSV / trim
 machinery is imported from eval/auto_benchmark.py — one implementation.
 
-Timelines come from eval/timelines/5090/ (the board's request-rate envelope):
+Timelines come from data/timelines/5090/ (the board's request-rate envelope):
 
     --loose            timeline_loose.csv
     --tight            timeline_tight.csv
@@ -77,7 +77,7 @@ from launch_deltaserve import (  # noqa: E402
 )
 
 OUTPUT_DIR = _HERE / "output"
-TIMELINES_DIR = _EVAL / "timelines" / "5090"
+TIMELINES_DIR = _EVAL.parent / "data" / "timelines" / "5090"
 MODES = {
     "loose": "timeline_loose.csv",
     "tight": "timeline_tight.csv",

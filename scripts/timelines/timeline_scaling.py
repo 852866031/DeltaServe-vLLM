@@ -34,7 +34,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # ─── CONFIG ───────────────────────────────────────────────────────────
-_HERE = Path(__file__).resolve().parent
+_HERE = Path(__file__).resolve().parents[2] / "data" / "timelines"   # <repo>/data/timelines
 
 # Which timeline to rescale. The default is the 5090 `live` schedule
 # because it's the one auto_benchmark picks up by default; swap to

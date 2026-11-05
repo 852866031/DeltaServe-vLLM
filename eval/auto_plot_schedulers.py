@@ -530,7 +530,7 @@ def main() -> None:
     # SLO from the YAML.
     ttft_slo = read_ttft_slo(args.config) or 1.0
     avg_tbt_slo = read_slo(args.config, "avg_tbt_slo")
-    timeline_dir = os.path.join(_HERE, "timelines", args.timeline_gpu)
+    timeline_dir = os.path.join(_HERE, "..", "data", "timelines", args.timeline_gpu)
 
     written = make_figures(
         mode=args.mode,
