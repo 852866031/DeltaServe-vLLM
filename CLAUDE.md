@@ -115,7 +115,9 @@ satisfaction everywhere, TTFT p99 201→137 / 204→134 / 295→~100 ms, FT thro
 equal or higher (numbers + plots in README "Results"). Llama-3-8B (TP=1/2) and
 Qwen3-0.6B are supported; A100 TP=4 presets exist for Qwen3-14B/32B.
 
-**Inference correctness gate: `tests/test_phase1_m1.py`.** FT runs with a 10×-amplified
+**Inference correctness gates: `tests/test_phase1_m1.py` (Qwen3-0.6B) and
+`tests/test_tp_inference_leak.py` (Qwen3-14B TP=2, the production preset unchanged —
+same method, profile `tp2`).** FT runs with a 10×-amplified
 FT adapter (a leak would move logits by ~97 nats; a positive control proves it) against
 FT-off baselines, eager and CUDA-graph, admission phase `prefill` and `both`, with
 staggered arrivals so FT provably co-batches with real prefills and decodes. Measured
