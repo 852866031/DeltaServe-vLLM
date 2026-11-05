@@ -11,7 +11,7 @@ Slice the default 5090 production trace between 600s and 800s::
 
     python timeline_slice.py --start 600 --end 800
 
-→ writes `timelines/5090/timeline_production_original_600-800.csv` with only
+→ writes `data/timelines/5090/timeline_production_original_600-800.csv` with only
 the requests originally fired in [600, 800), with every `timestamp_s`
 shifted down by 600 so the first window second is t=0. A request that
 fired at t=605.0 in the original lands at t=5.0 in the slice — the
@@ -43,7 +43,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-_HERE = Path(__file__).resolve().parent
+_HERE = Path(__file__).resolve().parents[2] / "data" / "timelines"   # <repo>/data/timelines
 
 
 # ----------------------------------------------------------------------

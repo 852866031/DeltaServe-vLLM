@@ -29,10 +29,10 @@ phase-by-phase design note (`INTEGRATION_PROGRESS.md`, `VLLM_FORK_CHANGES.md`,
 deltaserve-plugin/deltaserve/   ALL our code (see README "Repository layout")
 vllm-upstream/                  stock vLLM submodule — NEVER edit
 configs/                        serving YAMLs: finetune / throttles / slo / debug + plain vLLM sections
-adapters/  data/                toy LoRA adapters; FT corpora
+adapters/  data/                toy LoRA adapters; datasets (FT corpora, data/timelines/ request traces)
 eval-tp/                        main eval (launcher, timeline replay, compare_runs, cleanup_validate.sh)
-eval/  eval-arxiv/              single-GPU eval + timelines; long-context probe
-scripts/                        adapter builders, convert_config_layout.py
+eval/  eval-arxiv/              single-GPU eval; long-context probe
+scripts/                        adapter builders, convert_config_layout.py, timelines/ generators
 tests/                          standalone scripts (python, NOT pytest); tests/run_all.sh
 docs/figures/                   architecture figure + generator (make_architecture.py), result plots
 ```

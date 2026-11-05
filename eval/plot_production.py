@@ -19,7 +19,7 @@ the timeline's char-based ``prompt_length``, see CHARS_PER_TOKEN) +
 rate.
 
 Inputs default to ``eval/production_trace/`` (written by production_gpu_bench.py)
-and the replayed timeline under ``eval/timelines/<gpu>/``. The figure is written
+and the replayed timeline under ``data/timelines/<gpu>/``. The figure is written
 to ``eval/production_trace/``.
 
 Usage (defaults assume an inference-only production run on the 5090):
@@ -175,7 +175,7 @@ def main():
                     help="Which timelines/<gpu>/ dir the run replayed. Default 5090.")
     ap.add_argument("--timeline", default=None,
                     help="Replayed timeline CSV. Default: "
-                         "eval/timelines/<gpu>/timeline_<mode>.csv")
+                         "data/timelines/<gpu>/timeline_<mode>.csv")
     ap.add_argument("--gpu-util", default=None,
                     help="GPU-util CSV. Default: "
                          "eval/production_trace/gpu_util_<mode>.csv")
@@ -190,7 +190,7 @@ def main():
     args = ap.parse_args()
 
     timeline = args.timeline or os.path.join(
-        _HERE, "timelines", args.timeline_gpu, f"timeline_{args.mode}.csv")
+        _HERE, "..", "data", "timelines", args.timeline_gpu, f"timeline_{args.mode}.csv")
     gpu_util = args.gpu_util or os.path.join(PROD_DIR, f"gpu_util_{args.mode}.csv")
     bench_meta = args.bench_meta or os.path.join(
         PROD_DIR, f"bench_meta_{args.mode}.json")

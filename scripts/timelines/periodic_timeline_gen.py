@@ -94,7 +94,7 @@ if __name__ == "__main__":
     initial_idle = 1.0
 
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    output_path = os.path.join(current_dir, "timeline_gen.csv")
+    output_path = os.path.join(current_dir, "..", "..", "data", "timelines", "timeline_gen.csv")
 
     generate_peak_valley_timeline(
         peak_duration,

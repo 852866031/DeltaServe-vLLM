@@ -111,7 +111,7 @@ def detect_gpu_subdir() -> str:
 
 
 _DEFAULT_GPU_SUBDIR = detect_gpu_subdir()
-TIMELINES_DIR = os.path.join(_HERE, "timelines", _DEFAULT_GPU_SUBDIR)
+TIMELINES_DIR = os.path.join(_HERE, "..", "data", "timelines", _DEFAULT_GPU_SUBDIR)
 
 
 # ---------------- IO helpers (csv + numpy) ----------------

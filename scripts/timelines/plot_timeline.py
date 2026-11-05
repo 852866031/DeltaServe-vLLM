@@ -7,13 +7,14 @@ import numpy as np
 def main():
     # === Determine input CSV path ===
     current_file_path = os.path.abspath(__file__)
-    current_directory = os.path.dirname(current_file_path)
+    # timelines live in <repo>/data/timelines/ (relative names resolve there)
+    current_directory = os.path.join(os.path.dirname(current_file_path), "..", "..", "data", "timelines")
 
     # If a filename is passed as a command-line argument, use it
     if len(sys.argv) > 1:
         csv_filename = sys.argv[1]
     else:
-        csv_filename = "timeline_live.csv"
+        csv_filename = "5090/timeline_live.csv"
 
     # Support both absolute and relative paths
     if not os.path.isabs(csv_filename):

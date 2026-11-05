@@ -313,11 +313,12 @@ DeltaServe-vLLM/
 ├── vllm-upstream/                     stock vLLM @ 117afeea4 (git submodule, no patches)
 ├── configs/                           serving YAMLs (5090 + A100 presets)
 ├── adapters/                          toy LoRA adapters (inference + "-ft" training target)
-├── data/                              FT corpora (alpaca_1000.txt, test_dataset.txt)
+├── data/                              datasets: FT corpora (alpaca_1000.txt, test_dataset.txt),
+│                                      request traces (timelines/5090, timelines/A100)
 ├── eval-tp/                           main eval: launcher, timeline replay, A/B compare, plots
-├── eval/                              single-GPU eval, timelines (eval/timelines/), pure-FT bench
+├── eval/                              single-GPU eval, pure-FT bench, plotting
 ├── eval-arxiv/                        long-context probe (16k, arxiv summarization)
-├── scripts/                           adapter builders, config converter
+├── scripts/                           adapter builders, config converter, timeline generators (timelines/)
 ├── tests/                             standalone test scripts (+ run_all.sh)
 └── docs/figures/                      architecture figure (+ generator), result plots
 ```
@@ -528,7 +529,7 @@ CSVs. Keep `HF_HOME` / `HF_HUB_OFFLINE` set.
 ### Timeline replay (the main benchmark)
 
 `eval-tp/auto_benchmark_tp.py` replays a recorded arrival trace
-(`eval/timelines/5090/`) as streaming `/v1/completions` calls. It records per-request
+(`data/timelines/5090/`) as streaming `/v1/completions` calls. It records per-request
 TTFT, latency and avg/worst TBT. With `--co` it also triggers finetuning after
 warmup and logs every backward cycle.
 
