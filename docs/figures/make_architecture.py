@@ -23,7 +23,7 @@ OUT = Path(__file__).resolve().parent
 BW, BH = 230, 70            # box size
 COL0, CSTEP = 250, 300      # first column x, column pitch (70 px gutters)
 LANE_X = COL0 - 20
-LANE_W = 20 + 4 * CSTEP + BW + 20
+LANE_W = 20 + 3 * CSTEP + BW + 20
 R1, R2 = 40, 150            # row offsets inside a two-row lane
 LEFT_X, LEFT_W = 20, 190
 W = LANE_X + LANE_W + 20
@@ -73,8 +73,8 @@ def edge(s, t, exit, entry, label="", dashed=False, inherit=False, lpos="c"):
 lane("api", 60, 130, "API server process   (vLLM frontend)")
 lane("eng", 215, 240, "EngineCore process   (scheduler + executor driver)")
 lane("wrk", 480, 240, "Worker process   (one per TP rank · owns the GPU)")
-lane("shm", 745, 130, "Shared between the worker and its backward child   (CUDA IPC / shared memory)")
-lane("bwd", 900, 240, "Backward child   (one per TP rank · own CUDA context · spawned by the worker)")
+lane("shm", 745, 130, "Shared by the worker and its backward child   (CUDA IPC)")
+lane("bwd", 900, 240, "Backward child   (one per TP rank · own CUDA context)")
 
 node("a1", "api", 0, 1, "stock", "OpenAI-compatible server", "vllm serve · FastAPI")
 node("a3", "api", 1, 1, "stock", "AsyncLLM", "frontend · ZMQ to EngineCore")
@@ -110,8 +110,8 @@ node("s1", "shm", 1, 1, "data", "Base + FT-LoRA weights", "zero-copy CUDA IPC")
 node("s2", "shm", 2, 1, "data", "Activation buffers",
      "layer_in · gate_up · qkv · ctx\nresid_mid · final hidden")
 node("s3", "shm", 3, 1, "data", "Served LoRA slot", "trainer publishes\npunica reads")
-node("s4", "shm", 4, 1, "signal", "FtArrivalSignal",
-     "shm counter, bumped by the\nEngineCore input thread")
+node("s4", "eng", 3, 1, "signal", "FtArrivalSignal",
+     "shm counter bumped by the input\nthread · read by poller + child")
 
 node("d1", "bwd", 0, 1, "plugin", "BackwardService loop",
      "_maybe_pause at every boundary\nrun-ahead ring · TP pause vote")
@@ -159,7 +159,7 @@ edge("c5", "c7", (1, .25), (0, .75), "poll", dashed=True)
 edge("c1", "s0", B, T, "grant / revoke", dashed=True)
 edge("c4", "s1", B, T, "reads", dashed=True)
 edge("c5", "s2", B, T, "writes FT rows", dashed=True)
-edge("c7", "s4", B, T, "reads", dashed=True)
+edge("c7", "s4", T, B, "reads", dashed=True)
 edge("d1", "s0", T, B, "waits", dashed=True)
 edge("d2", "s1", T, B, "reads", dashed=True)
 edge("d3", "s2", T, B, "reads", dashed=True)
@@ -174,7 +174,7 @@ edge("l2", "l3", B, T)
 edge("l3", "l4", B, T)
 
 LEGEND_Y = 1165
-H = LEGEND_Y + 60
+H = LEGEND_Y + 80
 TITLE = "DeltaServe on stock vLLM: what the plugin adds to each process"
 
 
@@ -216,8 +216,11 @@ def render():
         ax.add_patch(FancyBboxPatch((c["x"], c["y"]), c["w"], c["h"],
                                     boxstyle="round,pad=0,rounding_size=6",
                                     fc=LANE_FILL, ec=LANE_STROKE, lw=1.2, zorder=1))
+        # above the edges, on an opaque patch: a line crossing a lane title
+        # stops at the text instead of striking through it
         ax.text(c["x"] + 14, c["y"] + 20, bold_title, ha="left", va="center",
-                fontsize=14 * PX, fontweight="bold", color=SUB, zorder=2)
+                fontsize=14 * PX, fontweight="bold", color=SUB, zorder=6,
+                bbox=dict(boxstyle="square,pad=0.25", fc=LANE_FILL, ec="none"))
 
     for c in LANES.values():
         container(c, c["title"])
@@ -278,15 +281,16 @@ def render():
                                     fc=fc, ec=ec, lw=1.2))
         ax.text(x + 44, LEGEND_Y + 10, txt, va="center", fontsize=13 * PX, color=INK)
         x += 60 + 7.8 * len(txt)
+    x, y2 = LANE_X, LEGEND_Y + 34        # second legend row: line styles
     for dashed, txt in ((False, "call / data flow"), (True, "shared-memory access")):
-        ax.plot([x, x + 40], [LEGEND_Y + 10] * 2, color=EDGE, lw=1.3,
+        ax.plot([x, x + 40], [y2 + 10] * 2, color=EDGE, lw=1.3,
                 ls=(0, (5, 3)) if dashed else "-")
-        ax.text(x + 50, LEGEND_Y + 10, txt, va="center", fontsize=13 * PX, color=INK)
-        x += 64 + 7.0 * len(txt)
-    ax.add_patch(FancyArrowPatch((x, LEGEND_Y + 10), (x + 40, LEGEND_Y + 10),
+        ax.text(x + 50, y2 + 10, txt, va="center", fontsize=13 * PX, color=INK)
+        x += 80 + 7.8 * len(txt)
+    ax.add_patch(FancyArrowPatch((x, y2 + 10), (x + 40, y2 + 10),
                                  arrowstyle="-|>", mutation_scale=12, color=EDGE,
                                  fc="white", lw=1.3))
-    ax.text(x + 50, LEGEND_Y + 10, "subclass of", va="center", fontsize=13 * PX, color=INK)
+    ax.text(x + 50, y2 + 10, "subclass of", va="center", fontsize=13 * PX, color=INK)
 
     fig.savefig(OUT / "architecture.svg")
     fig.savefig(OUT / "architecture.png", dpi=150)
@@ -362,7 +366,7 @@ def drawio():
         x += 60 + 7.8 * len(txt)
     v("lgt_lines", "solid: call / data · dashed: shared memory · "
       "hollow arrow: subclass of",
-      "text;html=1;fontSize=13;align=left;verticalAlign=middle;", x, LEGEND_Y - 5, 540, 30)
+      "text;html=1;fontSize=13;align=left;verticalAlign=middle;", LANE_X, LEGEND_Y + 29, 540, 30)
 
     xml = (f'<mxfile host="deltaserve"><diagram name="architecture" id="arch">'
            f'<mxGraphModel adaptiveColors="auto" dx="{W}" dy="{H}" grid="1" gridSize="10" '
