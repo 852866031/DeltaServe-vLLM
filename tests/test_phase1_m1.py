@@ -9,7 +9,7 @@ different points of the backward cycle.
   - baseline / baseline-graph: enable_finetuning=False (eager / CUDA graphs).
   - ft-* runs: enable_finetuning=True. FT samples are injected as prefill-only
     requests routed to the FT adapter and retired the same step. The FT adapter
-    is a copy of the toy one with lora_B scaled by _AMPLIFY, so any leak of FT
+    is a copy of the toy one with lora_B scaled by the profile's amplify factor, so any leak of FT
     state into a real request (mask misalignment routing real tokens through
     the FT adapter, FT KV reused by a real request, a wrong LoRA mapping in a
     mixed batch, a save op writing into live activations) moves its logits by
@@ -52,35 +52,66 @@ import time
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
-_CONFIG = _REPO / "configs" / "serving_config_finetuning_qwen3_0.6b.yaml"
 _PROMPTS = [
     "The capital of France is",
     "Water boils at a temperature of",
     "The opposite of hot is",
     "Once upon a time, there was a",
 ]
-# seconds after the start at which each prompt is submitted
-_ARRIVALS = [0.0, 0.0, 0.25, 0.5]
 # Long enough that mixed steps land mid-generation even with graphs (~0.5 s of
 # decode vs ~110 ms backward cycles): the real requests' KV written in a mixed
 # step feeds the later tokens.
 _MAX_TOKENS = 128
-# lora_B scale for the FT adapter. Measured on Qwen3-0.6B: at 10x, applying the
-# adapter pushes the baseline's first token out of the top 5 on every prompt.
-_AMPLIFY = 10.0
 # Batch-shape noise with FT co-batched, measured: <= 0.18 nats on the baseline
 # token. A leak of the amplified adapter moves it by tens of nats.
 _DRIFT_NATS = 0.5
 # A divergence is numerical noise when the ft run's two choices were this close.
-_TIE_NATS = 0.25
+# Logits are bf16 (steps of 0.125 at these magnitudes): 0.4 admits 3 steps, still
+# 2x the measured drift and far below a leak's tens of nats.
+_TIE_NATS = 0.4
 _CONTROL_MIN_NATS = 5.0
-_MODES = ("baseline", "ft", "ft-both", "control",
-          "baseline-graph", "ft-graph", "ft-both-graph")
-# (label, baseline mode, ft mode, step kind the ft run must co-batch with)
-_PAIRS = (("eager / prefill", "baseline", "ft", "prefill"),
-          ("eager / both", "baseline", "ft-both", "decode"),
-          ("graph / prefill", "baseline-graph", "ft-graph", "prefill"),
-          ("graph / both", "baseline-graph", "ft-both-graph", "decode"))
+# Profiles (DSERVE_M1_PROFILE; the worker subprocesses inherit it):
+#   tp1  Qwen3-0.6B on one GPU, eager + graph, a minimal FT config (the default).
+#   tp2  Qwen3-14B TP=2 with the production preset's FT config unchanged (graphs,
+#        rank-symmetric tier-C aborts, pause_on_arrival, every activation save),
+#        graph mode only. tests/test_tp_inference_leak.py runs it.
+_PROFILES = {
+    "tp1": dict(
+        config="serving_config_finetuning_qwen3_0.6b.yaml",
+        preset=False,
+        # lora_B scale for the FT adapter. Measured: at 10x, applying the adapter
+        # pushes the baseline's first token out of the top 5 on every prompt.
+        amplify=10.0,
+        # seconds after the start at which each prompt is submitted
+        arrivals=[0.0, 0.0, 0.25, 0.5],
+        timeout=600,
+        modes=("baseline", "ft", "ft-both", "control",
+               "baseline-graph", "ft-graph", "ft-both-graph"),
+        # (label, baseline mode, ft mode, step kind the ft run must co-batch with)
+        pairs=(("eager / prefill", "baseline", "ft", "prefill"),
+               ("eager / both", "baseline", "ft-both", "decode"),
+               ("graph / prefill", "baseline-graph", "ft-graph", "prefill"),
+               ("graph / both", "baseline-graph", "ft-both-graph", "decode")),
+    ),
+    "tp2": dict(
+        config="serving_config_finetuning_qwen3_14b_tp2.yaml",
+        preset=True,
+        # Qwen3-14B is less sensitive (lora_A half the 0.6B's scale): at 10x the
+        # control moved a first token by only 0.4 nats
+        amplify=100.0,
+        arrivals=[0.0, 0.0, 0.6, 1.2],
+        timeout=1500,
+        modes=("baseline-graph", "ft-graph", "ft-both-graph", "control-graph"),
+        pairs=(("TP=2 graph / prefill", "baseline-graph", "ft-graph", "prefill"),
+               ("TP=2 graph / both", "baseline-graph", "ft-both-graph", "decode")),
+    ),
+}
+_PROFILE_NAME = os.environ.get("DSERVE_M1_PROFILE", "tp1")
+_PROFILE = _PROFILES[_PROFILE_NAME]
+_CONFIG = _REPO / "configs" / _PROFILE["config"]
+_ARRIVALS = _PROFILE["arrivals"]
+_MODES = _PROFILE["modes"]
+_PAIRS = _PROFILE["pairs"]
 _BATCH_RE = re.compile(r"\[batch [^\]]*\] prefill=(\d+) ft=(\d+) decode=\[([^\]]*)\]")
 
 _TTY = sys.stdout.isatty()
@@ -94,7 +125,7 @@ def _amplified_adapter(src: Path, dst: Path) -> Path:
 
     shutil.copytree(src, dst)
     w = load_file(str(src / "adapter_model.safetensors"))
-    w = {k: (v * _AMPLIFY if "lora_B" in k else v) for k, v in w.items()}
+    w = {k: (v * _PROFILE["amplify"] if "lora_B" in k else v) for k, v in w.items()}
     save_file(w, str(dst / "adapter_model.safetensors"))
     return dst
 
@@ -136,29 +167,38 @@ def run_worker(mode: str) -> None:
     from vllm import LLM, SamplingParams
     from vllm.lora.request import LoRARequest
 
-    from deltaserve.config_loader import load_yaml_config, split_config
+    from deltaserve.config_loader import additional_config, load_yaml_config, split_config
 
-    engine_kwargs, ft_cfg, _ = split_config(load_yaml_config(str(_CONFIG)))
+    raw = load_yaml_config(str(_CONFIG))
+    engine_kwargs, ft_cfg, _ = split_config(raw)
     graph = mode.endswith("-graph")
     engine_kwargs["enforce_eager"] = not graph
     adapter = os.environ.get("DSERVE_M1_ADAPTER", ft_cfg.finetuning_lora_path)
     enabled = mode.startswith("ft")
-    ft = dict(
+    common = dict(
         enable_finetuning=enabled,
         finetuning_lora_path=adapter,
-        data_path=ft_cfg.data_path,
-        num_epochs=ft_cfg.num_epochs,
-        max_saved_finetuning_tokens=ft_cfg.max_saved_finetuning_tokens,
         # enable the one-shot activation-hash check so the M2 test can observe it
         print_activation_hash=enabled,
         # per-step batch shape, parsed by the driver to prove co-batching
         print_engine_batch_exec=enabled,
         coserving_admission_phase="both" if "-both" in mode else "prefill",
-        graph_ft_batches=graph,
-        graph_ft_only_batches=graph,
     )
+    if _PROFILE["preset"]:
+        # the YAML's whole finetune / throttles / slo config, as served; only
+        # admission opens at launch (no /start_finetuning offline)
+        ft = additional_config(raw, start_on_launch=True, **common)["deltaserve"]
+    else:
+        ft = dict(
+            data_path=ft_cfg.data_path,
+            num_epochs=ft_cfg.num_epochs,
+            max_saved_finetuning_tokens=ft_cfg.max_saved_finetuning_tokens,
+            graph_ft_batches=graph,
+            graph_ft_only_batches=graph,
+            **common,
+        )
     llm = LLM(**engine_kwargs, additional_config={"deltaserve": ft})
-    lora = LoRARequest("amplified", 1, adapter) if mode == "control" else None
+    lora = LoRARequest("amplified", 1, adapter) if mode.startswith("control") else None
     # Untimed warm-up generation (every mode, so the runs stay symmetric): the
     # first backward cycle is slow, and FT can only co-batch once it is done.
     llm.generate(["Warm-up:"], SamplingParams(temperature=0.0, max_tokens=_MAX_TOKENS))
@@ -196,7 +236,7 @@ def _spawn(mode: str, adapter: Path) -> dict:
     env["DSERVE_M1_ADAPTER"] = str(adapter)
     proc = subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), "--worker", mode],
-        capture_output=True, text=True, env=env, timeout=600,
+        capture_output=True, text=True, env=env, timeout=_PROFILE["timeout"],
     )
     if not os.path.exists(result_path):
         print(proc.stdout[-2000:])
@@ -207,7 +247,9 @@ def _spawn(mode: str, adapter: Path) -> dict:
     os.unlink(result_path)
     result["top"] = [[{t: lp for t, lp in pos} for pos in seq] for seq in result["top"]]
     # mixed steps of the served window only (the warm-up does not count)
-    log = proc.stdout + proc.stderr
+    # under TP every rank prints the same batch line: keep rank 0's
+    log = "\n".join(l for l in (proc.stdout + proc.stderr).splitlines()
+                    if "Worker_TP" not in l or "Worker_TP0 " in l)
     a, b = log.find("__SERVE_START__"), log.find("__SERVE_END__")
     steps = [(int(p), int(f), bool(d.strip()))
              for p, f, d in _BATCH_RE.findall(log[a:b] if 0 <= a < b else "")]
@@ -233,7 +275,8 @@ def main():
         run_worker(sys.argv[sys.argv.index("--worker") + 1])
         return
 
-    print(f"{_GREEN}=== Milestone 1: FT injection leaves inference unchanged ==={_RESET}")
+    print(f"{_GREEN}=== Milestone 1: FT injection leaves inference unchanged "
+          f"[{_PROFILE_NAME}: {_CONFIG.name}] ==={_RESET}")
     from deltaserve.config_loader import load_yaml_config, split_config
 
     _, ft_cfg, _ = split_config(load_yaml_config(str(_CONFIG)))
@@ -256,7 +299,9 @@ def main():
     for m in _MODES:
         check(f"{m}: one output per prompt (no FT output leak, no hang)",
               runs[m]["num_outputs"] == n)
-    ctl = min(_drift(runs["baseline"], runs["control"], i, 0) for i in range(n))
+    ctl_m = next(m for m in _MODES if m.startswith("control"))
+    ctl_base = "baseline-graph" if ctl_m.endswith("-graph") else "baseline"
+    ctl = min(_drift(runs[ctl_base], runs[ctl_m], i, 0) for i in range(n))
     check(f"positive control: applying the amplified FT adapter moves the first "
           f"token by >= {_CONTROL_MIN_NATS} nats on every prompt (min {ctl:.1f})",
           ctl >= _CONTROL_MIN_NATS)
