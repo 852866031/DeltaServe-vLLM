@@ -29,7 +29,7 @@ finetune:
   graph_ft_max_tokens: 512           # capture the has_ft set up to this padded size
   backward_run_ahead_boundaries: 2   # child CPU ≤2 _maybe_pause boundaries ahead of its GPU → a pause lands within ~3-6 ms (0 = unbounded)
   finetuning_lora_path: ../adapters/qwen3-14b-toy-lora-ft
-  data_path: ../alpaca_1000.txt
+  data_path: ../data/alpaca_1000.txt
   max_saved_finetuning_tokens: 256
   num_epochs: 20
   learning_rate: 0.000005
