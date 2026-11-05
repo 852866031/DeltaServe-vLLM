@@ -21,7 +21,7 @@ finetune:
   graph_ft_batches: true             # [mixed-fwd-cuda-graph] mixed batches (inference + FT) replay has_ft CUDA graphs; FT-only stays eager
   graph_ft_max_tokens: 512           # capture the has_ft set up to this padded size
   finetuning_lora_path: ../adapters/qwen3-0.6b-toy-lora-ft
-  data_path: ../alpaca_1000.txt
+  data_path: ../data/alpaca_1000.txt
   max_saved_finetuning_tokens: 256
   num_epochs: 20
   learning_rate: 0.000005

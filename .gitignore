@@ -48,3 +48,7 @@ venv/
 
 # ---- arxiv probe data (re-fetch with eval-arxiv/fetch_arxiv.py) ----
 eval-arxiv/data/
+
+# benchmark outputs
+eval-arxiv/output/
+eval/estimator/*.csv

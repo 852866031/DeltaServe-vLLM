@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Baseline vs final comparison plots for the 2026-10 cleanup (CLEANUP_LOG.md).
+"""Baseline vs final comparison plots (the 2026-10 fork → plugin move).
 
 Reads the validation runs under eval-tp/output/cleanup/ (Qwen3-14B TP=2,
 co-serving) and writes two figures to eval-tp/plots/:

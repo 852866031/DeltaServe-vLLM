@@ -31,7 +31,7 @@ finetune:
   backward_run_ahead_boundaries: 2   # child CPU ≤2 _maybe_pause boundaries ahead of its GPU → a pause lands within ~3-6 ms (0 = unbounded)
   pause_on_arrival: true            # yield the GPU when a request arrives during a cycle (nutanix TTFT p99 270 → 99 ms, FT −1.5 %)
   finetuning_lora_path: ../adapters/qwen3-14b-toy-lora-ft
-  data_path: ../alpaca_1000.txt
+  data_path: ../data/alpaca_1000.txt
   max_saved_finetuning_tokens: 256
   num_epochs: 20
   learning_rate: 0.000005

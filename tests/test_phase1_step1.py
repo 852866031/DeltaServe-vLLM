@@ -132,7 +132,7 @@ def test_gpu_runtime():
               enable_lora=True, max_loras=2, max_lora_rank=16,
               additional_config=_ft(
                   finetuning_lora_path=str(repo / "adapters/qwen3-0.6b-toy-lora-ft"),
-                  data_path=str(repo / "alpaca_1000.txt")))
+                  data_path=str(repo / "data" / "alpaca_1000.txt")))
     out = llm.generate("Hello")
     check("LLM loaded and generated with finetuning on", len(out) > 0)
 

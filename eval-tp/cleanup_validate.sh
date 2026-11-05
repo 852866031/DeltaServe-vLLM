@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Perf validation for the cleanup / restructure work (CLEANUP_LOG.md).
+# Perf validation runner (Qwen3-14B TP=2 timeline replays, A/B against a saved run).
 #
 #   eval-tp/cleanup_validate.sh <tag> [mode ...]          (default modes: tight-half loose-half)
 #   BASE=00_base eval-tp/cleanup_validate.sh 05_worker nutanix-600-800

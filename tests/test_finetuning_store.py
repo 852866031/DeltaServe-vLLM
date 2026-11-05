@@ -17,7 +17,7 @@ os.environ.setdefault("HF_HOME", "/mnt/storage/huggingface")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 _REPO = Path(__file__).resolve().parent.parent
-_CORPUS = _REPO / "alpaca_1000.txt"
+_CORPUS = _REPO / "data" / "alpaca_1000.txt"
 
 _passed = 0
 _failed = 0

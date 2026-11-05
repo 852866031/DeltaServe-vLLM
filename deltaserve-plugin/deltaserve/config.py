@@ -117,8 +117,8 @@ class FinetuneConfig:
     s_max=256). RMSNorm in_ln stays a recompute (cheap, needed for Q/K/V
     LoRA-A grad). Memory cost: ~99 MB at s_max=256 (qh [s_max, q_size] +
     kh/vh [s_max, kv_size] bf16 × 32 layers). Best perf/MB candidate of the
-    remaining activation-save optimizations (see ``INTEGRATION_PROGRESS.md``
-    Phase 5 "future activation-save optimization" section). Families with a
+    remaining activation-save optimizations (see ``INTEGRATION_PROGRESS.md`` on
+    the ``legacy`` branch, Phase 5 "future activation-save optimization"). Families with a
     per-head q/k transform before RoPE (Qwen3's q/k-norm) capture q/k at the
     transform's INPUT instead (pre-hooks on ``self_attn.{q,k}_norm``) so the
     norm backward has what it needs; the backward re-applies only the

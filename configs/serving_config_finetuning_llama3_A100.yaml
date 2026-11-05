@@ -18,8 +18,8 @@ finetune:
   # repo-root adapters.
   finetuning_lora_path: ../adapters/llama3-toy-lora-ft
   # Finetuning corpus: one tokenizable sample per non-empty line.
-  # data_path: ../test_dataset.txt
-  data_path: ../alpaca_1000.txt
+  # data_path: ../data/test_dataset.txt
+  data_path: ../data/alpaca_1000.txt
   max_saved_finetuning_tokens: 600   # buffer capacity; ~2 inference steps to fill
   num_epochs: 20
   learning_rate: 0.000005
