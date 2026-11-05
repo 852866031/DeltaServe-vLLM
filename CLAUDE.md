@@ -115,6 +115,17 @@ satisfaction everywhere, TTFT p99 201→137 / 204→134 / 295→~100 ms, FT thro
 equal or higher (numbers + plots in README "Results"). Llama-3-8B (TP=1/2) and
 Qwen3-0.6B are supported; A100 TP=4 presets exist for Qwen3-14B/32B.
 
+**Inference correctness gate: `tests/test_phase1_m1.py`.** FT runs with a 10×-amplified
+FT adapter (a leak would move logits by ~97 nats; a positive control proves it) against
+FT-off baselines, eager and CUDA-graph, admission phase `prefill` and `both`, with
+staggered arrivals so FT provably co-batches with real prefills and decodes. Measured
+drift is bf16 batch-shape noise (≤ 0.19 nats); divergences are exact or near ties.
+
+**Upstream issue (not ours):** at the pinned vLLM commit, the v2 model runner + LoRA +
+CUDA graphs fails at warmup ("CUDA graphs must be captured on a non-default stream"),
+plugins disabled or not. Qwen3 defaults to v2 when finetuning is off, so FT-off Qwen3
++ LoRA runs need `VLLM_USE_V2_MODEL_RUNNER=0` (finetuning runs are routed to v1).
+
 Open: the live backward-graph vs eager A/B under TP on the real models; a relative
 (not seconds-based) admission margin for the estimator; mixed-batch forward graphs
 for Llama-3 (only Qwen3 has the save call sites).
