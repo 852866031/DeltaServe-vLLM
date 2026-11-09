@@ -137,6 +137,12 @@ CUDA graphs fails at warmup ("CUDA graphs must be captured on a non-default stre
 plugins disabled or not. Qwen3 defaults to v2 when finetuning is off, so FT-off Qwen3
 + LoRA runs need `VLLM_USE_V2_MODEL_RUNNER=0` (finetuning runs are routed to v1).
 
+**vLLM v0.33.0 port (2026-11-09):** every test passes (incl. the 2-GPU NCCL gates and the
+14B TP leak gate), and the TP=2 timeline A/B against the old pin is better on all three
+workloads (FT +8 / +22 / +15 %, TTFT p50 −7 to −16 %, 100 % SLO). vLLM 0.33's piecewise
+prefill steps spend ~20 ms blocked on the host (2 ms before), inference-only too —
+upstream, hidden by async scheduling; profile it if it ever shows in TTFT.
+
 Open: the live backward-graph vs eager A/B under TP on the real models; a relative
 (not seconds-based) admission margin for the estimator; mixed-batch forward graphs
 for Llama-3 (only Qwen3 has the save call sites).
