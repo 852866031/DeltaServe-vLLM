@@ -37,31 +37,111 @@ vLLM's own `--additional-config`. Without it, the server is plain vLLM.
 
 ## Contents
 
-1. [How it works](#how-it-works)
-2. [Supported models](#supported-models)
-3. [Features](#features)
+1. [Get started](#get-started)
+2. [How it works](#how-it-works)
+3. [Supported models](#supported-models)
+4. [Features](#features)
    - [Forward pass](#forward-pass)
    - [Backward pass](#backward-pass)
    - [CUDA graphs at a glance](#cuda-graphs-at-a-glance)
    - [Interrupts and pauses](#interrupts-and-pauses-protecting-inference-latency)
    - [Throttles and admission control](#throttles-and-admission-control)
    - [Optimizations](#optimizations)
-4. [Results](#results)
-5. [Repository layout](#repository-layout)
-6. [Installation](#installation)
-7. [Launching a server](#launching-a-server)
-8. [Running experiments](#running-experiments)
-9. [Tests](#tests)
+5. [Results](#results)
+6. [Repository layout](#repository-layout)
+7. [Installation](#installation)
+8. [Launching a server](#launching-a-server)
+9. [Running experiments](#running-experiments)
+10. [Tests](#tests)
+
+---
+
+## Get started
+
+The shortest path from a fresh clone to a co-serving server on one GPU
+(Qwen3-0.6B). Every step links to its full section below.
+
+**1. Clone** with the pinned vLLM submodule:
+
+```bash
+git clone --recurse-submodules https://github.com/852866031/DeltaServe-vLLM.git
+cd DeltaServe-vLLM
+```
+
+**2. Install** vLLM v0.33.0 (precompiled kernels, no CUDA build) and the plugin into
+a fresh env. On an RTX 5090, use the [RTX 5090 steps](#rtx-5090-blackwell-sm_120)
+instead (it needs CUDA 13 inside the env first).
+
+```bash
+conda create -n deltaserve python=3.12 -y && conda activate deltaserve
+pip install uv
+cd vllm-upstream
+VLLM_VERSION_OVERRIDE=0.33.0 \
+    VLLM_PRECOMPILED_WHEEL_COMMIT=4ba787ec9959e566d3b587a796dff07673324da5 \
+    VLLM_USE_PRECOMPILED=1 \
+    uv pip install --editable . --torch-backend=auto
+cd ..
+uv pip install --editable deltaserve-plugin --no-deps
+pip install peft datasets pandas matplotlib
+uv pip uninstall torchaudio     # vLLM 0.33 pins a torchaudio built for an older torch
+```
+
+**3. Download the model.** The launchers run with `HF_HUB_OFFLINE=1`, so fetch the
+weights once:
+
+```bash
+export HF_HOME=$HOME/hf-cache
+huggingface-cli download Qwen/Qwen3-0.6B-Base
+```
+
+**4. Build the LoRA adapters.** The repo ships only their configs; the weights
+(an inference adapter and the `-ft` copy the backward trains) are built locally in a
+few minutes:
+
+```bash
+python scripts/init_adapters_qwen3.py --size 0.6b
+```
+
+**5. Check the install** (CPU only, a few seconds), then **launch** a co-serving
+server. `--start-finetuning` opens FT admission once the server is healthy:
+
+```bash
+python tests/test_phase1_step1.py
+python eval-tp/launch_deltaserve.py --family qwen3-0.6b --start-finetuning --hf-home $HF_HOME
+```
+
+**6. Send a request** from another shell. The server log prints one
+`[backward] … loss=…` line per training cycle while it serves:
+
+```bash
+curl -s localhost:8000/v1/completions -H 'content-type: application/json' \
+     -d '{"model": "qwen3-0.6b-toy-lora", "prompt": "The capital of France is", "max_tokens": 16}'
+```
+
+**Next:** the Qwen3-14B TP=2 preset (`--family qwen3-14b`, two GPUs), the
+[timeline benchmarks](#running-experiments) and the [tests](#tests).
 
 ---
 
 ## How it works
 
+![DeltaServe in one picture](docs/figures/overview.png)
+
+Inference requests and finetuning samples go through **one** scheduler, which
+packs FT samples into inference batches only while the latency SLOs allow it. The
+forward pass serves both. For FT samples it also saves their activations, from
+which a separate backward process trains the LoRA adapter, yielding the GPU
+whenever inference needs it. The trained adapter is published back into the
+server.
+
+**In detail** — what the plugin adds to each vLLM process:
+
 ![DeltaServe on stock vLLM](docs/figures/architecture.png)
 
-<sub>Editable source: [`docs/figures/architecture.drawio`](docs/figures/architecture.drawio)
+<sub>Editable sources: [`docs/figures/overview.drawio`](docs/figures/overview.drawio),
+[`docs/figures/architecture.drawio`](docs/figures/architecture.drawio)
 (open in draw.io / diagrams.net). Regenerate the PNG/SVG with
-`python docs/figures/make_architecture.py`.</sub>
+`python docs/figures/make_overview.py` / `make_architecture.py`.</sub>
 
 vLLM runs three kinds of processes. DeltaServe adds a fourth, the backward child.
 The plugin's entry point, `deltaserve.plugin:register`, is declared under
@@ -334,7 +414,7 @@ DeltaServe-vLLM/
 ├── eval-arxiv/                        long-context probe (16k, arxiv summarization)
 ├── scripts/                           adapter builders, config converter, timeline generators (timelines/)
 ├── tests/                             standalone test scripts (+ run_all.sh)
-└── docs/figures/                      architecture figure (+ generator), result plots
+└── docs/figures/                      overview + architecture figures (+ generators), result plots
 ```
 
 ---
@@ -431,6 +511,7 @@ VLLM_VERSION_OVERRIDE=0.33.0 \
 cd ..
 uv pip install --editable deltaserve-plugin --no-deps
 pip install peft datasets pandas matplotlib
+uv pip uninstall torchaudio     # vLLM 0.33 pins torchaudio 2.11 next to torch 2.14
 
 # Check, then trigger the one-time FlashInfer JIT
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_capability())"
@@ -453,10 +534,16 @@ the TP floor on that hardware. No MPS daemon is assumed
 
 ### Models and adapters
 
-Set `HF_HOME` to your weight cache (`HF_HUB_OFFLINE=1` once downloaded). Every
-serving YAML needs two adapter directories: an **inference** adapter, served by
-name, and an **`-ft`** copy that the backward trains. The toy adapters are
-committed under `adapters/`. To rebuild them:
+Set `HF_HOME` to your weight cache. The launchers set `HF_HUB_OFFLINE=1` unless you
+set it yourself, so download each base model once first
+(`huggingface-cli download Qwen/Qwen3-14B-Base`), and pass `--hf-home` (the
+launcher's built-in default is this project's own machine).
+
+Every serving YAML needs two adapter directories: an **inference** adapter, served
+by name, and an **`-ft`** copy that the backward trains. `adapters/` holds only
+their configs; the weights (`adapter_model.safetensors`) are not in the repo, so
+build them once (a few minutes; the 14B one uses both GPUs). A launch whose FT
+adapter has no weights stops at startup with an error saying so.
 
 ```bash
 python scripts/init_adapters_qwen3.py              # adapters/qwen3-14b-toy-lora{,-ft}  (Qwen/Qwen3-14B-Base)

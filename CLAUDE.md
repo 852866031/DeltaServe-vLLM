@@ -35,7 +35,7 @@ eval-tp/                        main eval (launcher, timeline replay, compare_ru
 eval/  eval-arxiv/              single-GPU eval; long-context probe
 scripts/                        adapter builders, convert_config_layout.py, timelines/ generators
 tests/                          standalone scripts (python, NOT pytest); tests/run_all.sh
-docs/figures/                   architecture figure + generator (make_architecture.py), result plots
+docs/figures/                   overview + architecture figures + generators (make_overview.py, make_architecture.py), result plots
 ```
 
 **vLLM version.** v0.33.0 is the last release with the v1 model runner, where every
@@ -156,7 +156,7 @@ $P eval-tp/auto_benchmark_tp.py --family qwen3-14b --tp 2 --co --tight-half --ki
 eval-tp/cleanup_validate.sh <tag> tight-half loose-half production-600-800   # A/B vs eval-tp/output/cleanup/00_base
 $P eval-tp/compare_runs.py --suffix <sfx> --a <dirA> --b <dirB>
 tests/run_all.sh /tmp/ds-tests
-$P docs/figures/make_architecture.py                                  # regenerate the architecture figure
+$P docs/figures/make_overview.py && $P docs/figures/make_architecture.py   # regenerate both figures
 ```
 
 Env switches: `DSERVE_BACKWARD_NCCL_PORT` (backward NCCL group, default 29677),
