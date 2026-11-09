@@ -22,8 +22,9 @@ not have:
 
 All of it ships as a **vLLM general plugin** (`deltaserve`, in `deltaserve-plugin/`).
 **vLLM itself is unmodified:** `vllm-upstream/` is a git submodule pinned at
-[`117afeea4`](https://github.com/vllm-project/vllm/commit/117afeea4)
-(`0.21.1rc1.dev123`), with no patches. Co-serving is enabled per launch through
+the
+[`v0.33.0`](https://github.com/vllm-project/vllm/releases/tag/v0.33.0) release
+(`4ba787ec9`), with no patches. Co-serving is enabled per launch through
 vLLM's own `--additional-config`. Without it, the server is plain vLLM.
 
 > **Looking for the original code?** The pre-plugin version (a patched vLLM fork,
@@ -310,7 +311,7 @@ DeltaServe-vLLM/
 │       │   ├── llama3.py              Llama-3 family
 │       │   └── qwen3.py               Qwen3 family
 │       └── api.py                     HTTP routes
-├── vllm-upstream/                     stock vLLM @ 117afeea4 (git submodule, no patches)
+├── vllm-upstream/                     stock vLLM v0.33.0 (git submodule, no patches)
 ├── configs/                           serving YAMLs (5090 + A100 presets)
 ├── adapters/                          toy LoRA adapters (inference + "-ft" training target)
 ├── data/                              datasets: FT corpora (alpaca_1000.txt, test_dataset.txt),
@@ -349,14 +350,18 @@ pip install uv            # for --torch-backend=auto
 # 3. Stock vLLM, editable, with its precompiled kernels (no CUDA build).
 #    VLLM_PRECOMPILED_WHEEL_COMMIT pins the .so files to the submodule commit.
 cd vllm-upstream
-VLLM_VERSION_OVERRIDE=0.21.1rc1.dev123+g117afeea4.precompiled \
-    VLLM_PRECOMPILED_WHEEL_COMMIT=117afeea4665367a3066c1df58d4082d07fcc946 \
+VLLM_VERSION_OVERRIDE=0.33.0 \
+    VLLM_PRECOMPILED_WHEEL_COMMIT=4ba787ec9959e566d3b587a796dff07673324da5 \
     VLLM_USE_PRECOMPILED=1 \
     uv pip install --editable . --torch-backend=auto
 cd ..
 
 # 4. The plugin (pure Python; vLLM discovers it through its entry point)
 uv pip install --editable deltaserve-plugin --no-deps
+
+# vLLM 0.33 pins torchaudio 2.11 next to torch 2.14; transformers imports it and
+# its CUDA-version check fails. Text-only serving does not need it:
+uv pip uninstall torchaudio
 
 # 5. Eval / adapter-building extras
 pip install peft datasets pandas matplotlib
@@ -406,8 +411,8 @@ which nvcc && nvcc --version     # MUST be $CONDA_PREFIX/bin/nvcc, release 13.0
 # vLLM (precompiled, pulls torch cu130) + the plugin
 pip install uv
 cd vllm-upstream
-VLLM_VERSION_OVERRIDE=0.21.1rc1.dev123+g117afeea4.precompiled \
-    VLLM_PRECOMPILED_WHEEL_COMMIT=117afeea4665367a3066c1df58d4082d07fcc946 \
+VLLM_VERSION_OVERRIDE=0.33.0 \
+    VLLM_PRECOMPILED_WHEEL_COMMIT=4ba787ec9959e566d3b587a796dff07673324da5 \
     VLLM_USE_PRECOMPILED=1 \
     uv pip install --editable . --torch-backend=auto
 cd ..
@@ -416,7 +421,7 @@ pip install peft datasets pandas matplotlib
 
 # Check, then trigger the one-time FlashInfer JIT
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_capability())"
-# expect: 2.11.0+cu130 13.0 (12, 0)
+# expect: 2.14.0+cu132 13.2 (12, 0)
 python -c "from vllm import LLM; print(LLM('facebook/opt-125m').generate('Hello'))"
 ```
 

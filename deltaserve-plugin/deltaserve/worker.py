@@ -122,6 +122,19 @@ class DeltaServeWorker(Worker):
                     f"FT adapter safetensors not found at {safetensors_path}; "
                     f"sharing base weights only"
                 )
+        # A trainer with no FT adapter weights cannot train, and the same adapter
+        # would later fail to load as a LoRA inside the launch profiling pass —
+        # after EngineCore reported ready, which leaves the client waiting on a
+        # utility call forever. Fail here, at worker init, where vLLM's startup
+        # handshake reports the error and exits.
+        from deltaserve.bwd_services.registry import get_family
+
+        if not ft_state and get_family(self.model_config.hf_config.architectures[0]):
+            raise RuntimeError(
+                f"[deltaserve] finetuning is enabled but the FT adapter at "
+                f"{path!r} has no weights (adapter_model.safetensors missing or "
+                f"empty): set finetune.finetuning_lora_path to a LoRA adapter "
+                f"directory (see scripts/init_adapters_*.py)")
 
         # Resolve the LM-head weight + trim/scale info the backward process needs
         # to reconstruct logits. Models that tie word embeddings (Qwen3-0.6B) have

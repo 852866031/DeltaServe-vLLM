@@ -850,10 +850,7 @@ class FinetuneScheduler(AsyncScheduler):
             req = self.requests.get(req_id)
             if req is None:
                 continue
-            req.status = RequestStatus.FINISHED_LENGTH_CAPPED
-            if req in self.running:
-                self.running.remove(req)
-            self._free_blocks(req)
+            self._retire_request(req)
         # Drop any still queued in waiting.
         leftover = [r for r in self.waiting
                     if r.request_id.startswith("__prof_")]
@@ -877,13 +874,29 @@ class FinetuneScheduler(AsyncScheduler):
                    f"req={getattr(request, 'request_id', '?')}")
         super().add_request(request)
 
+    def _retire_request(self, req) -> None:
+        """Finish a request the frontend never sees (an FT sample or a profiling
+        request): free its KV and drop it from the scheduler's state. Mirrors
+        the bookkeeping of Scheduler._free_request that applies to these
+        requests (no connector, no encoder inputs); _free_blocks also removes
+        it from self.requests."""
+        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        if req in self.running:
+            self.running.remove(req)
+        # vLLM >= 0.33 tracks requests still prefilling after a chunk; a chunked
+        # FT sample must not stay there (it would reserve KV blocks forever).
+        inflight = getattr(self, "_inflight_prefills", None)
+        if inflight is not None:
+            inflight.discard(req)
+        self._free_blocks(req)
+
     @staticmethod
     def _is_ft_only(output: SchedulerOutput) -> bool:
         ft_ids = getattr(output, "finetune_req_ids", None)
         return bool(ft_ids) and output.total_num_scheduled_tokens > 0 and (
             len(ft_ids) == len(output.num_scheduled_tokens))
 
-    def schedule(self) -> SchedulerOutput:
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         inputs = self._engine_inputs
         interruptible = (inputs is not None and not self._profiling_mode
                          and self.vllm_config.finetune_config.forward_interruptible)
@@ -894,7 +907,7 @@ class FinetuneScheduler(AsyncScheduler):
             grace_s = self.vllm_config.finetune_config.ft_only_admission_grace_ms / 1e3
             if grace_s > 0 and self.would_step_be_ft_only():
                 inputs.poll(grace_s)
-        output = self._schedule_step()
+        output = self._schedule_step(throttle_prefills)
         if interruptible and self._is_ft_only(output) and inputs.pending():
             # [tier B] A request landed after the drain: undo the FT-only step,
             # admit the arrival(s) and schedule once more (bounded to one retry;
@@ -902,10 +915,10 @@ class FinetuneScheduler(AsyncScheduler):
             # runs).
             self._rollback_ft_step(output)
             inputs.drain()
-            output = self._schedule_step()
+            output = self._schedule_step(throttle_prefills)
         return output
 
-    def _schedule_step(self) -> SchedulerOutput:
+    def _schedule_step(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # [Phase 4] Drain step durations the runner finished timing (deferred
         # CUDA-event ring) into the tracker. Pairs each step's features (stamped
         # at schedule) with its measured duration (read a few steps later).
@@ -1003,7 +1016,8 @@ class FinetuneScheduler(AsyncScheduler):
         # (next_ft_requests advances it via the store's advance_epoch).
         self._coord.current_epoch = self._ft_injector.store.current_epoch
 
-        output = super().schedule()
+        # vLLM >= 0.33 passes the engine's prefill-throttle decision through
+        output = super().schedule(throttle_prefills)
 
         # Partition FT requests. Under async scheduling, schedule(N+1) runs
         # before update_from_output(N), so PRIOR-step FT requests are still in
@@ -1173,10 +1187,7 @@ class FinetuneScheduler(AsyncScheduler):
             req = self.requests.get(req_id)
             if req is None:
                 continue
-            req.status = RequestStatus.FINISHED_LENGTH_CAPPED
-            if req in self.running:
-                self.running.remove(req)
-            self._free_blocks(req)
+            self._retire_request(req)
             self._ft_retired_pending.append(req_id)   # runner may hold state (tier C)
         # Restore the activation-buffer reservation and the in-flight
         # samples list on the coordinator.
@@ -1241,10 +1252,7 @@ class FinetuneScheduler(AsyncScheduler):
             req = self.requests.get(req_id)
             if req is None:
                 continue
-            req.status = RequestStatus.FINISHED_LENGTH_CAPPED
-            if req in self.running:
-                self.running.remove(req)
-            self._free_blocks(req)
+            self._retire_request(req)
             self._ft_retired_pending.append(req_id)
 
         # NOTE: estimator samples are recorded in schedule() by draining the

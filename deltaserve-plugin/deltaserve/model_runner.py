@@ -194,8 +194,14 @@ class DeltaServeModelRunner(GPUModelRunner):
         # removals as the stock finished path, so its condense() covers them.
         for req_id in (getattr(scheduler_output, "finetune_retired_req_ids", None)
                        or ()):
-            if self.requests.pop(req_id, None) is not None:
+            req_state = self.requests.pop(req_id, None)
+            if req_state is not None:
                 self.num_prompt_logprobs.pop(req_id, None)
+                # vLLM >= 0.33: the stock finished path calls this hook too
+                # (platform runners clean request-scoped side caches there)
+                hook = getattr(self, "_on_request_state_removed", None)
+                if hook is not None:
+                    hook(req_id, req_state)
             if req_id in self.input_batch.req_id_to_index:
                 self.input_batch.remove_request(req_id)
         return super()._update_states(scheduler_output)
@@ -502,6 +508,11 @@ class DeltaServeModelRunner(GPUModelRunner):
             # [Phase 7 / M4.1] Relay this rank's backward ack + saved counts to
             # the EngineCore scheduler. Async outputs wrap the ModelRunnerOutput
             # the scheduler eventually receives — set the fields on that one.
+            if out is EMPTY_MODEL_RUNNER_OUTPUT:
+                # vLLM >= 0.33 returns the shared EMPTY sentinel (formerly
+                # None) when there is nothing to sample: fill a private copy,
+                # never the singleton every later empty step would share.
+                out = copy(EMPTY_MODEL_RUNNER_OUTPUT)
             target = getattr(out, "_model_runner_output", out)
             if isinstance(target, ModelRunnerOutput):
                 self._ft_fill_relay_fields(target, coord)

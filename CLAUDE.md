@@ -9,7 +9,8 @@ an **SLO-aware scheduler** decides each step how much FT work to admit without
 breaking inference TTFT / TBT.
 
 It is a **vLLM general plugin** (`deltaserve-plugin/`, import `deltaserve`) on
-**stock, unpatched vLLM** (`vllm-upstream/`, submodule pinned at 117afeea4). vLLM
+**stock, unpatched vLLM** (`vllm-upstream/`, submodule pinned at the v0.33.0 release,
+`4ba787ec9`; branch `vllm-v0.33`, env `deltaserve-v033`). vLLM
 supplies multi-LoRA batching, paged KV, the scheduler and the multi-process engine;
 the plugin adds activation capture, the backward process, the FT-admission
 scheduler + estimator, and the interrupt/pause machinery.
@@ -37,6 +38,14 @@ tests/                          standalone scripts (python, NOT pytest); tests/r
 docs/figures/                   architecture figure + generator (make_architecture.py), result plots
 ```
 
+**vLLM version.** v0.33.0 is the last release with the v1 model runner, where every
+runner hook lives (`model_runner.py`, `cudagraph.py`). vLLM `main` removed v1 on
+2026-11-07 (vllm-project/vllm#63373), so the next upgrade means re-hosting those hooks
+on the v2 runner (`vllm/v1/worker/gpu/`): `prepare_inputs` for the FT mask, a wrapper
+around the inline forward for timing / pause / tier-C, and a `CudaGraphManager`
+subclass for the `has_ft` set. Scheduler, EngineCore, LoRA and model internals carry
+over (checked statically against main).
+
 ## Rules
 
 - **vLLM stays unmodified.** If something seems to need a vLLM edit, find a seam
@@ -45,7 +54,7 @@ docs/figures/                   architecture figure + generator (make_architectu
 - **One file per model family** in `bwd_services/` (`llama3.py`, `qwen3.py`); shared
   logic lives in `bwd_services/common/`. Never route a new family through another
   family's file.
-- **Env:** conda env `deltaserve-plugin` (`/mnt/storage/conda/envs/deltaserve-plugin`):
+- **Env:** conda env `deltaserve-v033` (`/mnt/storage/conda/envs/deltaserve-v033`, vLLM v0.33.0, torch 2.14, no torchaudio; the pre-upgrade env `deltaserve-plugin` stays for the old pin):
   vllm editable from `vllm-upstream/` + the plugin editable. Weights in
   `HF_HOME=/mnt/storage/huggingface`, `HF_HUB_OFFLINE=1`.
 - **Tests are scripts:** `python tests/test_x.py`, or `tests/run_all.sh <out_dir> [glob]`.
@@ -123,7 +132,7 @@ FT-off baselines, eager and CUDA-graph, admission phase `prefill` and `both`, wi
 staggered arrivals so FT provably co-batches with real prefills and decodes. Measured
 drift is bf16 batch-shape noise (≤ 0.19 nats); divergences are exact or near ties.
 
-**Upstream issue (not ours):** at the pinned vLLM commit, the v2 model runner + LoRA +
+**Upstream issue (not ours):** at the previous pin (117afeea4), the v2 model runner + LoRA +
 CUDA graphs fails at warmup ("CUDA graphs must be captured on a non-default stream"),
 plugins disabled or not. Qwen3 defaults to v2 when finetuning is off, so FT-off Qwen3
 + LoRA runs need `VLLM_USE_V2_MODEL_RUNNER=0` (finetuning runs are routed to v1).
@@ -135,7 +144,7 @@ for Llama-3 (only Qwen3 has the save call sites).
 ## Useful commands
 
 ```bash
-P=/mnt/storage/conda/envs/deltaserve-plugin/bin/python
+P=/mnt/storage/conda/envs/deltaserve-v033/bin/python
 $P eval-tp/launch_deltaserve.py --family qwen3-14b --dry-run          # resolved vllm serve cmd
 $P eval-tp/auto_benchmark_tp.py --family qwen3-14b --tp 2 --co --tight-half --kill-stale
 eval-tp/cleanup_validate.sh <tag> tight-half loose-half production-600-800   # A/B vs eval-tp/output/cleanup/00_base
