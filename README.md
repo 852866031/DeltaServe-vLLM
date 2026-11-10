@@ -237,7 +237,7 @@ Every step is one vLLM batch. What runs depends on what the batch contains:
 | **Inference-only** | prefill and/or decode | stock vLLM | ✅ stock: piecewise, plus FULL for uniform decode | — |
 | **Mixed** | inference + FT samples | compiled forward | ✅ **`has_ft` piecewise set** (`graph_ft_batches`, Qwen3), up to `graph_ft_max_tokens` (512) padded tokens; larger batches run compiled without a graph. Never FULL | `torch.ops.vllm.dserve_save_rows`, a capturable op fed by persistent index tensors |
 | **Mixed** (graphs off / Llama-3) | inference + FT | eager | ❌ | Python forward hooks (slice fast path) |
-| **FT-only** | only FT samples (idle GPU) | compiled + graphs with `graph_ft_only_batches`, else eager | ✅ same `has_ft` set (opt-in) / ❌ | same as above |
+| **FT-only** | only FT samples (idle GPU) | compiled + graphs with `graph_ft_only_batches`, else eager | ✅ with `graph_ft_only_batches`: replays the mixed batches' `has_ft` graphs; ❌ otherwise (default) | same as above |
 
 - FT samples are **prefill-only**. They run once, hold no KV past the step, emit no
   tokens, and are invisible to clients.
@@ -253,6 +253,21 @@ Every step is one vLLM batch. What runs depends on what the batch contains:
 The trainer is a hand-written LoRA SFT backward (no autograd), gradchecked against
 autograd to ~1e-7. It rematerializes each layer from the saved activations,
 backpropagates, and steps an fp32 master copy of the LoRA weights.
+
+**This is the template every supported family follows.** The loop, the LM head,
+the optimizer, the TP collectives, the three CUDA graphs and the publish are shared
+(`bwd_services/common/trainer.py`, `graph.py`). A family file (`llama3.py`,
+`qwen3.py`) supplies only its per-layer math through a `Family` record: the layer
+forward recompute, the layer backward and its graphed variant, and its weight names.
+What differs per family:
+
+| Family | Layer forward recompute / backward adds |
+|---|---|
+| Llama-3 / 3.1 / 3.2 / 3.3 | RoPE with the model's scaling (`llama3` for 3.1+); saved q/k are post-RoPE |
+| Qwen3 | per-head `q_norm` / `k_norm` RMSNorm before RoPE, and their backward; saved q/k are taken at the norm inputs |
+
+A new family follows the same table by providing those functions
+([Adding a family](#supported-models)).
 
 | Stage | What it does | CUDA graph? | Precision |
 |---|---|---|---|
