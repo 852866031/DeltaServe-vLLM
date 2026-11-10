@@ -756,6 +756,8 @@ ssh -N -L 8090:localhost:8090 you@gpu-box        # on your laptop; then open htt
 (VS Code Remote-SSH: forward port 8090 in the Ports panel.) The page refreshes about
 three times a second and is read-only:
 
+![dserve-top on Qwen3-14B TP=2 under load](docs/figures/dserve_top_qwen3_14b_tp2.png)
+
 | Panel | Shows |
 |---|---|
 | Engine | every step as a bar, newest right: FT (bottom) / inference prefill / decode tokens on a √ scale; runs of plain decode steps fold into one growing `d×N` block; under each bar the FT admission decision (`A` admitted, `S` SLO, `F` buffer full, `C` step budget, `B` backward running, `T` throttle / flush, …) and the FT tokens admitted; `✗` = an FT-only step pre-empted for an arriving request. Hover for the step's GPU ms, graph / eager, backward state. GPU busy over the last 10 s: inference forward, FT forward, backward |
