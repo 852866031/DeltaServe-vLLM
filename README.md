@@ -722,6 +722,14 @@ percentiles are within 2 % (mean, max and SLO attainment are exact). The cost is
 about 75 µs per 256-request step, writes happen on a background thread, and the window
 in progress is written when the server is asked to stop.
 
+Measured overhead (`eval-tp/bench_metrics_overhead.py`: interleaved on/off runs under
+`vllm bench serve` load with finetuning running, plus every recorder call timed in
+the EngineCore): **0.32 %** of the engine thread on Qwen3-0.6B (host-bound, ~2.3 ms
+steps; 7 µs per step) and **0.05 %** on Qwen3-14B TP=2 (7 µs per step); slowest single
+call 0.4 ms. Throughput, TTFT / TPOT / ITL percentiles and FT tokens/s on vs off: every
+difference within run-to-run noise (0.6B, 3 + 3 runs: output tok/s +0.3 %, TPOT p50
+−0.1 %; 14B: all within ±0.15 %).
+
 ### Saving the trained adapter
 
 The adapter being trained lives in GPU memory. Save it with `POST /save_adapter`
