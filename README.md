@@ -19,6 +19,10 @@ not have:
 - **Backward process:** one per GPU, with a hand-written LoRA backward and CUDA graphs.
 - **SLO-aware admission scheduler:** with a step-time estimator.
 - **Pre-emption and pause machinery:** keeps inference latency protected.
+- **Training outputs:** the trained adapter is saved on request or periodically as a
+  standard PEFT LoRA (merged across TP ranks), and `GET /finetuning_status`
+  reports progress. Failures stop the launch or switch finetuning off with a
+  reason; they never hang the server or train silently wrong.
 
 All of it ships as a **vLLM general plugin** (`deltaserve`, in `deltaserve-plugin/`).
 **vLLM itself is unmodified:** `vllm-upstream/` is a git submodule pinned at
@@ -51,6 +55,9 @@ vLLM's own `--additional-config`. Without it, the server is plain vLLM.
 6. [Repository layout](#repository-layout)
 7. [Installation](#installation)
 8. [Launching a server](#launching-a-server)
+   - [HTTP endpoints](#http-endpoints)
+   - [Saving the trained adapter](#saving-the-trained-adapter)
+   - [When something fails](#when-something-fails)
 9. [Running experiments](#running-experiments)
 10. [Tests](#tests)
 
@@ -117,6 +124,22 @@ python eval-tp/launch_deltaserve.py --family qwen3-0.6b --start-finetuning --hf-
 curl -s localhost:8000/v1/completions -H 'content-type: application/json' \
      -d '{"model": "qwen3-0.6b-toy-lora", "prompt": "The capital of France is", "max_tokens": 16}'
 ```
+
+**7. Watch training and save the result.** The adapter being trained lives in GPU
+memory until you save it:
+
+```bash
+curl -s localhost:8000/finetuning_status          # backwards done, tokens, loss, epoch
+curl -s -X POST localhost:8000/save_adapter -H 'content-type: application/json' \
+     -d '{"path": "out/qwen3-0.6b-sft"}'           # PEFT dir: adapter_model.safetensors + configs
+```
+
+The saved directory is an ordinary LoRA adapter: serve it with
+`vllm serve Qwen/Qwen3-0.6B-Base --enable-lora --lora-modules sft=out/qwen3-0.6b-sft`,
+load it with PEFT, or point `finetune.finetuning_lora_path` at it to keep training.
+For periodic saves, set `finetune.adapter_save_path` and
+`adapter_save_every_backwards` / `adapter_save_every_epoch`
+([details](#saving-the-trained-adapter)).
 
 **Next:** the Qwen3-14B TP=2 preset (`--family qwen3-14b`, two GPUs), the
 [timeline benchmarks](#running-experiments) and the [tests](#tests).
@@ -387,7 +410,7 @@ DeltaServe-vLLM/
 │       ├── config.py                  FinetuneConfig: every flag, documented
 │       ├── config_loader.py           YAML → vLLM CLI args (+ --additional-config)
 │       ├── engine_config.py           worker_cls / scheduler_cls / async defaults
-│       ├── engine_core.py             EngineHooks: arrival signal, profiling, input queue
+│       ├── engine_core.py             EngineHooks: arrival signal, profiling (failure → FT off), input queue, status
 │       ├── ft_scheduler.py            FinetuneScheduler: injection, SLO admission, tiers A/B
 │       ├── ft_scheduler_both.py       BothPhaseFinetuneScheduler (admission phase "both")
 │       ├── estimator.py               step-time estimator + tracker
@@ -401,13 +424,14 @@ DeltaServe-vLLM/
 │       ├── accumulate.py              per-layer activation-save hooks
 │       ├── ft_save_op.py              torch.ops.vllm.dserve_save_rows
 │       ├── backward_process.py        child process launch / IPC
+│       ├── adapter_io.py              trained-adapter checkpoints: PEFT writer, TP shard merge, save results
 │       ├── bwd_services/              backward trainers
 │       │   ├── base.py                recv loop, _maybe_pause
 │       │   ├── registry.py            HF arch → service
-│       │   ├── common/                ops, attention, ffn, head, tp, trainer, graph
-│       │   ├── llama3.py              Llama-3 family
+│       │   ├── common/                ops (RoPE incl. llama3 scaling), attention, ffn, head, tp, trainer (+ adapter saves), graph
+│       │   ├── llama3.py              Llama-3 / 3.1 / 3.2 / 3.3 family
 │       │   └── qwen3.py               Qwen3 family
-│       └── api.py                     HTTP routes
+│       └── api.py                     HTTP routes: start/stop, finetuning_status, save_adapter, save_estimator_state
 ├── vllm-upstream/                     stock vLLM v0.33.0 (git submodule, no patches)
 ├── configs/                           serving YAMLs (5090 + A100 presets)
 ├── adapters/                          toy LoRA adapters (inference + "-ft" training target)
@@ -566,7 +590,7 @@ sections go into `--additional-config`. The rest become ordinary vLLM flags.
 
 | Section | Holds |
 |---|---|
-| `finetune` | the FT job (corpus `data_path`, FT adapter, epochs, lr, buffer size `max_saved_finetuning_tokens`), forward/backward graph flags, activation saves, interrupts, pauses |
+| `finetune` | the FT job (corpus `data_path`, FT adapter, epochs, lr, buffer size `max_saved_finetuning_tokens`), adapter checkpoints (`adapter_save_*`), forward/backward graph flags, activation saves, interrupts, pauses |
 | `throttles` | admission shapers ([table above](#throttles-and-admission-control)) |
 | `slo` | `ttft_slo`, `avg_tbt_slo`, `max_tbt_slo`, estimator profiling, admission phase |
 | `debug` | log switches (`print_scheduler_add`, `print_engine_batch_exec`, …) and trace paths |
