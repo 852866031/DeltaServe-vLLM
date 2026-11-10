@@ -16,7 +16,8 @@ write on a daemon thread:
                    wall time (incl. pauses while inference had the GPU),
                    tokens, samples, loss, the child's GPU memory.
 ``summary.jsonl``  one JSON line every ``metrics_interval_s``: over that
-                   window — TTFT / TBT percentiles + SLO attainment,
+                   window — TTFT (of the requests whose first token came out
+                   in it) / TBT percentiles + SLO attainment,
                    inference and FT token throughput, forward GPU time by step
                    kind (inference-only / mixed / FT-only) with the mixed
                    steps' time split by tokens, backward GPU time, and the
@@ -42,7 +43,6 @@ import os
 import queue
 import threading
 import time
-from collections import deque
 
 _REQ_FIELDS = ("finish_unix_time", "request_id", "prompt_tokens",
                "output_tokens", "ttft_s", "tbt_mean_s", "tbt_max_s", "e2e_s",
@@ -165,7 +165,7 @@ class _Window:
 
     def __init__(self, t0: float, max_tbt_slo: float | None = None) -> None:
         self.t0 = t0
-        self.ttft: list[float] = []        # one per finished request: exact
+        self.ttft: list[float] = []        # one per first token in the window: exact
         self.gaps = LogHistogram(max_tbt_slo)   # one per token: bucketed
         self.e2e: list[float] = []
         self.requests = 0
@@ -206,10 +206,11 @@ class MetricsRecorder:
         self._cycle = 0
         self.enabled = True
         # run totals
-        self.tot = {"requests": 0, "prompt_tokens": 0, "output_tokens": 0,
-                    "ttft_slo_met": 0, "backwards": 0, "trained_tokens": 0,
+        # requests = finished; first_tokens = requests that produced one (the
+        # TTFT population); ttft_slo_met counts against first_tokens.
+        self.tot = {"requests": 0, "first_tokens": 0, "prompt_tokens": 0,
+                    "output_tokens": 0, "ttft_slo_met": 0, "backwards": 0, "trained_tokens": 0,
                     "ft_fwd_tokens": 0, "fwd_gpu_s": 0.0, "bwd_gpu_s": 0.0}
-        self._recent_ttft: deque = deque(maxlen=10000)
         # The window is touched by the engine loop and by the ticker that
         # closes windows while the engine idles (no steps → no flush otherwise).
         self._lock = threading.Lock()
@@ -267,6 +268,7 @@ class MetricsRecorder:
                     prompt = int(getattr(req, "num_prompt_tokens", 0) or 0)
                     st = live[o.request_id] = [arrival, now, now, 0, 0.0, 0.0, prompt]
                     st[3] = n_new
+                    self._first_token(max(0.0, now - arrival))
                 elif n_new:
                     gap = now - st[2]
                     st[2] = now
@@ -280,6 +282,16 @@ class MetricsRecorder:
                                  str(getattr(o.finish_reason, "name", o.finish_reason)),
                                  now)
 
+    def _first_token(self, ttft: float) -> None:
+        """A request's TTFT counts in the window where its first token came
+        out (not where the request finished, which can be many windows
+        later) — so the live view and each window show TTFT as it happens."""
+        self._win.ttft.append(ttft)
+        t = self.tot
+        t["first_tokens"] += 1
+        if self.ttft_slo and ttft <= self.ttft_slo:
+            t["ttft_slo_met"] += 1
+
     def _finish(self, rid, st, reason, now) -> None:
         arrival, first, last, n, gap_sum, gap_max, prompt = st
         ttft = max(0.0, first - arrival)
@@ -288,7 +300,6 @@ class MetricsRecorder:
         tbt_mean = gap_sum / n_gaps if n_gaps else None
         w = self._win
         w.requests += 1
-        w.ttft.append(ttft)
         w.e2e.append(e2e)
         w.prompt_tokens += prompt
         w.output_tokens += n
@@ -296,9 +307,6 @@ class MetricsRecorder:
         t["requests"] += 1
         t["prompt_tokens"] += prompt
         t["output_tokens"] += n
-        if self.ttft_slo and ttft <= self.ttft_slo:
-            t["ttft_slo_met"] += 1
-        self._recent_ttft.append(ttft)
         self._w.row("requests.csv", _REQ_FIELDS, (
             round(now, 3), rid, prompt, n, round(ttft, 5),
             "" if tbt_mean is None else round(tbt_mean, 5),
@@ -420,6 +428,7 @@ class MetricsRecorder:
             "window_s": round(dt, 3),
             "inference": {
                 "requests_finished": w.requests,
+                "first_tokens": len(ttft),       # TTFTs below: requests whose first token came out in this window
                 "ttft_s": {"p50": rd(_pct(ttft, 50)), "p90": rd(_pct(ttft, 90)),
                            "p99": rd(_pct(ttft, 99)), "max": rd(ttft[-1] if ttft else None),
                            "mean": rd(sum(ttft) / len(ttft) if ttft else None)},

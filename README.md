@@ -713,7 +713,10 @@ GPU) and draws TTFT per request, throughput, GPU busy time and memory.
 
 How it is measured: request times are taken in the EngineCore (arrival = the
 frontend's stamp, a token = the step that produced it), so they exclude HTTP and
-detokenization — measured against a client, about 1 ms lower. Step GPU times are the
+detokenization — measured against a client, about 1 ms lower. A request's TTFT
+counts in the window where its first token came out (live in `GET /system_metrics`
+at once), not when the request finishes; `requests.csv` gets the full row at the
+finish. Step GPU times are the
 runner's CUDA-event samples (the ones the SLO estimator fits on); in a mixed step the
 time is split between inference and FT by token count. The backward child shares the
 GPU (time-sliced), so forward and backward GPU seconds can overlap: each share is of

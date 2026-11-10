@@ -140,7 +140,8 @@ def part_a_to_d(root):
          and mem["backward_child_rank0_gib"]["lora_train_state"] == 0.25,
          json.dumps(mem)[:120])
     t = snap["totals"]
-    C.ok("totals", t["requests"] == 2 and t["output_tokens"] == 6
+    C.ok("totals", t["requests"] == 2 and t["first_tokens"] == 2
+         and t["output_tokens"] == 6
          and t["ttft_slo_met"] == 1 and t["backwards"] == 2
          and t["trained_tokens"] == 512, json.dumps(t))
     # a new window starts empty
@@ -260,6 +261,42 @@ def part_idle(root):
     m.close()
 
 
+def part_live_ttft(root):
+    print("\nI. TTFT counts where the first token came out")
+    clk = Clock(0.0)
+    m = MetricsRecorder(root, interval_s=10, ttft_slo=0.4, clock=clk,
+                        start_ticker=False)
+    reqs = {"long": types.SimpleNamespace(arrival_time=1.0, num_prompt_tokens=10)}
+    clk.t = 1.6                                   # first token: TTFT 0.6 > SLO
+    m.on_outputs(outputs(out("long")), reqs)
+    live = m.current()["current_window"]["inference"]
+    C.ok("visible live before the request finishes",
+         live["first_tokens"] == 1 and live["requests_finished"] == 0
+         and abs(live["ttft_s"]["max"] - 0.6) < 1e-9
+         and live["ttft_slo_attainment"] == 0.0, json.dumps(live["ttft_s"]))
+    for k in range(1, 300):                       # decode through 3 windows
+        clk.t = 1.6 + k * 0.08
+        m.on_outputs(outputs(out("long")), reqs)
+        m.maybe_flush()
+    clk.t = 30.0
+    m.on_outputs(outputs(out("long", finish="length")), reqs)
+    m.maybe_flush(force=True)
+    m.close()
+    w = [json.loads(l) for l in open(os.path.join(root, "summary.jsonl"))]
+    C.ok("in the window of its first token, not of its finish",
+         w[0]["inference"]["first_tokens"] == 1
+         and abs(w[0]["inference"]["ttft_s"]["p50"] - 0.6) < 1e-9
+         and all(x["inference"]["first_tokens"] == 0 for x in w[1:])
+         and sum(x["inference"]["requests_finished"] for x in w) == 1
+         and w[0]["inference"]["requests_finished"] == 0,
+         str([(x["inference"]["first_tokens"], x["inference"]["requests_finished"])
+              for x in w]))
+    r = rows(os.path.join(root, "requests.csv"))
+    C.ok("requests.csv still one full row at the finish",
+         len(r) == 1 and float(r[0]["ttft_s"]) == 0.6
+         and r[0]["output_tokens"] == "301", str(r[0]))
+
+
 def part_hist():
     print("\nG. histogram percentiles")
     import random
@@ -313,6 +350,7 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as root:
         part_a_to_d(os.path.join(root, "m"))
         part_e(root)
+        part_live_ttft(os.path.join(root, "live"))
         part_hist()
         part_idle(os.path.join(root, "idle"))
         part_f(os.path.join(root, "perf"))
