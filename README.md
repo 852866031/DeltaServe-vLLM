@@ -31,12 +31,6 @@ the
 (`4ba787ec9`), with no patches. Co-serving is enabled per launch through
 vLLM's own `--additional-config`. Without it, the server is plain vLLM.
 
-> **Looking for the original code?** The pre-plugin version (a patched vLLM fork,
-> `dserve-vllm/`), the original DeltaServe framework (`DeltaServe/`) and all the
-> phase-by-phase design notes (`INTEGRATION_PROGRESS.md`, `VLLM_FORK_CHANGES.md`, …)
-> are on the [`legacy`](https://github.com/852866031/DeltaServe-vLLM/tree/legacy)
-> branch.
-
 ---
 
 ## Contents
@@ -792,3 +786,11 @@ tests/run_all.sh /tmp/ds-tests 'test_qwen3_*'  # a subset
 with its SHA, and run `tests/run_all.sh`. The plugin depends only on the vLLM APIs
 it imports and the methods `deltaserve/plugin.py` wraps (listed in that file's
 docstring).
+
+---
+
+> **Looking for the original code?** The pre-plugin version (a patched vLLM fork,
+> `dserve-vllm/`), the original DeltaServe framework (`DeltaServe/`) and all the
+> phase-by-phase design notes (`INTEGRATION_PROGRESS.md`, `VLLM_FORK_CHANGES.md`, …)
+> are on the [`legacy`](https://github.com/852866031/DeltaServe-vLLM/tree/legacy)
+> branch.
