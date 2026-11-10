@@ -82,21 +82,32 @@ class LoraSftTrainerService(BackwardService):
         self._comm: CommQueue | None = None
         self._bucket: FactorBucket | None = None
         self._diag_count = 0
+        # Trained-adapter checkpoints: the PEFT key of every master (so a
+        # save uses the source adapter's names), cycles seen, and the
+        # epoch-end snapshot waiting to be written after the cycle's reply.
+        self._ft_keys: dict = {}
+        self._cycles_attempted = 0
+        self._last_cycle_epoch: int | None = None
+        self._pending_epoch_save = None
         # Family layer functions, bound once in _build_state.
         self._layer_forward = self.family.layer_forward
         self._layer_backward = self.family.layer_backward
 
     # -- build master params + optimizer once weights are received -----------
 
-    def _handle_share_weights(self, conn, msg) -> None:
-        super()._handle_share_weights(conn, msg)
+    def _on_weights_shared(self) -> str | None:
+        """Build the training state; a failure is returned to the worker (in
+        the ``weights_received`` reply), which aborts the launch with it —
+        a trainer without state would only fail every backward later."""
         try:
             self._build_state()
             self._built = True
-        except Exception as e:  # noqa: BLE001 — surface but keep the service alive
+            return None
+        except Exception as e:  # noqa: BLE001 — reported to the worker
             import traceback
             dprint(f"[backward] {self.family.name} state build failed: {e}")
             traceback.print_exc()
+            return f"{type(e).__name__}: {e}"
 
     def _build_state(self) -> None:
         meta = self.shared["meta"]
@@ -113,6 +124,15 @@ class LoraSftTrainerService(BackwardService):
         # before sharing. tp_size=1 → local == full → single-GPU behaviour.
         self.tp_size = int(meta.get("tp_size", 1))
         self.tp_rank = int(meta.get("tp_rank", 0))
+        # Geometry first: it fails the same way on every rank, so no rank is
+        # left waiting in the group rendezvous below for one that gave up.
+        Hq_full = int(meta["num_attention_heads"])
+        Hkv_full = int(meta["num_key_value_heads"])
+        inter_full = int(meta["intermediate_size"])
+        assert Hq_full % self.tp_size == 0 and Hkv_full % self.tp_size == 0 \
+            and inter_full % self.tp_size == 0, (
+                f"[backward] TP finetuning needs Hq({Hq_full}) / Hkv({Hkv_full})"
+                f" / inter({inter_full}) divisible by tp_size({self.tp_size})")
         # [DeltaServe] Phase 7 / M3: stand up a NCCL group ACROSS the backward
         # children (one per rank) — they are NOT in vLLM's inference NCCL group.
         # This carries the per-layer gradient/activation all-reduces.
@@ -122,13 +142,6 @@ class LoraSftTrainerService(BackwardService):
             int(meta.get("backward_nccl_port", DEFAULT_BACKWARD_NCCL_PORT)))
         # [pause] the gloo group the rank-symmetric pause agrees over (tp>1).
         self._pause_group = _tp.backward_cpu_group()
-        Hq_full = int(meta["num_attention_heads"])
-        Hkv_full = int(meta["num_key_value_heads"])
-        inter_full = int(meta["intermediate_size"])
-        assert Hq_full % self.tp_size == 0 and Hkv_full % self.tp_size == 0 \
-            and inter_full % self.tp_size == 0, (
-                f"[backward] TP finetuning needs Hq({Hq_full}) / Hkv({Hkv_full})"
-                f" / inter({inter_full}) divisible by tp_size({self.tp_size})")
         self.D = int(meta["hidden_size"])          # full (residual stream)
         self.L = int(meta["num_hidden_layers"])
         self.Hq = Hq_full // self.tp_size          # local q heads
@@ -138,6 +151,8 @@ class LoraSftTrainerService(BackwardService):
         self.q_size = self.Hq * self.Hd            # local
         self.inter = inter_full // self.tp_size    # local
         self.theta = float(meta["rope_theta"])
+        # Normalized RoPE scaling (ft_meta.rope_scaling_of); None = plain RoPE.
+        self.rope_scaling = meta.get("rope_scaling")
         self.eps = float(meta["rms_norm_eps"])
         self.scaling = float(meta.get("lora_scaling", 1.0))
         self.vocab = int(meta["vocab_size"])
@@ -224,6 +239,7 @@ class LoraSftTrainerService(BackwardService):
             # fp32 master, contiguous so the fused AdamW + IPC publish are happy.
             param = nn.Parameter(shard.detach().clone().float().contiguous())
             self.lora.setdefault(layer, {}).setdefault(proj, {})[ab] = param
+            self._ft_keys[(layer, proj, ab)] = key
             params.append(param)
 
         # ``fused=True`` uses PyTorch's CUDA-fused AdamW kernel — one launch
@@ -238,7 +254,9 @@ class LoraSftTrainerService(BackwardService):
             self.optimizer, step_size=1, gamma=float(meta["gamma"]))
         dprint(
             f"[backward] {fam.name} built: {self.L} layers, {len(params)} LoRA "
-            f"tensors, scaling={self.scaling}, lr={meta['learning_rate']}, "
+            f"tensors, scaling={self.scaling}, rope="
+            f"{(self.rope_scaling or {}).get('rope_type', 'default')}"
+            f"(theta={self.theta:g}), lr={meta['learning_rate']}, "
             f"wd={meta['weight_decay']}, gamma={meta['gamma']}"
         )
 
@@ -311,6 +329,126 @@ class LoraSftTrainerService(BackwardService):
             traceback.print_exc()
             self.graph_runner = None
 
+    # -- trained-adapter checkpoints (deltaserve/adapter_io.py) ---------------
+
+    @torch.no_grad()
+    def _gather_adapter(self) -> tuple[dict | None, str | None]:
+        """The full fp32 adapter ``{peft_key: cpu tensor}`` on TP rank 0
+        (``(None, None)`` on the other ranks), or ``(None, error)``.
+
+        Under TP every rank's shard goes to rank 0 over the children's gloo
+        group. Every rank calls this at the same point of its command stream
+        (a manual save is sent to every child at the same engine step, the
+        periodic ones follow the broadcast cycle count), and a rank that fails
+        to build its part still joins the gather, sending its error."""
+        try:
+            local = {k: p.detach().to("cpu", copy=True)
+                     for k, p in ((key, self.lora[key[0]][key[1]][key[2]])
+                                  for key in self._ft_keys)}
+            mine = {"tensors": local}
+        except Exception as e:  # noqa: BLE001 — reported by rank 0
+            mine = {"error": f"rank {self.tp_rank}: {type(e).__name__}: {e}"}
+        if self.tp_size > 1:
+            import torch.distributed as dist
+
+            gathered = [None] * self.tp_size if self.tp_rank == 0 else None
+            dist.gather_object(mine, gathered, dst=0, group=self._pause_group)
+            if self.tp_rank != 0:
+                return None, None
+        else:
+            gathered = [mine]
+        errors = [g["error"] for g in gathered if "error" in g]
+        if errors:
+            return None, "; ".join(errors)
+        from deltaserve.adapter_io import merge_tp_shards
+
+        full = merge_tp_shards([g["tensors"] for g in gathered])
+        return {self._ft_keys[k]: t for k, t in full.items()}, None
+
+    def _snapshot(self, reason: str, epoch: int):
+        """``(tensors, error, state)``: the gathered adapter plus the training
+        progress AT THIS MOMENT (an epoch checkpoint is written one cycle
+        later, so the state must not be read at write time)."""
+        tensors, error = self._gather_adapter()
+        state = {"reason": reason, "epoch": int(epoch),
+                 "backward_cycles": int(self._cycles_attempted),
+                 "tokens_trained": int(self._total_tokens_trained),
+                 "last_loss": self._last_loss,
+                 "learning_rate": float(self.optimizer.param_groups[0]["lr"])
+                 if self.optimizer is not None else None,
+                 "tp_size": int(self.tp_size),
+                 "source_adapter": self.shared["meta"].get("finetuning_lora_path")}
+        return tensors, error, state
+
+    def _write_adapter(self, out_dir: str, save_id: str, snap) -> None:
+        """Rank 0: write a snapshot (or its error) to ``out_dir``."""
+        from deltaserve.adapter_io import write_peft_adapter, write_save_error
+
+        if self.tp_rank != 0:
+            return
+        tensors, error, state = snap
+        if error is None:
+            try:
+                write_peft_adapter(
+                    out_dir, tensors,
+                    source_dir=self.shared["meta"].get("finetuning_lora_path"),
+                    scaling=self.scaling, state={"save_id": save_id, **state})
+                dprint(f"[backward] adapter saved ({state['reason']}) → {out_dir}")
+                return
+            except Exception as e:  # noqa: BLE001
+                error = f"{type(e).__name__}: {e}"
+        dprint(f"[backward] adapter save ({state['reason']}) to {out_dir} "
+               f"FAILED: {error}")
+        write_save_error(out_dir, save_id, error)
+
+    def save_adapter(self, out_dir: str, save_id: str, reason: str = "manual") -> None:
+        if not self._built:
+            if self.tp_rank == 0:
+                from deltaserve.adapter_io import write_save_error
+                write_save_error(out_dir, save_id, "trainer state not built")
+            return
+        self._write_adapter(out_dir, save_id,
+                            self._snapshot(reason, self.current_epoch))
+
+    def _handle_save_adapter(self, msg) -> None:
+        self.save_adapter(str(msg.get("path")), str(msg.get("save_id")))
+
+    def _save_policy(self) -> tuple[str | None, int, bool, int]:
+        meta = self.shared.get("meta") or {}
+        return (meta.get("adapter_save_path"),
+                int(meta.get("adapter_save_every_backwards", 0) or 0),
+                bool(meta.get("adapter_save_every_epoch", False)),
+                int(meta.get("adapter_save_keep_last", 0) or 0))
+
+    def _before_cycle(self, epoch: int, attempted: bool) -> None:
+        root, _, every_epoch, _ = self._save_policy()
+        if (attempted and root and every_epoch and self._built
+                and self._last_cycle_epoch is not None
+                and epoch > self._last_cycle_epoch):
+            # The previous epoch's last backward is done: snapshot it now
+            # (symmetric gather), write it once this cycle has replied.
+            e = self._last_cycle_epoch
+            self._pending_epoch_save = (e, self._snapshot("epoch", e))
+
+    def _after_cycle(self, epoch: int, attempted: bool) -> None:
+        if not attempted:
+            return
+        self._cycles_attempted += 1
+        self._last_cycle_epoch = epoch
+        root, every_n, _, keep_last = self._save_policy()
+        if self._pending_epoch_save is not None:
+            e, snap = self._pending_epoch_save
+            self._pending_epoch_save = None
+            self._write_adapter(os.path.join(root, f"epoch-{e}"), f"epoch-{e}", snap)
+        if root and every_n > 0 and self._built \
+                and self._cycles_attempted % every_n == 0:
+            name = f"backward-{self._cycles_attempted:06d}"
+            self._write_adapter(os.path.join(root, name), name,
+                                self._snapshot("every_backwards", epoch))
+            if self.tp_rank == 0:
+                from deltaserve.adapter_io import prune_checkpoints
+                prune_checkpoints(root, "backward-", keep_last)
+
     def _layer_weights(self, i: int) -> dict:
         """Base (compute dtype) + fp32 LoRA params for layer i, as one dict."""
         lw = dict(self.base[i])
@@ -376,7 +514,7 @@ class LoraSftTrainerService(BackwardService):
         positions = torch.cat([
             torch.arange(s, device=device) for s in seq_lens]) if seq_lens else \
             torch.zeros(0, device=device)
-        cos, sin = rope_cos_sin(positions, self.Hd, self.theta)
+        cos, sin = rope_cos_sin(positions, self.Hd, self.theta, self.rope_scaling)
         ids = activations["concat_input_ids"][:n]
         if os.environ.get("DSERVE_TP_DIAG") and self._diag_count < 5:
             self._diag_count += 1

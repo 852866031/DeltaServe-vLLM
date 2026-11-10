@@ -15,11 +15,52 @@ import torch
 import torch.nn.functional as F
 
 
-def rope_cos_sin(positions: torch.Tensor, head_dim: int, theta: float):
-    """NeoX cos/sin for the given positions. Returns (cos, sin) [n, head_dim//2] fp32."""
-    inv_freq = 1.0 / (theta ** (
-        torch.arange(0, head_dim, 2, dtype=torch.float32, device=positions.device)
+import math
+
+# RoPE variants the backward reproduces exactly (same frequencies as vLLM's
+# served rotary embedding). Anything else is refused at startup
+# (``ft_meta.rope_scaling_of``) instead of training with the wrong positions.
+SUPPORTED_ROPE_TYPES = ("default", "linear", "llama3")
+
+
+def rope_inv_freq(head_dim: int, theta: float, rope_scaling: dict | None = None,
+                  device=None) -> torch.Tensor:
+    """Inverse frequencies [head_dim//2] fp32, with the model's RoPE scaling.
+
+    ``rope_scaling`` is the normalized dict from ``ft_meta.rope_scaling_of``
+    (``None`` / ``rope_type == "default"`` → plain RoPE). ``llama3`` is the
+    Llama-3.1/3.2/3.3 frequency-dependent rescale, written as vLLM's
+    ``Llama3RotaryEmbedding._compute_inv_freq``; ``linear`` divides every
+    frequency by ``factor`` (vLLM divides the positions — same angles)."""
+    inv = 1.0 / (theta ** (
+        torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
         / head_dim))
+    rtype = (rope_scaling or {}).get("rope_type", "default")
+    if rtype in (None, "default"):
+        return inv
+    if rtype == "linear":
+        return inv / float(rope_scaling["factor"])
+    if rtype == "llama3":
+        factor = float(rope_scaling["factor"])
+        low = float(rope_scaling["low_freq_factor"])
+        high = float(rope_scaling["high_freq_factor"])
+        orig = float(rope_scaling["original_max_position_embeddings"])
+        low_wavelen, high_wavelen = orig / low, orig / high
+        wavelen = 2 * math.pi / inv
+        smooth = ((orig / wavelen - low) / (high - low)) if low != high else 0
+        return torch.where(
+            wavelen < high_wavelen, inv,
+            torch.where(wavelen > low_wavelen, inv / factor,
+                        (1 - smooth) * inv / factor + smooth * inv))
+    raise NotImplementedError(
+        f"RoPE type {rtype!r} is not supported by the DeltaServe backward "
+        f"(supported: {', '.join(SUPPORTED_ROPE_TYPES)})")
+
+
+def rope_cos_sin(positions: torch.Tensor, head_dim: int, theta: float,
+                 rope_scaling: dict | None = None):
+    """NeoX cos/sin for the given positions. Returns (cos, sin) [n, head_dim//2] fp32."""
+    inv_freq = rope_inv_freq(head_dim, theta, rope_scaling, device=positions.device)
     freqs = torch.outer(positions.float(), inv_freq)   # [n, head_dim//2]
     return freqs.cos(), freqs.sin()
 

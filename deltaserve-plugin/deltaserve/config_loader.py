@@ -50,6 +50,8 @@ from vllm.engine.arg_utils import EngineArgs
 FINETUNE_SECTIONS: dict[str, tuple[str, ...]] = {
     "finetune": (
         "enable_finetuning", "start_on_launch", "finetuning_lora_path",
+        "adapter_save_path", "adapter_save_every_backwards",
+        "adapter_save_every_epoch", "adapter_save_keep_last",
         "data_path", "max_prepare", "num_epochs", "learning_rate",
         "weight_decay", "gamma", "max_saved_finetuning_tokens",
         "backward_mps_percentage", "backward_fp32", "backward_cuda_graph",

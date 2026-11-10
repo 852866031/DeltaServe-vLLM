@@ -362,6 +362,21 @@ class BackwardProcess:
         except (BrokenPipeError, OSError, EOFError, ValueError) as e:
             dprint(f"[backward] set_corpus_meta skipped (child gone): {e}")
 
+    def request_save_adapter(self, path: str, save_id: str) -> bool:
+        """Ask the child to write its trained adapter to ``path`` (ASYNC, no
+        reply on the pipe — its replies are read as backward acks). The child
+        handles it between backward cycles, so the snapshot is consistent; the
+        outcome lands in ``path`` (``adapter_io.read_save_result``)."""
+        if self._conn is None or self._proc is None or not self._proc.is_alive():
+            return False
+        try:
+            self._conn.send({"cmd": "save_adapter", "path": str(path),
+                             "save_id": str(save_id)})
+            return True
+        except (BrokenPipeError, OSError, EOFError, ValueError) as e:
+            dprint(f"[backward] save_adapter skipped (child gone): {e}")
+            return False
+
     def notify_buffer_full(self, n: int,
                            sample_lens: list[int] | None = None,
                            epoch: int = 0) -> None:

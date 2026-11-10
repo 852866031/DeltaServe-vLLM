@@ -117,6 +117,7 @@ class BackwardService:
         self._epoch_processed_tokens: int = 0
         self._cur_epoch_seen: int = 0
         self._total_tokens_per_epoch: int = 0
+        self._last_loss: float | None = None
 
     def _maybe_pause(self) -> None:
         """GPU-yield contract: block at a layer boundary while the main process
@@ -323,6 +324,11 @@ class BackwardService:
                            f"total_tokens_per_epoch={self._total_tokens_per_epoch}")
                 elif cmd == "process_activations":
                     self._handle_process_activations(conn, msg)
+                elif cmd == "save_adapter":
+                    # Fire-and-forget: the result goes to the file system
+                    # (adapter_io.read_save_result) — this pipe's replies are
+                    # read as backward acks.
+                    self._handle_save_adapter(msg)
                 else:
                     conn.send({"event": "error", "msg": f"unknown cmd {cmd!r}"})
         finally:
@@ -334,11 +340,16 @@ class BackwardService:
         self.shared["base"] = msg.get("base") or {}
         self.shared["ft"] = msg.get("ft") or {}
         self.shared["meta"] = msg.get("meta") or {}
+        # Subclasses build their training state here, BEFORE the reply: a
+        # failure travels back in it and the worker aborts the launch instead
+        # of serving with a trainer that can never run a backward.
+        error = self._on_weights_shared()
         resp = {
             "event": "weights_received",
             "base_num": len(self.shared["base"]),
             "ft_num": len(self.shared["ft"]),
             "hash_report": {},
+            "error": error,
         }
         # Only hash + print when the debug flag is on (else stay quiet).
         if msg.get("print_hash"):
@@ -347,6 +358,28 @@ class BackwardService:
             resp["hash_report"] = report
             resp.update(_summarize_weights(self.shared["base"], self.shared["ft"]))
         conn.send(resp)
+
+    def _handle_save_adapter(self, msg) -> None:
+        """POST /save_adapter. Only a trainer has weights to save."""
+        from deltaserve.adapter_io import write_save_error
+
+        if int((self.shared.get("meta") or {}).get("tp_rank", 0)) == 0:
+            write_save_error(msg.get("path"), msg.get("save_id"),
+                             f"{type(self).__name__} trains no adapter")
+
+    def _before_cycle(self, epoch: int, attempted: bool) -> None:
+        """Hook at a cycle's start, before its backward (trainer: epoch-end
+        checkpoint snapshot). ``attempted`` = the cycle has data to train."""
+
+    def _after_cycle(self, epoch: int, attempted: bool) -> None:
+        """Hook after a cycle's done-reply (trainer: periodic checkpoints —
+        FT admission is already open again while they are written)."""
+
+    def _on_weights_shared(self) -> str | None:
+        """Hook run once the shared weights are mapped, before the
+        ``weights_received`` reply. Returns an error message (sent back in the
+        reply) or None. The protocol-only base service has nothing to build."""
+        return None
 
     def _handle_share_activations(self, conn, msg) -> None:
         self.activations = msg.get("buffers")
@@ -407,6 +440,7 @@ class BackwardService:
             and self.activations.get("concat_input_ids") is not None
             and bool(sample_lens)
         )
+        self._before_cycle(epoch, can_compute)
         if can_compute:
             try:
                 if self._verify:
@@ -476,6 +510,7 @@ class BackwardService:
                 loss_f = loss.item() if hasattr(loss, "item") else float(loss)
             except Exception:
                 loss_f = float("nan")
+            self._last_loss = loss_f
             # Per-epoch progress meter: tokens trained in THIS epoch over the
             # corpus total. ``?`` when the parent hasn't yet sent ``set_corpus_meta``
             # (shouldn't happen on the live path — scheduler sends it BEFORE
@@ -506,4 +541,5 @@ class BackwardService:
                 )
 
         conn.send({"event": "activations_processed", "n": n, "loss": loss})
+        self._after_cycle(epoch, can_compute)
         #dprint("[backward] cleaned; sent done response")

@@ -43,6 +43,49 @@ def rope_theta_of(hf_config: Any) -> float:
     return _DEFAULT_ROPE_THETA
 
 
+def rope_scaling_of(hf_config: Any) -> dict | None:
+    """The model's RoPE scaling as the backward applies it, or ``None`` for
+    plain RoPE. Raises ``ValueError`` for a variant the backward cannot
+    reproduce, so an unsupported model fails at worker start instead of
+    training with positions that differ from the served forward.
+
+    transformers >= 5 keep it in ``hf_config.rope_parameters`` (with
+    ``rope_theta``); older configs in ``hf_config.rope_scaling`` (``type`` or
+    ``rope_type``). Llama-3.1/3.2/3.3 use ``rope_type == "llama3"``."""
+    from deltaserve.bwd_services.common.ops import SUPPORTED_ROPE_TYPES
+
+    rp = getattr(hf_config, "rope_parameters", None)
+    if not isinstance(rp, dict) or not rp:
+        rp = getattr(hf_config, "rope_scaling", None)
+    rp = dict(rp) if isinstance(rp, dict) else {}
+    rtype = rp.get("rope_type") or rp.get("type") or "default"
+    if rtype == "su":              # legacy alias (HF)
+        rtype = "longrope"
+    partial = rp.get("partial_rotary_factor",
+                     getattr(hf_config, "partial_rotary_factor", 1.0))
+    if partial is not None and float(partial) != 1.0:
+        raise ValueError(
+            f"[deltaserve] partial_rotary_factor={partial} is not supported by "
+            "the finetuning backward (it rotates the whole head)")
+    if "mrope_section" in rp:
+        raise ValueError("[deltaserve] multimodal RoPE (mrope_section) is not "
+                         "supported by the finetuning backward")
+    if rtype not in SUPPORTED_ROPE_TYPES:
+        raise ValueError(
+            f"[deltaserve] RoPE type {rtype!r} is not supported by the "
+            f"finetuning backward (supported: {', '.join(SUPPORTED_ROPE_TYPES)});"
+            " training it would silently use the wrong positions")
+    if rtype == "default":
+        return None
+    need = {"linear": ("factor",),
+            "llama3": ("factor", "low_freq_factor", "high_freq_factor",
+                       "original_max_position_embeddings")}[rtype]
+    missing = [k for k in need if rp.get(k) is None]
+    if missing:
+        raise ValueError(f"[deltaserve] RoPE type {rtype!r} config lacks {missing}")
+    return {"rope_type": rtype, **{k: float(rp[k]) for k in need}}
+
+
 def read_lora_scaling(adapter_path: str | None) -> float:
     """``lora_alpha / r`` from the adapter's ``adapter_config.json`` (1.0 if
     the file is absent). The backward bakes this into B at publish time."""
@@ -116,9 +159,21 @@ def build_backward_meta(hf_config: Any, ft_cfg: Any, *, lm_head_key: str | None,
         "head_dim": head_dim,
         "intermediate_size": int(hf_config.intermediate_size),
         "rope_theta": rope_theta_of(hf_config),
+        "rope_scaling": rope_scaling_of(hf_config),
         "lora_scaling": float(lora_scaling),
         # Optimizer hyperparameters (Phase 3 LoRA backward).
         "learning_rate": float(ft_cfg.learning_rate),
+        # Trained-adapter checkpoints (deltaserve/adapter_io.py): the source
+        # adapter (its adapter_config.json is copied into every save) and the
+        # periodic-save policy, applied by the child after each cycle.
+        "finetuning_lora_path": getattr(ft_cfg, "finetuning_lora_path", None),
+        "adapter_save_path": getattr(ft_cfg, "adapter_save_path", None),
+        "adapter_save_every_backwards":
+            int(getattr(ft_cfg, "adapter_save_every_backwards", 0) or 0),
+        "adapter_save_every_epoch":
+            bool(getattr(ft_cfg, "adapter_save_every_epoch", False)),
+        "adapter_save_keep_last":
+            int(getattr(ft_cfg, "adapter_save_keep_last", 0) or 0),
         "weight_decay": float(ft_cfg.weight_decay),
         "gamma": float(ft_cfg.gamma),
         "backward_fp32": bool(ft_cfg.backward_fp32),

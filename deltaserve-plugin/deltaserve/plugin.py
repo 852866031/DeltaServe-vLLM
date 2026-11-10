@@ -31,7 +31,8 @@ around upstream methods, never replacing their bodies:
 - ``EngineCore`` / ``EngineCoreProc``: the ``EngineHooks`` (arrival signal
   before the executor, profiling pass before the busy loop, estimator save at
   shutdown, the input thread's ADD signal) and the
-  ``deltaserve_save_estimator_state`` utility.
+  ``deltaserve_save_estimator_state`` / ``deltaserve_finetuning_status``
+  utilities.
 - ``register_vllm_serve_api_routers``: the /start_finetuning, /stop_finetuning
   and /save_estimator_state routes.
 """
@@ -169,6 +170,7 @@ def _patch_engine_core() -> None:
     from deltaserve.engine_core import (
         FtInputQueue,
         attach_engine_hooks,
+        finetuning_status,
         save_estimator_state,
     )
 
@@ -237,6 +239,13 @@ def _patch_engine_core() -> None:
             return save_estimator_state(self, path)
 
         EngineCore.deltaserve_save_estimator_state = deltaserve_save_estimator_state
+
+    if not hasattr(EngineCore, "deltaserve_finetuning_status"):
+        def deltaserve_finetuning_status(self) -> dict:
+            """Utility behind GET /finetuning_status."""
+            return finetuning_status(self)
+
+        EngineCore.deltaserve_finetuning_status = deltaserve_finetuning_status
 
 
 def _patch_api_server() -> None:

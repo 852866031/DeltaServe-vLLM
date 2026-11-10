@@ -17,6 +17,9 @@ finetuning is off, so a plain deployment pays one is None check per hook).
 - **Launch-time profiling pass** that seeds the SLO estimator, before the busy loop.
 - **Estimator state** saved at the first sign of a shutdown, and on request
   (deltaserve_save_estimator_state utility).
+- **Finetuning status** (deltaserve_finetuning_status utility, GET
+  /finetuning_status). A failed profiling pass disables finetuning and the
+  engine serves inference, instead of dying after it reported ready.
 """
 
 import queue
@@ -120,7 +123,18 @@ class EngineHooks:
         sched = self.engine.scheduler
         if hasattr(self.engine, "input_queue") and hasattr(sched, "set_engine_inputs"):
             sched.set_engine_inputs(EngineInputs(self.engine))
-        profile_execution_model(self.engine)
+        try:
+            profile_execution_model(self.engine)
+        except Exception as e:  # noqa: BLE001
+            # The engine already reported ready: raising here kills the
+            # EngineCore after the client started waiting on it (observed:
+            # the client hangs in its first utility call). The pass only
+            # seeds the FT estimator, so serve inference without finetuning.
+            logger.exception("[deltaserve] launch profiling pass failed")
+            coord = self._coordinator()
+            if coord is not None:
+                coord.disable_finetuning(
+                    f"launch profiling pass failed: {type(e).__name__}: {e}")
 
     def save_estimator_state(self) -> None:
         save = getattr(self.engine.scheduler, "save_estimator_state", None)
@@ -187,6 +201,14 @@ def save_estimator_state(engine, path: str | None = None) -> dict:
     return {"saved": True, "path": path,
             "samples": engine.scheduler._tracker.size()}
 
+def finetuning_status(engine) -> dict:
+    """[status] Utility behind GET /finetuning_status."""
+    status = getattr(engine.scheduler, "finetuning_status", None)
+    if status is None:
+        return {"enabled": False, "error": "finetuning is not enabled"}
+    return {"enabled": True, **status()}
+
+
 def profile_execution_model(engine) -> None:
     """[Phase 4] Offline pass that seeds the SLO execution-time estimator.
 
@@ -210,6 +232,9 @@ def profile_execution_model(engine) -> None:
     # Only the FinetuneScheduler carries the estimator/tracker + hooks.
     if not hasattr(sched, "_estimator"):
         return
+    import os
+    if os.environ.get("DSERVE_TEST_FAIL_PROFILING"):   # tests only
+        raise RuntimeError("DSERVE_TEST_FAIL_PROFILING is set")
     coord = sched._coord
 
     from deltaserve import dprint

@@ -200,6 +200,10 @@ class DeltaServeWorker(Worker):
         )
         summary = backward_process.share_weights(
             base_state, ft_state, print_hash=ft_cfg.print_weight_hash, meta=meta)
+        if summary.get("error"):
+            raise RuntimeError(
+                f"[deltaserve] the backward child (rank {tp_rank}) could not "
+                f"build its training state: {summary['error']}")
 
         # Optionally hash the first/last FFN weight (base) + first/last q_proj
         # LoRA-A (adapter) on the PARENT side and compare to the child's hashes.
@@ -426,8 +430,15 @@ class DeltaServeWorker(Worker):
         coord = get_coordinator()
         if coord is None:
             return False
-        coord.start_finetuning()
-        return True
+        return coord.start_finetuning()
+
+    def deltaserve_save_adapter(self, path: str, save_id: str) -> bool:
+        """[DeltaServe] POST /save_adapter, via collective_rpc: every rank
+        asks its backward child to save (under TP the children gather their
+        shards to rank 0, which writes ``path``). Returns whether the request
+        reached the child; the save itself completes asynchronously."""
+        bp = getattr(self, "backward_process", None)
+        return bool(bp is not None and bp.request_save_adapter(path, save_id))
 
     def deltaserve_stop_finetuning(self) -> bool:
         """[DeltaServe] Close FT admission. Invoked via collective_rpc from the

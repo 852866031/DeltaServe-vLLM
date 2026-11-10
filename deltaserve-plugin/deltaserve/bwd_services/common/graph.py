@@ -407,7 +407,8 @@ class GraphedBackward:
                 pos_cpu.extend(range(want))
             pos_cpu.extend([0] * (self.s_max - len(pos_cpu)))
             pos_t = torch.tensor(pos_cpu, dtype=torch.long, device=self.device)
-            cos, sin = rope_cos_sin(pos_t, self.Hd, float(self.svc.theta))
+            cos, sin = rope_cos_sin(pos_t, self.Hd, float(self.svc.theta),
+                                    getattr(self.svc, "rope_scaling", None))
             self.static_cos.copy_(cos)
             self.static_sin.copy_(sin)
         else:

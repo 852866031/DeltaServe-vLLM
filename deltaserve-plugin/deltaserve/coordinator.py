@@ -407,6 +407,18 @@ class FinetuneCoordinator:
         # scheduler. The launch profiler bypasses this (it injects FT directly),
         # so profiling is unaffected.
         self.ft_started = True
+        # Set once finetuning is switched off for good (dead backward child,
+        # failed launch profiling pass): the reason, shown by GET
+        # /finetuning_status. Sticky — start_finetuning() and the TP mirror of
+        # the workers' ft_started flag cannot reopen admission after it.
+        self.ft_disabled_reason: str | None = None
+        # Training progress for GET /finetuning_status, updated on every
+        # backward ack (tp=1 poll_backward and the TP relay alike).
+        self.backwards_done = 0
+        self.tokens_trained = 0
+        self.last_loss: float | None = None
+        self.last_backward_wall: float | None = None
+        self._recent_losses: collections.deque = collections.deque(maxlen=20)
         # Wall-clock (monotonic) instant FT admission was opened by HTTP, used
         # as t=0 for the [batch] log's elapsed-since-start timer. None until
         # start_finetuning() fires.
@@ -578,13 +590,64 @@ class FinetuneCoordinator:
                     f"close_rps={close_rps:g} → "
                     f"admission_open=False{_ct}")
 
-    def start_finetuning(self) -> None:
-        """Open FT admission (POST /start_finetuning). Idempotent."""
+    def start_finetuning(self) -> bool:
+        """Open FT admission (POST /start_finetuning). Idempotent. Refused
+        (False) once finetuning was disabled (``disable_finetuning``)."""
+        if self.ft_disabled_reason is not None:
+            dprint(f"[coord] start_finetuning refused: finetuning was disabled "
+                   f"({self.ft_disabled_reason})")
+            return False
         if self.ft_start_time is None:
             self.ft_start_time = time.monotonic()
         if not self.ft_started:
             self.ft_started = True
             dprint("[coord] finetuning STARTED (admission opened by HTTP)")
+        return True
+
+    def disable_finetuning(self, reason: str) -> None:
+        """Switch finetuning off for the rest of the run (inference goes on):
+        closes admission and records ``reason`` so nothing reopens it."""
+        if self.ft_disabled_reason is None:
+            self.ft_disabled_reason = str(reason)
+            dprint(f"[coord] !!! FINETUNING DISABLED for the rest of this run: "
+                   f"{reason} (inference continues; restart the server to "
+                   f"resume finetuning)")
+        self.ft_started = False
+        self.admission_open = False
+
+    def note_backward_done(self, resp) -> None:
+        """Book one backward ack (``activations_processed``) for the status."""
+        if not isinstance(resp, dict) or resp.get("event") != "activations_processed":
+            return
+        self.backwards_done += 1
+        self.tokens_trained += int(resp.get("n", 0) or 0)
+        loss = resp.get("loss")
+        if loss is not None:
+            try:
+                self.last_loss = float(loss)
+                self._recent_losses.append(self.last_loss)
+            except (TypeError, ValueError):
+                pass
+        self.last_backward_wall = time.time()
+
+    def status(self) -> dict:
+        """Admission + training progress (GET /finetuning_status)."""
+        recent = list(self._recent_losses)
+        return {
+            "started": bool(self.ft_started),
+            "disabled_reason": self.ft_disabled_reason,
+            "admission_open": bool(self.admission_open),
+            "backward_in_flight": bool(self.pending_backward),
+            "epoch": int(self.current_epoch),
+            "backwards_done": int(self.backwards_done),
+            "tokens_trained": int(self.tokens_trained),
+            "last_loss": self.last_loss,
+            "mean_loss_last_20": (sum(recent) / len(recent)) if recent else None,
+            "last_backward_unix_time": self.last_backward_wall,
+            "buffer_fill": int(self.fill_count),
+            "buffer_capacity": int(self.capacity),
+            "corpus_tokens_per_epoch": int(self.corpus_total_tokens),
+        }
 
     def stop_finetuning(self) -> None:
         """Close FT admission (POST /stop_finetuning). Idempotent.
@@ -844,13 +907,9 @@ class FinetuneCoordinator:
         if (waited > self.pending_backward_warn_s
                 and (alive is False or waited > self.backward_dead_after_s)
                 and self.ft_started):
-            dprint(
-                f"[coord] !!! backward child {'DEAD' if alive is False else 'unresponsive'} "
-                f"after {waited:.0f}s — FINETUNING DISABLED for the rest of this run "
-                f"(inference continues; restart the server to resume finetuning)."
-            )
-            self.ft_started = False
-            self.admission_open = False
+            self.disable_finetuning(
+                f"backward child {'DEAD' if alive is False else 'unresponsive'} "
+                f"after {waited:.0f}s")
 
     def poll_backward(self) -> None:
         """Non-blocking: reopen admission once the backward pass has finished.
@@ -873,6 +932,7 @@ class FinetuneCoordinator:
                             "is_alive", lambda: None)()
             self._check_backward_stuck(alive=alive)
             return
+        self.note_backward_done(resp)
         if (self.bwd_log_path and isinstance(resp, dict)
                 and resp.get("event") == "activations_processed"):
             self._write_bwd_log_row(
@@ -921,6 +981,7 @@ class FinetuneCoordinator:
         samples, reset the buffer, and reopen FT admission."""
         if not self.relay_mode or not resp:
             return
+        self.note_backward_done(resp)
         if (self.bwd_log_path and isinstance(resp, dict)
                 and resp.get("event") == "activations_processed"):
             self._write_bwd_log_row(int(resp.get("n", 0)), resp.get("loss"))

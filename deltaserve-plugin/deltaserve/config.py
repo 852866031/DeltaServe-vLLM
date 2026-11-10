@@ -40,6 +40,26 @@ class FinetuneConfig:
     shared with the backward process. Analogue of DeltaServe's
     finetune.lora_path / finetuning_adapter (model_rpc.py:134-146)."""
 
+    adapter_save_path: str | None = None
+    """Directory trained-adapter checkpoints are written under (PEFT format:
+    ``adapter_model.safetensors`` with the fp32 masters, the source adapter's
+    ``adapter_config.json``, and ``trainer_state.json``). The periodic saves
+    below go to ``<adapter_save_path>/backward-<N>`` / ``epoch-<E>``; POST
+    /save_adapter without a ``path`` to ``<adapter_save_path>/manual-<time>``.
+    None (default): no periodic saves; POST /save_adapter needs a ``path``."""
+
+    adapter_save_every_backwards: int = 0
+    """Save the trained adapter after every N-th backward cycle (0 = off).
+    Written after the cycle's done-reply, so FT admission is not held for it."""
+
+    adapter_save_every_epoch: bool = False
+    """Save the trained adapter at every finetuning-epoch boundary (the state
+    after the last backward of the epoch, written as ``epoch-<E>``)."""
+
+    adapter_save_keep_last: int = 0
+    """Keep only the newest N periodic ``backward-*`` checkpoints (0 = keep
+    all). Epoch and manual saves are never pruned."""
+
     data_path: str | None = None
     """Path to the finetuning corpus: one tokenizable sample per non-empty line.
     Loaded + tokenized at startup by the FinetuningStore."""

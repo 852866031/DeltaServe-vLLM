@@ -153,7 +153,7 @@ config fields.
 
 | Process | Stock vLLM | What DeltaServe adds | Seam (how it plugs in, no vLLM edit) |
 |---|---|---|---|
-| **API server** | OpenAI server, `AsyncLLM` | `/start_finetuning`, `/stop_finetuning`, `/save_estimator_state` | wrapper on `register_vllm_serve_api_routers` |
+| **API server** | OpenAI server, `AsyncLLM` | `/start_finetuning`, `/stop_finetuning`, `/finetuning_status`, `/save_adapter`, `/save_estimator_state` | wrapper on `register_vllm_serve_api_routers` |
 | **EngineCore** | `EngineCoreProc`, `Scheduler` | `FinetuneScheduler`: FT injection, SLO admission, throttles, interrupt tiers A/B. `EngineHooks`: arrival counter, launch profiling pass, estimator save | `scheduler_cls`; wrappers on `EngineCore` / `EngineCoreProc` methods; input-queue class swap |
 | **Worker** (per TP rank) | `Worker`, `GPUModelRunner`, model, CUDA graphs | `DeltaServeWorker` spawns the backward child and exports weights and buffers over CUDA IPC. `DeltaServeModelRunner` builds the FT mask, keeps the timing ring, handles tier-C abort and relays results to the scheduler. `FtCudagraphDispatcher` adds the `has_ft` graph set. Accumulator hooks save FT activations | `worker_cls`; the worker adopts the runner by class swap; a dispatcher subclass with its own batch-descriptor class; wrapper on `CUDAGraphWrapper.__call__`; a custom op traced by Dynamo |
 | **Backward child** (per TP rank) | — | LoRA SFT trainer (`bwd_services/`): manual per-layer backward, CUDA graphs, fused AdamW, publish to the served LoRA slot | spawned by the worker (daemon check lifted around `start()`) |
@@ -190,13 +190,17 @@ hook is inert.
 | Family | HF architecture | Backward service | Tested on | Notes |
 |---|---|---|---|---|
 | **Qwen3** | `Qwen3ForCausalLM` | `bwd_services/qwen3.py` | **Qwen3-14B-Base, TP=2** (2× RTX 5090): primary target, full stack. Qwen3-0.6B-Base, TP=1 (smoke). Qwen3-14B / 32B at TP=4 on A100 (configs in `configs/*_A100*.yaml`) | Per-head `q_norm` / `k_norm` handled in the backward. Mixed-batch forward CUDA graphs supported. Tied `lm_head` (0.6B) resolved through the LoRA-wrapped embedding |
-| **Llama-3** | `LlamaForCausalLM` | `bwd_services/llama3.py` | Meta-Llama-3-8B, TP=1 and TP=2 | Full backward stack. Mixed-batch forward graphs not wired (FT batches run eager) |
+| **Llama-3 / 3.1 / 3.2 / 3.3** | `LlamaForCausalLM` | `bwd_services/llama3.py` | Meta-Llama-3-8B, TP=1 and TP=2; Llama-3.2-1B, TP=1 (end-to-end test) | Full backward stack. The 3.1+ RoPE rescale (`rope_type: llama3`) is reproduced exactly in the backward. Mixed-batch forward graphs not wired (FT batches run eager) |
 
 **Adding a family.** Write `bwd_services/<family>.py` (its layer forward and
 backward plus a `Family` record; everything shared lives in `bwd_services/common/`),
 register it in `bwd_services/registry.py`, and add a YAML. vLLM needs no change
 unless the architecture breaks a generic assumption: module names, SwiGLU or
 RMSNorm.
+
+**RoPE:** plain, `linear` and `llama3` scaling. Any other variant (`yarn`,
+`dynamic`, `longrope`, partial rotary, multimodal) makes the worker refuse to start
+rather than train with positions that differ from the served forward.
 
 **LoRA targets:** `q_proj`, `k_proj`, `v_proj`, `o_proj` (rank 16 in the shipped
 toy adapters). **Parallelism:** tensor parallel. Each rank trains its own weight
@@ -619,10 +623,51 @@ curl -X POST localhost:8000/start_finetuning        # open FT admission (start_o
 curl -X POST localhost:8000/stop_finetuning         # close it
 curl -X POST localhost:8000/save_estimator_state -H 'content-type: application/json' \
      -d '{"path": "estimator.json"}'                # dump the fitted estimator
+curl localhost:8000/finetuning_status               # progress: backwards, tokens, loss, epoch, admission
+curl -X POST localhost:8000/save_adapter -H 'content-type: application/json' \
+     -d '{"path": "out/my-adapter"}'                # write the trained adapter now (PEFT format)
 ```
 
-Per-cycle training progress goes to the server log (`[backward] <ms>ms (graph)
-loss=… n=… epoch=…`) and, if `bwd_log_path` is set, to a CSV.
+`GET /finetuning_status` returns whether finetuning is running (or why it was
+switched off), backward cycles done, tokens trained, last loss and the mean of the
+last 20, epoch, buffer fill and corpus progress. Under TP it is the EngineCore's
+view, fed by every rank's relayed acks. Per-cycle progress also goes to the server
+log (`[backward] <ms>ms (graph) loss=… n=… epoch=…`) and, if `bwd_log_path` is set,
+to a CSV.
+
+### Saving the trained adapter
+
+The adapter being trained lives in GPU memory. Save it with `POST /save_adapter`
+or periodically:
+
+| `finetune.*` | Writes | Default |
+|---|---|---|
+| `adapter_save_path` | root directory for the saves below; `POST /save_adapter` without a `path` writes `<root>/manual-<time>` | unset |
+| `adapter_save_every_backwards: N` | `<root>/backward-<N>` after every N-th backward cycle | `0` (off) |
+| `adapter_save_every_epoch` | `<root>/epoch-<E>`: the adapter after the last backward of epoch E | `false` |
+| `adapter_save_keep_last: K` | keep only the newest K `backward-*` saves (epoch and manual saves are kept) | `0` (all) |
+
+Each save is a standard PEFT LoRA directory: `adapter_model.safetensors` (the fp32
+masters, under TP merged from every rank's shard), the source adapter's
+`adapter_config.json`, and `trainer_state.json` (cycles, tokens, last loss, epoch,
+lr). It loads with `vllm serve --lora-modules name=<dir>`, with PEFT, or as
+`finetune.finetuning_lora_path` to keep training from it (the optimizer state starts
+fresh). The backward child writes it between cycles, so the snapshot is consistent
+and FT admission is not held for it. `POST /save_adapter` waits until it is on disk
+(`{"wait": false}` returns at once; `timeout_s`, default 300).
+
+### When something fails
+
+| Failure | Behaviour |
+|---|---|
+| FT adapter missing or empty | the worker refuses to start, with the path in the error |
+| the backward child cannot build its training state (missing weight, bad TP geometry, …) | the child's error comes back in its first reply; the launch aborts with it |
+| unsupported RoPE variant | the launch aborts (see [Supported models](#supported-models)) |
+| the launch profiling pass raises | finetuning is switched off with the reason; the server serves inference |
+| the backward child dies or stops answering | finetuning is switched off for the run (also under TP); inference continues |
+
+The reason shows in `GET /finetuning_status` as `disabled_reason`, and
+`POST /start_finetuning` cannot reopen a disabled run.
 
 ---
 
@@ -707,6 +752,10 @@ tests/run_all.sh /tmp/ds-tests 'test_qwen3_*'  # a subset
 | Group | Scripts | Needs |
 |---|---|---|
 | Plugin wiring, config, store, estimator, child spawn | `test_phase1_step1`, `test_phase1_step2`, `test_config_loader`, `test_finetuning_store`, `test_merged_estimator`, `test_profiling_shapes`, `test_step_trace` | CPU |
+| RoPE scaling == vLLM's served RoPE (llama3 / linear / default), unsupported variants refused, trainer gradients with llama3 RoPE (+ negative control) | `test_rope_scaling` | CPU |
+| Adapter checkpoints: TP merge, periodic / epoch / manual saves, PEFT-loadable with matching logits, error reporting, TP=2 gather | `test_adapter_save` | CPU (gloo) |
+| Fail-safes and status: build errors reach the worker, sticky disable (incl. the TP mirror), profiling failure degrades, status bookkeeping, HTTP routes | `test_ft_failsafe` | CPU |
+| **Checkpoints / status / fail-safes end to end**: real server, saved adapter == the served trained slot (vLLM and HF PEFT), profiling failure, resume, Llama-3.2-1B remat == served forward | `test_adapter_save_e2e` (`--tp 2` for the HTTP phase on 2 GPUs) | 1 / 2 GPUs + weights |
 | Activation hooks | `test_accumulate_hooks` | CPU |
 | Graph-capturable save op, CUDA-IPC weight sharing | `test_ft_save_op`, `test_phase1_step3` | 1 GPU |
 | Backward math (gradcheck vs autograd), graph == eager | `test_{llama3,qwen3}_backward`, `test_{llama3,qwen3}_backward_graph`, `test_{llama3,qwen3}_train_overfit` | 1 GPU |

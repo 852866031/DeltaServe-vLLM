@@ -593,10 +593,14 @@ class FinetuneScheduler(AsyncScheduler):
         if not self.vllm_config.finetune_config.enable_finetuning:
             return False
         coord = self._coord
+        if coord.pending_backward and coord.ft_disabled_reason is None:
+            # Poll the in-flight backward to completion — also after a POST
+            # /stop_finetuning, or its ack (sample commit, status) is never
+            # collected while the engine idles. Not once finetuning is
+            # disabled (a dead child never acks: that would spin forever).
+            return True
         if not coord.ft_started:
             return False  # FT held closed (awaiting POST /start_finetuning)
-        if coord.pending_backward:
-            return True  # poll the in-flight backward to completion
         if coord.epoch_flush_pending and (
                 coord.fill_count + coord.reserved_fill) > 0:
             return True  # flush flag set at inject → step so the backward fires  # epoch tail awaiting flush
@@ -752,6 +756,23 @@ class FinetuneScheduler(AsyncScheduler):
             feats.t_in, feats.p, feats.t_ft, feats.b_d, feats.k, feats.s,
             at[0], at[1], at[2], at[3], at[4], at[5], at[6], at[7], at[8],
             pred_raw, predicted, None, None, pending, None, run_inf, waiting))
+
+    # ─── GET /finetuning_status ───────────────────────────────────────────────
+    def finetuning_status(self) -> dict:
+        """Admission + training progress (EngineCore utility behind GET
+        /finetuning_status). Under TP this is the EngineCore coordinator: it
+        sees every backward through the relayed acks."""
+        st = self._coord.status()
+        store = self._ft_injector.store
+        n = len(store)
+        st.update({
+            "total_epochs": int(store.total_epochs),
+            "store_epoch": int(store.current_epoch),
+            "corpus_samples": int(n),
+            "samples_trained_this_epoch": int(sum(store.trained)) if n else 0,
+            "estimator_fitted": self._estimator.eager_rmse is not None,
+        })
+        return st
 
     # ─── Estimator state carry-over (estimator_state_{save,load}_path) ────────
     def save_estimator_state(self, path: str | None = None) -> str | None:
@@ -1294,7 +1315,8 @@ class FinetuneScheduler(AsyncScheduler):
             # collective_rpc that only reaches workers) so this scheduler coord
             # opens admission. One-step lag after the POST is fine.
             _started = getattr(model_runner_output, "finetune_ft_started", None)
-            if _started is not None and _started and not self._coord.ft_started:
+            if (_started is not None and _started and not self._coord.ft_started
+                    and self._coord.ft_disabled_reason is None):
                 self._coord.start_finetuning()
             elif _started is not None and not _started and self._coord.ft_started:
                 # POST /stop_finetuning only reaches the workers as well.
