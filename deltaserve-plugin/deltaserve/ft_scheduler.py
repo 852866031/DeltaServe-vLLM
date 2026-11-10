@@ -9,7 +9,7 @@ max_tokens=1 prefill-only requests, and are scrubbed + KV-freed in
 update_from_output BEFORE the base loop runs — so they never produce an
 EngineCoreOutput and are invisible to the frontend.
 
-Selected via scheduler_config.scheduler_cls when finetune.enable_finetuning is
+Selected via scheduler_config.scheduler_cls when finetune_param.enable_finetuning is
 set (``deltaserve/engine_config.py``).
 
 With ``forward_interruptible`` it also pre-empts FT-only steps for inference
@@ -184,7 +184,7 @@ class FinetuneScheduler(AsyncScheduler):
 
         # [match_prefill_workload_factor] Leaky-bucket counter of inference
         # prefill tokens we've observed but NOT spent on FT admission. When
-        # ``finetune.match_prefill_workload_factor > 0`` this gates each
+        # ``throttles.match_prefill_workload_factor > 0`` this gates each
         # prefill-step's FT admit: hold off until
         # ``(counter + t_in) * factor`` covers the next FT sample's size,
         # then admit ONE sample + reset. Set to 0 on every successful FT
@@ -777,7 +777,7 @@ class FinetuneScheduler(AsyncScheduler):
     # ─── Estimator state carry-over (estimator_state_{save,load}_path) ────────
     def save_estimator_state(self, path: str | None = None) -> str | None:
         """Write the estimator state to ``path`` (explicit request, e.g. POST
-        /save_estimator_state) or to ``finetune.estimator_state_save_path``
+        /save_estimator_state) or to ``slo.estimator_state_save_path``
         (shutdown hooks; best effort and at most once, since a server that is
         stopped by signalling its process group rarely gets that far)."""
         if path is None:

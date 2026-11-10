@@ -23,7 +23,7 @@ from launch_deltaserve import (build_server_cmd, post_start_finetuning,  # noqa:
                                terminate, wait_for_health)
 
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-ap.add_argument("--config", default=str(_ROOT / "configs" / "serving_config_finetuning_qwen3_14b_tp2_arxiv.yaml"))
+ap.add_argument("--config", default=str(_ROOT / "configs" / "preset" / "serving_config_finetuning_qwen3_14b_tp2_arxiv.yaml"))
 ap.add_argument("--family", default="qwen3-14b")
 ap.add_argument("--port", type=int, default=8000)
 ap.add_argument("--tp", type=int, default=None)

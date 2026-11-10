@@ -2,7 +2,7 @@
 """TP=2 inference-correctness gate: FT co-serving must not perturb real requests.
 
 Runs tests/test_phase1_m1.py's leak check on Qwen3-14B with tensor parallelism 2
-and the production preset's FT config unchanged (configs/serving_config_finetuning_
+and the production preset's FT config unchanged (configs/preset/serving_config_finetuning_
 qwen3_14b_tp2.yaml: has_ft CUDA graphs, FT-only graphs, rank-symmetric tier-C
 aborts, pause_on_arrival, every activation save, backward CUDA graphs). Same
 method: an amplified FT adapter, a positive control, staggered arrivals so FT

@@ -34,7 +34,7 @@ from deltaserve import dprint
 
 class RpsTracker:
     """Sliding-window inference-arrival rate tracker for the
-    ``finetune.rps_throttle_*`` knobs.
+    ``throttles.rps_throttle_*`` knobs.
 
     Hooked from ``v1/engine/core.py``'s input-queue drain — every
     request that lands in the engine's input_queue calls
@@ -396,14 +396,14 @@ class FinetuneCoordinator:
         self._completed_samples: list = []
         self.record_timing = True
         # [eval] Optional finetune-throughput log: one row per completed
-        # backward (set from finetune.bwd_log_path by the scheduler). The eval
+        # backward (set from telemetry.bwd_log_path by the scheduler). The eval
         # harness reads it for the FT-throughput plot.
         self.bwd_log_path: str | None = None
         self._bwd_idx = 0
         self._bwd_total_tokens = 0
         # FT admission master switch (separate from the buffer/backward gates).
         # When False, no FT is injected regardless of buffer space — flipped on
-        # by POST /start_finetuning. Set from finetune.start_on_launch by the
+        # by POST /start_finetuning. Set from finetune_param.start_on_launch by the
         # scheduler. The launch profiler bypasses this (it injects FT directly),
         # so profiling is unaffected.
         self.ft_started = True

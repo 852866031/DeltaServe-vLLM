@@ -5,7 +5,7 @@
 mixed, idle) under the SLO estimator's gate — NOT just prefill-carrying steps.
 
 Selected via ``scheduler_config.scheduler_cls`` when
-``finetune.coserving_admission_phase == "both"`` (see ``vllm/config/vllm.py``
+``throttles.coserving_admission_phase == "both"`` (see ``vllm/config/vllm.py``
 __post_init__). The proportional cap
 ``ft_tokens_admission_constrain_factor`` is prefill-relative so it's
 incompatible with this mode — selection soft-falls back to ``FinetuneScheduler``

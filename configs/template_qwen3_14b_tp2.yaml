@@ -1,0 +1,121 @@
+# DeltaServe template — Qwen3-14B-Base, tensor parallel 2 (e.g. 2× RTX 5090 32 GB).
+#
+# The recommended starting point: the settings of the validated main preset
+# (configs/preset/serving_config_finetuning_qwen3_14b_tp2.yaml: 100 % TTFT SLO on the
+# tight / loose / production traces), with finetuning opened at launch, the per-batch
+# prints off, and the trained adapter + per-backward log written to disk.
+#
+#   python eval-tp/launch_deltaserve.py --config configs/template_qwen3_14b_tp2.yaml
+#
+# Relative paths resolve against this file's directory (configs/).
+# Every finetune key is documented in deltaserve-plugin/deltaserve/config.py.
+
+# ── finetune_param: the training job ─────────────────────────────────────────
+finetune_param:
+  enable_finetuning: true            # master switch: false = plain vLLM (no backward child, no FT)
+  start_on_launch: true              # open FT admission at launch (false: wait for POST /start_finetuning)
+  finetuning_lora_path: ../adapters/qwen3-14b-toy-lora-ft   # PEFT LoRA dir the backward trains (q/k/v/o); a saved checkpoint resumes training
+  data_path: ../data/alpaca_1000.txt # corpus: one training sample per non-empty line
+  num_epochs: 20                     # passes over the corpus
+  learning_rate: 0.000005            # AdamW lr on the fp32 LoRA masters
+  weight_decay: 0.01                 # AdamW weight decay
+  gamma: 0.9                         # StepLR decay applied once per epoch
+  max_saved_finetuning_tokens: 256   # activation buffer in tokens = FT tokens per backward cycle (also sizes the backward graphs); samples longer than this are dropped
+  adapter_save_path: ../checkpoints/qwen3-14b   # where trained adapters go (PEFT format); also the default of POST /save_adapter
+  adapter_save_every_backwards: 500  # save every N backward cycles as backward-<N> (0 = off)
+  adapter_save_keep_last: 3          # keep only the newest 3 backward-* saves (0 = keep all)
+  adapter_save_every_epoch: true     # save epoch-<E> after each epoch's last backward
+
+# ── finetune_features: how co-serving runs the job ───────────────────────────
+finetune_features:
+  # backward child
+  backward_mps_percentage: 0         # 0 = no MPS (the pause contract protects prefill); >0 needs an MPS daemon and caps the child's SMs
+  backward_fp32: false               # false = bf16 bulk backward GEMMs (scores, softmax, norms, LM head, masters stay fp32)
+  backward_cuda_graph: true          # per-layer backward CUDA graphs (forward recompute, FFN bwd, shared attention bwd); TP-safe
+  backward_cuda_graph_attn_bn_max: 8 # padded attention graph fits ≤ 8 samples per cycle, else that cycle runs eager
+  backward_cuda_graph_attn_l_max: 64 # ... and samples ≤ 64 tokens (cost is quadratic in this)
+  # activation saves (skip parts of the backward's forward recompute)
+  save_activations: true             # false only to measure the save overhead (nothing is trained)
+  save_attn_qkv: true                # save q/k/v: skips the Q/K/V projection (exact for Qwen3: saved before q_norm/k_norm)
+  save_attn_ctx: true                # save the attention context: skips the attention forward
+  save_resid_mid: true               # save the post-attention residual: skips the O projection + one all-reduce per layer (~100 MB)
+  # forward graphs for batches carrying FT samples
+  graph_ft_batches: true             # mixed (inference + FT) batches replay their own has_ft piecewise CUDA graphs
+  graph_ft_max_tokens: 512           # capture the has_ft graphs up to this padded batch size; larger mixed batches run without a graph
+  graph_ft_only_batches: true        # FT-only batches (idle GPU) replay the same has_ft graphs (+5 % FT on production)
+  # protecting inference latency
+  forward_interruptible: true        # tiers A/B/C: a request that arrives during an FT-only step pre-empts it
+  ft_only_admission_grace_ms: 2.0    # tier A: wait this long for a request before scheduling an FT-only step (0 = off)
+  pause_until_prefill_done: true     # the backward child stays paused until the inference prefill has finished on the GPU
+  pause_on_arrival: true             # the child also yields as soon as a request arrives (production TTFT p99 270 → 99 ms)
+  pause_prefill_always: false        # pause the child on every prefill step, not only while a backward runs (fewer FT cycles)
+  backward_run_ahead_boundaries: 2   # the child's CPU runs ≤ 2 pause boundaries ahead of its GPU, so a pause lands in ~3-6 ms
+
+# ── throttles: how much FT rides next to inference (all off: the SLO gate decides) ──
+throttles:
+  coserving_admission_phase: prefill # FT joins only prefill-carrying steps ("both": decode-only steps too)
+  ft_tokens_admission_constrain_factor: -1   # >0: FT tokens per step ≤ factor × inference prefill tokens (-1 = off)
+  match_prefill_workload_factor: 0   # >0: leaky bucket, FT admitted only as inference prefill credit accrues (0 = off)
+  fwd_token_throttle_enable: false   # pause the backward while a step's token count ≥ fwd_token_throttle
+  fwd_token_throttle: 200            # threshold for the above
+  rps_throttle_enable: false         # close FT admission while the request rate is above close_rps
+  rps_throttle_close_rps: 50.0       # close above this many requests/s
+  rps_throttle_open_rps: 30.0        # reopen below this (hysteresis)
+  rps_throttle_window_s: 1.0         # rate measured over this sliding window
+  rps_throttle_close_time: 0.0       # stay closed at least this long once closed
+
+# ── slo: inference targets + the step-time estimator that enforces them ──────
+slo:
+  ttft_slo: 0.4                      # time-to-first-token target (s): FT is admitted only while the predicted step keeps it
+  avg_tbt_slo: 0.02                  # average time-between-tokens target (s) for running decodes
+  max_tbt_slo: 0.05                  # max single-step time (s) while FT is admitted
+  profile_on_launch: true            # profile synthetic batches at launch to fit the estimator (~1-2 min)
+  profile_num_repeats: 2             # recorded passes per profiling shape
+  decode_only_ft_safety_margin: 0.7  # ("both" phase only) max_tbt_slo × this on decode-only steps
+  # estimator_state_save_path: ../logs/qwen3-14b/estimator.json   # keep the fitted estimator for the next launch
+  # estimator_state_load_path: ../logs/qwen3-14b/estimator.json   # ... and restore it
+
+# ── debug: log prints (stdout) ───────────────────────────────────────────────
+debug:
+  print_weight_hash: false           # hash-compare the weights the backward child sees (startup)
+  print_activation_hash: false       # verify the captured activations every cycle (slow)
+  print_scheduler_add: false         # one line per scheduled non-decode batch
+  print_engine_batch_exec: false     # one line per executed batch: prefill / FT / decode composition, graph or eager
+  print_engine_batch_done: false     # one line per finished batch
+  print_engine_req_recv: false       # one line per received request
+
+# ── telemetry: what is recorded to disk ──────────────────────────────────────
+telemetry:
+  bwd_log_path: ../logs/qwen3-14b/bwd_log.csv   # one row per backward cycle: time, epoch, tokens, loss, total tokens
+  # step_trace_path: ../logs/qwen3-14b/step_trace.csv   # one row per engine step: composition, predicted vs measured GPU time (eval-tp/analyze_step_trace.py)
+  # batch_prediction_stats_path: ../logs/qwen3-14b/batch_prediction_stats.csv   # estimator prediction stats, written at shutdown
+
+# ── plain vLLM settings below ────────────────────────────────────────────────
+adapters:
+  lora_path_0: ../adapters/qwen3-14b-toy-lora   # inference LoRA served as "qwen3-14b-toy-lora"
+
+lora:
+  enable_lora: true                  # required: the FT adapter is served as a LoRA
+  max_loras: 2                       # LoRA slots per batch: the FT adapter + 1 inference adapter
+  max_lora_rank: 16                  # ≥ the rank of every adapter
+
+server:
+  host: 127.0.0.1
+  port: 8000
+  rank_id: 0                         # reserved
+  api_server_count: 1                # API frontend processes
+
+model:
+  model: Qwen/Qwen3-14B-Base
+  tokenizer_mode: auto
+  trust_remote_code: false
+  dtype: auto                        # bf16 for this model
+  max_model_len: 2048                # context length
+
+engine:
+  gpu_memory_utilization: 0.80       # vLLM's share of each GPU; the rest is left to the backward child (fp32 logits, temporaries)
+  enforce_eager: false               # CUDA graphs on
+  disable_log_stats: true            # vLLM's per-step stats stream (forced on when finetuning: it stalls the frontend)
+
+parallel:
+  tensor_parallel_size: 2            # one backward child per rank, each training its shard

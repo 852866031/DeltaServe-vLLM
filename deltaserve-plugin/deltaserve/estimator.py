@@ -88,7 +88,7 @@ REGIMES = (REGIME_INF_PREFILL, REGIME_EAGER, REGIME_DECODE_ONLY,
 
 # Process-wide switch: split FT-carrying steps into EAGER (FT-only, eager)
 # and FT_MIXED (with inference, graphed). Set by the FT scheduler from
-# ``finetune.graph_ft_batches``; off keeps the single EAGER regime.
+# ``finetune_features.graph_ft_batches``; off keeps the single EAGER regime.
 _FT_MIXED_SPLIT = False
 
 

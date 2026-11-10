@@ -14,19 +14,21 @@
 # tests/test_qwen3_backward_graph.py) — flip it on to A/B. All three activation
 # saves are on (save_attn_qkv captures the pre-norm q/k, exact for Qwen3).
 
-finetune:
+finetune_param:
   enable_finetuning: true
   start_on_launch: false             # hold FT admission closed until POST /start_finetuning
-  backward_mps_percentage: 0         # no MPS daemon on this box; the pause contract protects prefill
-  graph_ft_batches: true             # [mixed-fwd-cuda-graph] mixed batches (inference + FT) replay has_ft CUDA graphs; FT-only stays eager
-  graph_ft_max_tokens: 512           # capture the has_ft set up to this padded size
-  finetuning_lora_path: ../adapters/qwen3-0.6b-toy-lora-ft
-  data_path: ../data/alpaca_1000.txt
+  finetuning_lora_path: ../../adapters/qwen3-0.6b-toy-lora-ft
+  data_path: ../../data/alpaca_1000.txt
   max_saved_finetuning_tokens: 256
   num_epochs: 20
   learning_rate: 0.000005
   weight_decay: 0.01
   gamma: 0.9
+
+finetune_features:
+  backward_mps_percentage: 0         # no MPS daemon on this box; the pause contract protects prefill
+  graph_ft_batches: false            # [mixed-fwd-cuda-graph] mixed batches (inference + FT) replay has_ft CUDA graphs; FT-only stays eager
+  graph_ft_max_tokens: 512           # capture the has_ft set up to this padded size
   backward_fp32: false
   forward_interruptible: false       # off for bring-up
   ft_only_admission_grace_ms: 0
@@ -58,7 +60,7 @@ debug:
   print_engine_req_recv: false
 
 adapters:
-  lora_path_0: ../adapters/qwen3-0.6b-toy-lora
+  lora_path_0: ../../adapters/qwen3-0.6b-toy-lora
 
 lora:
   enable_lora: true

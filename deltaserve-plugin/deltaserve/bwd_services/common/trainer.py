@@ -531,7 +531,7 @@ class LoraSftTrainerService(BackwardService):
         # Saved MLP pre-activations (gate||up) per layer, if captured in the forward
         # — lets the remat skip the gate_up matmul (the layer's biggest recompute).
         saved_gu = activations.get("mlp_gate_up")
-        # Saved post-RoPE q/k/v per layer (opt-in via finetune.save_attn_qkv) —
+        # Saved post-RoPE q/k/v per layer (opt-in via finetune_features.save_attn_qkv) —
         # when present AND exact for this family, lets the remat skip the
         # second-biggest layer recompute: Q/K/V projection + RoPE.
         if self.save_attn_qkv:
@@ -541,11 +541,11 @@ class LoraSftTrainerService(BackwardService):
         else:
             saved_qh_all = saved_kh_all = saved_vh_all = None
         # Saved attention context (o_proj input) per layer (opt-in via
-        # finetune.save_attn_ctx) — lets the remat skip the attention forward
+        # finetune_features.save_attn_ctx) — lets the remat skip the attention forward
         # (scores/softmax/AV). None when the feature is off.
         saved_ctx_all = activations.get("attn_ctx")
         # Saved post-attention residual per layer (opt-in via
-        # finetune.save_resid_mid) — lets the remat skip the O projection and,
+        # finetune_features.save_resid_mid) — lets the remat skip the O projection and,
         # under TP, the forward's only all-reduce. None when the feature is off.
         saved_rm_all = activations.get("resid_mid") if self.save_resid_mid else None
 

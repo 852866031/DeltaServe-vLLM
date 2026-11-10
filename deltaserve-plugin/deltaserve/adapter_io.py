@@ -20,7 +20,7 @@ them into a checkpoint with the helpers here:
   backward acks).
 
 A checkpoint loads anywhere a PEFT LoRA does: vLLM ``--lora-modules``, PEFT
-``PeftModel.from_pretrained``, or as ``finetune.finetuning_lora_path`` to keep
+``PeftModel.from_pretrained``, or as ``finetune_param.finetuning_lora_path`` to keep
 training from it (the optimizer state starts fresh).
 """
 

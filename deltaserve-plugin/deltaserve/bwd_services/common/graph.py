@@ -19,7 +19,7 @@ captured regions per layer:
   * **Padded-attention graph** — the per-sample scores/softmax/dQ/dK/dV core,
     rewritten against a padded ``[bn_max, l_max, H_*, Hd]`` view of the
     cached qh/kh/vh + grad_ctx (scatter in, compute, gather out). Bounds come
-    from ``finetune.backward_cuda_graph_attn_{bn_max,l_max}``.
+    from ``finetune_features.backward_cuda_graph_attn_{bn_max,l_max}``.
 
 Everything outside these three regions stays eager (O-proj bwd, RoPE bwd,
 Q/K/V-proj bwd, in_ln rmsnorm bwd, optimizer/publish). ``_maybe_pause`` is the
@@ -423,7 +423,7 @@ class GraphedBackward:
                     f"eager attn for this and similar batches "
                     f"(bn={bn}/{self.bn_max}, max_l={max_l}/{self.l_max}, "
                     f"n={n}/{self.s_max}). Tune "
-                    f"finetune.backward_cuda_graph_attn_{{bn_max,l_max}} if "
+                    f"finetune_features.backward_cuda_graph_attn_{{bn_max,l_max}} if "
                     f"this is frequent.")
             return
 

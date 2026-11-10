@@ -94,12 +94,12 @@ def resolve_timelines_dir(gpu: str) -> Path:
 # phase + decode_only_ft_safety_margin knobs.
 _SCHED_CONFIGS = {
     "5090": {
-        "prefill": _ROOT / "configs" / "serving_config_finetuning_llama3.yaml",
-        "both":    _ROOT / "configs" / "serving_config_finetuning_llama3_both.yaml",
+        "prefill": _ROOT / "configs" / "preset" / "serving_config_finetuning_llama3.yaml",
+        "both":    _ROOT / "configs" / "preset" / "serving_config_finetuning_llama3_both.yaml",
     },
     "A100": {
-        "prefill": _ROOT / "configs" / "serving_config_finetuning_llama3_A100.yaml",
-        "both":    _ROOT / "configs" / "serving_config_finetuning_llama3_both_A100.yaml",
+        "prefill": _ROOT / "configs" / "preset" / "serving_config_finetuning_llama3_A100.yaml",
+        "both":    _ROOT / "configs" / "preset" / "serving_config_finetuning_llama3_both_A100.yaml",
     },
 }
 # Schedulers are the same set across boards; flatten for argparse choices
@@ -191,7 +191,7 @@ def _load_yaml_cfg(config_path: Optional[str] = None) -> dict:
     output-file suffix without re-implementing the path dance.
 
     ``config_path`` overrides the default
-    ``configs/serving_config_finetuning_llama3.yaml`` — used by the
+    ``configs/preset/serving_config_finetuning_llama3.yaml`` — used by the
     ``--config`` CLI arg to A/B different scheduler variants."""
     sys.path[:] = [p for p in sys.path
                    if os.path.abspath(p or ".") not in {str(_HERE), str(_ROOT)}]
@@ -643,7 +643,7 @@ async def main() -> None:
                     help="Path to a serving YAML to use verbatim, overriding "
                          "the --scheduler/--timeline-gpu auto-resolution. Use "
                          "for one-off configs (e.g. the estimator-validation "
-                         "YAML, configs/serving_config_finetuning_llama3_"
+                         "YAML, configs/preset/serving_config_finetuning_llama3_"
                          "validate.yaml).")
     ap.add_argument("--model", default=None,
                     help="Base model id (HF) or local path. Default is "

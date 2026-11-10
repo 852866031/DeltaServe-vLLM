@@ -5,20 +5,22 @@
 # scheduling OFF and appends one (predicted, actual, features) row per
 # scheduled batch to estimator_validation_path. Drive it with co-serving on:
 #   python eval/auto_benchmark.py --co \
-#       --config configs/serving_config_finetuning_llama3_validate.yaml \
+#       --config configs/preset/serving_config_finetuning_llama3_validate.yaml \
 #       --timeline_csv eval/estimator/timeline_production.csv
 # then analyze with eval/estimator/plot_estimator_accuracy.py.
 
-finetune:
+finetune_param:
   enable_finetuning: true
-  backward_mps_percentage: 0         # no MPS daemon on this box; the pause contract protects prefill
-  finetuning_lora_path: ../adapters/llama3-toy-lora-ft
-  data_path: ../data/alpaca_1000.txt
+  finetuning_lora_path: ../../adapters/llama3-toy-lora-ft
+  data_path: ../../data/alpaca_1000.txt
   max_saved_finetuning_tokens: 256
   num_epochs: 20
   learning_rate: 0.000005
   weight_decay: 0.01
   gamma: 0.9
+
+finetune_features:
+  backward_mps_percentage: 0         # no MPS daemon on this box; the pause contract protects prefill
   backward_fp32: false
   # Estimator does not model mid-forward aborts; keep steps running to
   # completion so each measured "actual" is a full step (clean predicted-vs-
@@ -44,9 +46,9 @@ throttles:
 slo:
   # --- Estimator-accuracy validation ---
   validate_estimator: true             # forces async OFF + per-batch CSV append
-  # Path is resolved relative to THIS file's dir (configs/), so this lands at
+  # Path is resolved relative to THIS file's dir (configs/preset/), so this lands at
   # repo-root/eval/estimator/. (Path resolution applies to the finetune section.)
-  estimator_validation_path: ../eval/estimator/estimator_validation_production.csv
+  estimator_validation_path: ../../eval/estimator/estimator_validation_production.csv
   ttft_slo: 0.3
   avg_tbt_slo: 0.02
   max_tbt_slo: 0.1
@@ -63,7 +65,7 @@ debug:
   print_engine_req_recv: false
 
 adapters:
-  lora_path_0: ../adapters/llama3-toy-lora
+  lora_path_0: ../../adapters/llama3-toy-lora
 
 lora:
   enable_lora: true

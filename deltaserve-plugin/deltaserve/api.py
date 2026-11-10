@@ -4,7 +4,7 @@
 """HTTP control for co-serving finetuning admission.
 
 POST /start_finetuning opens FT admission (when the server was launched with
-finetune.start_on_launch=false). It runs `deltaserve_start_finetuning` on the
+finetune_param.start_on_launch=false). It runs `deltaserve_start_finetuning` on the
 worker via collective_rpc; under single-GPU/uniproc the worker shares the
 process with the scheduler + coordinator, so the flag flip is seen immediately.
 
@@ -71,8 +71,8 @@ async def stop_finetuning(raw_request: Request):
 async def save_estimator_state(raw_request: Request):
     """Write the SLO estimator's state (fitted coefficients + the recorded
     step samples) to a JSON file NOW. Optional JSON body ``{"path": ...}``;
-    default is ``finetune.estimator_state_save_path``. A later launch restores
-    it with ``finetune.estimator_state_load_path`` — this is how a long trace
+    default is ``slo.estimator_state_save_path``. A later launch restores
+    it with ``slo.estimator_state_load_path`` — this is how a long trace
     is replayed as separate runs with one continuous estimator. Call it before
     stopping the server: the shutdown-time save is only best effort."""
     try:
@@ -103,11 +103,11 @@ async def save_adapter(raw_request: Request):
     """Write the adapter being trained to a PEFT directory NOW (fp32 masters
     + the source ``adapter_config.json`` + ``trainer_state.json``). Optional
     JSON body: ``{"path": dir, "wait": true, "timeout_s": 300}``; ``path``
-    defaults to ``<finetune.adapter_save_path>/manual-<time>``. The save runs
+    defaults to ``<finetune_param.adapter_save_path>/manual-<time>``. The save runs
     in the backward child between cycles; with ``wait`` (default) the route
     returns once it is on disk (200, the trainer state) or failed (500), else
     202 right away. Loadable as a vLLM ``--lora-modules`` adapter, with PEFT,
-    or as ``finetune.finetuning_lora_path`` to continue training."""
+    or as ``finetune_param.finetuning_lora_path`` to continue training."""
     import asyncio
     import os
     import time
@@ -125,7 +125,7 @@ async def save_adapter(raw_request: Request):
         root = _ft_config(raw_request).get("adapter_save_path")
         if not root:
             return JSONResponse(status_code=400, content={
-                "error": "no path given and finetune.adapter_save_path is not set"})
+                "error": "no path given and finetune_param.adapter_save_path is not set"})
         path = os.path.join(root, time.strftime("manual-%Y%m%d-%H%M%S"))
     path = os.path.abspath(str(path))
     save_id = uuid.uuid4().hex

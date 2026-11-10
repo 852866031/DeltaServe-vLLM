@@ -29,7 +29,9 @@ phase-by-phase design note (`INTEGRATION_PROGRESS.md`, `VLLM_FORK_CHANGES.md`,
 ```
 deltaserve-plugin/deltaserve/   ALL our code (see README "Repository layout")
 vllm-upstream/                  stock vLLM submodule — NEVER edit
-configs/                        serving YAMLs: finetune / throttles / slo / debug + plain vLLM sections
+configs/                        template_<model>.yaml (commented starting points); preset/ = the configs behind
+                                experiments + tests. Sections: finetune_param / finetune_features / throttles /
+                                slo / debug / telemetry + plain vLLM sections (old single `finetune` still loads)
 adapters/  data/                toy LoRA adapters; datasets (FT corpora, data/timelines/ request traces)
 eval-tp/                        main eval (launcher, timeline replay, compare_runs, cleanup_validate.sh)
 eval/  eval-arxiv/              single-GPU eval; long-context probe
@@ -62,7 +64,10 @@ over (checked statically against main).
   `cleanup_validate.sh`): give the user the command and the expected output rather
   than running them yourself, unless asked.
 - New features go behind a config flag that defaults to the previous behaviour
-  (bit-identical when off).
+  (bit-identical when off). A new key goes into `FINETUNE_SECTIONS`
+  (`config_loader.py`) under its section, and into the templates with a comment.
+- **Presets reproduce runs:** edit `configs/preset/*.yaml` only together with the
+  experiments that use them; user-facing defaults live in `configs/template_*.yaml`.
 
 ## How the plugin hooks into vLLM
 

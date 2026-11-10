@@ -133,7 +133,7 @@ class DeltaServeWorker(Worker):
             raise RuntimeError(
                 f"[deltaserve] finetuning is enabled but the FT adapter at "
                 f"{path!r} has no weights (adapter_model.safetensors missing or "
-                f"empty): set finetune.finetuning_lora_path to a LoRA adapter "
+                f"empty): set finetune_param.finetuning_lora_path to a LoRA adapter "
                 f"directory (see scripts/init_adapters_*.py)")
 
         # Resolve the LM-head weight + trim/scale info the backward process needs
@@ -319,7 +319,7 @@ class DeltaServeWorker(Worker):
         coordinator.relay_mode = tp_size > 1
         # NOTE (known issue): under TP this worker-side coordinator keeps the
         # default ft_started=True and the scheduler mirrors it on the first
-        # step, so finetune.start_on_launch=false does not hold admission
+        # step, so finetune_param.start_on_launch=false does not hold admission
         # closed. Initialising the flag from start_on_launch here is not
         # enough: POST /start_finetuning only reaches the workers, and an idle
         # engine produces no ModelRunnerOutput to relay the flag back, so

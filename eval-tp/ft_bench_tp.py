@@ -10,7 +10,7 @@ eval/auto_benchmark.py, trimmed to the one question "does co-serving FT train
 correctly under TP=2".
 
 It reuses eval-tp/launch_deltaserve.build_server_cmd (same dir) so the server is
-built from configs/serving_config_finetuning_llama3_tp2.yaml exactly like the
+built from configs/preset/serving_config_finetuning_llama3_tp2.yaml exactly like the
 launch script, then appends a bwd_log path.
 
 Usage (dserve-vllm env, CUDA env per README.md):

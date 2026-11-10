@@ -50,9 +50,9 @@ _HF_HOME_DEFAULT = "/mnt/storage/huggingface"
 # the inference adapter (``adapters.lora_path_0``); the preset name doubles as
 # the served model name and the output-file tag.
 PRESETS: dict[str, Path] = {
-    "llama3": _ROOT / "configs" / "serving_config_finetuning_llama3_tp2.yaml",
-    "qwen3-14b": _ROOT / "configs" / "serving_config_finetuning_qwen3_14b_tp2.yaml",
-    "qwen3-0.6b": _ROOT / "configs" / "serving_config_finetuning_qwen3_0.6b.yaml",
+    "llama3": _ROOT / "configs" / "preset" / "serving_config_finetuning_llama3_tp2.yaml",
+    "qwen3-14b": _ROOT / "configs" / "preset" / "serving_config_finetuning_qwen3_14b_tp2.yaml",
+    "qwen3-0.6b": _ROOT / "configs" / "preset" / "serving_config_finetuning_qwen3_0.6b.yaml",
 }
 DEFAULT_FAMILY = "llama3"
 
@@ -110,7 +110,7 @@ def build_server_cmd(config_path: str, port: int, base_model: str | None = None,
     slo sections are NOT passed, so ``enable_finetuning`` stays at its default
     (False) and no backward child is spawned. ``bwd_log_path`` (co only) is the
     backward-throughput CSV the server appends to; ``step_trace_path`` (co only)
-    the per-step predicted-vs-actual trace (``finetune.step_trace_path``, see
+    the per-step predicted-vs-actual trace (``telemetry.step_trace_path``, see
     eval-tp/analyze_step_trace.py). ``api_server_count``
     overrides the YAML's ``server.api_server_count``."""
     _strip_repo_from_syspath()

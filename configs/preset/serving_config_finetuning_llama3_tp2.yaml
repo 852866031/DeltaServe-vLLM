@@ -22,17 +22,19 @@
 # M4.2 landed: the SLO estimator's timing feedback + the backward ack agreement
 # ride the TP relay, so `profile_on_launch` is ON and FT admission is SLO-gated.
 
-finetune:
+finetune_param:
   enable_finetuning: true
   start_on_launch: false             # hold FT admission closed (M1: launch-only)
-  backward_mps_percentage: 0         # no MPS daemon on this box; the pause contract protects prefill
-  finetuning_lora_path: ../adapters/llama3-toy-lora-ft
-  data_path: ../data/alpaca_1000.txt
+  finetuning_lora_path: ../../adapters/llama3-toy-lora-ft
+  data_path: ../../data/alpaca_1000.txt
   max_saved_finetuning_tokens: 256
   num_epochs: 20
   learning_rate: 0.000005
   weight_decay: 0.01
   gamma: 0.9
+
+finetune_features:
+  backward_mps_percentage: 0         # no MPS daemon on this box; the pause contract protects prefill
   backward_fp32: false
   forward_interruptible: true        # tiers A/B (scheduler) + tier C rank-symmetric under TP
   ft_only_admission_grace_ms: 2.0
@@ -70,7 +72,7 @@ debug:
   print_engine_req_recv: false
 
 adapters:
-  lora_path_0: ../adapters/llama3-toy-lora
+  lora_path_0: ../../adapters/llama3-toy-lora
 
 lora:
   enable_lora: true

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """M5 gate: the CUDA-graph backward under TP=2 on two real GPUs (NCCL).
 
-Phase 7 / M5 re-enables ``finetune.backward_cuda_graph`` under tensor
+Phase 7 / M5 re-enables ``finetune_features.backward_cuda_graph`` under tensor
 parallelism by keeping every collective OUT of the captured regions: the
 forward graph is split at the O-proj output (``static_o``, all-reduced
 eagerly before the runner's ``forward_tail``), and the family's

@@ -33,14 +33,14 @@ _ROOT = os.path.dirname(_HERE)  # repo root (this script lives in scripts/)
 sys.path[:] = [p for p in sys.path
                if os.path.abspath(p or ".") not in (_HERE, _ROOT)]
 
-_DEFAULT_CONFIG = Path(_ROOT) / "configs" / "serving_config_finetuning_llama3.yaml"
+_DEFAULT_CONFIG = Path(_ROOT) / "configs" / "preset" / "serving_config_finetuning_llama3.yaml"
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=str(_DEFAULT_CONFIG),
-                    help="DeltaServe YAML config (default: configs/serving_config_finetuning_llama3.yaml)")
+                    help="DeltaServe YAML config (default: configs/preset/serving_config_finetuning_llama3.yaml)")
     ap.add_argument("--model", default=None,
                     help="override model dir/id from the YAML (e.g. Qwen/Qwen3-0.6B)")
     ap.add_argument("--prompt", default="The capital of France is")

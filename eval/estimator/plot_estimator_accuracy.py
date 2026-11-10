@@ -2,7 +2,7 @@
 """plot_estimator_accuracy.py — SLO execution-time estimator error vs time.
 
 Reads the per-batch predicted-vs-actual CSV written by the server in
-``validate_estimator`` mode (see configs/serving_config_finetuning_llama3_
+``validate_estimator`` mode (see configs/preset/serving_config_finetuning_llama3_
 validate.yaml) and produces ONE figure:
 
   • a single combined **error-vs-time** plot mixing the selected regimes
@@ -323,7 +323,7 @@ def main():
     if not os.path.exists(args.input):
         sys.exit(f"[estimator-eval] input not found: {args.input}\n"
                  "Run a validate_estimator session first (see "
-                 "configs/serving_config_finetuning_llama3_validate.yaml).")
+                 "configs/preset/serving_config_finetuning_llama3_validate.yaml).")
 
     times, actual, predicted, regime, was_graph = load_rows(args.input)
     if actual.size == 0:

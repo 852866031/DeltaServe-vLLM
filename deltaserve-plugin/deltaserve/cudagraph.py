@@ -6,7 +6,7 @@
 * An FT-only step and a mixed step without the graph-capturable save path
   run eager: the activation hooks read per-step Python state a replay would
   bake in.
-* A mixed step on the save-op path (``finetune.graph_ft_batches``) replays a
+* A mixed step on the save-op path (``finetune_features.graph_ft_batches``) replays a
   graph from a second PIECEWISE set — captured with the save op live — keyed
   by ``FtBatchDescriptor``. Being its own class, it never compares equal to the
   plain ``BatchDescriptor`` of the same shape, so the two sets cannot collide

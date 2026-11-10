@@ -188,7 +188,7 @@ def _profiling_step(engine) -> None:
 def save_estimator_state(engine, path: str | None = None) -> dict:
     """[estimator] Utility call behind POST /save_estimator_state: write
     the SLO estimator's state now. ``path`` defaults to
-    ``finetune.estimator_state_save_path``."""
+    ``slo.estimator_state_save_path``."""
     save = getattr(engine.scheduler, "save_estimator_state", None)
     if save is None:
         return {"saved": False, "error": "finetuning is not enabled"}
@@ -196,7 +196,7 @@ def save_estimator_state(engine, path: str | None = None) -> dict:
                            "estimator_state_save_path", None)
     if not path:
         return {"saved": False, "error": "no path given and "
-                "finetune.estimator_state_save_path is not set"}
+                "slo.estimator_state_save_path is not set"}
     save(path)
     return {"saved": True, "path": path,
             "samples": engine.scheduler._tracker.size()}

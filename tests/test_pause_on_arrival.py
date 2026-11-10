@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""finetune.pause_on_arrival — the backward child's arrival wait (CPU only).
+"""finetune_features.pause_on_arrival — the backward child's arrival wait (CPU only).
 
 Drives ``BackwardService._arrival_blocked`` / ``_maybe_pause`` with a real
 shared-memory arrival counter and a threading.Event standing in for the GPU

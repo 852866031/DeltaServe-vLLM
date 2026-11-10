@@ -104,11 +104,12 @@ python scripts/init_adapters_qwen3.py --size 0.6b
 ```
 
 **5. Check the install** (CPU only, a few seconds), then **launch** a co-serving
-server. `--start-finetuning` opens FT admission once the server is healthy:
+server from the Qwen3-0.6B template ([`configs/template_qwen3_0.6b.yaml`](configs/template_qwen3_0.6b.yaml),
+every setting commented). Finetuning starts as soon as the server is up:
 
 ```bash
 python tests/test_phase1_step1.py
-python eval-tp/launch_deltaserve.py --family qwen3-0.6b --start-finetuning --hf-home $HF_HOME
+python eval-tp/launch_deltaserve.py --config configs/template_qwen3_0.6b.yaml --hf-home $HF_HOME
 ```
 
 **6. Send a request** from another shell. The server log prints one
@@ -124,19 +125,18 @@ memory until you save it:
 
 ```bash
 curl -s localhost:8000/finetuning_status          # backwards done, tokens, loss, epoch
-curl -s -X POST localhost:8000/save_adapter -H 'content-type: application/json' \
-     -d '{"path": "out/qwen3-0.6b-sft"}'           # PEFT dir: adapter_model.safetensors + configs
+curl -s -X POST localhost:8000/save_adapter       # → checkpoints/qwen3-0.6b/manual-<time>/
 ```
 
-The saved directory is an ordinary LoRA adapter: serve it with
-`vllm serve Qwen/Qwen3-0.6B-Base --enable-lora --lora-modules sft=out/qwen3-0.6b-sft`,
-load it with PEFT, or point `finetune.finetuning_lora_path` at it to keep training.
-For periodic saves, set `finetune.adapter_save_path` and
-`adapter_save_every_backwards` / `adapter_save_every_epoch`
+The template also saves on its own (every 500 backward cycles and after each epoch,
+under `checkpoints/qwen3-0.6b/`) and logs every backward cycle to
+`logs/qwen3-0.6b/bwd_log.csv`. A saved directory is an ordinary LoRA adapter: serve it
+with `vllm serve Qwen/Qwen3-0.6B-Base --enable-lora --lora-modules sft=<dir>`, load it
+with PEFT, or set it as `finetune_param.finetuning_lora_path` to keep training
 ([details](#saving-the-trained-adapter)).
 
-**Next:** the Qwen3-14B TP=2 preset (`--family qwen3-14b`, two GPUs), the
-[timeline benchmarks](#running-experiments) and the [tests](#tests).
+**Next:** the Qwen3-14B TP=2 template (`configs/template_qwen3_14b_tp2.yaml`, two
+GPUs), the [timeline benchmarks](#running-experiments) and the [tests](#tests).
 
 ---
 
@@ -302,7 +302,7 @@ failure, with identical gradients.
 Two directions of contention, two sets of mechanisms:
 
 **1. An inference request arrives while an FT-only forward is about to run or is
-running. That forward is pre-empted.** Enabled by `finetune.forward_interruptible`.
+running. That forward is pre-empted.** Enabled by `finetune_features.forward_interruptible`.
 
 | Tier | When | What happens | TP |
 |---|---|---|---|
@@ -343,7 +343,7 @@ applies. The throttles shape admission further:
 | `throttles.match_prefill_workload_factor` | leaky bucket: admit one FT sample once accumulated prefill × factor covers its length (`0` = off) | `0` |
 | `throttles.fwd_token_throttle_enable` / `fwd_token_throttle` | pause the backward when the batch's total tokens ≥ threshold | off / 1024 |
 | `throttles.rps_throttle_*` | close FT admission above `close_rps`, reopen below `open_rps` (hysteresis, sliding window, minimum close time) | off |
-| `finetune.start_on_launch` | open admission at launch, or wait for `POST /start_finetuning` | `true` (`false` in the shipped YAMLs) |
+| `finetune_param.start_on_launch` | open admission at launch, or wait for `POST /start_finetuning` | `true` (`false` in the shipped YAMLs) |
 | Buffer accounting | FT budget ≤ free activation-buffer space; flush when the next-smallest sample won't fit | always |
 
 ### Optimizations
@@ -370,7 +370,7 @@ applies. The throttles shape admission further:
 ## Results
 
 Qwen3-14B-Base, TP=2 on 2× RTX 5090, co-serving the shipped preset
-(`configs/serving_config_finetuning_qwen3_14b_tp2.yaml`), TTFT SLO 0.4 s. Three
+(`configs/preset/serving_config_finetuning_qwen3_14b_tp2.yaml`), TTFT SLO 0.4 s. Three
 inference workloads replayed from recorded traces:
 
 | Workload | Requests | Span | Rate |
@@ -442,7 +442,8 @@ DeltaServe-vLLM/
 │       │   └── qwen3.py               Qwen3 family
 │       └── api.py                     HTTP routes: start/stop, finetuning_status, save_adapter, save_estimator_state
 ├── vllm-upstream/                     stock vLLM v0.33.0 (git submodule, no patches)
-├── configs/                           serving YAMLs (5090 + A100 presets)
+├── configs/                           template_*.yaml (commented starting points, one per model)
+│   └── preset/                        the configs behind experiments + tests (5090 + A100)
 ├── adapters/                          toy LoRA adapters (inference + "-ft" training target)
 ├── data/                              datasets: FT corpora (alpaca_1000.txt, test_dataset.txt),
 │                                      request traces (timelines/5090, timelines/A100)
@@ -594,23 +595,39 @@ python scripts/init_adapters_llama3.py             # adapters/llama3-toy-lora{,-
 
 ### The serving YAML
 
-Launchers turn one YAML (`configs/`) into a `vllm serve` command. The co-serving
-sections go into `--additional-config`. The rest become ordinary vLLM flags.
+Launchers turn one YAML into a `vllm serve` command. The co-serving sections go
+into `--additional-config`. The rest become ordinary vLLM flags.
 
 | Section | Holds |
 |---|---|
-| `finetune` | the FT job (corpus `data_path`, FT adapter, epochs, lr, buffer size `max_saved_finetuning_tokens`), adapter checkpoints (`adapter_save_*`), forward/backward graph flags, activation saves, interrupts, pauses |
+| `finetune_param` | the training job: switch, FT adapter, corpus `data_path`, epochs, lr, weight decay, buffer size `max_saved_finetuning_tokens`, adapter checkpoints (`adapter_save_*`) |
+| `finetune_features` | how co-serving runs it: backward precision and CUDA graphs, activation saves, mixed-batch forward graphs, interrupts, pauses |
 | `throttles` | admission shapers ([table above](#throttles-and-admission-control)) |
-| `slo` | `ttft_slo`, `avg_tbt_slo`, `max_tbt_slo`, estimator profiling, admission phase |
-| `debug` | log switches (`print_scheduler_add`, `print_engine_batch_exec`, …) and trace paths |
+| `slo` | `ttft_slo`, `avg_tbt_slo`, `max_tbt_slo`, estimator profiling |
+| `debug` | log prints (`print_scheduler_add`, `print_engine_batch_exec`, …) |
+| `telemetry` | what is recorded to disk: per-backward log `bwd_log_path`, per-step trace `step_trace_path`, admission stats |
 | `model`, `engine`, `parallel`, `lora`, `adapters`, `server` | plain vLLM settings: base model, memory, TP size, LoRA limits, inference adapter, port |
 
-`finetune.*` fields are documented one by one in
+Every finetune key is documented in
 [`deltaserve-plugin/deltaserve/config.py`](deltaserve-plugin/deltaserve/config.py).
-Relative paths resolve against the YAML's directory. Old flat-layout YAMLs still
-load (with a warning); `scripts/convert_config_layout.py` rewrites them.
+Relative paths resolve against the YAML's directory. Older layouts (a single
+`finetune` section, or no sections) still load, with a note;
+`scripts/convert_config_layout.py --in-place <yaml>` rewrites them, keeping comments.
 
-**Presets:**
+**Templates** (`configs/`): start here. Each is the validated preset for its model
+with every setting commented, finetuning opened at launch, the per-batch prints off,
+and adapter checkpoints (`checkpoints/<model>/`) plus the backward log
+(`logs/<model>/`) on.
+
+| YAML | Model | GPUs |
+|---|---|---|
+| `template_qwen3_14b_tp2.yaml` | Qwen3-14B-Base | 2 GPUs, TP=2 (e.g. 2× 5090) |
+| `template_qwen3_0.6b.yaml` | Qwen3-0.6B-Base | 1 GPU |
+| `template_llama3_8b.yaml` | Meta-Llama-3-8B (3.1 / 3.2 / 3.3: change `model`) | 1 GPU |
+
+**Presets** (`configs/preset/`): the exact configs behind the experiments, tests and
+the launchers' `--family` names. Change these only together with the runs they
+reproduce.
 
 | YAML | Model | GPUs |
 |---|---|---|
@@ -626,6 +643,7 @@ load (with a warning); `scripts/convert_config_layout.py` rewrites them.
 ```bash
 export HF_HOME=/path/to/hf-cache HF_HUB_OFFLINE=1
 
+python eval-tp/launch_deltaserve.py --config configs/template_qwen3_14b_tp2.yaml   # a template
 python eval-tp/launch_deltaserve.py --family qwen3-14b                     # Qwen3-14B TP=2 preset
 python eval-tp/launch_deltaserve.py --family qwen3-14b --start-finetuning  # …and open FT admission once healthy
 python eval-tp/launch_deltaserve.py --family qwen3-0.6b                    # single-GPU smoke
@@ -665,15 +683,15 @@ curl -X POST localhost:8000/save_adapter -H 'content-type: application/json' \
 switched off), backward cycles done, tokens trained, last loss and the mean of the
 last 20, epoch, buffer fill and corpus progress. Under TP it is the EngineCore's
 view, fed by every rank's relayed acks. Per-cycle progress also goes to the server
-log (`[backward] <ms>ms (graph) loss=… n=… epoch=…`) and, if `bwd_log_path` is set,
-to a CSV.
+log (`[backward] <ms>ms (graph) loss=… n=… epoch=…`) and, if
+`telemetry.bwd_log_path` is set, to a CSV.
 
 ### Saving the trained adapter
 
 The adapter being trained lives in GPU memory. Save it with `POST /save_adapter`
 or periodically:
 
-| `finetune.*` | Writes | Default |
+| `finetune_param.*` | Writes | Default |
 |---|---|---|
 | `adapter_save_path` | root directory for the saves below; `POST /save_adapter` without a `path` writes `<root>/manual-<time>` | unset |
 | `adapter_save_every_backwards: N` | `<root>/backward-<N>` after every N-th backward cycle | `0` (off) |
@@ -684,7 +702,7 @@ Each save is a standard PEFT LoRA directory: `adapter_model.safetensors` (the fp
 masters, under TP merged from every rank's shard), the source adapter's
 `adapter_config.json`, and `trainer_state.json` (cycles, tokens, last loss, epoch,
 lr). It loads with `vllm serve --lora-modules name=<dir>`, with PEFT, or as
-`finetune.finetuning_lora_path` to keep training from it (the optimizer state starts
+`finetune_param.finetuning_lora_path` to keep training from it (the optimizer state starts
 fresh). The backward child writes it between cycles, so the snapshot is consistent
 and FT admission is not held for it. `POST /save_adapter` waits until it is on disk
 (`{"wait": false}` returns at once; `timeout_s`, default 300).
@@ -746,7 +764,7 @@ Plot one run with
 ```bash
 eval-tp/cleanup_validate.sh 00_base tight-half loose-half production-600-800              # reference run
 eval-tp/cleanup_validate.sh my_change tight-half loose-half                             # candidate, compared to 00_base
-BASE=00_base CONFIG=configs/my_variant.yaml eval-tp/cleanup_validate.sh my_variant      # A/B a YAML variant
+BASE=00_base CONFIG=configs/preset/my_variant.yaml eval-tp/cleanup_validate.sh my_variant      # A/B a YAML variant
 CO=0 eval-tp/cleanup_validate.sh inf_only tight-half                                    # inference-only
 
 python eval-tp/compare_runs.py --suffix _qwen3-14b_tp2_co_factor_off_phase_prefill_tight-half \
@@ -788,6 +806,8 @@ tests/run_all.sh /tmp/ds-tests 'test_qwen3_*'  # a subset
 | RoPE scaling == vLLM's served RoPE (llama3 / linear / default), unsupported variants refused, trainer gradients with llama3 RoPE (+ negative control) | `test_rope_scaling` | CPU |
 | Adapter checkpoints: TP merge, periodic / epoch / manual saves, PEFT-loadable with matching logits, error reporting, TP=2 gather | `test_adapter_save` | CPU (gloo) |
 | Fail-safes and status: build errors reach the worker, sticky disable (incl. the TP mirror), profiling failure degrades, status bookkeeping, HTTP routes | `test_ft_failsafe` | CPU |
+| Configs: every template + preset loads in the current layout, templates fully commented, old `finetune` layout + converter | `test_config_loader` | CPU |
+| **Every template launches as shipped** (serves, trains, saves the adapter, writes the backward log) | `test_templates_launch` | GPUs of each template + weights |
 | **Checkpoints / status / fail-safes end to end**: real server, saved adapter == the served trained slot (vLLM and HF PEFT), profiling failure, resume, Llama-3.2-1B remat == served forward | `test_adapter_save_e2e` (`--tp 2` for the HTTP phase on 2 GPUs) | 1 / 2 GPUs + weights |
 | Activation hooks | `test_accumulate_hooks` | CPU |
 | Graph-capturable save op, CUDA-IPC weight sharing | `test_ft_save_op`, `test_phase1_step3` | 1 GPU |

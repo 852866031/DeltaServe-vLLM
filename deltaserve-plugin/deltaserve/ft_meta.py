@@ -102,7 +102,7 @@ def read_lora_scaling(adapter_path: str | None) -> float:
 
 
 def effective_save_attn_qkv(arch: str, ft_cfg: Any) -> bool:
-    """``finetune.save_attn_qkv`` as the accumulator should apply it: off when
+    """``finetune_features.save_attn_qkv`` as the accumulator should apply it: off when
     the family's backward cannot consume saved q/k at all, so the worker does
     not allocate and fill buffers the child will ignore."""
     if not ft_cfg.save_attn_qkv:

@@ -52,3 +52,5 @@ eval-arxiv/data/
 # benchmark outputs
 eval-arxiv/output/
 eval/estimator/*.csv
+checkpoints/
+logs/
