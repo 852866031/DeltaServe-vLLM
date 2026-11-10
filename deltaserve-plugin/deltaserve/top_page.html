@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dserve-top</title>
+<style>
+:root{--bg:#141413;--panel:#1a1a19;--line:#34342f;--grid:#262624;--ink:#f0efec;--ink2:#c3c2b7;--mute:#898781;
+--ft:#d95926;--inf:#3987e5;--dec:#199e70;--p99:#e8a33a;--bad:#e66767;--ok:#3fbf7f;--other:#c98500;--cache:#9085e9;--child:#d55181;--free:#2a2a28}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink2);font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.wrap{max-width:1500px;margin:0 auto;padding:12px 16px 20px}
+.hdr{display:flex;flex-wrap:wrap;gap:6px 16px;justify-content:space-between;align-items:center;margin-bottom:10px}
+.hi{color:var(--ink)}.mu{color:var(--mute)}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--p99)}
+.grid{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(300px,1fr);gap:10px}
+@media (max-width:900px){.grid{grid-template-columns:minmax(0,1fr)}}
+.box{border:1px solid var(--line);border-radius:6px;padding:14px 12px 10px;position:relative;background:var(--panel);margin-bottom:10px}
+.tt{position:absolute;top:-9px;left:10px;background:var(--bg);padding:0 6px;color:var(--ink2);letter-spacing:.02em}
+.row{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+svg text{font-family:inherit;font-size:10px}
+.btn{background:none;border:1px solid var(--line);color:var(--ink2);border-radius:4px;padding:1px 7px;font:inherit;cursor:pointer}
+.btn.on{border-color:var(--ink2);color:var(--ink)}
+.bar{display:flex;height:14px;gap:2px;border-radius:2px;overflow:hidden;flex:1}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:1px 10px}
+.sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px;vertical-align:-1px}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px}
+#tip{position:fixed;pointer-events:none;background:#0b0b0b;border:1px solid var(--line);border-radius:4px;padding:6px 8px;color:var(--ink);display:none;z-index:9;white-space:pre;max-width:420px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hdr">
+    <div><span class="hi">dserve-top</span> <span class="mu">▸</span> <span id="model" class="hi">…</span> <span class="mu">▸</span> TP=<span id="tp">?</span> <span class="mu">▸</span> recording <span id="up" class="hi">–</span> <span class="mu">▸</span> FT <span id="ftstate">…</span></div>
+    <div><span id="conn"><span class="dot" style="background:var(--mute)"></span>connecting</span> <span class="mu">· <span id="rec"></span></span></div>
+  </div>
+  <div class="grid">
+    <div>
+      <div class="box"><span class="tt">ENGINE · batches (newest →) · height = tokens (√)</span>
+        <svg id="wave" width="100%" height="150" role="img" aria-label="Engine batches"></svg>
+        <div id="last" class="mu" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">waiting for steps…</div>
+        <div class="row" style="margin-top:6px">
+          <div class="mu"><span class="sw" style="background:var(--ft)"></span>FT <span class="sw" style="background:var(--inf);margin-left:8px"></span>inference prefill <span class="sw" style="background:var(--dec);margin-left:8px"></span>decode <span style="color:var(--bad);margin-left:8px">✗</span> FT step pre-empted</div>
+          <div id="codes" class="mu"></div>
+        </div>
+        <div id="gpu" style="margin-top:8px"></div>
+      </div>
+      <div class="box"><span class="tt">TTFT (s) · <span style="color:var(--inf)">p50</span> <span style="color:var(--p99)">p99</span> · <span id="ttft_hdr" class="mu"></span></span>
+        <div class="row" style="justify-content:flex-end;margin-bottom:2px"><span class="mu">range&nbsp;</span><button class="btn" data-r="60">1m</button> <button class="btn on" data-r="300">5m</button> <button class="btn" data-r="1800">30m</button> <button class="btn" data-r="3600">60m</button></div>
+        <svg id="ttft" width="100%" height="120" role="img" aria-label="TTFT p50 and p99 over time"></svg>
+      </div>
+      <div class="box"><span class="tt">TPOT per request (ms) · <span style="color:var(--inf)">p50</span> <span style="color:var(--p99)">p99</span> · <span id="tpot_hdr" class="mu"></span></span>
+        <svg id="tpot" width="100%" height="120" role="img" aria-label="Per-request TPOT p50 and p99 over time"></svg>
+      </div>
+    </div>
+    <div>
+      <div class="box"><span class="tt">FINETUNING PROGRESS</span>
+        <div id="ft"></div>
+        <div style="margin-top:8px">loss <span id="loss" class="hi">–</span> <span class="mu">(mean of last 20 backwards)</span></div>
+        <svg id="lossc" width="100%" height="90" role="img" aria-label="Loss over time"></svg>
+        <div id="ft2" style="margin-top:6px"></div>
+      </div>
+      <div class="box"><span class="tt">THROUGHPUT (tokens/s) · last 10 s</span><div id="thr"></div></div>
+    </div>
+  </div>
+  <div class="box"><span class="tt">MEMORY (GiB)</span><div id="mem" class="mu">waiting for the per-GPU snapshot…</div></div>
+  <div class="mu">Read-only. Request times are measured in the engine (≈1 ms below what a client sees). Forward and backward share the GPU, so their busy fractions can overlap.</div>
+</div>
+<div id="tip"></div>
+<script>
+const $=id=>document.getElementById(id);
+const C={ft:'#d95926',inf:'#3987e5',dec:'#199e70',p99:'#e8a33a',bad:'#e66767',grid:'#262624',line:'#34342f',mute:'#898781',ink2:'#c3c2b7'};
+let S={steps:[],series:[],latest:{}},range=300,lastSeq=0,lastT=0,busy=false;
+const fmt=(x,k=1)=>x==null||!isFinite(x)?'–':(+x).toFixed(k);
+const big=n=>n==null?'–':n>=1e6?(n/1e6).toFixed(2)+' M':n>=1e3?(n/1e3).toFixed(1)+' k':String(Math.round(n));
+const dur=s=>{s=Math.max(0,Math.floor(s));const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return (h?h+':':'')+String(m).padStart(h?2:1,'0')+':'+String(x).padStart(2,'0')};
+const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+document.querySelectorAll('.btn[data-r]').forEach(b=>b.onclick=()=>{range=+b.dataset.r;document.querySelectorAll('.btn[data-r]').forEach(x=>x.classList.toggle('on',x===b));render();});
+const tip=$('tip');
+document.addEventListener('mousemove',e=>{const t=e.target.closest&&e.target.closest('[data-tip]');if(!t){tip.style.display='none';return;}
+ tip.textContent=t.getAttribute('data-tip');tip.style.display='block';const w=tip.offsetWidth;tip.style.left=Math.min(innerWidth-w-8,e.clientX+12)+'px';tip.style.top=(e.clientY+14)+'px';});
+
+async function poll(){
+ if(busy)return;busy=true;
+ try{
+  const r=await fetch(`/api/state?steps_since=${lastSeq}&series_since=${lastT}`,{cache:'no-store'});
+  const d=await r.json();
+  if(S.latest.t_start!==undefined&&d.t_start!==undefined&&d.t_start!==S.latest.t_start){S.steps=[];S.series=[];}
+  if(d.steps&&d.steps.length){const f=d.steps[0].s;while(S.steps.length&&S.steps[S.steps.length-1].s>=f)S.steps.pop();S.steps.push(...d.steps);if(S.steps.length>3000)S.steps.splice(0,S.steps.length-2000);lastSeq=S.steps[S.steps.length-1].s;}
+  if(d.series&&d.series.length){S.series.push(...d.series.filter(x=>x.t>lastT));if(S.series.length>4000)S.series.splice(0,S.series.length-3600);lastT=S.series[S.series.length-1].t;}
+  delete d.steps;delete d.series;S.latest=d;S.ok=true;
+ }catch(e){S.ok=false;}
+ busy=false;render();
+}
+
+function header(){
+ const L=S.latest,m=L.meta||{},w=L.window||{},f=L.finetuning||{};
+ const mp=String(m.model||''),hf=mp.match(/models--([^/]+?)--([^/]+)/);
+ const sv=Array.isArray(m.served_model_name)?m.served_model_name[0]:m.served_model_name;
+ $('model').textContent=(hf?hf[1]+'/'+hf[2]:mp.split('/').filter(Boolean).slice(-2).join('/')||'…')+(sv?`  (served as ${sv})`:'');
+ $('tp').textContent=m.tensor_parallel_size??'?';
+ $('up').textContent=L.now&&L.t_start?dur(L.now-L.t_start):'–';
+ let st;
+ if(f.disabled_reason)st=`<span class="bad">● disabled</span> <span class="mu">(${esc(f.disabled_reason)})</span>`;
+ else if(!f.started)st='<span class="warn">● stopped</span>';
+ else st=`<span class="ok">● running</span>${f.backward_in_flight?' <span class="mu">· backward in flight</span>':''}`;
+ $('ftstate').innerHTML=st;
+ const live=S.ok&&L.connected;
+ $('conn').innerHTML=live?'<span class="dot" style="background:var(--ok)"></span>live':`<span class="dot" style="background:var(--bad)"></span>${esc(S.ok?(L.error||'server unreachable'):'dserve-top unreachable')}`;
+ $('rec').textContent=(L.top&&L.top.recording_dir)||L.dir||'';
+}
+
+function wave(){
+ const svg=$('wave'),W=svg.clientWidth||800,H=104,base=H+6,maxT=Math.max(512,(S.latest.meta||{}).max_num_batched_tokens||2048);
+ const h=t=>t<=0?0:Math.max(2,Math.sqrt(t)/Math.sqrt(maxT)*H);
+ const codes=(S.latest.meta||{}).admit_codes||{};
+ let x=W-2,lastNum=1e9,lastCode=1e9,o=`<line x1="0" y1="${base}" x2="${W}" y2="${base}" stroke="${C.line}"/>`;
+ for(let i=S.steps.length-1;i>=0&&x>0;i--){
+  const e=S.steps[i],t=new Date(e.t*1000).toLocaleTimeString();
+  if(e.k==='d'){
+   const lab='d×'+e.n,w=Math.max(18,lab.length*6.2+8),hh=h(e.dc);x-=w+3;
+   const tipt=`plain decode × ${e.n} steps\nbatch ${e.dc} requests (latest)\nGPU ${fmt(e.ms,1)} ms total · ${fmt(e.ms/e.n,2)} ms/step\n${t} → ${new Date(e.te*1000).toLocaleTimeString()}`;
+   lastNum=lastCode=1e9;
+   o+=`<g data-tip="${esc(tipt)}"><rect x="${x}" y="${base-hh}" width="${w}" height="${hh}" fill="${C.dec}" opacity=".5" rx="1"/><rect x="${x}" y="0" width="${w}" height="${base+30}" fill="transparent"/>`+
+      `<text x="${x+w/2}" y="${base-hh-4}" fill="${C.ink2}" text-anchor="middle">${lab}</text></g>`;
+  }else if(e.k==='p'){
+   const w=8;x-=w+3;const hh=h(e.ft||64);
+   o+=`<g data-tip="${esc(`FT-only step pre-empted (tier B/C)\nan inference request arrived\n${e.ft} FT tokens rolled back\n${t}`)}"><rect x="${x}" y="${base-hh}" width="${w}" height="${hh}" fill="none" stroke="${C.bad}" stroke-dasharray="2 2"/><rect x="${x}" y="0" width="${w}" height="${base+30}" fill="transparent"/><text x="${x+w/2}" y="${base+13}" fill="${C.bad}" text-anchor="middle">✗</text></g>`;
+  }else{
+   const w=8;x-=w+3;const tot=e.ft+e.pf+e.dc,ht=h(tot),hf=ht*e.ft/tot,hp=ht*e.pf/tot,hd=ht-hf-hp;let y=base,b='';
+   if(hf>0){b+=`<rect x="${x}" y="${y-hf}" width="${w}" height="${hf}" fill="${C.ft}"/>`;y-=hf+(hp>0||hd>0?1:0);}
+   if(hp>0){b+=`<rect x="${x}" y="${y-hp}" width="${w}" height="${hp}" fill="${C.inf}"/>`;y-=hp+(hd>0?1:0);}
+   if(hd>0)b+=`<rect x="${x}" y="${y-hd}" width="${w}" height="${hd}" fill="${C.dec}"/>`;
+   const cc=e.a==='A'?C.ink2:e.a==='S'?C.p99:C.mute;
+   const tipt=`${e.ft&&e.pf?'mixed step':e.ft?'FT-only step':'inference prefill step'} · ${t}\nprefill ${e.pf} · FT ${e.ft} · decode ${e.dc}\nGPU ${fmt(e.ms,1)} ms · ${e.g==null?'':e.g?'CUDA graph':'eager'}${e.pz?' · backward paused':''}${e.bw?' · backward running':''}\nFT admission: ${e.a||'–'} ${esc(codes[e.a]||'')}${e.at?` (${e.at} tok)`:''}`;
+   const cx=x+w/2,showCode=e.a&&cx<lastCode-8,numW=String(e.at).length*5+4,showNum=e.at&&cx+numW/2<lastNum-numW/2-2;
+   if(showCode)lastCode=cx;if(showNum)lastNum=cx;
+   o+=`<g data-tip="${esc(tipt)}">${b}<rect x="${x}" y="0" width="${w}" height="${base+30}" fill="transparent"/>`+
+      (showCode?`<text x="${cx}" y="${base+13}" fill="${cc}" text-anchor="middle">${e.a}</text>`:'')+
+      (showNum?`<text x="${cx}" y="${base+25}" fill="${C.mute}" text-anchor="middle" font-size="8">${e.at}</text>`:'')+`</g>`;
+  }
+ }
+ svg.innerHTML=o;
+ const l=[...S.steps].reverse().find(e=>e.k==='x');
+ if(l)$('last').innerHTML=`last  prefill <span class="hi">${l.pf}</span> · FT <span class="hi">${l.ft}</span>${l.a?` (<span class="hi">${l.a}</span> ${esc(codes[l.a]||'')})`:''} · decode <span class="hi">${l.dc}</span> · <span class="hi">${fmt(l.ms,1)}</span> ms${l.g==null?'':l.g?' · graph':' · eager'}`;
+ $('codes').innerHTML=Object.entries(codes).filter(([k])=>k).map(([k,v])=>`<span class="hi">${k}</span> ${esc(v.split(/[ :(]/)[0])}`).join(' · ');
+}
+
+function lineChart(id,keys,scale,slo,unit,k){
+ const svg=$(id),W=svg.clientWidth||800,H=100,L=40,top=6,now=S.latest.now||Date.now()/1000,t0=now-range;
+ const rows=S.series.filter(r=>r.t>=t0);
+ let mx=slo?slo*1.15:0;rows.forEach(r=>keys.forEach(kk=>{if(r[kk]!=null)mx=Math.max(mx,r[kk]*scale)}));mx=mx||1;
+ const X=t=>L+(t-t0)/range*(W-L-6),Y=v=>top+H-Math.min(v,mx)/mx*H;
+ let o='';[0,.5,1].forEach(f=>{const v=mx*f;o+=`<line x1="${L}" x2="${W}" y1="${Y(v)}" y2="${Y(v)}" stroke="${C.grid}"/><text x="${L-4}" y="${Y(v)+3}" fill="${C.mute}" text-anchor="end">${fmt(v,v<1?2:0)}</text>`;});
+ for(let s=0;s<=4;s++){const t=t0+range*s/4;o+=`<text x="${X(t)}" y="${H+top+14}" fill="${C.mute}" text-anchor="${s===0?'start':s===4?'end':'middle'}">${s===4?'now':'-'+dur(range*(1-s/4))}</text>`;}
+ if(slo)o+=`<line x1="${L}" x2="${W}" y1="${Y(slo)}" y2="${Y(slo)}" stroke="${C.mute}" stroke-dasharray="5 4"/><text x="${W-4}" y="${Y(slo)-4}" fill="${C.mute}" text-anchor="end">SLO ${fmt(slo,slo<1?2:0)}${unit}</text>`;
+ keys.forEach((kk,i)=>{const col=i?C.p99:C.inf;const pts=rows.filter(r=>r[kk]!=null);
+  if(pts.length>1)o+=`<polyline fill="none" stroke="${col}" stroke-width="1.6" stroke-linejoin="round" points="${pts.map(r=>X(r.t)+','+Y(r[kk]*scale)).join(' ')}"/>`;
+  if(pts.length<=1||range<=300)pts.forEach(r=>o+=`<circle cx="${X(r.t)}" cy="${Y(r[kk]*scale)}" r="${pts.length>200?1:1.8}" fill="${col}" data-tip="${esc(new Date(r.t*1000).toLocaleTimeString()+'  '+kk+' '+fmt(r[kk]*scale,k)+unit+'  ('+(kk.startsWith('ttft')?r.nt+' first tokens':r.nf+' finished')+')')}"/>`);});
+ if(!rows.some(r=>r[keys[0]]!=null))o+=`<text x="${(L+W)/2}" y="${top+H/2}" fill="${C.mute}" text-anchor="middle">no ${id==='ttft'?'first tokens':'finished requests'} in this range</text>`;
+ svg.innerHTML=o;
+}
+
+function charts(){
+ const w=(S.latest.window||{}).inference||{},m=S.latest.meta||{};
+ const rows=S.series.filter(r=>r.t>=(S.latest.now||0)-range);
+ const nt=rows.reduce((a,r)=>a+r.nt,0),nf=rows.reduce((a,r)=>a+r.nf,0);
+ $('ttft_hdr').textContent=`SLO ${m.ttft_slo??w.ttft_slo??'–'} s · ${nt} first tokens in range`;
+ $('tpot_hdr').textContent=`${nf} finished in range`;
+ lineChart('ttft',['ttft50','ttft99'],1,w.ttft_slo,' s',3);
+ lineChart('tpot',['tpot50','tpot99'],1000,w.max_tbt_slo?w.max_tbt_slo*1000:null,' ms',1);
+}
+
+function bar(f,n=18,col=C.ft){f=Math.max(0,Math.min(1,f||0));const k=Math.round(f*n);return `<span style="color:${col}">${'█'.repeat(k)}</span><span style="color:#2f2f2c">${'█'.repeat(n-k)}</span>`;}
+
+function ft(){
+ const f=S.latest.finetuning||{},w=S.latest.window||{},fw=w.finetune||{},now=S.latest.now||0;
+ const last10=S.series.filter(r=>r.t>now-10),tr=last10.reduce((a,r)=>a+r.tr,0)/10;
+ const ep=f.total_epochs?((f.store_epoch??f.epoch??0)+1):null,frac=f.corpus_samples?(f.samples_trained_this_epoch||0)/f.corpus_samples:0;
+ const tokEpoch=f.corpus_tokens_per_epoch||0,remain=tokEpoch*(1-frac),etaE=tr>0&&tokEpoch?remain/tr:null,etaAll=etaE!=null&&f.total_epochs?etaE+tokEpoch*Math.max(0,f.total_epochs-ep)/tr:null;
+ $('ft').innerHTML=`<div>epoch <span class="hi">${ep??'–'}</span> / ${f.total_epochs??'–'} ${bar(frac,16)} <span class="hi">${fmt(frac*100,0)}%</span></div>`+
+  `<div class="mu">samples <span class="hi">${f.samples_trained_this_epoch??'–'}</span> / ${f.corpus_samples??'–'} this epoch</div>`+
+  `<div class="mu">trained <span class="hi">${big(f.tokens_trained)}</span> tok · <span class="hi">${fmt(tr,0)}</span> tok/s</div>`+
+  `<div class="mu">ETA epoch <span class="hi">${etaE!=null?dur(etaE):'–'}</span> · all epochs <span class="hi">${etaAll!=null?dur(etaAll):'–'}</span></div>`;
+ $('loss').textContent=fmt(f.mean_loss_last_20,3);
+ const pts=S.series.filter(r=>r.loss!=null&&r.t>=now-1800),svg=$('lossc'),W=svg.clientWidth||300,H=74;
+ if(pts.length>1){let mx=-1e9,mn=1e9;pts.forEach(r=>{mx=Math.max(mx,r.loss);mn=Math.min(mn,r.loss)});const span=mx-mn||1,t0=pts[0].t,t1=pts[pts.length-1].t||t0+1;
+  svg.innerHTML=`<text x="0" y="10" fill="${C.mute}">${fmt(mx,2)}</text><text x="0" y="${H}" fill="${C.mute}">${fmt(mn,2)}</text><text x="${W}" y="${H+12}" fill="${C.mute}" text-anchor="end">last ${dur(t1-t0)}</text>`+
+   `<polyline fill="none" stroke="${C.ft}" stroke-width="1.6" points="${pts.map(r=>(34+(r.t-t0)/(t1-t0||1)*(W-36))+','+(4+(mx-r.loss)/span*(H-6))).join(' ')}"/>`;}
+ else svg.innerHTML=`<text x="0" y="40" fill="${C.mute}">waiting for backward cycles…</text>`;
+ const g=fw.backward_gpu_ms_mean,wl=fw.backward_wall_ms_mean,cap=f.buffer_capacity||1;
+ const state=f.disabled_reason?`<span class="bad">disabled</span>`:f.backward_in_flight?'<span class="ok">▶ backward running</span>':'<span class="mu">◦ filling buffer</span>';
+ $('ft2').innerHTML=`<div class="mu">backward GPU <span class="hi">${fmt(g ?? f.last_backward_gpu_ms,0)}</span> ms · wall <span class="hi">${fmt(wl,0)}</span> ms${g&&wl?` · paused <span class="hi">${fmt(Math.max(0,1-g/wl)*100,0)}%</span>`:''}</div>`+
+  `<div class="mu">cycles <span class="hi">${(f.backwards_done??0).toLocaleString()}</span></div>`+
+  `<div>buffer ${bar((f.buffer_fill||0)/cap,16)} <span class="hi">${f.buffer_fill??'–'}</span> / ${f.buffer_capacity??'–'} tok</div>`+
+  `<div class="mu">state ${state} · admission <span class="${f.admission_open?'ok':'warn'}">${f.admission_open?'open':'closed'}</span>${f.estimator_fitted?' · SLO-gated':' · estimator cold'}</div>`+
+  (f.disabled_reason?`<div class="bad">${esc(f.disabled_reason)}</div>`:'');
+}
+
+function gpu(){
+ const now=S.latest.now||0,r=S.series.filter(x=>x.t>now-10),n=Math.max(1,r.length);
+ const fi=r.reduce((a,x)=>a+x.fi,0)/n,ff=r.reduce((a,x)=>a+x.ff,0)/n,bw=r.reduce((a,x)=>a+x.bw,0)/n;
+ const row=(l,v,c)=>`<div class="row" style="flex-wrap:nowrap;align-items:center"><span style="width:150px">${l}</span><span style="flex:1">${bar(v,40,c)}</span><span class="hi" style="width:44px;text-align:right">${fmt(v*100,0)}%</span></div>`;
+ $('gpu').innerHTML=`<div class="mu" style="margin-bottom:2px">GPU busy, last 10 s (rank 0 kernel time ÷ wall; forward and backward overlap)</div>`+row('inference forward',fi,C.inf)+row('FT forward',ff,C.ft)+row('LoRA backward',bw,'#1baf7a');
+ const out=r.reduce((a,x)=>a+x.out,0)/n,inp=r.reduce((a,x)=>a+x.inp,0)/n,tr=r.reduce((a,x)=>a+x.tr,0)/n,ftf=r.reduce((a,x)=>a+x.ftf,0)/n;
+ $('thr').innerHTML=`<div class="kv"><span class="mu">inference output</span><span class="hi">${big(out)}</span><span class="mu">inference prompt (finished)</span><span class="hi">${big(inp)}</span><span class="mu">FT forwarded</span><span class="hi">${big(ftf)}</span><span class="mu">FT trained (backward)</span><span class="hi">${big(tr)}</span></div>`;
+}
+
+function mem(){
+ const M=(S.latest.window||{}).memory||{},ranks=Object.keys(M).filter(k=>k.startsWith('rank')).sort();
+ if(!ranks.length)return;
+ const segs=[['model_weights','weights','#3987e5'],['kv_cache','KV cache','#d95926'],['ft_activation_buffers','FT buffers','#199e70']];
+ let o='';
+ for(const r of ranks){const g=M[r].gib||{},tot=g.device_total||1,used=g.device_used_all_processes||0;
+  const oth=Object.entries(g).find(([k])=>k.startsWith('other_allocated'));const res=Object.entries(g).find(([k])=>k.startsWith('torch_reserved'));
+  const parts=segs.map(([k,l,c])=>[l,g[k]||0,c]).concat([['other (lm_head copy, LoRA slots, temp)',oth?oth[1]:0,'#c98500'],['cached / CUDA graphs',res?res[1]:0,'#9085e9'],['backward child + other processes',Math.max(0,used-(g.inference_process_reserved||0)),'#d55181']]);
+  o+=`<div class="row" style="align-items:center;flex-wrap:nowrap;margin-top:6px"><span class="hi" style="width:52px">GPU${r.slice(4)}</span><div class="bar">`+
+   parts.map(([l,v,c])=>v>0?`<div data-tip="${esc(l+': '+fmt(v,2)+' GiB')}" style="width:${v/tot*100}%;background:${c}"></div>`:'').join('')+`<div style="flex:1;background:var(--free)" data-tip="free ${fmt(tot-used,2)} GiB"></div></div>`+
+   `<span style="width:170px;text-align:right"><span class="hi">${fmt(used,1)}</span> / ${fmt(tot,1)} GiB · ${fmt(used/tot*100,0)}%</span></div>`+
+   `<div class="mu" style="padding-left:52px">${parts.map(([l,v,c])=>`<span class="sw" style="background:${c}"></span>${l.split(' (')[0]} <span class="hi">${fmt(v,2)}</span>`).join(' &nbsp;')} &nbsp;<span class="sw" style="background:var(--free)"></span>free <span class="hi">${fmt(tot-used,2)}</span></div>`;}
+ const ch=M.backward_child_rank0_gib;
+ if(ch)o+=`<div class="mu" style="margin-top:6px">backward child, rank 0: allocated <span class="hi">${fmt(ch.alloc,2)}</span> · peak <span class="hi">${fmt(ch.peak,2)}</span> · reserved <span class="hi">${fmt(ch.reserved,2)}</span> · LoRA masters + grads + Adam <span class="hi">${fmt(ch.lora_train_state,3)}</span> GiB</div>`;
+ $('mem').innerHTML=o;
+}
+
+function render(){try{header();wave();charts();ft();gpu();mem();}catch(e){console.error(e);}}
+addEventListener('resize',render);
+poll();setInterval(poll,300);
+</script>
+</body>
+</html>

@@ -1,0 +1,296 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+"""dserve-top: a live web dashboard for a running DeltaServe server.
+
+    dserve-top                                   # server at 127.0.0.1:8000
+    dserve-top --server http://127.0.0.1:8001 --port 8095
+
+Run it on the GPU machine, next to the server. It
+
+1. asks the server to start recording telemetry (POST /telemetry/start) unless
+   it already records (telemetry.metrics_dir in its config) — into ``--dir``,
+   default ``./dserve-top/<time>``; on exit it stops a recording it started;
+2. polls the live feed (GET /telemetry/data) ~4×/s into its own buffers — one
+   poller however many browser tabs are open — and refreshes the per-GPU
+   memory snapshot every 30 s;
+3. serves the dashboard page on ``--port`` (127.0.0.1 only) and prints how to
+   open it through an SSH tunnel.
+
+Standard library only (no vLLM import): starts instantly, safe to run anywhere.
+"""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import signal
+import socket
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+PAGE = Path(__file__).with_name("top_page.html")
+MAX_STEPS = 20000
+MAX_SERIES = 3600
+
+
+class DServe:
+    """HTTP client for the dserve server's telemetry routes."""
+
+    def __init__(self, base: str, timeout: float = 5.0) -> None:
+        self.base = base.rstrip("/")
+        self.timeout = timeout
+
+    def call(self, method: str, path: str, body: dict | None = None):
+        req = urllib.request.Request(
+            self.base + path, method=method,
+            data=None if body is None else json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read() or b"{}")
+            except ValueError:
+                return e.code, {}
+
+
+class Feed:
+    """The poller's merged view of the server's live feed."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.steps: list[dict] = []
+        self.series: list[dict] = []
+        self.latest: dict = {}
+        self.connected = False
+        self.error: str | None = None
+        self.last_ok = 0.0
+        self.server_t_start = None
+
+    @property
+    def last_seq(self) -> int:
+        return self.steps[-1]["s"] if self.steps else 0
+
+    @property
+    def last_t(self) -> float:
+        return self.series[-1]["t"] if self.series else 0.0
+
+    def merge(self, d: dict) -> None:
+        with self.lock:
+            if self.server_t_start is not None and d.get("t_start") != self.server_t_start:
+                self.steps, self.series = [], []          # server / recording restarted
+            self.server_t_start = d.get("t_start")
+            new = d.get("steps") or []
+            if new:
+                first = new[0]["s"]
+                while self.steps and self.steps[-1]["s"] >= first:
+                    self.steps.pop()                      # the re-sent open decode run
+                self.steps.extend(new)
+                if len(self.steps) > 2 * MAX_STEPS:
+                    del self.steps[:len(self.steps) - MAX_STEPS]
+            ser = d.get("series") or []
+            if ser:
+                self.series.extend(r for r in ser if r["t"] > self.last_t)
+                if len(self.series) > 2 * MAX_SERIES:
+                    del self.series[:len(self.series) - MAX_SERIES]
+            self.latest = {k: v for k, v in d.items() if k not in ("steps", "series")}
+            self.connected, self.error, self.last_ok = True, None, time.time()
+
+    def state(self, steps_since: int, series_since: float, limit: int = 3000) -> dict:
+        with self.lock:
+            st = [e for e in self.steps[-limit:] if e["s"] >= steps_since]
+            se = [r for r in self.series if r["t"] > series_since]
+            return {**self.latest, "steps": st, "series": se,
+                    "connected": self.connected, "error": self.error,
+                    "last_ok": self.last_ok}
+
+
+def poll_loop(srv: DServe, feed: Feed, stop: threading.Event, every: float) -> None:
+    last_mem = 0.0
+    while not stop.is_set():
+        try:
+            code, d = srv.call(
+                "GET", f"/telemetry/data?steps_since={feed.last_seq}"
+                       f"&series_since={feed.last_t}")
+            if code == 200 and d.get("active"):
+                feed.merge(d)
+            else:
+                feed.connected = False
+                feed.error = d.get("error") or ("not recording" if code == 200
+                                                 else f"HTTP {code}")
+            if time.time() - last_mem > 30:
+                last_mem = time.time()
+                srv.call("POST", "/telemetry/memory", {})
+        except Exception as e:  # noqa: BLE001 — keep polling through restarts
+            feed.connected = False
+            feed.error = f"{type(e).__name__}: {e}"
+        stop.wait(every)
+
+
+def make_handler(feed: Feed, info: dict):
+    page = PAGE.read_bytes()
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):          # quiet
+            pass
+
+        def _send(self, code, body: bytes, ctype: str):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            u = urllib.parse.urlparse(self.path)
+            if u.path in ("/", "/index.html"):
+                return self._send(200, page, "text/html; charset=utf-8")
+            if u.path == "/api/state":
+                q = urllib.parse.parse_qs(u.query)
+                body = feed.state(int(q.get("steps_since", ["0"])[0]),
+                                  float(q.get("series_since", ["0"])[0]))
+                body["top"] = info
+                return self._send(200, json.dumps(body).encode(), "application/json")
+            self._send(404, b"not found", "text/plain")
+
+    return H
+
+
+def ssh_guide(port: int) -> str:
+    user = getpass.getuser()
+    host = socket.gethostname()
+    target, extra = f"{user}@{host}", ""
+    conn = os.environ.get("SSH_CONNECTION", "").split()
+    if len(conn) == 4:                      # client_ip client_port server_ip server_port
+        target = f"{user}@{conn[2]}"
+        if conn[3] != "22":
+            extra = f" -p {conn[3]}"
+    local = port
+    alt = port + 10000 if port + 10000 <= 65535 else port - 10000
+    lines = [
+        "",
+        "  Open the dashboard from your laptop (the page is served on this machine,",
+        f"  127.0.0.1:{port} only):",
+        "",
+        "  1. On your LAPTOP (a new local terminal, not this SSH session), run:",
+        "",
+        f"       ssh -N -L {local}:localhost:{port}{extra} {target}",
+        "",
+        "     -N opens only the tunnel (no shell); leave it running. If you normally",
+        "     go through a jump host, add  -J <jump-host>  (or reuse your ~/.ssh/config",
+        f"     alias:  ssh -N -L {local}:localhost:{port} <alias>).",
+        "",
+        f"  2. In your laptop's browser open:   http://localhost:{local}",
+        "",
+        f"  Port {local} already used on your laptop? Pick another local port, e.g.",
+        f"     ssh -N -L {alt}:localhost:{port}{extra} {target}   →  http://localhost:{alt}",
+        "  VS Code Remote-SSH: Ports panel → Forward a Port → "
+        f"{port} → open the Local Address.",
+        f"  On this machine's own desktop: just open http://127.0.0.1:{port}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def bind(bind_host: str, port: int, handler) -> ThreadingHTTPServer:
+    for p in range(port, port + 20):
+        try:
+            return ThreadingHTTPServer((bind_host, p), handler)
+        except OSError:
+            continue
+    raise SystemExit(f"dserve-top: no free port in {port}..{port + 19}")
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="dserve-top", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--server", default="http://127.0.0.1:8000",
+                    help="the DeltaServe server (default http://127.0.0.1:8000)")
+    ap.add_argument("--port", type=int, default=8090,
+                    help="dashboard port on this machine (default 8090, next free)")
+    ap.add_argument("--bind", default="127.0.0.1",
+                    help="address to serve on (default 127.0.0.1: reach it via SSH)")
+    ap.add_argument("--dir", default=None,
+                    help="where the server records when dserve-top starts the "
+                         "recording (default ./dserve-top/<time>)")
+    ap.add_argument("--interval", type=float, default=10.0,
+                    help="summary window seconds for a recording started here")
+    ap.add_argument("--keep-recording", action="store_true",
+                    help="leave a recording dserve-top started running on exit")
+    ap.add_argument("--poll", type=float, default=0.25, help="seconds between polls")
+    a = ap.parse_args(argv)
+
+    srv = DServe(a.server)
+    try:
+        code, _ = srv.call("GET", "/health")
+    except Exception as e:  # noqa: BLE001
+        print(f"dserve-top: cannot reach the server at {a.server} ({e}).\n"
+              f"  Start it first (eval-tp/launch_deltaserve.py …) or pass --server.")
+        return 1
+    code, d = srv.call("GET", "/telemetry/data?steps_since=9223372036854775807"
+                              "&series_since=1e18")
+    if code == 404:
+        print(f"dserve-top: {a.server} has no /telemetry routes — is finetuning "
+              "enabled on it (finetune_param.enable_finetuning) and the plugin "
+              "up to date?")
+        return 1
+    started = False
+    rec_dir = d.get("dir")
+    if not d.get("active"):
+        rec_dir = os.path.abspath(a.dir or os.path.join(
+            "dserve-top", time.strftime("%Y%m%d-%H%M%S")))
+        code, r = srv.call("POST", "/telemetry/start",
+                           {"dir": rec_dir, "interval_s": a.interval})
+        if code != 200 or not r.get("active"):
+            print(f"dserve-top: could not start recording: {r}")
+            return 1
+        started = bool(r.get("started"))
+        rec_dir = r.get("dir", rec_dir)
+        print(f"dserve-top: started telemetry recording → {rec_dir}")
+    else:
+        print(f"dserve-top: the server already records telemetry → {rec_dir}")
+
+    feed = Feed()
+    stop = threading.Event()
+    th = threading.Thread(target=poll_loop, args=(srv, feed, stop, a.poll), daemon=True)
+    th.start()
+    info = {"server": a.server, "recording_dir": rec_dir, "started_by_top": started}
+    httpd = bind(a.bind, a.port, make_handler(feed, info))
+    port = httpd.server_address[1]
+    print(f"dserve-top: dashboard on http://{a.bind}:{port}  (server {a.server})")
+    print(ssh_guide(port), flush=True)
+    print("  Ctrl-C to quit" + (" (stops the recording it started)"
+                                if started and not a.keep_recording else ""), flush=True)
+
+    def shutdown(*_):
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+    signal.signal(signal.SIGTERM, shutdown)
+    try:
+        httpd.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        httpd.server_close()
+        if started and not a.keep_recording:
+            try:
+                srv.call("POST", "/telemetry/stop", {})
+                print(f"\ndserve-top: recording stopped (kept in {rec_dir})")
+            except Exception as e:  # noqa: BLE001
+                print(f"\ndserve-top: could not stop the recording: {e}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

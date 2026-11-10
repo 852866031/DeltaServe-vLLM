@@ -380,6 +380,12 @@ class FinetuneConfig:
     metrics_interval_s: float = 10.0
     """[telemetry] Seconds per ``summary.jsonl`` window (``metrics_dir``)."""
 
+    steps_log_max_mb: float = 256.0
+    """[telemetry] Size cap of the per-step log ``steps.<n>.jsonl.gz`` in
+    ``metrics_dir`` (every step's composition, GPU time and FT admission,
+    plain decode runs folded): rolling segments, the oldest deleted beyond
+    the cap. 0 = no step log (the dashboard's live stream still works)."""
+
     estimator_state_save_path: str | None = None
     """[estimator] JSON file the SLO estimator's state (fitted per-regime
     coefficients + the recorded step samples it refits from) is written to at

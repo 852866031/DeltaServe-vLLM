@@ -94,7 +94,7 @@ FINETUNE_SECTIONS: dict[str, tuple[str, ...]] = {
     # Everything recorded to disk for analysis: per-step trace, per-backward
     # log, admission statistics.
     "telemetry": (
-        "metrics_dir", "metrics_interval_s",
+        "metrics_dir", "metrics_interval_s", "steps_log_max_mb",
         "step_trace_path", "bwd_log_path", "batch_prediction_stats_path",
     ),
 }

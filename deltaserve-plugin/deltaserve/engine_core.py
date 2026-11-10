@@ -231,6 +231,14 @@ def metrics_summary(engine) -> dict:
     return fn()
 
 
+def telemetry(engine, op: str, arg=None) -> dict:
+    """[telemetry] Utility behind /telemetry/{data,start,stop} (dserve-top)."""
+    fn = getattr(engine.scheduler, "telemetry", None)
+    if fn is None:
+        return {"active": False, "error": "finetuning is not enabled"}
+    return fn(op, arg)
+
+
 def profile_execution_model(engine) -> None:
     """[Phase 4] Offline pass that seeds the SLO execution-time estimator.
 

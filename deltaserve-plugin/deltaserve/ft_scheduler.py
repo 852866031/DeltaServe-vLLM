@@ -47,6 +47,22 @@ def _ts() -> str:
     return time.strftime("%H:%M:%S") + f".{int((time.time() % 1) * 1000):03d}"
 
 
+# [telemetry] FT admission decision per step (``StepFeatures.admit``).
+ADMIT_CODES = {
+    "A": "admitted",
+    "S": "SLO: no headroom / cut short",
+    "F": "buffer: admitted what fit / full",
+    "C": "step budget: admitted what fit / none left",
+    "B": "backward running",
+    "T": "admission closed (throttle / epoch flush)",
+    "X": "finetuning not started / disabled",
+    "E": "corpus finished",
+    "D": "decode-only step (admission phase prefill)",
+    "K": "waiting for prefill credit (match_prefill_workload_factor)",
+    "": "no admission attempted",
+}
+
+
 class FinetuneScheduler(AsyncScheduler):
     """FT-injecting scheduler. Inherits AsyncScheduler so it carries the
     output-placeholder bookkeeping vLLM's pipelined (async) scheduling needs;
@@ -166,14 +182,10 @@ class FinetuneScheduler(AsyncScheduler):
         self._trace = StepTraceWriter(_trace_path) if _trace_path else None
         # [telemetry] System metrics (deltaserve/metrics.py); None = off.
         self._metrics = None
+        self._metrics_runtime = False      # started by POST /telemetry/start
         _mdir = getattr(ft_cfg, "metrics_dir", None)
         if _mdir:
-            from deltaserve.metrics import MetricsRecorder
-            self._metrics = MetricsRecorder(
-                _mdir, interval_s=getattr(ft_cfg, "metrics_interval_s", 10.0),
-                ttft_slo=getattr(ft_cfg, "ttft_slo", None),
-                max_tbt_slo=getattr(ft_cfg, "max_tbt_slo", None))
-            self._coord.metrics = self._metrics
+            self._new_metrics(_mdir, getattr(ft_cfg, "metrics_interval_s", 10.0))
             dprint(f"[telemetry] recording system metrics to {_mdir}")
         self._step_seq = 0
         self._trace_ctx: dict[int, tuple] = {}
@@ -309,16 +321,24 @@ class FinetuneScheduler(AsyncScheduler):
         )
 
         # ─── Stage 0: hard preconditions ────────────────────────────────
+        # [telemetry] ``self._last_admit`` = (code, tokens) of this decision —
+        # see ADMIT_CODES; stamped on the step's features for the dashboard.
         if self._profiling_mode:
             return 0, []
-        if self._coord.next_ft_budget() <= 0:
+        coord = self._coord
+        if coord.next_ft_budget() <= 0:
             # ft_started False / pending_backward True / admission_open False /
             # buffer full — coordinator already encodes all the precondition
             # checks; honor its verdict.
+            self._last_admit = (
+                "X" if not coord.ft_started else
+                "B" if coord.pending_backward else
+                "T" if not coord.admission_open else "F", 0)
             return 0, []
         store = self._ft_injector.store
         if not store.has_next() and store.current_epoch >= store.total_epochs - 1:
             # Pool exhausted across remaining epochs — nothing to admit.
+            self._last_admit = ("E", 0)
             return 0, []
 
         # ─── Stage 1: features for the upcoming step (no FT yet) ────────
@@ -335,6 +355,7 @@ class FinetuneScheduler(AsyncScheduler):
         ft_cfg = self.vllm_config.finetune_config
         phase = getattr(ft_cfg, "coserving_admission_phase", "prefill")
         if phase == "prefill" and is_decode_only:
+            self._last_admit = ("D", 0)
             return 0, []
 
         # Decode-only safety margin only applies in "both" mode on decode-only
@@ -377,9 +398,11 @@ class FinetuneScheduler(AsyncScheduler):
         if feats.b_d > 0 and self._estimator.is_ready:
             effective_tbt = self._max_tbt_slo * decode_only_margin
             if t_baseline >= effective_tbt:
+                self._last_admit = ("S", 0)
                 return 0, []
         if ttft_deadline is not None and self._estimator.is_ready:
             if (ttft_deadline - now - queue_wait - t_baseline) <= 0:
+                self._last_admit = ("S", 0)
                 return 0, []
 
         # ─── Stage 4: admission shapers (outer pre-filters) + iterative loop ─
@@ -396,6 +419,7 @@ class FinetuneScheduler(AsyncScheduler):
         if _match_factor > 0 and has_prefill:
             _peek = store.pop_next()
             if _peek is None:
+                self._last_admit = ("E", 0)
                 return 0, []
             credit = (self._unspent_prefill + feats.t_in) * _match_factor
             if credit >= _peek.input_len:
@@ -409,6 +433,7 @@ class FinetuneScheduler(AsyncScheduler):
             else:
                 # Not enough credit yet — accumulate and skip FT this step.
                 self._unspent_prefill += int(feats.t_in)
+                self._last_admit = ("K", 0)
                 return 0, []
 
         # Buffer-space cap (always applies). Proportional cap layers on
@@ -434,6 +459,7 @@ class FinetuneScheduler(AsyncScheduler):
                           - feats.t_in - feats.b_d)
         token_cap = min(token_cap, budget_left)
         if token_cap <= 0:
+            self._last_admit = ("C" if budget_left <= 0 else "F", 0)
             return 0, []
 
         # Iterative greedy admission. Smallest-first via pop_next; each
@@ -446,10 +472,13 @@ class FinetuneScheduler(AsyncScheduler):
         cur_prefill_lens = list(feats.prefill_lens) if feats.prefill_lens \
             else []
 
+        stop = "A"                  # why the loop ended (telemetry)
+        cap_code = "C" if budget_left < buffer_cap else "F"
         while True:
             if max_iterations is not None and len(admitted) >= max_iterations:
                 break
             if cur_t_ft >= token_cap:
+                stop = cap_code
                 break
             # Advance epoch if the current epoch's pool is exhausted.
             if not store.has_next() and not store.advance_epoch():
@@ -458,6 +487,7 @@ class FinetuneScheduler(AsyncScheduler):
             if candidate is None:
                 break
             if cur_t_ft + candidate.input_len > token_cap:
+                stop = cap_code
                 break
 
             # Hypothetical features with this sample added. Subset convention:
@@ -482,9 +512,11 @@ class FinetuneScheduler(AsyncScheduler):
                 if feats.b_d > 0:
                     effective_tbt = self._max_tbt_slo * decode_only_margin
                     if t_with_ft > effective_tbt:
+                        stop = "S"
                         break
                 if ttft_deadline is not None:
                     if (ttft_deadline - now - queue_wait - t_with_ft) <= 0:
+                        stop = "S"
                         break
             # (Cold-start: estimator not ready; admit up to token_cap unchecked.
             # Matches the pre-redesign cold-start behavior where the coord
@@ -502,7 +534,11 @@ class FinetuneScheduler(AsyncScheduler):
 
         # ─── Stage 5: commit ────────────────────────────────────────────
         if not admitted:
+            self._last_admit = (stop if stop != "A" else "E", 0)
             return 0, []
+        # admitted: "A" = everything it could take; "S" / "F" / "C" = cut
+        # short by the SLO / the buffer / the step's token budget.
+        self._last_admit = (stop, int(cur_t_ft))
         store.claim(admitted)
         reqs = [self._ft_injector._make_request(s) for s in admitted]
         return int(cur_t_ft), reqs
@@ -971,7 +1007,8 @@ class FinetuneScheduler(AsyncScheduler):
                     self._trace_step(feats, dur, was_graph, predicted,
                                      _extra[0] if _extra else None)
                 if self._metrics is not None and not self._profiling_mode:
-                    self._metrics.on_step(feats, dur)
+                    self._metrics.on_step(feats, dur, was_graph,
+                                          _extra[0] if _extra else None)
 
         # Live refit of the SLO estimator every REFIT_EVERY steps. Skipped during
         # offline profiling (one fit at the end of the pass).
@@ -1024,6 +1061,7 @@ class FinetuneScheduler(AsyncScheduler):
         self._admit_trace = (
             [None, None, None, None, 0, None, None, None, None]
             if self._trace is not None else None)
+        self._last_admit = ("", 0)
         admitted_now, ft_reqs = self.admit_ft_to_step()
         for req in ft_reqs:
             self._enqueue_waiting_request(req)
@@ -1178,6 +1216,8 @@ class FinetuneScheduler(AsyncScheduler):
                     feats, apply_margin=not self._validate_estimator)
                 if self._estimator.is_ready else None)
             output._ft_step_features = feats
+            # [telemetry] the FT admission decision for this step (code, tokens)
+            feats.admit = getattr(self, "_last_admit", ("", 0))
             output._ft_step_was_graph = was_graph
             output._ft_step_predicted = predicted
             # Remember this step's predicted time as the in-flight queue-wait
@@ -1263,6 +1303,9 @@ class FinetuneScheduler(AsyncScheduler):
         scheduler_output.finetune_req_ids = set()
         scheduler_output._ft_samples = []
         scheduler_output._ft_tokens_reserved = 0
+        if self._metrics is not None and not self._profiling_mode:
+            self._metrics.on_preempt(
+                getattr(scheduler_output, "_ft_step_features", None))
         if self._trace is not None:
             self._trace_rollback(scheduler_output)
         return len(ft_ids)
@@ -1303,6 +1346,71 @@ class FinetuneScheduler(AsyncScheduler):
             self._metrics.on_outputs(outputs, self.requests)
             self._metrics.maybe_flush()
         return outputs
+
+    # ─── [telemetry] recorder lifecycle (config, or dserve-top at runtime) ────
+    def _new_metrics(self, root: str, interval_s: float = 10.0):
+        from deltaserve.ft_scheduler import ADMIT_CODES
+        from deltaserve.metrics import MetricsRecorder
+        ft_cfg = self.vllm_config.finetune_config
+        mc = self.vllm_config.model_config
+        store = self._ft_injector.store
+        meta = {
+            "model": getattr(mc, "model", None),
+            "served_model_name": getattr(mc, "served_model_name", None),
+            "tensor_parallel_size":
+                self.vllm_config.parallel_config.tensor_parallel_size,
+            "max_num_batched_tokens": int(self.max_num_scheduled_tokens),
+            "max_saved_finetuning_tokens": int(ft_cfg.max_saved_finetuning_tokens),
+            "num_epochs": int(store.total_epochs),
+            "corpus_samples": len(store),
+            "admission_phase": getattr(ft_cfg, "coserving_admission_phase", "prefill"),
+            "admit_codes": ADMIT_CODES,
+        }
+        self._metrics = MetricsRecorder(
+            root, interval_s=interval_s,
+            ttft_slo=getattr(ft_cfg, "ttft_slo", None),
+            max_tbt_slo=getattr(ft_cfg, "max_tbt_slo", None),
+            steps_log_max_mb=float(getattr(ft_cfg, "steps_log_max_mb", 256.0)),
+            meta=meta)
+        self._coord.metrics = self._metrics
+        return self._metrics
+
+    def telemetry(self, op: str, arg=None) -> dict:
+        """[telemetry] EngineCore utility (GET /telemetry/data, POST
+        /telemetry/start | stop). ``start`` records into ``arg["dir"]`` unless
+        telemetry is already on; ``stop`` ends only a runtime-started one."""
+        m = self._metrics
+        if op == "data":
+            if m is None:
+                return {"active": False}
+            a = arg or {}
+            return {"active": True, "runtime": self._metrics_runtime,
+                    **m.live(int(a.get("steps_since", 0)),
+                             float(a.get("series_since", 0.0))),
+                    "finetuning": self.finetuning_status()}
+        if op == "start":
+            if m is not None:
+                return {"active": True, "started": False, "dir": m.root,
+                        "runtime": self._metrics_runtime}
+            a = arg or {}
+            m = self._new_metrics(str(a["dir"]), float(a.get("interval_s", 10.0)))
+            self._metrics_runtime = True
+            m.start_serving()
+            dprint(f"[telemetry] recording started at runtime → {m.root}")
+            return {"active": True, "started": True, "dir": m.root, "runtime": True}
+        if op == "stop":
+            if m is None:
+                return {"active": False, "stopped": False}
+            if not self._metrics_runtime:
+                return {"active": True, "stopped": False,
+                        "reason": "telemetry is on in the config"}
+            self._metrics = None
+            self._coord.metrics = None
+            self._metrics_runtime = False
+            m.close()
+            dprint("[telemetry] runtime recording stopped")
+            return {"active": False, "stopped": True, "dir": m.root}
+        return {"error": f"unknown op {op!r}"}
 
     def metrics_summary(self) -> dict:
         """[telemetry] GET /system_metrics."""

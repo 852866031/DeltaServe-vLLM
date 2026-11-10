@@ -107,11 +107,14 @@ class LogHistogram:
 class _Writer:
     """Appends CSV rows / JSON lines on a daemon thread."""
 
-    def __init__(self, root: str) -> None:
+    def __init__(self, root: str, gz_max_mb: float = 256.0) -> None:
         os.makedirs(root, exist_ok=True)
         self.root = root
         self._q: queue.Queue = queue.Queue()
         self._files: dict = {}
+        self._gz: dict = {}
+        self._gz_max_mb = gz_max_mb
+        self._gz_flushed = time.monotonic()
         self._t = threading.Thread(target=self._run, name="ds-metrics",
                                    daemon=True)
         self._t.start()
@@ -121,6 +124,10 @@ class _Writer:
 
     def line(self, name: str, obj: dict) -> None:
         self._q.put(("json", name, None, obj))
+
+    def gz(self, prefix: str, obj: dict) -> None:
+        """A line for the rolling gzip log ``<prefix>.<n>.jsonl.gz``."""
+        self._q.put(("gz", prefix, None, obj))
 
     def _open(self, name: str, fields):
         f = self._files.get(name)
@@ -140,6 +147,16 @@ class _Writer:
                 break
             kind, name, fields, payload = item
             try:
+                if kind == "gz":
+                    from deltaserve.live import RollingGz
+                    g = self._gz.get(name)
+                    if g is None:
+                        g = self._gz[name] = RollingGz(self.root, name, self._gz_max_mb)
+                    g.write(payload)
+                    if time.monotonic() - self._gz_flushed > 5.0:   # stays readable
+                        self._gz_flushed = time.monotonic()
+                        g.flush()
+                    continue
                 f = self._open(name, fields)
                 if kind == "csv":
                     csv.writer(f).writerow(payload)
@@ -149,7 +166,7 @@ class _Writer:
                     f.flush()
             except Exception:  # noqa: BLE001 — metrics never break serving
                 pass
-        for f in self._files.values():
+        for f in list(self._files.values()) + list(self._gz.values()):
             try:
                 f.close()
             except Exception:  # noqa: BLE001
@@ -190,13 +207,20 @@ class MetricsRecorder:
 
     def __init__(self, root: str, interval_s: float = 10.0,
                  ttft_slo: float | None = None, max_tbt_slo: float | None = None,
-                 clock=time.time, start_ticker: bool = True) -> None:
+                 clock=time.time, start_ticker: bool = True,
+                 steps_log_max_mb: float = 256.0, meta: dict | None = None) -> None:
         self.root = root
         self.interval_s = max(0.5, float(interval_s))
         self.ttft_slo = ttft_slo
         self.max_tbt_slo = max_tbt_slo
         self._clock = clock
-        self._w = _Writer(root)
+        self.meta = dict(meta or {})
+        self._w = _Writer(root, steps_log_max_mb)
+        # [dashboard] step stream + per-second series (deltaserve/live.py)
+        from deltaserve.live import LiveFeed
+        self.feed = LiveFeed(
+            write=(lambda e: self._w.gz("steps", e)) if steps_log_max_mb > 0 else None)
+        self._mem_cache = (0.0, {})
         now = clock()
         self._win = _Window(now, max_tbt_slo)
         self._t_start = now
@@ -231,6 +255,13 @@ class MetricsRecorder:
             self._win = _Window(now, self.max_tbt_slo)
             self._t_start = now
             self._serving = True
+        try:
+            with open(os.path.join(self.root, "run.json"), "w") as f:
+                json.dump({**self.meta, "start_unix_time": round(now, 3),
+                           "interval_s": self.interval_s, "ttft_slo": self.ttft_slo,
+                           "max_tbt_slo": self.max_tbt_slo}, f, indent=2, default=str)
+        except OSError:
+            pass
 
     def _tick(self) -> None:
         while not self._closed:
@@ -238,6 +269,8 @@ class MetricsRecorder:
             if not self._serving:
                 continue
             try:
+                with self._lock:
+                    self.feed.tick(self._clock())
                 self.maybe_flush()
             except Exception:  # noqa: BLE001
                 pass
@@ -256,9 +289,11 @@ class MetricsRecorder:
 
     def _on_outputs(self, outputs, requests, now) -> None:
         live = self._live
+        n_tok = 0
         for eco in outputs.values():
             for o in getattr(eco, "outputs", ()) or ():
                 n_new = len(o.new_token_ids or ())
+                n_tok += n_new
                 st = live.get(o.request_id)
                 if st is None:
                     if not n_new:
@@ -268,7 +303,7 @@ class MetricsRecorder:
                     prompt = int(getattr(req, "num_prompt_tokens", 0) or 0)
                     st = live[o.request_id] = [arrival, now, now, 0, 0.0, 0.0, prompt]
                     st[3] = n_new
-                    self._first_token(max(0.0, now - arrival))
+                    self._first_token(max(0.0, now - arrival), now)
                 elif n_new:
                     gap = now - st[2]
                     st[2] = now
@@ -281,12 +316,15 @@ class MetricsRecorder:
                     self._finish(o.request_id, live.pop(o.request_id),
                                  str(getattr(o.finish_reason, "name", o.finish_reason)),
                                  now)
+        if n_tok:
+            self.feed.tokens(now, n_tok)
 
-    def _first_token(self, ttft: float) -> None:
+    def _first_token(self, ttft: float, now: float | None = None) -> None:
         """A request's TTFT counts in the window where its first token came
         out (not where the request finished, which can be many windows
         later) — so the live view and each window show TTFT as it happens."""
         self._win.ttft.append(ttft)
+        self.feed.first_token(self._clock() if now is None else now, ttft)
         t = self.tot
         t["first_tokens"] += 1
         if self.ttft_slo and ttft <= self.ttft_slo:
@@ -307,6 +345,7 @@ class MetricsRecorder:
         t["requests"] += 1
         t["prompt_tokens"] += prompt
         t["output_tokens"] += n
+        self.feed.finished(now, prompt, tbt_mean)
         self._w.row("requests.csv", _REQ_FIELDS, (
             round(now, 3), rid, prompt, n, round(ttft, 5),
             "" if tbt_mean is None else round(tbt_mean, 5),
@@ -314,12 +353,21 @@ class MetricsRecorder:
 
     # -- forward steps --------------------------------------------------------
 
-    def on_step(self, feats, gpu_s: float) -> None:
-        """One timed forward step (the runner's CUDA-event sample)."""
+    def on_step(self, feats, gpu_s: float, graph=None, extra=None) -> None:
+        """One timed forward step (the runner's CUDA-event sample). ``extra``:
+        the runner's (seq, t_exec wall, host s, paused) when known."""
         if gpu_s <= 0:
             return
         with self._lock:
             self._on_step(feats, gpu_s)
+            t_exec = extra[1] if extra and len(extra) > 1 and extra[1] else None
+            paused = extra[3] if extra and len(extra) > 3 else None
+            self.feed.step(t_exec or self._clock(), feats, gpu_s, graph, paused)
+
+    def on_preempt(self, feats) -> None:
+        """An FT-only step undone for an arriving request (tier B / C)."""
+        with self._lock:
+            self.feed.preempt(self._clock(), feats)
 
     def _on_step(self, feats, gpu_s: float) -> None:
         t_in, t_ft, b_d = float(feats.t_in), float(feats.t_ft), int(feats.b_d)
@@ -337,6 +385,10 @@ class MetricsRecorder:
             kind = "ft_only"
         if kind == "inference_only" and t_in <= 0 and b_d == 0:
             return                                   # empty step
+        inf_s = {"inference_only": gpu_s, "ft_only": 0.0}.get(kind)
+        if inf_s is None:
+            inf_s = gpu_s * share
+        self.feed.fwd(self._clock(), inf_s, gpu_s - inf_s, int(t_ft))
         s = w.steps[kind]
         s[0] += 1
         s[1] += gpu_s
@@ -377,6 +429,8 @@ class MetricsRecorder:
                 pass
         self.tot["backwards"] += 1
         self.tot["trained_tokens"] += n
+        self.feed.backward(self._clock(), n,
+                           (gpu_ms or 0.0) / 1000.0, loss)
 
         def r(x, k=3):
             return "" if x is None else round(float(x), k)
@@ -391,7 +445,15 @@ class MetricsRecorder:
     # -- summaries ------------------------------------------------------------
 
     def memory(self) -> dict:
-        """Worker files (per rank, written after warm-up) + the child's latest."""
+        """Worker files (per rank, written after warm-up) + the child's latest
+        (files re-read at most every 2 s)."""
+        t, cached = self._mem_cache
+        if time.monotonic() - t < 2.0:
+            out = dict(cached)
+            if self._child_mem:
+                out["backward_child_rank0_gib"] = {
+                    k: round(v / GIB, 3) for k, v in self._child_mem.items()}
+            return out
         out = {}
         try:
             for name in sorted(os.listdir(self.root)):
@@ -400,10 +462,26 @@ class MetricsRecorder:
                         out[name[len("memory_"):-len(".json")]] = json.load(f)
         except OSError:
             pass
+        self._mem_cache = (time.monotonic(), dict(out))
         if self._child_mem:
             out["backward_child_rank0_gib"] = {
                 k: round(v / GIB, 3) for k, v in self._child_mem.items()}
         return out
+
+    def live(self, steps_since: int = 0, series_since: float = 0.0) -> dict:
+        """[dashboard] What a client has not seen yet: steps with seq ≥
+        ``steps_since``, per-second rows after ``series_since``, plus the
+        current window, totals and memory."""
+        with self._lock:
+            now = self._clock()
+            self.feed.tick(now)
+            steps = self.feed.steps_since(steps_since)
+            series = self.feed.series_since(series_since)
+            snap = self.snapshot(now)
+            last_seq = self.feed.last_seq
+        return {"now": round(now, 3), "dir": self.root, "meta": self.meta,
+                "t_start": round(self._t_start, 3), "last_seq": last_seq,
+                "steps": steps, "series": series, "window": snap}
 
     def snapshot(self, now: float | None = None) -> dict:
         now = self._clock() if now is None else now
@@ -507,6 +585,8 @@ class MetricsRecorder:
         if self._closed:
             return
         try:
+            with self._lock:
+                self.feed.flush_open_run()
             self.maybe_flush(force=True)
         finally:
             self._closed = True

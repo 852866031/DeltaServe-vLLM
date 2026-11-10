@@ -88,6 +88,7 @@ Co-serving is switched on per launch with `--additional-config '{"deltaserve": {
 | tiers A/B, rollback, rps / recv bookkeeping | `ft_scheduler.FinetuneScheduler` (`BothPhaseFinetuneScheduler` for phase `both`) |
 | arrival signal, profiling pass (a failure disables FT, inference serves), estimator save, status utility, input-thread ADD signal | `engine_core.EngineHooks`, via `EngineCore` / `EngineCoreProc` wrappers + `FtInputQueue` |
 | system metrics (`telemetry.metrics_dir`) | `metrics.MetricsRecorder` owned by the FinetuneScheduler: tokens from `update_from_output`, step GPU time from the timing-sample drain, backward rows from the ack (child adds gpu/wall ms + memory), memory files from `DeltaServeWorker.compile_or_warm_up_model`; final window on the stop request |
+| live dashboard (`dserve-top`) | `live.LiveFeed` inside the recorder (step stream with folded decode runs, per-second series, rolling `steps.*.jsonl.gz`); FT admission codes stamped on `StepFeatures.admit` by `admit_ft_to_step`; `/telemetry/{data,start,stop,memory}` → `FinetuneScheduler.telemetry`; `deltaserve/top.py` (stdlib) polls and serves `top_page.html` |
 | trained-adapter checkpoints | `save_adapter` cmd to the child (fire-and-forget; result via files, `adapter_io`); TP shards gathered to rank 0 over the children's gloo group |
 | `disable_log_stats` auto-on | `EngineArgs.create_engine_config` wrapper |
 | relay data (TP) | attributes on `SchedulerOutput` / `ModelRunnerOutput` (pickled with them) |
@@ -174,6 +175,8 @@ per model) and `configs/preset/`; sections finetune_param / finetune_features /
 telemetry; `telemetry.metrics_dir` records requests.csv / backward.csv /
 summary.jsonl / memory_rank*.json, GET /system_metrics, `scripts/metrics_report.py`.
 Tests: `test_metrics` (CPU), `test_metrics_e2e`, `test_templates_launch` (GPU).
+`dserve-top` (live web dashboard; starts recording at runtime if the config does not):
+`test_dserve_top` (CPU), `test_dserve_top_e2e` (GPU).
 
 Open: the live backward-graph vs eager A/B under TP on the real models; a relative
 (not seconds-based) admission margin for the estimator; mixed-batch forward graphs

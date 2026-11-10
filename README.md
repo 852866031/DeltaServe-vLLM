@@ -52,6 +52,7 @@ vLLM's own `--additional-config`. Without it, the server is plain vLLM.
 8. [Launching a server](#launching-a-server)
    - [HTTP endpoints](#http-endpoints)
    - [System metrics](#system-metrics)
+   - [Live dashboard: `dserve-top`](#live-dashboard-dserve-top)
    - [Saving the trained adapter](#saving-the-trained-adapter)
    - [When something fails](#when-something-fails)
 9. [Running experiments](#running-experiments)
@@ -437,6 +438,8 @@ DeltaServe-vLLM/
 │       ├── backward_process.py        child process launch / IPC
 │       ├── adapter_io.py              trained-adapter checkpoints: PEFT writer, TP shard merge, save results
 │       ├── metrics.py                 system metrics recorder (telemetry.metrics_dir) + per-GPU memory snapshot
+│       ├── live.py                    live feed for the dashboard: step stream, per-second series, rolling step log
+│       ├── top.py, top_page.html      dserve-top: starts recording, serves the dashboard, prints the SSH guide
 │       ├── bwd_services/              backward trainers
 │       │   ├── base.py                recv loop, _maybe_pause
 │       │   ├── registry.py            HF arch → service
@@ -679,6 +682,7 @@ curl -X POST localhost:8000/save_estimator_state -H 'content-type: application/j
      -d '{"path": "estimator.json"}'                # dump the fitted estimator
 curl localhost:8000/finetuning_status               # progress: backwards, tokens, loss, epoch, admission
 curl localhost:8000/system_metrics                 # system metrics (telemetry.metrics_dir): TTFT/TBT, throughput, GPU time, memory
+dserve-top                                          # live web dashboard (see below)
 curl -X POST localhost:8000/save_adapter -H 'content-type: application/json' \
      -d '{"path": "out/my-adapter"}'                # write the trained adapter now (PEFT format)
 ```
@@ -732,6 +736,39 @@ steps; 7 µs per step) and **0.05 %** on Qwen3-14B TP=2 (7 µs per step); slowes
 call 0.4 ms. Throughput, TTFT / TPOT / ITL percentiles and FT tokens/s on vs off: every
 difference within run-to-run noise (0.6B, 3 + 3 runs: output tok/s +0.3 %, TPOT p50
 −0.1 %; 14B: all within ±0.15 %).
+
+### Live dashboard: `dserve-top`
+
+```bash
+dserve-top                       # on the GPU machine, next to a running server (:8000)
+```
+
+It works whether or not the server's config turns telemetry on: if the server is not
+recording, `dserve-top` starts the recording (into `./dserve-top/<time>`, or `--dir`)
+and stops it again when you quit. It serves the dashboard on `127.0.0.1:8090` (next
+free port) and prints how to open it from your laptop, filled in with the address you
+SSH'd into:
+
+```bash
+ssh -N -L 8090:localhost:8090 you@gpu-box        # on your laptop; then open http://localhost:8090
+```
+
+(VS Code Remote-SSH: forward port 8090 in the Ports panel.) The page refreshes about
+three times a second and is read-only:
+
+| Panel | Shows |
+|---|---|
+| Engine | every step as a bar, newest right: FT (bottom) / inference prefill / decode tokens on a √ scale; runs of plain decode steps fold into one growing `d×N` block; under each bar the FT admission decision (`A` admitted, `S` SLO, `F` buffer full, `C` step budget, `B` backward running, `T` throttle / flush, …) and the FT tokens admitted; `✗` = an FT-only step pre-empted for an arriving request. Hover for the step's GPU ms, graph / eager, backward state. GPU busy over the last 10 s: inference forward, FT forward, backward |
+| TTFT, TPOT | p50 / p99 per second (TTFT by first token, TPOT per finished request) against the SLO, over 1 / 5 / 30 / 60 min |
+| Finetuning progress | epoch, samples, tokens trained and tokens/s, ETA, loss curve, backward GPU / wall ms and pause share, buffer fill, admission and backward state, why finetuning stopped if it did |
+| Throughput | inference output / prompt and FT forwarded / trained tokens per second |
+| Memory | per GPU: weights, KV cache, FT buffers, other, cached / CUDA graphs, backward child + other processes, free |
+
+Server side this is `/telemetry/data` (the feed: steps since a sequence number,
+per-second rows since a time, window, memory, FT status) and `/telemetry/start` /
+`stop` / `memory`. While telemetry records, the step stream is also written to
+`steps.*.jsonl.gz` in the metrics dir, rolling under `telemetry.steps_log_max_mb`
+(256 MB) — the data a later replay will read.
 
 ### Saving the trained adapter
 
@@ -856,6 +893,8 @@ tests/run_all.sh /tmp/ds-tests 'test_qwen3_*'  # a subset
 | Configs: every template + preset loads in the current layout, templates fully commented, old `finetune` layout + converter | `test_config_loader` | CPU |
 | System metrics: TTFT / TBT / token counts on a simulated clock, step kinds and the mixed-step split, backward rows, windows, idle ticker, final flush, histogram accuracy, hot-path cost, the child's ack fields, the route | `test_metrics` | CPU |
 | **System metrics end to end**: real server + streaming clients; server TTFT vs client TTFT, tokens vs usage, backward rows vs status, memory vs checkpoint size and vLLM's KV log, the report script | `test_metrics_e2e` (`--tp2` for Qwen3-14B on 2 GPUs) | 1 / 2 GPUs + weights |
+| `dserve-top` + its feed: decode folding, per-second rows, the rolling step log; against a fake server: starts / stops the recording, SSH guide, page served, feed merged, headless-Chrome render | `test_dserve_top` | CPU |
+| **`dserve-top` end to end**: a real server with telemetry off; dserve-top switches recording on, the feed carries real admission codes, per-GPU memory, the step log; stops on exit | `test_dserve_top_e2e` (`--tp2`) | 1 / 2 GPUs + weights |
 | **Every template launches as shipped** (serves, trains, saves the adapter, writes the backward log) | `test_templates_launch` | GPUs of each template + weights |
 | **Checkpoints / status / fail-safes end to end**: real server, saved adapter == the served trained slot (vLLM and HF PEFT), profiling failure, resume, Llama-3.2-1B remat == served forward | `test_adapter_save_e2e` (`--tp 2` for the HTTP phase on 2 GPUs) | 1 / 2 GPUs + weights |
 | Activation hooks | `test_accumulate_hooks` | CPU |

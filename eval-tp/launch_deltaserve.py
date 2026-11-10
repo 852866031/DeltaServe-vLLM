@@ -57,6 +57,19 @@ PRESETS: dict[str, Path] = {
 DEFAULT_FAMILY = "llama3"
 
 
+def family_of_model(model: str | None) -> str | None:
+    """The preset family a base model belongs to (for the served name and the
+    output-file tag), or None if it matches none."""
+    m = (model or "").lower().replace("_", "-")
+    if "qwen3-14b" in m:
+        return "qwen3-14b"
+    if "qwen3-0.6b" in m:
+        return "qwen3-0.6b"
+    if "llama-3" in m or "llama3" in m:
+        return "llama3"
+    return None
+
+
 @dataclass
 class LaunchSpec:
     """Everything a driver needs about one resolved launch."""
@@ -136,6 +149,12 @@ def build_server_cmd(config_path: str, port: int, base_model: str | None = None,
         raise SystemExit(f"[launch-tp] {config_path} has no adapters.lora_path_0 "
                          "(the inference adapter to serve)")
     infer_lora_name = Path(infer_lora_dir).name
+    # A YAML for another model than the family's (``--config`` with the
+    # default ``--family``): name the server after the YAML's model, not the
+    # default family (a Qwen3-0.6B template was served as "llama3").
+    inferred = family_of_model(base_model)
+    if inferred and inferred != family and not served_name:
+        family = inferred
     served_name = served_name or family
 
     vllm_bin = str(Path(sys.executable).parent / "vllm")

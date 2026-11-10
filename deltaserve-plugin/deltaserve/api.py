@@ -15,7 +15,8 @@ benchmark phase or to bracket a deliberate idle window.
 
 POST /save_adapter writes the trained adapter (PEFT format); GET
 /finetuning_status reports admission + training progress; GET
-/system_metrics the system metrics (telemetry.metrics_dir).
+/system_metrics the system metrics (telemetry.metrics_dir); /telemetry/*
+the live feed of dserve-top (start / stop recording at runtime, data).
 
 Only attached when finetuning is enabled.
 """
@@ -181,6 +182,79 @@ async def metrics_summary(raw_request: Request):
         return JSONResponse(status_code=500, content={"error": str(e)})
     return JSONResponse(status_code=200 if result.get("enabled") else 409,
                         content=result)
+
+
+async def _telemetry(raw_request: Request, op: str, arg=None):
+    return await engine_client(raw_request).engine_core.call_utility_async(
+        "deltaserve_telemetry", op, arg)
+
+
+@router.get("/telemetry/data")
+async def telemetry_data(raw_request: Request, steps_since: int = 0,
+                         series_since: float = 0.0):
+    """[dserve-top] The live feed: steps with seq ≥ steps_since, per-second
+    rows after series_since, current window, totals, memory, FT status.
+    ``{"active": false}`` while telemetry is not recording."""
+    try:
+        res = await _telemetry(raw_request, "data", {
+            "steps_since": steps_since, "series_since": series_since})
+    except Exception as e:
+        logger.exception("telemetry data failed")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    return JSONResponse(status_code=200, content=res)
+
+
+async def _memory_snapshot(raw_request: Request, root: str) -> None:
+    try:
+        await engine_client(raw_request).collective_rpc(
+            method="deltaserve_memory_snapshot", args=(root,))
+    except Exception:
+        logger.exception("memory snapshot failed")
+
+
+@router.post("/telemetry/start")
+async def telemetry_start(raw_request: Request):
+    """[dserve-top] Start recording into ``{"dir": ...}`` unless telemetry is
+    already on (config or an earlier start), and take each GPU's memory
+    snapshot."""
+    try:
+        body = await raw_request.json()
+    except Exception:
+        body = {}
+    if not (body or {}).get("dir"):
+        return JSONResponse(status_code=400, content={"error": "dir is required"})
+    import os
+    body["dir"] = os.path.abspath(str(body["dir"]))
+    try:
+        res = await _telemetry(raw_request, "start", body)
+    except Exception as e:
+        logger.exception("telemetry start failed")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    await _memory_snapshot(raw_request, res.get("dir") or body["dir"])
+    return JSONResponse(status_code=200, content=res)
+
+
+@router.post("/telemetry/memory")
+async def telemetry_memory(raw_request: Request):
+    """[dserve-top] Refresh every GPU's memory_rank<r>.json."""
+    res = await _telemetry(raw_request, "data", {"steps_since": 1 << 62,
+                                                 "series_since": 1e18})
+    if not res.get("active"):
+        return JSONResponse(status_code=409, content={"error": "not recording"})
+    await _memory_snapshot(raw_request, res["dir"])
+    return JSONResponse(status_code=200, content={"dir": res["dir"]})
+
+
+@router.post("/telemetry/stop")
+async def telemetry_stop(raw_request: Request):
+    """[dserve-top] Stop a recording started by /telemetry/start (one from
+    the config keeps running)."""
+    try:
+        res = await _telemetry(raw_request, "stop")
+    except Exception as e:
+        logger.exception("telemetry stop failed")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    return JSONResponse(status_code=200, content=res)
 
 
 def attach_router(app: FastAPI):

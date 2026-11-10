@@ -173,6 +173,7 @@ def _patch_engine_core() -> None:
         finetuning_status,
         metrics_summary,
         save_estimator_state,
+        telemetry,
     )
 
     EngineCore, EngineCoreProc = core_mod.EngineCore, core_mod.EngineCoreProc
@@ -247,6 +248,13 @@ def _patch_engine_core() -> None:
             return finetuning_status(self)
 
         EngineCore.deltaserve_finetuning_status = deltaserve_finetuning_status
+
+    if not hasattr(EngineCore, "deltaserve_telemetry"):
+        def deltaserve_telemetry(self, op, arg=None) -> dict:
+            """Utility behind /telemetry/{data,start,stop}."""
+            return telemetry(self, op, arg)
+
+        EngineCore.deltaserve_telemetry = deltaserve_telemetry
 
     if not hasattr(EngineCore, "deltaserve_metrics_summary"):
         def deltaserve_metrics_summary(self) -> dict:

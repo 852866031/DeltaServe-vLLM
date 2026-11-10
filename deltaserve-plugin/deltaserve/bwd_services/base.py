@@ -549,8 +549,9 @@ class BackwardService:
                 "gpu_ms": (None if total_ms is None or total_ms != total_ms
                            else float(total_ms)),
                 "wall_ms": (time.perf_counter() - t_wall0) * 1000.0}
-        if (self.shared.get("meta") or {}).get("metrics") \
-                and torch.cuda.is_available():
+        # [telemetry] host-side allocator counters (µs, no sync): always
+        # sent, so telemetry started at runtime (dserve-top) sees them too.
+        if torch.cuda.is_available():
             resp["mem"] = {"alloc": torch.cuda.memory_allocated(),
                            "peak": torch.cuda.max_memory_allocated(),
                            "reserved": torch.cuda.memory_reserved(),

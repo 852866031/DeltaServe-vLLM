@@ -456,6 +456,14 @@ class DeltaServeWorker(Worker):
         bp = getattr(self, "backward_process", None)
         return bool(bp is not None and bp.request_save_adapter(path, save_id))
 
+    def deltaserve_memory_snapshot(self, root: str) -> dict:
+        """[telemetry] Write this rank's memory_rank<r>.json into ``root`` now
+        (POST /telemetry/start and dserve-top's periodic refresh)."""
+        from deltaserve.metrics import write_memory_snapshot
+        return write_memory_snapshot(
+            root, self.rank, self.model_runner,
+            getattr(self.model_runner, "_finetune_accumulator", None))["gib"]
+
     def deltaserve_stop_finetuning(self) -> bool:
         """[DeltaServe] Close FT admission. Invoked via collective_rpc from the
         POST /stop_finetuning HTTP route. Mirror of
