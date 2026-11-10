@@ -171,6 +171,7 @@ def _patch_engine_core() -> None:
         FtInputQueue,
         attach_engine_hooks,
         finetuning_status,
+        metrics_summary,
         save_estimator_state,
     )
 
@@ -216,7 +217,7 @@ def _patch_engine_core() -> None:
             ds = getattr(self, "_ds", None)
             if (ds is not None and self.shutdown_state
                     == core_mod.EngineShutdownState.REQUESTED):
-                ds.save_estimator_state()   # before the process is gone
+                ds.on_shutdown_requested()  # estimator + metrics, before the process is gone
             return orig(self, *args, **kwargs)
         return wrapper
 
@@ -246,6 +247,13 @@ def _patch_engine_core() -> None:
             return finetuning_status(self)
 
         EngineCore.deltaserve_finetuning_status = deltaserve_finetuning_status
+
+    if not hasattr(EngineCore, "deltaserve_metrics_summary"):
+        def deltaserve_metrics_summary(self) -> dict:
+            """Utility behind GET /system_metrics."""
+            return metrics_summary(self)
+
+        EngineCore.deltaserve_metrics_summary = deltaserve_metrics_summary
 
 
 def _patch_api_server() -> None:

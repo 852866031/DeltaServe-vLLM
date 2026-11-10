@@ -67,7 +67,8 @@ def redirected(template: Path, tmp: Path) -> Path:
                     sec[k] = str((template.parent / v).resolve())
     raw["finetune_param"]["adapter_save_path"] = str(tmp / "checkpoints")
     for k in list((raw.get("telemetry") or {})):
-        raw["telemetry"][k] = str(tmp / "logs" / Path(raw["telemetry"][k]).name)
+        if k.endswith("_path") or k.endswith("_dir"):
+            raw["telemetry"][k] = str(tmp / "logs" / Path(raw["telemetry"][k]).name)
     raw["server"]["port"] = _PORT
     out = tmp / template.name
     out.write_text(yaml.safe_dump(raw))

@@ -164,6 +164,17 @@ class FinetuneScheduler(AsyncScheduler):
         # only the int rides on the SchedulerOutput. See step_trace.py.
         _trace_path = getattr(ft_cfg, "step_trace_path", None)
         self._trace = StepTraceWriter(_trace_path) if _trace_path else None
+        # [telemetry] System metrics (deltaserve/metrics.py); None = off.
+        self._metrics = None
+        _mdir = getattr(ft_cfg, "metrics_dir", None)
+        if _mdir:
+            from deltaserve.metrics import MetricsRecorder
+            self._metrics = MetricsRecorder(
+                _mdir, interval_s=getattr(ft_cfg, "metrics_interval_s", 10.0),
+                ttft_slo=getattr(ft_cfg, "ttft_slo", None),
+                max_tbt_slo=getattr(ft_cfg, "max_tbt_slo", None))
+            self._coord.metrics = self._metrics
+            dprint(f"[telemetry] recording system metrics to {_mdir}")
         self._step_seq = 0
         self._trace_ctx: dict[int, tuple] = {}
         self._admit_trace: list | None = None
@@ -838,6 +849,11 @@ class FinetuneScheduler(AsyncScheduler):
             dprint(f"[ft-sched] estimator stats dump failed: {e}")
         if self._trace is not None:
             self._trace.close()
+        if self._metrics is not None:
+            try:
+                self._metrics.close()
+            except Exception as e:  # noqa: BLE001
+                dprint(f"[telemetry] final flush failed: {e}")
         super().shutdown()
 
     # ─── Offline-profiling helpers (used by EngineCore.profile_execution_model) ──
@@ -954,6 +970,8 @@ class FinetuneScheduler(AsyncScheduler):
                 if self._trace is not None:
                     self._trace_step(feats, dur, was_graph, predicted,
                                      _extra[0] if _extra else None)
+                if self._metrics is not None and not self._profiling_mode:
+                    self._metrics.on_step(feats, dur)
 
         # Live refit of the SLO estimator every REFIT_EVERY steps. Skipped during
         # offline profiling (one fit at the end of the pass).
@@ -1280,7 +1298,18 @@ class FinetuneScheduler(AsyncScheduler):
         # coordinator's completed-sample queue — the runner times each step with
         # a deferred CUDA-event ring, so the duration isn't known here (it lands
         # a few steps later, off the hot path).
-        return super().update_from_output(scheduler_output, model_runner_output)
+        outputs = super().update_from_output(scheduler_output, model_runner_output)
+        if self._metrics is not None and not self._profiling_mode:
+            self._metrics.on_outputs(outputs, self.requests)
+            self._metrics.maybe_flush()
+        return outputs
+
+    def metrics_summary(self) -> dict:
+        """[telemetry] GET /system_metrics."""
+        if self._metrics is None:
+            return {"enabled": False,
+                    "error": "telemetry.metrics_dir is not set"}
+        return {"enabled": True, **self._metrics.current()}
 
     def _maybe_log_batch_done(self, scheduler_output) -> None:
         """``print_engine_batch_done``: one line when a non-decode-only batch's

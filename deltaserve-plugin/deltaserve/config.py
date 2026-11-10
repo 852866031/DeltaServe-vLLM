@@ -366,6 +366,20 @@ class FinetuneConfig:
 
     bwd_log_path: str | None = None
 
+    metrics_dir: str | None = None
+    """[telemetry] Record system metrics into this directory (see
+    ``deltaserve/metrics.py``): ``requests.csv`` (per request TTFT, TBT,
+    latency, tokens), ``backward.csv`` (per LoRA backward GPU / wall time,
+    tokens, loss, child memory), ``summary.jsonl`` (every
+    ``metrics_interval_s``: TTFT / TBT percentiles + SLO attainment, inference
+    and FT throughput, GPU time by step kind, memory) and
+    ``memory_rank<r>.json`` (per GPU: weights, KV cache, FT buffers, other).
+    Also served live by GET /system_metrics. None (default): off, nothing
+    recorded."""
+
+    metrics_interval_s: float = 10.0
+    """[telemetry] Seconds per ``summary.jsonl`` window (``metrics_dir``)."""
+
     estimator_state_save_path: str | None = None
     """[estimator] JSON file the SLO estimator's state (fitted per-regime
     coefficients + the recorded step samples it refits from) is written to at

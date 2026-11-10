@@ -135,6 +135,9 @@ class EngineHooks:
             if coord is not None:
                 coord.disable_finetuning(
                     f"launch profiling pass failed: {type(e).__name__}: {e}")
+        metrics = getattr(sched, "_metrics", None)
+        if metrics is not None:
+            metrics.start_serving()
 
     def save_estimator_state(self) -> None:
         save = getattr(self.engine.scheduler, "save_estimator_state", None)
@@ -143,6 +146,17 @@ class EngineHooks:
                 save()
             except Exception as e:
                 logger.warning("estimator state save failed: %s", e)
+
+    def on_shutdown_requested(self) -> None:
+        """First sign of a shutdown (EngineCoreProc._handle_shutdown): save
+        what must survive — the process may be killed right after."""
+        self.save_estimator_state()
+        metrics = getattr(getattr(self.engine, "scheduler", None), "_metrics", None)
+        if metrics is not None:
+            try:
+                metrics.final_flush()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("metrics final flush failed: %s", e)
 
     def on_shutdown(self) -> None:
         # Save the estimator state FIRST: tearing down the executor (TP workers
@@ -207,6 +221,14 @@ def finetuning_status(engine) -> dict:
     if status is None:
         return {"enabled": False, "error": "finetuning is not enabled"}
     return {"enabled": True, **status()}
+
+
+def metrics_summary(engine) -> dict:
+    """[telemetry] Utility behind GET /system_metrics."""
+    fn = getattr(engine.scheduler, "metrics_summary", None)
+    if fn is None:
+        return {"enabled": False, "error": "finetuning is not enabled"}
+    return fn()
 
 
 def profile_execution_model(engine) -> None:

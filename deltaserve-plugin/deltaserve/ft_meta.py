@@ -167,6 +167,8 @@ def build_backward_meta(hf_config: Any, ft_cfg: Any, *, lm_head_key: str | None,
         # adapter (its adapter_config.json is copied into every save) and the
         # periodic-save policy, applied by the child after each cycle.
         "finetuning_lora_path": getattr(ft_cfg, "finetuning_lora_path", None),
+        # [telemetry] the child adds its GPU memory to each backward ack.
+        "metrics": bool(getattr(ft_cfg, "metrics_dir", None)),
         "adapter_save_path": getattr(ft_cfg, "adapter_save_path", None),
         "adapter_save_every_backwards":
             int(getattr(ft_cfg, "adapter_save_every_backwards", 0) or 0),

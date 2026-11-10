@@ -394,6 +394,7 @@ class BackwardService:
 
     def _handle_process_activations(self, conn, msg) -> None:
         """Buffer-full signal: run the backward, then clean the buffers."""
+        t_wall0 = time.perf_counter()
         self._arrivals_reset()
         n = int(msg.get("n", 0))
         sample_lens = msg.get("sample_lens") or []
@@ -430,6 +431,7 @@ class BackwardService:
 
         loss = None
         n_valid = 0
+        total_ms = None
         start_evt = end_evt = None
         cpu_elapsed_ms: float | None = None
         # Run the backward BEFORE cleaning the buffers (clean zeros them). Skip
@@ -540,6 +542,19 @@ class BackwardService:
                     f"learning rate or disable FT to recover."
                 )
 
-        conn.send({"event": "activations_processed", "n": n, "loss": loss})
+        resp = {"event": "activations_processed", "n": n, "loss": loss,
+                # [telemetry] GPU time (CUDA events) and wall time (incl. the
+                # pauses while inference had the GPU) of this cycle.
+                "samples": len(sample_lens),
+                "gpu_ms": (None if total_ms is None or total_ms != total_ms
+                           else float(total_ms)),
+                "wall_ms": (time.perf_counter() - t_wall0) * 1000.0}
+        if (self.shared.get("meta") or {}).get("metrics") \
+                and torch.cuda.is_available():
+            resp["mem"] = {"alloc": torch.cuda.memory_allocated(),
+                           "peak": torch.cuda.max_memory_allocated(),
+                           "reserved": torch.cuda.memory_reserved(),
+                           "lora_train_state": getattr(self, "_train_state_bytes", 0)}
+        conn.send(resp)
         self._after_cycle(epoch, can_compute)
         #dprint("[backward] cleaned; sent done response")

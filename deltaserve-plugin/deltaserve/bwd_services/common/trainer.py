@@ -247,6 +247,8 @@ class LoraSftTrainerService(BackwardService):
         # Numerically identical to the default AdamW; cuts a few ms per
         # backward. Requires CUDA tensors (all our LoRA masters are on the
         # worker device).
+        # [telemetry] fp32 masters + their grads + AdamW's two moments.
+        self._train_state_bytes = 4 * 4 * sum(p.numel() for p in params)
         self.optimizer = torch.optim.AdamW(
             params, lr=float(meta["learning_rate"]), betas=(0.9, 0.999),
             weight_decay=float(meta["weight_decay"]), fused=True)

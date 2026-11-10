@@ -20,8 +20,9 @@ not have:
 - **SLO-aware admission scheduler:** with a step-time estimator.
 - **Pre-emption and pause machinery:** keeps inference latency protected.
 - **Training outputs:** the trained adapter is saved on request or periodically as a
-  standard PEFT LoRA (merged across TP ranks), and `GET /finetuning_status`
-  reports progress. Failures stop the launch or switch finetuning off with a
+  standard PEFT LoRA (merged across TP ranks), `GET /finetuning_status` reports
+  progress, and system metrics (TTFT / TBT, inference and FT throughput, GPU time
+  split, per-step LoRA time, memory per GPU) are recorded on launch. Failures stop the launch or switch finetuning off with a
   reason; they never hang the server or train silently wrong.
 
 All of it ships as a **vLLM general plugin** (`deltaserve`, in `deltaserve-plugin/`).
@@ -50,6 +51,7 @@ vLLM's own `--additional-config`. Without it, the server is plain vLLM.
 7. [Installation](#installation)
 8. [Launching a server](#launching-a-server)
    - [HTTP endpoints](#http-endpoints)
+   - [System metrics](#system-metrics)
    - [Saving the trained adapter](#saving-the-trained-adapter)
    - [When something fails](#when-something-fails)
 9. [Running experiments](#running-experiments)
@@ -170,7 +172,7 @@ config fields.
 
 | Process | Stock vLLM | What DeltaServe adds | Seam (how it plugs in, no vLLM edit) |
 |---|---|---|---|
-| **API server** | OpenAI server, `AsyncLLM` | `/start_finetuning`, `/stop_finetuning`, `/finetuning_status`, `/save_adapter`, `/save_estimator_state` | wrapper on `register_vllm_serve_api_routers` |
+| **API server** | OpenAI server, `AsyncLLM` | `/start_finetuning`, `/stop_finetuning`, `/finetuning_status`, `/system_metrics`, `/save_adapter`, `/save_estimator_state` | wrapper on `register_vllm_serve_api_routers` |
 | **EngineCore** | `EngineCoreProc`, `Scheduler` | `FinetuneScheduler`: FT injection, SLO admission, throttles, interrupt tiers A/B. `EngineHooks`: arrival counter, launch profiling pass, estimator save | `scheduler_cls`; wrappers on `EngineCore` / `EngineCoreProc` methods; input-queue class swap |
 | **Worker** (per TP rank) | `Worker`, `GPUModelRunner`, model, CUDA graphs | `DeltaServeWorker` spawns the backward child and exports weights and buffers over CUDA IPC. `DeltaServeModelRunner` builds the FT mask, keeps the timing ring, handles tier-C abort and relays results to the scheduler. `FtCudagraphDispatcher` adds the `has_ft` graph set. Accumulator hooks save FT activations | `worker_cls`; the worker adopts the runner by class swap; a dispatcher subclass with its own batch-descriptor class; wrapper on `CUDAGraphWrapper.__call__`; a custom op traced by Dynamo |
 | **Backward child** (per TP rank) | — | LoRA SFT trainer (`bwd_services/`): manual per-layer backward, CUDA graphs, fused AdamW, publish to the served LoRA slot | spawned by the worker (daemon check lifted around `start()`) |
@@ -434,6 +436,7 @@ DeltaServe-vLLM/
 │       ├── ft_save_op.py              torch.ops.vllm.dserve_save_rows
 │       ├── backward_process.py        child process launch / IPC
 │       ├── adapter_io.py              trained-adapter checkpoints: PEFT writer, TP shard merge, save results
+│       ├── metrics.py                 system metrics recorder (telemetry.metrics_dir) + per-GPU memory snapshot
 │       ├── bwd_services/              backward trainers
 │       │   ├── base.py                recv loop, _maybe_pause
 │       │   ├── registry.py            HF arch → service
@@ -605,7 +608,7 @@ into `--additional-config`. The rest become ordinary vLLM flags.
 | `throttles` | admission shapers ([table above](#throttles-and-admission-control)) |
 | `slo` | `ttft_slo`, `avg_tbt_slo`, `max_tbt_slo`, estimator profiling |
 | `debug` | log prints (`print_scheduler_add`, `print_engine_batch_exec`, …) |
-| `telemetry` | what is recorded to disk: per-backward log `bwd_log_path`, per-step trace `step_trace_path`, admission stats |
+| `telemetry` | what is recorded to disk: system metrics `metrics_dir` ([below](#system-metrics)), per-backward log `bwd_log_path`, per-step trace `step_trace_path`, admission stats |
 | `model`, `engine`, `parallel`, `lora`, `adapters`, `server` | plain vLLM settings: base model, memory, TP size, LoRA limits, inference adapter, port |
 
 Every finetune key is documented in
@@ -675,6 +678,7 @@ curl -X POST localhost:8000/stop_finetuning         # close it
 curl -X POST localhost:8000/save_estimator_state -H 'content-type: application/json' \
      -d '{"path": "estimator.json"}'                # dump the fitted estimator
 curl localhost:8000/finetuning_status               # progress: backwards, tokens, loss, epoch, admission
+curl localhost:8000/system_metrics                 # system metrics (telemetry.metrics_dir): TTFT/TBT, throughput, GPU time, memory
 curl -X POST localhost:8000/save_adapter -H 'content-type: application/json' \
      -d '{"path": "out/my-adapter"}'                # write the trained adapter now (PEFT format)
 ```
@@ -685,6 +689,38 @@ last 20, epoch, buffer fill and corpus progress. Under TP it is the EngineCore's
 view, fed by every rank's relayed acks. Per-cycle progress also goes to the server
 log (`[backward] <ms>ms (graph) loss=… n=… epoch=…`) and, if
 `telemetry.bwd_log_path` is set, to a CSV.
+
+### System metrics
+
+Set `telemetry.metrics_dir` (the templates do: `logs/<model>/metrics`) and the server
+records, from the moment it starts:
+
+| File | One row per | Holds |
+|---|---|---|
+| `requests.csv` | finished inference request | TTFT, mean / max time between tokens, end-to-end latency, prompt / output tokens |
+| `backward.csv` | LoRA backward cycle | GPU time, wall time (incl. pauses while inference has the GPU), tokens, samples, loss, the backward child's GPU memory |
+| `summary.jsonl` | `metrics_interval_s` window (10 s) | TTFT / TBT p50 / p90 / p99 / max and SLO attainment; inference and FT token throughput; forward GPU time by step kind (inference-only / mixed / FT-only) and its inference vs FT share; backward GPU time; memory; run totals |
+| `memory_rank<r>.json` | GPU (written after warm-up) | model weights, KV cache, FT activation buffers, other allocations, CUDA-graph / cached memory, device total and used |
+
+`GET /system_metrics` returns the last window and the one in progress, and
+
+```bash
+python scripts/metrics_report.py logs/qwen3-14b/metrics --png report.png
+```
+
+prints a run report (latency, throughput, LoRA step time, GPU time split, memory per
+GPU) and draws TTFT per request, throughput, GPU busy time and memory.
+
+How it is measured: request times are taken in the EngineCore (arrival = the
+frontend's stamp, a token = the step that produced it), so they exclude HTTP and
+detokenization — measured against a client, about 1 ms lower. Step GPU times are the
+runner's CUDA-event samples (the ones the SLO estimator fits on); in a mixed step the
+time is split between inference and FT by token count. The backward child shares the
+GPU (time-sliced), so forward and backward GPU seconds can overlap: each share is of
+that side's own busy time. Inter-token gaps go into 2 %-wide buckets, so their
+percentiles are within 2 % (mean, max and SLO attainment are exact). The cost is
+about 75 µs per 256-request step, writes happen on a background thread, and the window
+in progress is written when the server is asked to stop.
 
 ### Saving the trained adapter
 
@@ -807,6 +843,8 @@ tests/run_all.sh /tmp/ds-tests 'test_qwen3_*'  # a subset
 | Adapter checkpoints: TP merge, periodic / epoch / manual saves, PEFT-loadable with matching logits, error reporting, TP=2 gather | `test_adapter_save` | CPU (gloo) |
 | Fail-safes and status: build errors reach the worker, sticky disable (incl. the TP mirror), profiling failure degrades, status bookkeeping, HTTP routes | `test_ft_failsafe` | CPU |
 | Configs: every template + preset loads in the current layout, templates fully commented, old `finetune` layout + converter | `test_config_loader` | CPU |
+| System metrics: TTFT / TBT / token counts on a simulated clock, step kinds and the mixed-step split, backward rows, windows, idle ticker, final flush, histogram accuracy, hot-path cost, the child's ack fields, the route | `test_metrics` | CPU |
+| **System metrics end to end**: real server + streaming clients; server TTFT vs client TTFT, tokens vs usage, backward rows vs status, memory vs checkpoint size and vLLM's KV log, the report script | `test_metrics_e2e` (`--tp2` for Qwen3-14B on 2 GPUs) | 1 / 2 GPUs + weights |
 | **Every template launches as shipped** (serves, trains, saves the adapter, writes the backward log) | `test_templates_launch` | GPUs of each template + weights |
 | **Checkpoints / status / fail-safes end to end**: real server, saved adapter == the served trained slot (vLLM and HF PEFT), profiling failure, resume, Llama-3.2-1B remat == served forward | `test_adapter_save_e2e` (`--tp 2` for the HTTP phase on 2 GPUs) | 1 / 2 GPUs + weights |
 | Activation hooks | `test_accumulate_hooks` | CPU |

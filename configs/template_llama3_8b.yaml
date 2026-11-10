@@ -87,6 +87,8 @@ debug:
 
 # ── telemetry: what is recorded to disk ──────────────────────────────────────
 telemetry:
+  metrics_dir: ../logs/llama3-8b/metrics   # system metrics: requests.csv (TTFT/TBT per request), backward.csv (per LoRA step), summary.jsonl, memory per GPU; live at GET /system_metrics
+  metrics_interval_s: 10             # seconds per summary.jsonl window
   bwd_log_path: ../logs/llama3-8b/bwd_log.csv   # one row per backward cycle: time, epoch, tokens, loss, total tokens
   # step_trace_path: ../logs/llama3-8b/step_trace.csv   # one row per engine step: composition, predicted vs measured GPU time (eval-tp/analyze_step_trace.py)
   # batch_prediction_stats_path: ../logs/llama3-8b/batch_prediction_stats.csv   # estimator prediction stats, written at shutdown

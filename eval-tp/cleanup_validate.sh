@@ -4,7 +4,7 @@
 #   eval-tp/cleanup_validate.sh <tag> [mode ...]          (default modes: tight-half loose-half)
 #   BASE=00_base eval-tp/cleanup_validate.sh 05_worker production-600-800
 #   CO=0 eval-tp/cleanup_validate.sh 00_base_inf tight-half loose-half   (inference-only)
-#   CONFIG=configs/<variant>.yaml eval-tp/cleanup_validate.sh <tag>      (A/B a YAML variant)
+#   CONFIG=configs/preset/<variant>.yaml eval-tp/cleanup_validate.sh <tag>      (A/B a YAML variant)
 #
 # Runs the Qwen3-14B TP=2 co-serving timeline replay for each mode, sequentially,
 # into eval-tp/output/cleanup/<tag>/, then prints compare_runs.py against

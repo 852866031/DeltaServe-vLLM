@@ -94,6 +94,7 @@ FINETUNE_SECTIONS: dict[str, tuple[str, ...]] = {
     # Everything recorded to disk for analysis: per-step trace, per-backward
     # log, admission statistics.
     "telemetry": (
+        "metrics_dir", "metrics_interval_s",
         "step_trace_path", "bwd_log_path", "batch_prediction_stats_path",
     ),
 }
@@ -118,7 +119,7 @@ _SPECIAL_SECTIONS = (*ALL_FINETUNE_SECTIONS, *_PASSTHROUGH_SECTIONS)
 def load_yaml_config(path: str | Path, verbose: bool = True) -> dict[str, Any]:
     """Read the YAML file into a dict of sections. Validates top-level shape.
 
-    Relative path values (any key containing ``path``, e.g. ``finetuning_lora_path``,
+    Relative path values (any key containing ``path`` or ending ``_dir``, e.g. ``finetuning_lora_path``,
     ``bwd_log_path`` or ``lora_path_0``) inside the finetune sections and
     ``adapters`` are resolved to absolute against the YAML file's directory, so
     they work regardless of CWD (the worker process may run elsewhere). Mirrors
@@ -144,8 +145,8 @@ def load_yaml_config(path: str | Path, verbose: bool = True) -> dict[str, Any]:
     for section in (*ALL_FINETUNE_SECTIONS, "adapters"):
         body = raw.get(section) or {}
         for key, val in body.items():
-            if "path" in key.lower() and isinstance(val, str) \
-                    and not Path(val).is_absolute():
+            if ("path" in key.lower() or key.lower().endswith("_dir")) \
+                    and isinstance(val, str) and not Path(val).is_absolute():
                 body[key] = str((base_dir / val).resolve())
 
     if verbose:

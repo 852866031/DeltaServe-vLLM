@@ -87,6 +87,7 @@ Co-serving is switched on per launch with `--additional-config '{"deltaserve": {
 | activation save in graphs | accumulator hooks issue `torch.ops.vllm.dserve_save_rows` (traced by Dynamo) |
 | tiers A/B, rollback, rps / recv bookkeeping | `ft_scheduler.FinetuneScheduler` (`BothPhaseFinetuneScheduler` for phase `both`) |
 | arrival signal, profiling pass (a failure disables FT, inference serves), estimator save, status utility, input-thread ADD signal | `engine_core.EngineHooks`, via `EngineCore` / `EngineCoreProc` wrappers + `FtInputQueue` |
+| system metrics (`telemetry.metrics_dir`) | `metrics.MetricsRecorder` owned by the FinetuneScheduler: tokens from `update_from_output`, step GPU time from the timing-sample drain, backward rows from the ack (child adds gpu/wall ms + memory), memory files from `DeltaServeWorker.compile_or_warm_up_model`; final window on the stop request |
 | trained-adapter checkpoints | `save_adapter` cmd to the child (fire-and-forget; result via files, `adapter_io`); TP shards gathered to rank 0 over the children's gloo group |
 | `disable_log_stats` auto-on | `EngineArgs.create_engine_config` wrapper |
 | relay data (TP) | attributes on `SchedulerOutput` / `ModelRunnerOutput` (pickled with them) |
@@ -167,6 +168,12 @@ trainer build errors abort the launch, a failed profiling pass degrades to
 inference-only, Llama-3.1/3.2/3.3 RoPE scaling in the backward. Tests:
 `test_rope_scaling`, `test_adapter_save`, `test_ft_failsafe` (CPU),
 `test_adapter_save_e2e` (GPU).
+
+**Configs + system metrics (2026-11-10):** `configs/template_*.yaml` (commented, one
+per model) and `configs/preset/`; sections finetune_param / finetune_features /
+telemetry; `telemetry.metrics_dir` records requests.csv / backward.csv /
+summary.jsonl / memory_rank*.json, GET /system_metrics, `scripts/metrics_report.py`.
+Tests: `test_metrics` (CPU), `test_metrics_e2e`, `test_templates_launch` (GPU).
 
 Open: the live backward-graph vs eager A/B under TP on the real models; a relative
 (not seconds-based) admission margin for the estimator; mixed-batch forward graphs

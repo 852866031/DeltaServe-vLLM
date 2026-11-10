@@ -71,6 +71,22 @@ class DeltaServeWorker(Worker):
         # reads (no worker-side refresh).
         self._maybe_share_ft_served_lora()
 
+    def compile_or_warm_up_model(self):
+        out = super().compile_or_warm_up_model()
+        # [telemetry] KV cache, CUDA graphs and the FT buffers all exist now.
+        mdir = getattr(self.vllm_config.finetune_config, "metrics_dir", None)
+        if mdir:
+            from deltaserve import dprint
+            from deltaserve.metrics import write_memory_snapshot
+            try:
+                snap = write_memory_snapshot(
+                    mdir, self.rank, self.model_runner,
+                    getattr(self.model_runner, "_finetune_accumulator", None))
+                dprint(f"[telemetry] rank {self.rank} memory (GiB): {snap['gib']}")
+            except Exception as e:  # noqa: BLE001 — never block serving
+                dprint(f"[telemetry] memory snapshot failed: {e}")
+        return out
+
     def _maybe_share_finetuning_weights(self) -> None:
         """Share base + FT-adapter weights with the backward process (Step 3)."""
         backward_process = getattr(self, "backward_process", None)

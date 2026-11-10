@@ -414,10 +414,13 @@ class FinetuneCoordinator:
         self.ft_disabled_reason: str | None = None
         # Training progress for GET /finetuning_status, updated on every
         # backward ack (tp=1 poll_backward and the TP relay alike).
+        # [telemetry] MetricsRecorder (set by the scheduler) or None.
+        self.metrics = None
         self.backwards_done = 0
         self.tokens_trained = 0
         self.last_loss: float | None = None
         self.last_backward_wall: float | None = None
+        self.last_backward_gpu_ms: float | None = None
         self._recent_losses: collections.deque = collections.deque(maxlen=20)
         # Wall-clock (monotonic) instant FT admission was opened by HTTP, used
         # as t=0 for the [batch] log's elapsed-since-start timer. None until
@@ -629,6 +632,9 @@ class FinetuneCoordinator:
             except (TypeError, ValueError):
                 pass
         self.last_backward_wall = time.time()
+        self.last_backward_gpu_ms = resp.get("gpu_ms")
+        if self.metrics is not None:
+            self.metrics.on_backward(resp, self.current_epoch)
 
     def status(self) -> dict:
         """Admission + training progress (GET /finetuning_status)."""
@@ -644,6 +650,7 @@ class FinetuneCoordinator:
             "last_loss": self.last_loss,
             "mean_loss_last_20": (sum(recent) / len(recent)) if recent else None,
             "last_backward_unix_time": self.last_backward_wall,
+            "last_backward_gpu_ms": self.last_backward_gpu_ms,
             "buffer_fill": int(self.fill_count),
             "buffer_capacity": int(self.capacity),
             "corpus_tokens_per_epoch": int(self.corpus_total_tokens),

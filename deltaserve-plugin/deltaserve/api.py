@@ -14,7 +14,8 @@ intentionally preserves in-flight work). Useful for pausing FT during a
 benchmark phase or to bracket a deliberate idle window.
 
 POST /save_adapter writes the trained adapter (PEFT format); GET
-/finetuning_status reports admission + training progress.
+/finetuning_status reports admission + training progress; GET
+/system_metrics the system metrics (telemetry.metrics_dir).
 
 Only attached when finetuning is enabled.
 """
@@ -165,6 +166,21 @@ async def finetuning_status(raw_request: Request):
         logger.exception("finetuning_status failed")
         return JSONResponse(status_code=500, content={"error": str(e)})
     return JSONResponse(status_code=200, content=result)
+
+
+@router.get("/system_metrics")
+async def metrics_summary(raw_request: Request):
+    """System metrics (telemetry.metrics_dir): the last full window and the
+    one in progress — TTFT / TBT percentiles and SLO attainment, inference and
+    FT throughput, GPU time by step kind, memory, run totals."""
+    try:
+        result = await engine_client(raw_request).engine_core.call_utility_async(
+            "deltaserve_metrics_summary")
+    except Exception as e:
+        logger.exception("metrics_summary failed")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    return JSONResponse(status_code=200 if result.get("enabled") else 409,
+                        content=result)
 
 
 def attach_router(app: FastAPI):
