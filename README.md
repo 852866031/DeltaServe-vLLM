@@ -765,7 +765,7 @@ three times a second and is read-only:
 | Finetuning progress | epoch, samples, tokens trained and tokens/s, ETA, loss curve, backward GPU / wall ms and pause share, buffer fill, admission and backward state, why finetuning stopped if it did |
 | Throughput | inference output / prompt and FT forwarded / trained tokens per second |
 | At a glance (top row) | TTFT p99 over the last minute (green / red against the SLO), TTFT SLO met since start, TBT SLO met this window, inference and FT tokens/s, loss |
-| Memory | per GPU: weights, KV cache, FT buffers, other, cached / CUDA graphs, backward child + other processes, free |
+| Memory | one bar per GPU (one shared legend): weights, KV cache, LoRA adapter slots, FT buffers, other, cached / CUDA graphs, backward child + other processes, free; the LoRA line lists the GPU slots (vLLM preallocates `max_loras` slots sized for `max_lora_rank` and every LoRA-capable module), which adapter is in which slot, and the CPU adapter cache |
 
 Server side this is `/telemetry/data` (the feed: steps since a sequence number,
 per-second rows since a time, window, memory, FT status) and `/telemetry/start` /

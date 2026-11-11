@@ -223,9 +223,13 @@ class FakeDServe:
         os.makedirs(root, exist_ok=True)
         for r in (0, 1):
             with open(os.path.join(root, f"memory_rank{r}.json"), "w") as f:
-                json.dump({"gib": {"model_weights": 13.75, "kv_cache": 3.06,
-                                   "ft_activation_buffers": 0.65,
-                                   "other_allocated (lm_head copy, LoRA slots, temporaries)": 2.0,
+                json.dump({"lora": {"slots": 2, "slot_gib": 0.031, "in_slots": [
+                               {"slot": 0, "id": 1000, "role": "FT adapter (trained; pinned)"},
+                               {"slot": 1, "id": 1, "role": "inference"}],
+                               "cpu_cached": 2, "max_cpu_loras": 2, "cpu_cached_gib": 0.06},
+                           "gib": {"model_weights": 13.75, "kv_cache": 3.06,
+                                   "ft_activation_buffers": 0.65, "lora_slots": 0.062,
+                                   "other_allocated (lm_head copy, temporaries)": 1.94,
                                    "torch_reserved_not_allocated (incl. CUDA graph pools)": 0.76,
                                    "inference_process_reserved": 20.24,
                                    "device_total": 31.35,

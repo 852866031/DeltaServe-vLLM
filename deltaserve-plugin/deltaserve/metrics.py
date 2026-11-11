@@ -593,6 +593,65 @@ class MetricsRecorder:
             self._w.close()
 
 
+FT_SLOT_NOTE = "FT adapter (trained; pinned)"
+
+
+def _lora_memory(model_runner) -> dict:
+    """vLLM's LoRA memory on this GPU: the stacked slot buffers it
+    preallocates for ``max_loras`` adapters (every slot, used or not), which
+    adapter sits in which slot, and the adapters cached on the CPU
+    (``max_cpu_loras``; loaded on demand, moved into a free / LRU slot when a
+    request needs one)."""
+    am = getattr(getattr(model_runner, "lora_manager", None), "_adapter_manager", None)
+    if am is None:
+        return {}
+    seen, gpu = set(), 0
+
+    def add(t):
+        nonlocal gpu
+        if hasattr(t, "untyped_storage") and t.is_cuda:
+            st = t.untyped_storage()
+            if st.data_ptr() not in seen:
+                seen.add(st.data_ptr())
+                gpu += st.nbytes()
+    for m in am.modules.values():
+        for name, v in vars(m).items():
+            if not name.startswith(("lora_", "embeddings_")):
+                continue
+            for t in (v if isinstance(v, (list, tuple)) else [v]):
+                add(t)
+    try:
+        from deltaserve.ft_injector import FT_LORA_INT_ID
+    except Exception:  # noqa: BLE001
+        FT_LORA_INT_ID = -1
+    slots = list(getattr(am, "lora_index_to_id", []) or [])
+    cpu_bytes, cpu_n = 0, 0
+    reg = getattr(am, "_registered_adapters", None) or {}
+    for lid in list(getattr(reg, "keys", lambda: [])()):
+        try:
+            lm = reg[lid]
+        except Exception:  # noqa: BLE001
+            continue
+        cpu_n += 1
+        for w in getattr(lm, "loras", {}).values():
+            for t in (getattr(w, "lora_a", None), getattr(w, "lora_b", None)):
+                for x in (t if isinstance(t, (list, tuple)) else [t]):
+                    if hasattr(x, "numel"):
+                        cpu_bytes += x.numel() * x.element_size()
+    n = max(1, len(slots))
+    return {
+        "slots_bytes": gpu,
+        "slots": len(slots),
+        "slot_gib": round(gpu / n / GIB, 4),
+        "in_slots": [{"slot": i, "id": lid,
+                      "role": FT_SLOT_NOTE if lid == FT_LORA_INT_ID else "inference"}
+                     for i, lid in enumerate(slots) if lid is not None],
+        "cpu_cached": cpu_n,
+        "max_cpu_loras": getattr(getattr(am, "lora_config", None), "max_cpu_loras", None),
+        "cpu_cached_gib": round(cpu_bytes / GIB, 4),
+    }
+
+
 def write_memory_snapshot(root: str, rank: int, model_runner, accumulator=None,
                           extra: dict | None = None) -> dict:
     """Worker side, after warm-up: this rank's GPU memory by owner."""
@@ -614,6 +673,7 @@ def write_memory_snapshot(root: str, rank: int, model_runner, accumulator=None,
         if st.data_ptr() not in seen:
             seen.add(st.data_ptr())
             kv += st.nbytes()
+    lora = _lora_memory(model_runner)
     acts = 0
     if accumulator is not None:
         for v in accumulator.buffers.values():
@@ -627,8 +687,9 @@ def write_memory_snapshot(root: str, rank: int, model_runner, accumulator=None,
             "model_weights": weights,
             "kv_cache": kv,
             "ft_activation_buffers": acts,
-            "other_allocated (lm_head copy, LoRA slots, temporaries)":
-                max(0, alloc - weights - kv - acts),
+            "lora_slots": lora.get("slots_bytes", 0),
+            "other_allocated (lm_head copy, temporaries)":
+                max(0, alloc - weights - kv - acts - lora.get("slots_bytes", 0)),
             "torch_reserved_not_allocated (incl. CUDA graph pools)":
                 max(0, reserved - alloc),
             "inference_process_reserved": reserved,
@@ -636,6 +697,7 @@ def write_memory_snapshot(root: str, rank: int, model_runner, accumulator=None,
             "device_used_all_processes": total - free,
             **(extra or {}),
         }.items()},
+        "lora": {k: v for k, v in lora.items() if k != "slots_bytes"},
     }
     os.makedirs(root, exist_ok=True)
     tmp = os.path.join(root, f".memory_rank{rank}.json.tmp")

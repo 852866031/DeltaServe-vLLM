@@ -217,20 +217,26 @@ function gpu(){
 function mem(){
  const M=(S.latest.window||{}).memory||{},ranks=Object.keys(M).filter(k=>k.startsWith('rank')).sort();
  if(!ranks.length)return;
- const segs=[['model_weights','weights','#3987e5'],['kv_cache','KV cache','#d95926'],['ft_activation_buffers','FT buffers','#199e70']];
- let o='';
+ const pick=(g,pre)=>{const e=Object.entries(g).find(([k])=>k.startsWith(pre));return e?e[1]:0;};
+ const CAT=[['weights','#3987e5',g=>g.model_weights||0],['KV cache','#d95926',g=>g.kv_cache||0],
+  ['LoRA adapters','#5fb6c9',g=>g.lora_slots||0],['FT buffers','#199e70',g=>g.ft_activation_buffers||0],
+  ['other','#c98500',g=>pick(g,'other_allocated')],['cached / CUDA graphs','#9085e9',g=>pick(g,'torch_reserved')],
+  ['backward child + other processes','#d55181',g=>Math.max(0,(g.device_used_all_processes||0)-(g.inference_process_reserved||0))]];
+ const barW=Math.max(200,($('mem').clientWidth||1000)-240);
+ let o=`<div class="mu" style="margin-bottom:4px">${CAT.map(([l,c])=>`<span class="sw" style="background:${c}"></span>${l}`).join(' &nbsp;')} &nbsp;<span class="sw" style="background:var(--free)"></span>free</div>`;
  for(const r of ranks){const g=M[r].gib||{},tot=g.device_total||1,used=g.device_used_all_processes||0;
-  const oth=Object.entries(g).find(([k])=>k.startsWith('other_allocated'));const res=Object.entries(g).find(([k])=>k.startsWith('torch_reserved'));
-  const parts=segs.map(([k,l,c])=>[l,g[k]||0,c]).concat([['other (lm_head copy, LoRA slots, temp)',oth?oth[1]:0,'#c98500'],['cached / CUDA graphs',res?res[1]:0,'#9085e9'],['backward child + other processes',Math.max(0,used-(g.inference_process_reserved||0)),'#d55181']]);
-  o+=`<div class="row" style="align-items:center;flex-wrap:nowrap;margin-top:6px"><span class="hi" style="width:52px">GPU${r.slice(4)}</span><div class="bar">`+
-   parts.map(([l,v,c])=>v>0?`<div data-tip="${esc(l+': '+fmt(v,2)+' GiB')}" style="width:${v/tot*100}%;background:${c}"></div>`:'').join('')+`<div style="flex:1;background:var(--free)" data-tip="free ${fmt(tot-used,2)} GiB"></div></div>`+
-   `<span style="width:170px;text-align:right"><span class="hi">${fmt(used,1)}</span> / ${fmt(tot,1)} GiB · ${fmt(used/tot*100,0)}%</span></div>`+
-   `<div class="mu" style="padding-left:52px">${parts.map(([l,v,c])=>`<span class="sw" style="background:${c}"></span>${l.split(' (')[0]} <span class="hi">${fmt(v,2)}</span>`).join(' &nbsp;')} &nbsp;<span class="sw" style="background:var(--free)"></span>free <span class="hi">${fmt(tot-used,2)}</span></div>`;}
+  o+=`<div class="row" style="align-items:center;flex-wrap:nowrap;margin-top:5px"><span class="hi" style="width:52px">GPU${r.slice(4)}</span><div class="bar" style="height:18px">`+
+   CAT.map(([l,c,f])=>{const v=f(g);if(v<=0)return '';const pct=v/tot*100;
+    return `<div data-tip="${esc(l+': '+fmt(v,2)+' GiB')}" style="width:${pct}%;background:${c};color:#0b0b0b;font-size:10px;line-height:18px;text-align:center;overflow:hidden;white-space:nowrap">${pct*barW/100>=(fmt(v,v<1?2:1).length*6+6)?fmt(v,v<1?2:1):''}</div>`;}).join('')+
+   `<div style="flex:1;background:var(--free);font-size:10px;line-height:18px;text-align:center;color:var(--ink2)" data-tip="free ${fmt(tot-used,2)} GiB">${(tot-used)/tot>.06?fmt(tot-used,1)+' free':''}</div></div>`+
+   `<span style="width:170px;text-align:right"><span class="hi">${fmt(used,1)}</span> / ${fmt(tot,1)} GiB · ${fmt(used/tot*100,0)}%</span></div>`;}
+ const lo=M[ranks[0]].lora;
+ if(lo&&lo.slots){const inS=(lo.in_slots||[]).map(x=>`slot ${x.slot}: ${x.role==='inference'?'adapter id '+x.id:esc(x.role)}`).join(' · ')||'none loaded';
+  o+=`<div class="mu" style="margin-top:6px">LoRA: <span class="hi">${lo.slots}</span> GPU slots × <span class="hi">${fmt(lo.slot_gib*1024,0)}</span> MiB per GPU (preallocated) · ${inS} · CPU cache <span class="hi">${lo.cpu_cached}</span>${lo.max_cpu_loras?' / '+lo.max_cpu_loras:''} adapters (<span class="hi">${fmt(lo.cpu_cached_gib*1024,0)}</span> MiB host RAM)</div>`;}
  const ch=M.backward_child_rank0_gib;
- if(ch)o+=`<div class="mu" style="margin-top:6px">backward child, rank 0: allocated <span class="hi">${fmt(ch.alloc,2)}</span> · peak <span class="hi">${fmt(ch.peak,2)}</span> · reserved <span class="hi">${fmt(ch.reserved,2)}</span> · LoRA masters + grads + Adam <span class="hi">${fmt(ch.lora_train_state,3)}</span> GiB</div>`;
+ if(ch)o+=`<div class="mu" style="margin-top:2px">backward child, rank 0: allocated <span class="hi">${fmt(ch.alloc,2)}</span> · peak <span class="hi">${fmt(ch.peak,2)}</span> · reserved <span class="hi">${fmt(ch.reserved,2)}</span> GiB · trained LoRA masters + grads + Adam <span class="hi">${fmt(ch.lora_train_state*1024,0)}</span> MiB</div>`;
  $('mem').innerHTML=o;
 }
-
 let lastTbt=null;
 function kpi(){
  const L=S.latest,now=L.now||0,w=(L.window||{}).inference||{},t=(L.window||{}).totals||{},f=L.finetuning||{};
