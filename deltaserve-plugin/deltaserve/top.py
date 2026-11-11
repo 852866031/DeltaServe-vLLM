@@ -76,6 +76,7 @@ class Feed:
         self.error: str | None = None
         self.last_ok = 0.0
         self.server_t_start = None
+        self.models: list[dict] = []        # GET /v1/models (base + adapters)
 
     @property
     def last_seq(self) -> int:
@@ -110,7 +111,7 @@ class Feed:
         with self.lock:
             st = [e for e in self.steps[-limit:] if e["s"] >= steps_since]
             se = [r for r in self.series if r["t"] > series_since]
-            return {**self.latest, "steps": st, "series": se,
+            return {**self.latest, "steps": st, "series": se, "models": self.models,
                     "connected": self.connected, "error": self.error,
                     "last_ok": self.last_ok}
 
@@ -128,9 +129,17 @@ def poll_loop(srv: DServe, feed: Feed, stop: threading.Event, every: float) -> N
                 feed.connected = False
                 feed.error = d.get("error") or ("not recording" if code == 200
                                                  else f"HTTP {code}")
-            if time.time() - last_mem > 30:
+            if time.time() - last_mem > 10:
+                # adapters come and go (on-demand loads, LRU): refresh the
+                # per-GPU memory / adapter snapshot and the API's model list
                 last_mem = time.time()
                 srv.call("POST", "/telemetry/memory", {})
+                c, m = srv.call("GET", "/v1/models")
+                if c == 200:
+                    with feed.lock:
+                        feed.models = [{"id": x.get("id"), "parent": x.get("parent"),
+                                        "root": x.get("root")}
+                                       for x in m.get("data", [])]
         except Exception as e:  # noqa: BLE001 — keep polling through restarts
             feed.connected = False
             feed.error = f"{type(e).__name__}: {e}"

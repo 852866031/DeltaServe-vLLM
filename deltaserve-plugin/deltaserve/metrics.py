@@ -625,27 +625,42 @@ def _lora_memory(model_runner) -> dict:
     except Exception:  # noqa: BLE001
         FT_LORA_INT_ID = -1
     slots = list(getattr(am, "lora_index_to_id", []) or [])
-    cpu_bytes, cpu_n = 0, 0
+    names = getattr(model_runner, "_ds_lora_names", None) or {}
+    slot_of = {lid: i for i, lid in enumerate(slots) if lid is not None}
+    cpu_bytes, cpu_n, adapters = 0, 0, []
     reg = getattr(am, "_registered_adapters", None) or {}
+    pinned = getattr(reg, "pinned_items", set()) or set()
     for lid in list(getattr(reg, "keys", lambda: [])()):
         try:
             lm = reg[lid]
         except Exception:  # noqa: BLE001
             continue
         cpu_n += 1
+        nb = 0
         for w in getattr(lm, "loras", {}).values():
             for t in (getattr(w, "lora_a", None), getattr(w, "lora_b", None)):
                 for x in (t if isinstance(t, (list, tuple)) else [t]):
                     if hasattr(x, "numel"):
-                        cpu_bytes += x.numel() * x.element_size()
+                        nb += x.numel() * x.element_size()
+        cpu_bytes += nb
+        info = names.get(lid) or {}
+        path = info.get("path") or ""
+        adapters.append({
+            "id": lid, "name": info.get("name") or f"id {lid}",
+            "path": os.path.basename(str(path).rstrip("/")) if path else None,
+            "rank": getattr(lm, "rank", None), "cpu_mib": round(nb / (1 << 20), 2),
+            "slot": slot_of.get(lid), "pinned": lid in pinned,
+            "role": "finetune" if lid == FT_LORA_INT_ID else "inference"})
     n = max(1, len(slots))
+    nm = lambda lid: (names.get(lid) or {}).get("name") or f"id {lid}"  # noqa: E731
     return {
         "slots_bytes": gpu,
         "slots": len(slots),
         "slot_gib": round(gpu / n / GIB, 4),
-        "in_slots": [{"slot": i, "id": lid,
+        "in_slots": [{"slot": i, "id": lid, "name": nm(lid),
                       "role": FT_SLOT_NOTE if lid == FT_LORA_INT_ID else "inference"}
                      for i, lid in enumerate(slots) if lid is not None],
+        "adapters": adapters,
         "cpu_cached": cpu_n,
         "max_cpu_loras": getattr(getattr(am, "lora_config", None), "max_cpu_loras", None),
         "cpu_cached_gib": round(cpu_bytes / GIB, 4),

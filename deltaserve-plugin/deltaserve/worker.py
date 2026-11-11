@@ -60,6 +60,9 @@ class DeltaServeWorker(Worker):
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights=load_dummy_weights)
+        # [telemetry] remember each adapter's name / path by its id (the GPU
+        # side only sees ids) for the dashboard's adapter panel.
+        self._track_lora_names()
         # Base weights are on the GPU now: share them (frozen, zero-copy) plus
         # the fp32 FT-adapter master weights with the backward child.
         self._maybe_share_finetuning_weights()
@@ -86,6 +89,29 @@ class DeltaServeWorker(Worker):
             except Exception as e:  # noqa: BLE001 — never block serving
                 dprint(f"[telemetry] memory snapshot failed: {e}")
         return out
+
+    def _track_lora_names(self) -> None:
+        """Wrap this worker's LoRA manager ``add_adapter`` (instance level):
+        every adapter — the pinned FT adapter, the ones loaded on demand by a
+        request or by /v1/load_lora_adapter — passes through it with its
+        LoRARequest; record id → (name, path) on the model runner."""
+        lm = getattr(self.model_runner, "lora_manager", None)
+        if lm is None or getattr(lm, "_ds_tracked", False):
+            return
+        names: dict = {}
+        self.model_runner._ds_lora_names = names
+        orig = lm.add_adapter
+
+        def add_adapter(req, *a, **kw):
+            try:
+                names[int(req.lora_int_id)] = {
+                    "name": getattr(req, "lora_name", None),
+                    "path": getattr(req, "lora_path", None)}
+            except Exception:  # noqa: BLE001 — never block a load
+                pass
+            return orig(req, *a, **kw)
+        lm.add_adapter = add_adapter
+        lm._ds_tracked = True
 
     def _maybe_share_finetuning_weights(self) -> None:
         """Share base + FT-adapter weights with the backward process (Step 3)."""

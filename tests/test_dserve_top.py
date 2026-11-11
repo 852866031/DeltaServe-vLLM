@@ -224,9 +224,15 @@ class FakeDServe:
         for r in (0, 1):
             with open(os.path.join(root, f"memory_rank{r}.json"), "w") as f:
                 json.dump({"lora": {"slots": 2, "slot_gib": 0.031, "in_slots": [
-                               {"slot": 0, "id": 1000, "role": "FT adapter (trained; pinned)"},
-                               {"slot": 1, "id": 1, "role": "inference"}],
+                               {"slot": 0, "id": 1000, "name": "__finetune__", "role": "FT adapter (trained; pinned)"},
+                               {"slot": 1, "id": 1, "name": "qwen3-14b-toy-lora", "role": "inference"}],
+                               "adapters": [
+                                   {"id": 1000, "name": "__finetune__", "path": "qwen3-14b-toy-lora-ft",
+                                    "rank": 16, "cpu_mib": 30.0, "slot": 0, "pinned": True, "role": "finetune"},
+                                   {"id": 1, "name": "qwen3-14b-toy-lora", "path": "qwen3-14b-toy-lora",
+                                    "rank": 16, "cpu_mib": 30.0, "slot": 1, "pinned": False, "role": "inference"}],
                                "cpu_cached": 2, "max_cpu_loras": 2, "cpu_cached_gib": 0.06},
+                           "unix_time": time.time(),
                            "gib": {"model_weights": 13.75, "kv_cache": 3.06,
                                    "ft_activation_buffers": 0.65, "lora_slots": 0.062,
                                    "other_allocated (lm_head copy, temporaries)": 1.94,
@@ -315,6 +321,14 @@ def part_c(root, keep):
          and f"http://localhost:" in out)
     code, page = get(port, "/")
     C.ok("serves the page", code == 200 and b"dserve-top" in page and b"/api/state" in page)
+    node = shutil.which("node")
+    if node:
+        import re
+        js = re.findall(rb"<script>(.*?)</script>", page, re.S)[0]
+        jsf = os.path.join(root, "page.js")
+        open(jsf, "wb").write(js)
+        r = subprocess.run([node, "--check", jsf], capture_output=True, text=True)
+        C.ok("page script parses (node --check)", r.returncode == 0, r.stderr[:160])
     time.sleep(4)
     _, b = get(port, "/api/state?steps_since=0&series_since=0")
     st = json.loads(b)
@@ -341,8 +355,15 @@ def part_c(root, keep):
                         "--hide-scrollbars", f"--screenshot={shot}",
                         "--window-size=1440,1250", "--virtual-time-budget=6000",
                         f"http://127.0.0.1:{port}/"], capture_output=True, timeout=60)
-        C.ok("headless Chrome renders the page", os.path.exists(shot)
-             and os.path.getsize(shot) > 20000, shot)
+        dom = subprocess.run([chrome, "--headless=new", "--disable-gpu", "--no-sandbox",
+                              "--virtual-time-budget=6000", "--dump-dom",
+                              f"http://127.0.0.1:{port}/"], capture_output=True, text=True,
+                             timeout=60).stdout
+        C.ok("headless Chrome renders live data in every panel",
+             os.path.exists(shot) and "connecting" not in dom.split("ENGINE")[0]
+             and "waiting for steps" not in dom and "waiting for the adapter" not in dom
+             and "waiting for the per-GPU" not in dom and "GPU slot" in dom
+             and "TTFT p99" in dom, shot)
     p.send_signal(signal.SIGINT)
     p.wait(15)
     C.ok("on exit it stops the recording it started",

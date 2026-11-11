@@ -69,6 +69,7 @@ svg text{font-family:inherit;font-size:10px}
         <div id="ft2" style="margin-top:6px"></div>
       </div>
       <div class="box"><span class="tt">THROUGHPUT (tokens/s) · last 10 s</span><div id="thr"></div></div>
+      <div class="box grow"><span class="tt">ADAPTERS</span><div id="ad" class="mu">waiting for the adapter snapshot…</div></div>
     </div>
   </div>
   <div class="box"><span class="tt">MEMORY (GiB)</span><div id="mem" class="mu">waiting for the per-GPU snapshot…</div></div>
@@ -231,11 +232,32 @@ function mem(){
    `<div style="flex:1;background:var(--free);font-size:10px;line-height:18px;text-align:center;color:var(--ink2)" data-tip="free ${fmt(tot-used,2)} GiB">${(tot-used)/tot>.06?fmt(tot-used,1)+' free':''}</div></div>`+
    `<span style="width:170px;text-align:right"><span class="hi">${fmt(used,1)}</span> / ${fmt(tot,1)} GiB · ${fmt(used/tot*100,0)}%</span></div>`;}
  const lo=M[ranks[0]].lora;
- if(lo&&lo.slots){const inS=(lo.in_slots||[]).map(x=>`slot ${x.slot}: ${x.role==='inference'?'adapter id '+x.id:esc(x.role)}`).join(' · ')||'none loaded';
-  o+=`<div class="mu" style="margin-top:6px">LoRA: <span class="hi">${lo.slots}</span> GPU slots × <span class="hi">${fmt(lo.slot_gib*1024,0)}</span> MiB per GPU (preallocated) · ${inS} · CPU cache <span class="hi">${lo.cpu_cached}</span>${lo.max_cpu_loras?' / '+lo.max_cpu_loras:''} adapters (<span class="hi">${fmt(lo.cpu_cached_gib*1024,0)}</span> MiB host RAM)</div>`;}
+ if(lo&&lo.slots)o+=`<div class="mu" style="margin-top:6px">LoRA: <span class="hi">${lo.slots}</span> GPU slots × <span class="hi">${fmt(lo.slot_gib*1024,0)}</span> MiB per GPU, preallocated for max_lora_rank and every LoRA-capable module (which adapter is where: ADAPTERS)</div>`;
  const ch=M.backward_child_rank0_gib;
  if(ch)o+=`<div class="mu" style="margin-top:2px">backward child, rank 0: allocated <span class="hi">${fmt(ch.alloc,2)}</span> · peak <span class="hi">${fmt(ch.peak,2)}</span> · reserved <span class="hi">${fmt(ch.reserved,2)}</span> GiB · trained LoRA masters + grads + Adam <span class="hi">${fmt(ch.lora_train_state*1024,0)}</span> MiB</div>`;
  $('mem').innerHTML=o;
+}
+function adapters(){
+ const L=S.latest,M=(L.window||{}).memory||{},ranks=Object.keys(M).filter(k=>k.startsWith('rank')).sort();
+ if(!ranks.length)return;
+ const lo=M[ranks[0]].lora||{},ads=lo.adapters||[],served=(L.models||[]).filter(m=>m.parent);
+ const ago=M[ranks[0]].unix_time&&L.now?Math.max(0,L.now-M[ranks[0]].unix_time):null;
+ const tag=a=>a.role==='finetune'?'<span style="color:var(--ft)">FT · trained</span>':'<span style="color:#5fb6c9">inference</span>';
+ let o=`<div>served by the API <span class="hi">${served.length}</span>${served.length?': '+served.map(m=>`<span class="hi">${esc(m.id)}</span>`).join(', '):''}</div>`;
+ o+=`<div style="margin-top:6px">host (CPU cache) <span class="hi">${lo.cpu_cached??0}</span> / ${lo.max_cpu_loras??'–'} · <span class="hi">${fmt((lo.cpu_cached_gib||0)*1024,0)}</span> MiB</div>`;
+ o+=`<table style="width:100%;border-collapse:collapse;margin-top:2px">`+ads.map(a=>`<tr data-tip="${esc(`id ${a.id}
+${a.path||''}
+rank ${a.rank} · ${a.cpu_mib} MiB in host RAM${a.pinned?'\npinned (never evicted)':''}`)}">`+
+   `<td class="hi" style="padding:1px 0">${esc(a.name)}</td><td>${tag(a)}</td><td>r${a.rank??'?'}</td><td style="text-align:right">${fmt(a.cpu_mib,1)} MiB</td>`+
+   `<td style="text-align:right">${a.slot==null?'<span class="mu">host only</span>':'<span class="ok">GPU slot '+a.slot+'</span>'}${a.pinned?' <span class="mu">· pinned</span>':''}</td></tr>`).join('')+`</table>`;
+ o+=`<div style="margin-top:6px">GPU slots (<span class="hi">${lo.slots??'–'}</span> × <span class="hi">${fmt((lo.slot_gib||0)*1024,0)}</span> MiB, preallocated)</div>`;
+ for(const r of ranks){const l=M[r].lora||{},ins=l.in_slots||[],used=new Map(ins.map(x=>[x.slot,x]));
+  let cells='';for(let i=0;i<(l.slots||0);i++){const x=used.get(i);
+   cells+=x?`<span style="border:1px solid ${x.role!=='inference'?'var(--ft)':'#5fb6c9'};border-radius:3px;padding:0 5px;margin-right:4px" class="hi">${i}: ${esc(x.name||'id '+x.id)}</span>`
+           :`<span style="border:1px dashed var(--line);border-radius:3px;padding:0 5px;margin-right:4px">${i}: free</span>`;}
+  o+=`<div style="margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><span class="hi" style="display:inline-block;width:44px">GPU${r.slice(4)}</span>${cells}</div>`;}
+ if(ago!=null)o+=`<div class="mu" style="margin-top:6px">as of ${dur(ago)} ago · adapters load on demand (LRU) when a request needs one</div>`;
+ $('ad').innerHTML=o;
 }
 let lastTbt=null;
 function kpi(){
@@ -257,7 +279,7 @@ function kpi(){
   tile('FT trained',big(tr)+'/s','','tokens · last 10 s')+
   tile('loss',fmt(f.mean_loss_last_20,3),'','mean of last 20');
 }
-function render(){try{header();wave();charts();ft();gpu();kpi();mem();}catch(e){console.error(e);}}
+function render(){try{header();wave();charts();ft();gpu();kpi();mem();adapters();}catch(e){console.error(e);}}
 addEventListener('resize',render);
 poll();setInterval(poll,300);
 </script>

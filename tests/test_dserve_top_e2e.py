@@ -84,7 +84,8 @@ def main():
                                  adapter_save_every_epoch=False)
     cfg = tmp / "cfg.yaml"
     cfg.write_text(yaml.safe_dump(raw))
-    env = dict(os.environ, HF_HUB_OFFLINE="1", VLLM_USE_FLASHINFER_SAMPLER="0")
+    env = dict(os.environ, HF_HUB_OFFLINE="1", VLLM_USE_FLASHINFER_SAMPLER="0",
+               VLLM_ALLOW_RUNTIME_LORA_UPDATING="True")
     env.setdefault("HF_HOME", "/mnt/storage/huggingface")
     slog = open(tmp / "server.log", "w")
     server = subprocess.Popen(
@@ -161,6 +162,34 @@ def main():
               str(sorted(mem)))
         check("FT status in the feed", (st.get("finetuning") or {}).get("backwards_done", 0) > 0)
         bench.wait(600)
+        # On-demand adapters: register a second inference adapter at runtime
+        # and use it — with max_loras=2 (FT pinned) it must take slot 1.
+        lo = ((st.get("window") or {}).get("memory") or {}).get("rank0", {}).get("lora", {})
+        names = {a["name"] for a in lo.get("adapters", [])}
+        check("adapter names tracked (FT + inference)",
+              "__finetune__" in names and len(names) >= 2, str(sorted(names)))
+        src = raw["adapters"]["lora_path_0"]
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{_PORT}/v1/load_lora_adapter", method="POST",
+            data=json.dumps({"lora_name": "toy-copy", "lora_path": src}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            loaded = r.status == 200
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{_PORT}/v1/completions", method="POST",
+            data=json.dumps({"model": "toy-copy", "prompt": "Hello", "max_tokens": 8}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            answered = r.status == 200
+        time.sleep(14)                          # dserve-top refreshes every 10 s
+        _, st2 = get(f"http://127.0.0.1:{tport}/api/state?steps_since=999999999&series_since=1e18")
+        lo2 = ((st2.get("window") or {}).get("memory") or {}).get("rank0", {}).get("lora", {})
+        slots = {x["slot"]: x["name"] for x in lo2.get("in_slots", [])}
+        served = {m["id"] for m in st2.get("models", []) if m.get("parent")}
+        check("runtime-loaded adapter served and shown in its GPU slot",
+              loaded and answered and "toy-copy" in slots.values()
+              and "__finetune__" in slots.values() and "toy-copy" in served,
+              f"slots {slots} · served {sorted(served)}")
     finally:
         if top is not None:
             top.send_signal(signal.SIGINT)
