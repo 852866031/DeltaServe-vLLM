@@ -891,17 +891,17 @@ per-GPU memory and adapter snapshot (`POST /telemetry/memory`) and reads
 
 ### Reading the page
 
-The page is read-only (there are no buttons that change the server) and refreshes
-about three times a second.
+The page is read-only (there are no buttons that change the server), refreshes
+about three times a second, and fits one screen (1280 × 720 and up) without
+scrolling.
 
 | Panel | Shows |
 |---|---|
-| Header | model, TP size, how long it has been recording, FT state (running / stopped / disabled and why), connection, recording dir |
+| Header | model, TP size, how long it has been recording, FT state (running · backward / filling, stopped, disabled: hover for why), connection, recording dir (hover for the full path) |
 | At a glance (top row) | TTFT p99 over the last minute (green / red against the SLO), TTFT SLO met since start, TBT SLO met this window, inference and FT tokens/s (last 10 s), loss |
-| Engine | every engine step as a bar, newest on the right: FT (bottom), inference prefill, decode tokens, on a √ scale. Runs of plain decode steps fold into one growing `d×N` block. Under each bar: the FT admission decision (table below) and the FT tokens admitted. `✗` = an FT-only step pre-empted for an arriving request. Hover a bar for its GPU ms, CUDA graph / eager, backward running / paused. Below: the last step, and GPU busy over the last 10 s for inference forward, FT forward and LoRA backward |
-| TTFT, TPOT | p50 / p99 per second against the SLO line (TTFT counted when the first token comes out; TPOT per finished request); range 1 / 5 / 30 / 60 min |
-| Finetuning progress | epoch and progress through it, samples, tokens trained and tokens/s, ETA for the epoch and all epochs, loss curve, backward GPU / wall ms and paused share, cycles, buffer fill, admission open / closed, estimator fitted |
-| Throughput | inference output and prompt tokens/s, FT tokens forwarded and trained/s |
+| Engine | every engine step as a bar, newest on the right: FT (bottom), inference prefill, decode tokens, on a √ scale. Runs of plain decode steps fold into one growing `d×N` block. Under each bar: the FT admission decision (table below) and the FT tokens admitted. `✗` = an FT-only step pre-empted for an arriving request. Hover a bar for its GPU ms, CUDA graph / eager, backward running / paused. Below: the last step, and GPU busy over the last 10 s for inference forward, FT forward and LoRA backward (hover for how it is measured) |
+| TTFT, TPOT | side by side: p50 / p99 per second against the SLO line (TTFT counted when the first token comes out; TPOT per finished request); range 1 (default) / 5 / 30 / 60 min |
+| Finetuning progress | epoch and progress through it, samples, tokens trained and tokens/s, ETA for the epoch and all epochs, loss curve, backward GPU / wall ms and paused share, cycles, buffer fill, admission open / closed, estimator fitted; tokens/s over the last 10 s: inference output and prompt, FT forwarded and trained |
 | Adapters | adapters served by the API; the host (CPU) adapter cache with each adapter's role (FT / inference), rank, size and whether it sits in a GPU slot or host only (pinned = the FT adapter); each GPU's LoRA slots and what is in them |
 | Memory | one bar per GPU: weights, KV cache, LoRA adapter slots, FT buffers, other, cached / CUDA graphs, backward child + other processes, free. Below: the LoRA slot size and the backward child's memory (allocated / peak / reserved, LoRA masters + grads + Adam) |
 
