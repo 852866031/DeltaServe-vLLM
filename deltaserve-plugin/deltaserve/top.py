@@ -421,6 +421,9 @@ def make_handler(feed: Feed, info: dict, srv: DServe | None = None):
                     code, r = srv.call("POST", "/shutdown", {})
                 except Exception as e:  # noqa: BLE001
                     code, r = 502, {"error": f"server unreachable: {e}"}
+                if code == 404:
+                    r = {"error": "this server has no POST /shutdown (it was started with an "
+                                  "older plugin); stop it with Ctrl-C on its launcher"}
                 print(f"dserve-top: stop requested from the page (via {self.client_address[0]})"
                       f" → {code} {r.get('status') or r.get('error') or ''}", flush=True)
                 return self._send(code, json.dumps(r).encode(), "application/json")

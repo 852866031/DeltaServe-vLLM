@@ -371,7 +371,7 @@ def part_scrub_export(root, port, chrome):
     with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/export?max_mb=500", timeout=30) as r:
         C.ok("export size is capped at 50 MB whatever is asked", len(r.read()) <= 50 * 2**20)
     page_kib = len(html) - len(html.split(b'<script id="ds-embedded"')[1]) if b"ds-embedded" in html else 0
-    lim = (len(html) - (len(html) - page_kib) // 2) / 2**20     # page + about half the data
+    lim = round((len(html) - (len(html) - page_kib) // 2) / 2**20, 4)  # page + about half the data (as sent)
     with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/export?max_mb={lim:.4f}",
                                 timeout=30) as r:
         small = r.read()
