@@ -891,9 +891,10 @@ per-GPU memory and adapter snapshot (`POST /telemetry/memory`) and reads
 
 ### Reading the page
 
-The page is read-only (there are no buttons that change the server), refreshes
-about three times a second, and fits one screen (1280 × 720 and up) without
-scrolling.
+The page refreshes about three times a second and scales itself to the window
+(0.75× to 2.4×): it fills the width and fits the height, so it never scrolls and
+nothing is cut short; a window under 1000 px wide gets the plain stacked layout. The only button that changes
+the server is `■ STOP`.
 
 | Panel | Shows |
 |---|---|
@@ -938,6 +939,7 @@ the bad moments are easy to find.
 | `Home` | jump to the start of the history |
 | `▶` (`Space`), speed 1× / 10× / 60× | play from the cursor; from live it starts 5 min back |
 | `⏭ LIVE` (`End`) | jump back to the newest data and follow it again (`● LIVE`) |
+| `■ STOP` | stop the server, as `Ctrl-C` on the launcher would (asks first). In-flight requests are dropped; the estimator state and telemetry are saved; `dserve-top` keeps running with the history. Works only when `dserve-top` runs on the server's machine |
 
 While you look at the past, data keeps arriving in the background. The label shows
 the cursor's time and how far behind live it is (`−mm:ss`).
@@ -994,9 +996,11 @@ curl -o run.html "http://localhost:8090/api/export?max_mb=10"
 | `/` | dserve-top | the page (`deltaserve/top_page.html`) |
 | `/api/state?steps_since&series_since&snaps_since&mems_since&models_since` | dserve-top | what is new since the page's last poll; the first poll gets the whole history (gzip'd) |
 | `/api/export?max_mb=50` | dserve-top | the single-HTML export |
+| `POST /api/stop` | dserve-top | the `■ STOP` button: forwards to the server's `POST /shutdown` (needs the header `X-DServe-Stop: 1`) |
 | `/healthz` | dserve-top | `dserve-top OK · server connected` / not connected (why) |
 | `GET /telemetry/data?steps_since&series_since` | server | the live feed: steps since a sequence number, per-second rows since a time, current window, FT status |
 | `POST /telemetry/start` / `stop` / `memory` | server | start / stop a recording at runtime; refresh the per-GPU memory and adapter snapshot |
+| `POST /shutdown` | server | SIGINT to the API server, so vLLM shuts down as on `Ctrl-C`; loopback clients only (403 otherwise) |
 
 On the server, `live.LiveFeed` inside the telemetry recorder builds the step stream
 (plain decode steps folded into `d×N` runs; FT admission codes stamped by

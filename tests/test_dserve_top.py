@@ -205,6 +205,8 @@ class FakeDServe:
                     return self._j(200, {"stopped": stopped})
                 if u.path == "/telemetry/memory":
                     return self._j(200 if outer.rec else 409, {})
+                if u.path == "/shutdown":
+                    return self._j(200, {"status": "stopping"})
                 self._j(404, {})
 
         if port is None:
@@ -485,6 +487,24 @@ def part_c(root, keep):
              and "waiting for the per-GPU" not in dom and "GPU slot" in dom
              and "TTFT p99" in dom, shot)
     part_scrub_export(root, port, chrome)
+
+    def post(path, headers):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method="POST",
+                                     data=b"", headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            return e.code, {}
+    code0, _ = post("/api/stop", {})
+    C.ok("■ STOP: refused without the page's header (no cross-site posts)",
+         code0 == 403 and not any(c[:2] == ("POST", "/shutdown") for c in fake.calls), code0)
+    code1, r1 = post("/api/stop", {"X-DServe-Stop": "1"})
+    C.ok("■ STOP: forwarded to the server's POST /shutdown",
+         code1 == 200 and r1.get("status") == "stopping"
+         and any(c[:2] == ("POST", "/shutdown") for c in fake.calls), (code1, r1))
+    if chrome:
+        C.ok("the page has the ■ STOP button", 'id="stop"' in dom and "■ STOP" in dom)
     p.send_signal(signal.SIGINT)
     p.wait(15)
     C.ok("on exit it stops the recording it started",

@@ -8,7 +8,7 @@
 :root{--bg:#141413;--panel:#1a1a19;--line:#34342f;--grid:#262624;--ink:#f0efec;--ink2:#c3c2b7;--mute:#898781;
 --ft:#d95926;--inf:#3987e5;--dec:#199e70;--p99:#e8a33a;--bad:#e66767;--ok:#3fbf7f;--other:#c98500;--cache:#9085e9;--child:#d55181;--free:#2a2a28}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink2);font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+body{margin:0;overflow-x:hidden;background:var(--bg);color:var(--ink2);font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 .wrap{max-width:1500px;margin:0 auto;padding:8px 16px 12px}
 .hdr{display:flex;flex-wrap:nowrap;gap:16px;justify-content:space-between;align-items:center;margin-bottom:8px;white-space:nowrap}
 .hl{flex:none;overflow:hidden;text-overflow:ellipsis;max-width:75%}.hr{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;text-align:right}
@@ -50,6 +50,7 @@ svg text{font-family:inherit;font-size:10px}
 .track input::-moz-range-thumb{width:3px;height:30px;background:var(--ink);border:0;border-radius:1px}
 #follow.live{border-color:var(--ok);color:var(--ok)}
 #follow.off{border-color:var(--p99);color:var(--p99)}
+#stop{border-color:#6b2f2f;color:var(--bad)}#stop:hover:not(:disabled){background:#2a1616}#stop:disabled{opacity:.4;cursor:default}
 a.btn{text-decoration:none}
 select.btn{padding:1px 3px}
 .adt td{white-space:nowrap;padding-right:6px}.adt td:first-child{max-width:14ch;overflow:hidden;text-overflow:ellipsis}
@@ -67,15 +68,14 @@ select.btn{padding:1px 3px}
     <div class="col">
       <div class="box"><span class="tt">ENGINE · batches (newest →) · height = tokens (√)</span>
         <svg id="wave" width="100%" height="114" role="img" aria-label="Engine batches"></svg>
-        <div id="last" class="mu one">waiting for steps…</div>
-        <div class="row one" style="flex-wrap:nowrap">
-          <div class="mu" style="flex:none"><span class="sw" style="background:var(--ft)"></span>FT <span class="sw" style="background:var(--inf);margin-left:6px"></span>prefill <span class="sw" style="background:var(--dec);margin-left:6px"></span>decode <span style="color:var(--bad);margin-left:6px">✗</span> pre-empted</div>
-          <div id="codes" class="mu one" style="text-align:right;min-width:0"></div>
+        <div id="last" class="mu">waiting for steps…</div>
+        <div class="mu">
+          <span><span class="sw" style="background:var(--ft)"></span>FT <span class="sw" style="background:var(--inf);margin-left:6px"></span>prefill <span class="sw" style="background:var(--dec);margin-left:6px"></span>decode <span style="color:var(--bad);margin-left:6px">✗</span> pre-empted</span><span style="margin-left:6px">·</span> <span id="codes"></span>
         </div>
         <div id="gpu" style="margin-top:4px"></div>
       </div>
       <div class="pair">
-        <div class="box"><span class="tt">TTFT (s) · <span style="color:var(--inf)">p50</span> <span style="color:var(--p99)">p99</span> · <span id="ttft_hdr" class="mu"></span></span>
+        <div class="box"><span class="tt">TTFT (s) · <span style="color:var(--inf)">p50</span> <span style="color:var(--p99)">p99</span><span id="ttft_hdr" class="mu"></span></span>
           <span class="tr"><button class="btn on" data-r="60">1m</button><button class="btn" data-r="300">5m</button><button class="btn" data-r="1800">30m</button><button class="btn" data-r="3600">60m</button></span>
           <svg id="ttft" width="100%" height="96" role="img" aria-label="TTFT p50 and p99 over time"></svg>
         </div>
@@ -104,6 +104,7 @@ select.btn{padding:1px 3px}
   <span id="tlab" class="mu" style="min-width:150px;text-align:right">–</span>
   <button id="follow" class="btn live" title="jump back to the newest data and follow it (End)">● LIVE</button>
   <a id="dl" class="btn" href="/api/export?max_mb=50" download title="the whole history as one HTML file that replays offline (≤ 50 MB; oldest part dropped above that)">⤓ HTML</a>
+  <button id="stop" class="btn" title="stop the server, as Ctrl-C would (asks first). dserve-top keeps running with the history.">■ STOP</button>
 </div></div>
 <div id="tip"></div>
 <script>
@@ -111,7 +112,7 @@ const $=id=>document.getElementById(id);
 const C={ft:'#d95926',inf:'#3987e5',dec:'#199e70',p99:'#e8a33a',bad:'#e66767',grid:'#262624',line:'#34342f',mute:'#898781',ink2:'#c3c2b7'};
 let S={steps:[],series:[],snaps:[],mems:[],models_h:[],latest:{}},range=60,busy=false,REPLAY=null;
 let Q={steps:0,series:0,snaps:0,mems:0,models:0};
-let follow=true,cur=0,playing=false,V={latest:{},steps:[],series:[]};
+let follow=true,cur=0,playing=false,V={latest:{},steps:[],series:[]},Z=1;
 const fmt=(x,k=1)=>x==null||!isFinite(x)?'–':(+x).toFixed(k);
 const big=n=>n==null?'–':n>=1e6?(n/1e6).toFixed(2)+' M':n>=1e3?(n/1e3).toFixed(1)+' k':String(Math.round(n));
 const dur=s=>{s=Math.max(0,Math.floor(s));const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return (h?h+':':'')+String(m).padStart(h?2:1,'0')+':'+String(x).padStart(2,'0')};
@@ -169,6 +170,7 @@ function scrub(){
  $('tlab').innerHTML=`<span class="hi">${new Date(cur*1000).toLocaleTimeString()}</span>`+(follow?'':` <span class="warn">−${dur(back)}</span>`)+` <span class="mu">/ ${dur(t1-t0)}</span>`;
  $('play').textContent=playing?'❚❚':'▶';
  const est=S.latest.export_estimate_mb;
+ if(!REPLAY){const b=$('stop'),up=!!S.latest.connected;if(stopping&&!up){stopping=false;b.textContent='■ STOP';}if(!stopping){b.disabled=!up;b.title=up?'stop the server, as Ctrl-C would (asks first). dserve-top keeps running with the history.':'no server connected';}}
  if(!REPLAY)$('dl').textContent=`⤓ HTML${est!=null?' ~'+(est<1?'<1':Math.round(est))+' MB':''}`;
  marks(t0,t1);
 }
@@ -176,7 +178,7 @@ let mkKey='';
 function marks(t0,t1){  // load + SLO-miss strip behind the slider
  const c=$('marks'),W=c.clientWidth|0,H=22;if(!W)return;
  const key=[W,t0,S.series.length,S.series.length?S.series[S.series.length-1].t:0,Math.floor(t1)].join();if(key===mkKey)return;mkKey=key;
- c.width=W*devicePixelRatio;c.height=H*devicePixelRatio;const g=c.getContext('2d');g.scale(devicePixelRatio,devicePixelRatio);g.clearRect(0,0,W,H);
+ const pr=devicePixelRatio*Z;c.width=W*pr;c.height=H*pr;const g=c.getContext('2d');g.scale(pr,pr);g.clearRect(0,0,W,H);
  const n=Math.max(1,W),sp=Math.max(1e-6,t1-t0),out=new Float32Array(n),tr=new Float32Array(n),miss=new Uint8Array(n),has=new Uint8Array(n);
  const slo=((S.latest.meta||{}).ttft_slo)||((at(S.snaps,t1)||{}).win||{inference:{}}).inference.ttft_slo;
  for(const r of S.series){const i=Math.min(n-1,Math.max(0,Math.floor((r.t-t0)/sp*n)));out[i]=Math.max(out[i],r.out||0);tr[i]=Math.max(tr[i],r.tr||0);has[i]=1;
@@ -190,6 +192,15 @@ function marks(t0,t1){  // load + SLO-miss strip behind the slider
 }
 $('rng').addEventListener('input',e=>{follow=false;cur=+e.target.value;const [,t1]=span();if(t1-cur<0.5)follow=true;render();});
 $('follow').onclick=()=>{follow=true;playing=false;render();};
+let stopping=false;
+$('stop').onclick=async()=>{
+ const m=(S.latest.meta||{}).served_model_name||'the server';
+ if(!confirm(`Stop ${m}?\n\nThe server shuts down as on Ctrl-C (estimator state and telemetry are saved). Inference requests in flight are dropped. dserve-top keeps running with the history.`))return;
+ const b=$('stop');stopping=true;b.disabled=true;b.textContent='stopping…';
+ try{const r=await fetch('/api/stop',{method:'POST',headers:{'X-DServe-Stop':'1'}});const j=await r.json().catch(()=>({}));
+  if(!r.ok){stopping=false;b.disabled=false;b.textContent='■ STOP';alert('Could not stop the server: '+(j.error||r.status));}
+ }catch(e){stopping=false;b.disabled=false;b.textContent='■ STOP';alert('Could not stop the server: '+e);}
+};
 $('play').onclick=()=>{if(follow&&!playing){const [t0,t1]=span();cur=Math.max(t0,t1-300);follow=false;}playing=!playing;render();};
 addEventListener('keydown',e=>{if(e.target.tagName==='SELECT')return;
  if(e.key==='End'){follow=true;playing=false;render();e.preventDefault();}
@@ -275,7 +286,7 @@ function charts(){
  const w=(V.latest.window||{}).inference||{},m=V.latest.meta||{};
  const rows=V.series.filter(r=>r.t>=(V.latest.now||0)-range);
  const nt=rows.reduce((a,r)=>a+r.nt,0),nf=rows.reduce((a,r)=>a+r.nf,0);
- $('ttft_hdr').textContent=`SLO ${m.ttft_slo??w.ttft_slo??'–'} s · ${nt} req`;
+ $('ttft_hdr').textContent='';
  $('tpot_hdr').textContent=`${nf} finished`;
  lineChart('ttft',['ttft50','ttft99'],1,w.ttft_slo,' s',3);
  lineChart('tpot',['tpot50','tpot99'],1000,w.max_tbt_slo?w.max_tbt_slo*1000:null,' ms',1);
@@ -333,9 +344,9 @@ function mem(){
    `<div style="flex:1;background:var(--free);font-size:10px;line-height:18px;text-align:center;color:var(--ink2)" data-tip="free ${fmt(tot-used,2)} GiB">${(tot-used)/tot>.06?fmt(tot-used,1)+' free':''}</div></div>`+
    `<span style="width:170px;text-align:right"><span class="hi">${fmt(used,1)}</span> / ${fmt(tot,1)} GiB · ${fmt(used/tot*100,0)}%</span></div>`;}
  const lo=M[ranks[0]].lora;
- if(lo&&lo.slots)o+=`<div class="mu one" style="margin-top:4px" data-tip="vLLM preallocates max_loras slots per GPU, sized for max_lora_rank and every LoRA-capable module.\nWhich adapter is in which slot: ADAPTERS.">LoRA: <span class="hi">${lo.slots}</span> GPU slots × <span class="hi">${fmt(lo.slot_gib*1024,0)}</span> MiB per GPU, preallocated (occupants: ADAPTERS)</div>`;
+ if(lo&&lo.slots)o+=`<div class="mu" style="margin-top:4px" data-tip="vLLM preallocates max_loras slots per GPU, sized for max_lora_rank and every LoRA-capable module.\nWhich adapter is in which slot: ADAPTERS.">LoRA: <span class="hi">${lo.slots}</span> GPU slots × <span class="hi">${fmt(lo.slot_gib*1024,0)}</span> MiB per GPU, preallocated (occupants: ADAPTERS)</div>`;
  const ch=M.backward_child_rank0_gib;
- if(ch)o+=`<div class="mu one" style="margin-top:2px">backward child, rank 0: allocated <span class="hi">${fmt(ch.alloc,2)}</span> · peak <span class="hi">${fmt(ch.peak,2)}</span> · reserved <span class="hi">${fmt(ch.reserved,2)}</span> GiB · LoRA masters + grads + Adam <span class="hi">${fmt(ch.lora_train_state*1024,0)}</span> MiB</div>`;
+ if(ch)o+=`<div class="mu" style="margin-top:2px">backward child, rank 0: allocated <span class="hi">${fmt(ch.alloc,2)}</span> · peak <span class="hi">${fmt(ch.peak,2)}</span> · reserved <span class="hi">${fmt(ch.reserved,2)}</span> GiB · LoRA masters + grads + Adam <span class="hi">${fmt(ch.lora_train_state*1024,0)}</span> MiB</div>`;
  $('mem').innerHTML=o;
 }
 function adapters(){
@@ -379,7 +390,28 @@ function kpi(){
   tile('FT trained',big(tr)+'/s','','tok · 10 s')+
   tile('loss',fmt(f.mean_loss_last_20,3),'','mean of last 20');
 }
-function render(){try{view();header();wave();charts();ft();gpu();kpi();mem();adapters();scrub();}catch(e){console.error(e);}}
+// Fill the window: lay the page out at a design width between 1300 px (the
+// narrowest it fits on one line per row) and 1500 px, then scale it (CSS zoom)
+// to fill the window's width and as much of its height as fits, so it never
+// scrolls: up to 2.4× on big screens, down to 0.75× on short ones. Phone-sized
+// windows keep the natural (stacked) layout.
+function fit(){
+ const w=document.querySelector('.wrap'),sc=document.querySelector('.scrub .in'),prev=Z,H=innerHeight-8;
+ const set=(z,lw)=>{w.style.zoom=sc.style.zoom=z;w.style.maxWidth=sc.style.maxWidth=lw?'none':'';w.style.width=sc.style.width=lw?lw+'px':'';};
+ let z=1,lw=0;
+ if(innerWidth>=1000){
+  lw=Math.min(1500,Math.max(1300,innerWidth));
+  for(let i=0;i<3;i++){  // the height depends a little on the width; settle it in a few passes
+   set(1,lw);
+   const tot=w.offsetHeight-52+sc.offsetHeight+1;  // 52 = the bottom padding kept free for the scrubber
+   z=Math.max(.75,Math.floor(Math.min(H/tot,innerWidth/1300,2.4)*50)/50);
+   const nl=Math.floor(innerWidth/z);if(nl===lw)break;lw=nl;
+  }
+ }
+ set(z,lw);Z=z;tip.style.fontSize=(12*z)+'px';tip.style.maxWidth=(420*z)+'px';
+ if(z!==prev)mkKey='';
+}
+function render(){try{fit();view();header();wave();charts();ft();gpu();kpi();mem();adapters();scrub();}catch(e){console.error(e);}}
 addEventListener('resize',()=>{mkKey='';render();});
 async function boot(){
  const emb=document.getElementById('ds-embedded');
@@ -390,7 +422,7 @@ async function boot(){
    const d=JSON.parse(txt);REPLAY=d;
    absorb({...d,now:null,history_s:null,connected:false});
    S.latest={meta:d.meta,t_start:d.t_start,dir:d.dir,top:d.top,connected:false};S.ok=true;
-   $('dl').style.display='none';document.title='dserve-top · replay';
+   $('dl').style.display='none';$('stop').style.display='none';document.title='dserve-top · replay';
   }catch(e){$('conn').textContent='could not read the embedded data: '+e;console.error(e);}
   render();return;
  }

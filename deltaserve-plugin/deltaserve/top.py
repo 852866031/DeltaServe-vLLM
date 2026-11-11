@@ -349,7 +349,7 @@ def poll_loop(link: Link, feed: Feed, stop: threading.Event, every: float) -> No
         stop.wait(every)
 
 
-def make_handler(feed: Feed, info: dict):
+def make_handler(feed: Feed, info: dict, srv: DServe | None = None):
     page = PAGE.read_bytes()
     seen: set = set()
 
@@ -407,6 +407,23 @@ def make_handler(feed: Feed, info: dict):
                 return self._send(200, html, "text/html; charset=utf-8",
                                   {"Content-Disposition": f'attachment; filename="{name}"'},
                                   compress=False)
+            self._send(404, b"not found", "text/plain")
+
+        def do_POST(self):
+            u = urllib.parse.urlparse(self.path)
+            if u.path == "/api/stop":
+                # The page's ■ STOP button. The custom header keeps a cross-site form
+                # on some other web page from posting here (it cannot set headers
+                # without a CORS preflight, which this server never answers).
+                if self.headers.get("X-DServe-Stop") != "1" or srv is None:
+                    return self._send(403, b'{"error":"forbidden"}', "application/json")
+                try:
+                    code, r = srv.call("POST", "/shutdown", {})
+                except Exception as e:  # noqa: BLE001
+                    code, r = 502, {"error": f"server unreachable: {e}"}
+                print(f"dserve-top: stop requested from the page (via {self.client_address[0]})"
+                      f" → {code} {r.get('status') or r.get('error') or ''}", flush=True)
+                return self._send(code, json.dumps(r).encode(), "application/json")
             self._send(404, b"not found", "text/plain")
 
     return H
@@ -496,7 +513,7 @@ def main(argv=None) -> int:
     stop = threading.Event()
     info = {"server": a.server, "recording_dir": None, "started_by_top": False}
     link = Link(srv, a, info)
-    httpd = bind(a.bind, a.port, make_handler(feed, info))
+    httpd = bind(a.bind, a.port, make_handler(feed, info, srv))
     port = httpd.server_address[1]
     print(ssh_guide(port), flush=True)
     print(f"dserve-top: dashboard served on http://{a.bind}:{port} · watching the "

@@ -16,7 +16,9 @@ benchmark phase or to bracket a deliberate idle window.
 POST /save_adapter writes the trained adapter (PEFT format); GET
 /finetuning_status reports admission + training progress; GET
 /system_metrics the system metrics (telemetry.metrics_dir); /telemetry/*
-the live feed of dserve-top (start / stop recording at runtime, data).
+the live feed of dserve-top (start / stop recording at runtime, data); POST
+/shutdown stops the server the way Ctrl-C does (dserve-top's ■ STOP button),
+accepted only from the server's own machine.
 
 Only attached when finetuning is enabled.
 """
@@ -255,6 +257,28 @@ async def telemetry_stop(raw_request: Request):
         logger.exception("telemetry stop failed")
         return JSONResponse(status_code=500, content={"error": str(e)})
     return JSONResponse(status_code=200, content=res)
+
+
+_LOOPBACK = ("127.0.0.1", "::1", "localhost")
+
+
+@router.post("/shutdown")
+async def shutdown(raw_request: Request):
+    """[dserve-top] Stop the server as Ctrl-C would: SIGINT to this API
+    server process, so vLLM shuts the engine down normally (estimator state and
+    telemetry are saved on the way, as on Ctrl-C). Loopback clients only."""
+    import asyncio
+    import os
+    import signal
+
+    peer = raw_request.client.host if raw_request.client else ""
+    if peer not in _LOOPBACK and not peer.startswith("127."):
+        return JSONResponse(status_code=403, content={
+            "error": f"shutdown is accepted only from the server's own machine (not {peer})"})
+    logger.warning("POST /shutdown from %s: stopping the server", peer)
+    # After the response is on its way.
+    asyncio.get_running_loop().call_later(0.3, os.kill, os.getpid(), signal.SIGINT)
+    return JSONResponse(status_code=200, content={"status": "stopping"})
 
 
 def attach_router(app: FastAPI):
