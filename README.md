@@ -39,23 +39,24 @@ vLLM's own `--additional-config`. Without it, the server is plain vLLM.
 1. [Get started](#get-started)
 2. [How it works](#how-it-works)
 3. [Supported models](#supported-models)
-4. [Features](#features)
-   - [Telemetry and live monitoring (`dserve-top`)](#telemetry-and-live-monitoring-dserve-top): [system metrics](#recorded-system-metrics) · [quick start](#dserve-top-quick-start) · [over SSH](#opening-the-page-over-ssh) · [reading the page](#reading-the-page) · [going back in time](#going-back-in-time) · [exporting a run](#exporting-a-run)
+4. [Telemetry and live monitoring (`dserve-top`)](#telemetry-and-live-monitoring-dserve-top)
+   - [system metrics](#recorded-system-metrics) · [quick start](#dserve-top-quick-start) · [over SSH](#opening-the-page-over-ssh) · [reading the page](#reading-the-page) · [going back in time](#going-back-in-time) · [exporting a run](#exporting-a-run)
+5. [Features](#features)
    - [Forward pass](#forward-pass)
    - [Backward pass](#backward-pass)
    - [CUDA graphs at a glance](#cuda-graphs-at-a-glance)
    - [Interrupts and pauses](#interrupts-and-pauses-protecting-inference-latency)
    - [Throttles and admission control](#throttles-and-admission-control)
    - [Optimizations](#optimizations)
-5. [Results](#results)
-6. [Repository layout](#repository-layout)
-7. [Installation](#installation)
-8. [Launching a server](#launching-a-server)
+6. [Results](#results)
+7. [Repository layout](#repository-layout)
+8. [Installation](#installation)
+9. [Launching a server](#launching-a-server)
    - [HTTP endpoints](#http-endpoints)
    - [Saving the trained adapter](#saving-the-trained-adapter)
    - [When something fails](#when-something-fails)
-9. [Running experiments](#running-experiments)
-10. [Tests](#tests)
+10. [Running experiments](#running-experiments)
+11. [Tests](#tests)
 
 ---
 
@@ -228,9 +229,7 @@ has not been tested.
 
 ---
 
-## Features
-
-### Telemetry and live monitoring (`dserve-top`)
+## Telemetry and live monitoring (`dserve-top`)
 
 Two layers. The server records **system metrics**: per-request latency, per-cycle
 backward stats, 10-second summaries, GPU memory and a per-step log. Turn it on with
@@ -240,9 +239,14 @@ step, inference latency against the SLO, finetuning progress, throughput, adapte
 and GPU memory. You can scrub back through the run, download it as one HTML file
 that replays offline, and stop the server from it.
 
-![dserve-top on Qwen3-14B TP=2 under load](docs/figures/dserve_top_qwen3_14b_tp2.png)
+**[▶ Open an example run](https://raw.githack.com/852866031/DeltaServe-vLLM/main/docs/dserve-top-example.html)**:
+72 s of Qwen3-14B TP=2 on 2× RTX 5090 at about 3 req/s with finetuning running, exported
+from `dserve-top` as one HTML file (53 KB). It opens in the browser with no server: scrub
+the timeline, press `▶`, hover anything. The same file is
+[`docs/dserve-top-example.html`](docs/dserve-top-example.html) if you would rather open
+it locally.
 
-#### Recorded system metrics
+### Recorded system metrics
 
 Set `telemetry.metrics_dir` (the templates do: `logs/<model>/metrics`) and the server
 records, from the moment it starts:
@@ -285,7 +289,7 @@ call 0.4 ms. Throughput, TTFT / TPOT / ITL percentiles and FT tokens/s on vs off
 difference within run-to-run noise (0.6B, 3 + 3 runs: output tok/s +0.3 %, TPOT p50
 −0.1 %; 14B: all within ±0.15 %).
 
-#### `dserve-top`: quick start
+### `dserve-top`: quick start
 
 `dserve-top` is installed with the plugin (`pip install --editable deltaserve-plugin`
 puts it on the `PATH` of that env; `python -m deltaserve.top` is the same thing). It
@@ -313,7 +317,7 @@ ssh -N -o ExitOnForwardFailure=yes -L 8090:localhost:8090 -p 2222 you@gpu-box
 When it works, `dserve-top` prints `a browser opened the dashboard (via …)`.
 `Ctrl-C` quits; it stops the recording if it started one.
 
-#### Opening the page over SSH
+### Opening the page over SSH
 
 The page is served on `127.0.0.1` of the GPU machine only (nothing is exposed on the
 network), so you reach it through an SSH tunnel. The first thing `dserve-top` prints
@@ -346,7 +350,7 @@ logged in through):
 Any number of browser tabs can be open: `dserve-top` polls the server once, about
 four times a second, and every tab reads from its buffers.
 
-#### What `dserve-top` does to the server
+### What `dserve-top` does to the server
 
 The dashboard needs the server's telemetry recording. `dserve-top` handles that:
 
@@ -366,7 +370,7 @@ The recording is the [system metrics](#recorded-system-metrics) set (`requests.c
 per-GPU memory and adapter snapshot (`POST /telemetry/memory`) and reads
 `/v1/models`, so adapters loaded on demand show up.
 
-#### `dserve-top` options
+### `dserve-top` options
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -380,7 +384,7 @@ per-GPU memory and adapter snapshot (`POST /telemetry/memory`) and reads
 | `--history-hours H` | `12` | how far back the page can scrub, kept in `dserve-top`'s memory |
 | `--no-wait` | off | exit with an error if the server is not reachable now |
 
-#### Reading the page
+### Reading the page
 
 The page refreshes about three times a second and scales itself to the window
 (0.75× to 2.4×): it fills the width and fits the height, so it never scrolls and
@@ -416,7 +420,7 @@ Request times are measured in the engine, about 1 ms below what a client sees.
 Forward and backward share the GPU, so their busy fractions can add up to more
 than 100 %.
 
-#### Going back in time
+### Going back in time
 
 The bar at the bottom of the page covers the whole history `dserve-top` holds (the
 last `--history-hours`). Behind the slider is a strip of inference load (blue) and FT
@@ -439,7 +443,7 @@ When the server stops, the history stays: scrub and export as long as `dserve-to
 runs (reloading the page reloads the history). It is reset only when a new server
 run connects, so export first if you restart the server.
 
-#### Exporting a run
+### Exporting a run
 
 **`⤓ HTML`** downloads the history as one self-contained HTML file: the page with
 the data gzip'd and embedded. Open it anywhere, offline, with no server and no
@@ -467,7 +471,7 @@ curl -o run.html http://localhost:8090/api/export            # ≤ 50 MB
 curl -o run.html "http://localhost:8090/api/export?max_mb=10"
 ```
 
-#### `dserve-top` troubleshooting
+### `dserve-top` troubleshooting
 
 | You see | Means / do |
 |---|---|
@@ -480,7 +484,7 @@ curl -o run.html "http://localhost:8090/api/export?max_mb=10"
 | `dserve-top: command not found` | not in the plugin's env: activate it, or `python -m deltaserve.top` |
 | memory / adapters panels say waiting | the first per-GPU snapshot comes within ~10 s of connecting |
 
-#### Under the hood: the feed and the endpoints
+### Under the hood: the feed and the endpoints
 
 | Endpoint | Of | Returns |
 |---|---|---|
@@ -498,6 +502,10 @@ On the server, `live.LiveFeed` inside the telemetry recorder builds the step str
 `admit_ft_to_step`) and the per-second rows. While it records, the step stream is
 also written to `steps.*.jsonl.gz` in the recording dir, rolling under
 `telemetry.steps_log_max_mb` (256 MB).
+
+---
+
+## Features
 
 ### Forward pass
 
@@ -726,7 +734,9 @@ DeltaServe-vLLM/
 ├── eval-arxiv/                        long-context probe (16k, arxiv summarization)
 ├── scripts/                           adapter builders, config converter, timeline generators (timelines/)
 ├── tests/                             standalone test scripts (+ run_all.sh)
-└── docs/figures/                      overview + architecture figures (+ generators), result plots
+└── docs/
+    ├── figures/                       overview + architecture figures (+ generators), result plots
+    └── dserve-top-example.html        an exported dserve-top run (opens offline)
 ```
 
 ---

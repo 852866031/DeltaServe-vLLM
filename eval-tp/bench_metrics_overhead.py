@@ -13,6 +13,10 @@
     python eval-tp/bench_metrics_overhead.py                        # 0.6B, 3+3 runs
     python eval-tp/bench_metrics_overhead.py --config configs/template_qwen3_14b_tp2.yaml \\
         --order A --concurrency 16 --num-prompts 400                # accounting only
+    python eval-tp/bench_metrics_overhead.py --order ABTTBA          # + dserve-top attached
+
+Arms: A = metrics on, B = off, T = metrics on with a ``dserve-top`` polling the
+server the whole run (its live feed ~4×/s, memory / adapter snapshot every 10 s).
 """
 
 import argparse
@@ -52,7 +56,8 @@ try:
                     st = _stats.setdefault(key, [0, 0.0, 0.0])
                     st[0] += 1; st[1] += d; st[2] = max(st[2], d)
         setattr(_m.MetricsRecorder, name, w)
-    for _n in ("on_outputs", "on_step", "on_backward", "maybe_flush", "snapshot", "current"):
+    for _n in ("on_outputs", "on_step", "on_backward", "maybe_flush", "snapshot", "current",
+               "live", "memory"):
         _wrap(_n)
     def _dump():
         path = os.environ["DS_ACCT_FILE"]
@@ -98,7 +103,7 @@ def config_for(template: Path, tmp: Path, metrics: bool, tag: str) -> Path:
     return out
 
 
-def run_one(template, tmp, metrics, tag, port, args):
+def run_one(template, tmp, metrics, tag, port, args, top=False):
     cfg = config_for(template, tmp, metrics, tag)
     env = dict(os.environ, HF_HUB_OFFLINE="1", VLLM_USE_FLASHINFER_SAMPLER="0")
     env.setdefault("HF_HOME", "/mnt/storage/huggingface")
@@ -109,6 +114,7 @@ def run_one(template, tmp, metrics, tag, port, args):
         env["PYTHONPATH"] = f"{site}:{env.get('PYTHONPATH', '')}"
         env["DS_ACCT_FILE"] = str(tmp / f"acct_{tag}.json")
     log = open(tmp / f"server_{tag}.log", "w")
+    top_proc = None
     proc = subprocess.Popen([PY, str(_REPO / "eval-tp/launch_deltaserve.py"),
                              "--config", str(cfg), "--port", str(port)],
                             stdout=log, stderr=subprocess.STDOUT, env=env,
@@ -121,6 +127,12 @@ def run_one(template, tmp, metrics, tag, port, args):
             time.sleep(2)
         while (http("/finetuning_status", port) or {}).get("backwards_done", 0) < 3:
             time.sleep(1)                      # FT warmed up in both arms
+        if top:                                # the dashboard's poller, no browser needed
+            top_proc = subprocess.Popen(
+                [PY, "-m", "deltaserve.top", "--server", f"http://127.0.0.1:{port}",
+                 "--port", str(port + 1000), "--dir", str(tmp / f"top_{tag}")],
+                stdout=open(tmp / f"top_{tag}.log", "w"), stderr=subprocess.STDOUT, env=env)
+            time.sleep(5)
         model = http("/v1/models", port)["data"][0]["id"]
         raw = yaml.safe_load(cfg.read_text())
         st0 = http("/finetuning_status", port)
@@ -147,7 +159,7 @@ def run_one(template, tmp, metrics, tag, port, args):
         if metrics and (tmp / f"acct_{tag}.json").exists():
             acct = json.load(open(tmp / f"acct_{tag}.json"))
         return {
-            "tag": tag, "metrics": metrics,
+            "tag": tag, "metrics": metrics, "top": top,
             "req_per_s": res["request_throughput"],
             "out_tok_per_s": res["output_throughput"],
             **{f"{m}_{p}": res.get(f"p{p}_{m}_ms") for m in ("ttft", "tpot", "itl")
@@ -156,6 +168,12 @@ def run_one(template, tmp, metrics, tag, port, args):
             "bench_s": t_b1 - t_b0, "acct": acct,
         }
     finally:
+        if top_proc is not None:
+            top_proc.send_signal(signal.SIGINT)
+            try:
+                top_proc.wait(15)
+            except Exception:  # noqa: BLE001
+                top_proc.kill()
         try:
             os.killpg(proc.pid, signal.SIGINT)
             proc.wait(120)
@@ -168,7 +186,8 @@ def run_one(template, tmp, metrics, tag, port, args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=str(_REPO / "configs/template_qwen3_0.6b.yaml"))
-    ap.add_argument("--order", default="ABBAAB", help="A = metrics on, B = off")
+    ap.add_argument("--order", default="ABBAAB",
+                    help="A = metrics on, B = off, T = metrics on + dserve-top attached")
     ap.add_argument("--concurrency", type=int, default=32)
     ap.add_argument("--num-prompts", type=int, default=800)
     ap.add_argument("--input-len", type=int, default=512)
@@ -179,17 +198,21 @@ def main():
     print(f"work dir {tmp}", flush=True)
     runs = []
     for i, arm in enumerate(args.order):
-        r = run_one(Path(args.config), tmp, arm == "A", f"{i}{arm}", args.port, args)
+        r = run_one(Path(args.config), tmp, arm in "AT", f"{i}{arm}", args.port, args,
+                    top=arm == "T")
         runs.append(r)
         print(json.dumps({k: (round(v, 3) if isinstance(v, float) else v)
                           for k, v in r.items() if k != "acct"}), flush=True)
     json.dump(runs, open(tmp / "runs.json", "w"), indent=1)
     keys = ["req_per_s", "out_tok_per_s", "ttft_50", "ttft_99", "tpot_50", "tpot_99",
             "itl_50", "itl_99", "ft_tok_per_s"]
-    on = [r for r in runs if r["metrics"]]
     off = [r for r in runs if not r["metrics"]]
-    if on and off:
-        print(f"\n{'metric':<14}{'on (mean ± sd)':>22}{'off (mean ± sd)':>22}{'Δ on−off':>12}")
+    for name, on in (("on", [r for r in runs if r["metrics"] and not r["top"]]),
+                     ("on+top", [r for r in runs if r["top"]])):
+        if not (on and off):
+            continue
+        print(f"\n{'metric':<14}{name + ' (mean ± sd)':>22}{'off (mean ± sd)':>22}"
+              f"{'Δ vs off':>12}")
         for k in keys:
             a = [r[k] for r in on if r[k] is not None]
             b = [r[k] for r in off if r[k] is not None]
@@ -198,7 +221,7 @@ def main():
             ma, mb = statistics.mean(a), statistics.mean(b)
             print(f"{k:<14}{ma:>14.2f} ± {sa:<6.2f}{mb:>14.2f} ± {sb:<6.2f}"
                   f"{(ma - mb) / mb * 100:>+11.2f}%")
-    for r in on:
+    for r in (r for r in runs if r["metrics"]):
         a = r["acct"]
         if not a:
             continue
