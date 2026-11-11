@@ -32,6 +32,20 @@ svg text{font-family:inherit;font-size:10px}
 .kpi .k small{color:var(--mute);font-size:10px}
 .kpi .k b.ok{color:var(--ok)}.kpi .k b.bad{color:var(--bad)}
 .col{display:flex;flex-direction:column}.col>.box.grow{flex:1}
+.wrap{padding-bottom:64px}
+.scrub{position:fixed;left:0;right:0;bottom:0;background:#10100f;border-top:1px solid var(--line);z-index:8}
+.scrub .in{max-width:1500px;margin:0 auto;padding:6px 16px;display:flex;align-items:center;gap:8px}
+.track{position:relative;flex:1;height:30px;min-width:120px}
+.track canvas{position:absolute;left:0;top:0;width:100%;height:22px;border-radius:3px;background:#1a1a19}
+.track input{position:absolute;left:0;top:0;width:100%;height:30px;margin:0;background:transparent;-webkit-appearance:none;appearance:none;cursor:pointer}
+.track input::-webkit-slider-runnable-track{height:30px;background:transparent}
+.track input::-webkit-slider-thumb{-webkit-appearance:none;width:3px;height:30px;background:var(--ink);border-radius:1px}
+.track input::-moz-range-track{background:transparent}
+.track input::-moz-range-thumb{width:3px;height:30px;background:var(--ink);border:0;border-radius:1px}
+#follow.live{border-color:var(--ok);color:var(--ok)}
+#follow.off{border-color:var(--p99);color:var(--p99)}
+a.btn{text-decoration:none}
+select.btn{padding:1px 3px}
 #tip{position:fixed;pointer-events:none;background:#0b0b0b;border:1px solid var(--line);border-radius:4px;padding:6px 8px;color:var(--ink);display:none;z-index:9;white-space:pre;max-width:420px}
 </style>
 </head>
@@ -75,35 +89,111 @@ svg text{font-family:inherit;font-size:10px}
   <div class="box"><span class="tt">MEMORY (GiB)</span><div id="mem" class="mu">waiting for the per-GPU snapshot…</div></div>
   <div class="mu">Read-only. Request times are measured in the engine (≈1 ms below what a client sees). Forward and backward share the GPU, so their busy fractions can overlap.</div>
 </div>
+<div class="scrub"><div class="in">
+  <button id="play" class="btn" title="play from the cursor (space)">▶</button>
+  <select id="spd" class="btn" title="playback speed"><option value="1">1×</option><option value="10">10×</option><option value="60">60×</option></select>
+  <div class="track"><canvas id="marks"></canvas><input id="rng" type="range" min="0" max="1" step="any" value="1" aria-label="time"></div>
+  <span id="tlab" class="mu" style="min-width:150px;text-align:right">–</span>
+  <button id="follow" class="btn live" title="jump back to the newest data and follow it (End)">● LIVE</button>
+  <a id="dl" class="btn" href="/api/export?max_mb=50" download title="the whole history as one HTML file that replays offline (≤ 50 MB; oldest part dropped above that)">⤓ HTML</a>
+</div></div>
 <div id="tip"></div>
 <script>
 const $=id=>document.getElementById(id);
 const C={ft:'#d95926',inf:'#3987e5',dec:'#199e70',p99:'#e8a33a',bad:'#e66767',grid:'#262624',line:'#34342f',mute:'#898781',ink2:'#c3c2b7'};
-let S={steps:[],series:[],latest:{}},range=300,lastSeq=0,lastT=0,busy=false;
+let S={steps:[],series:[],snaps:[],mems:[],models_h:[],latest:{}},range=300,busy=false,REPLAY=null;
+let Q={steps:0,series:0,snaps:0,mems:0,models:0};
+let follow=true,cur=0,playing=false,V={latest:{},steps:[],series:[]};
 const fmt=(x,k=1)=>x==null||!isFinite(x)?'–':(+x).toFixed(k);
 const big=n=>n==null?'–':n>=1e6?(n/1e6).toFixed(2)+' M':n>=1e3?(n/1e3).toFixed(1)+' k':String(Math.round(n));
 const dur=s=>{s=Math.max(0,Math.floor(s));const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return (h?h+':':'')+String(m).padStart(h?2:1,'0')+':'+String(x).padStart(2,'0')};
-const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const bs=(a,t)=>{let lo=0,hi=a.length;while(lo<hi){const m=(lo+hi)>>1;if(a[m].t<=t)lo=m+1;else hi=m;}return lo;};  // first index with .t > t
 document.querySelectorAll('.btn[data-r]').forEach(b=>b.onclick=()=>{range=+b.dataset.r;document.querySelectorAll('.btn[data-r]').forEach(x=>x.classList.toggle('on',x===b));render();});
 const tip=$('tip');
 document.addEventListener('mousemove',e=>{const t=e.target.closest&&e.target.closest('[data-tip]');if(!t){tip.style.display='none';return;}
- tip.textContent=t.getAttribute('data-tip');tip.style.display='block';const w=tip.offsetWidth;tip.style.left=Math.min(innerWidth-w-8,e.clientX+12)+'px';tip.style.top=(e.clientY+14)+'px';});
+ tip.textContent=t.getAttribute('data-tip');tip.style.display='block';const w=tip.offsetWidth,h=tip.offsetHeight;tip.style.left=Math.min(innerWidth-w-8,e.clientX+12)+'px';tip.style.top=Math.min(innerHeight-h-8,e.clientY+14)+'px';});
 
+function reset(){S.steps=[];S.series=[];S.snaps=[];S.mems=[];S.models_h=[];Q={steps:0,series:0,snaps:0,mems:0,models:0};follow=true;}
+function absorb(d){
+ if(S.latest.t_start!==undefined&&d.t_start!==undefined&&d.t_start!==S.latest.t_start)reset();
+ if(d.steps&&d.steps.length){const f=d.steps[0].s;while(S.steps.length&&S.steps[S.steps.length-1].s>=f)S.steps.pop();for(const e of d.steps)S.steps.push(e);Q.steps=S.steps[S.steps.length-1].s;}
+ const add=(k,q)=>{const a=d[k];if(a&&a.length){for(const x of a)if(x.t>Q[q])S[k].push(x);if(S[k].length)Q[q]=S[k][S[k].length-1].t;}};
+ add('series','series');add('snaps','snaps');add('mems','mems');add('models_h','models');
+ // the same retention as dserve-top
+ const cut=(d.now||0)-(d.history_s||1e12);
+ for(const k of ['steps','series','snaps']){const a=S[k];if(a.length&&a[0].t<cut-600)a.splice(0,bs(a,cut));}
+ for(const k of ['steps','series','snaps','mems','models_h'])delete d[k];
+ S.latest=d;
+}
 async function poll(){
- if(busy)return;busy=true;
+ if(busy||REPLAY)return;busy=true;
  try{
-  const r=await fetch(`/api/state?steps_since=${lastSeq}&series_since=${lastT}`,{cache:'no-store'});
-  const d=await r.json();
-  if(S.latest.t_start!==undefined&&d.t_start!==undefined&&d.t_start!==S.latest.t_start){S.steps=[];S.series=[];}
-  if(d.steps&&d.steps.length){const f=d.steps[0].s;while(S.steps.length&&S.steps[S.steps.length-1].s>=f)S.steps.pop();S.steps.push(...d.steps);if(S.steps.length>3000)S.steps.splice(0,S.steps.length-2000);lastSeq=S.steps[S.steps.length-1].s;}
-  if(d.series&&d.series.length){S.series.push(...d.series.filter(x=>x.t>lastT));if(S.series.length>4000)S.series.splice(0,S.series.length-3600);lastT=S.series[S.series.length-1].t;}
-  delete d.steps;delete d.series;S.latest=d;S.ok=true;
+  const r=await fetch(`/api/state?steps_since=${Q.steps}&series_since=${Q.series}&snaps_since=${Q.snaps}&mems_since=${Q.mems}&models_since=${Q.models}`,{cache:'no-store'});
+  absorb(await r.json());S.ok=true;
  }catch(e){S.ok=false;}
  busy=false;render();
 }
+function span(){  // [tmin, tmax] of the history
+ const a=[S.series[0],S.steps[0],S.snaps[0]].filter(Boolean).map(x=>x.t);
+ const tmax=REPLAY?Math.max(S.series.length?S.series[S.series.length-1].t+1:0,S.snaps.length?S.snaps[S.snaps.length-1].t:0,S.steps.length?(S.steps[S.steps.length-1].te||S.steps[S.steps.length-1].t):0)
+   :(S.latest.now||Date.now()/1000);
+ return [a.length?Math.min(...a):tmax,tmax];
+}
+const at=(a,t)=>{const i=bs(a,t);return i?a[i-1]:null;};
+function view(){
+ const [t0,t1]=span();
+ if(follow)cur=t1;
+ cur=Math.max(t0,Math.min(t1,cur));
+ const T=cur,j=bs(S.steps,T);
+ const series=S.series.slice(bs(S.series,T-3600),bs(S.series,T)),steps=S.steps.slice(Math.max(0,j-3000),j);
+ const md=at(S.models_h,T),models=md?md.models:[];
+ if(follow&&!REPLAY){V={latest:{...S.latest,models},steps,series,T};return;}
+ const sn=at(S.snaps,T)||{},mm=at(S.mems,T);
+ V={latest:{...S.latest,now:T,finetuning:sn.ft||{},window:{...(sn.win||{}),memory:mm?mm.memory:{}},models},steps,series,T};
+}
+function scrub(){
+ const [t0,t1]=span(),rng=$('rng');
+ rng.min=t0;rng.max=Math.max(t1,t0+1e-3);if(document.activeElement!==rng||follow)rng.value=cur;
+ const back=t1-cur;
+ const fl=$('follow');fl.className='btn '+(follow?'live':'off');
+ fl.textContent=REPLAY?(follow?'■ END':'⏭ END'):(follow?'● LIVE':'⏭ LIVE');
+ $('tlab').innerHTML=`<span class="hi">${new Date(cur*1000).toLocaleTimeString()}</span>`+(follow?'':` <span class="warn">−${dur(back)}</span>`)+` <span class="mu">/ ${dur(t1-t0)}</span>`;
+ $('play').textContent=playing?'❚❚':'▶';
+ const est=S.latest.export_estimate_mb;
+ if(!REPLAY)$('dl').textContent=`⤓ HTML${est!=null?' ~'+(est<1?'<1':Math.round(est))+' MB':''}`;
+ marks(t0,t1);
+}
+let mkKey='';
+function marks(t0,t1){  // load + SLO-miss strip behind the slider
+ const c=$('marks'),W=c.clientWidth|0,H=22;if(!W)return;
+ const key=[W,t0,S.series.length,S.series.length?S.series[S.series.length-1].t:0,Math.floor(t1)].join();if(key===mkKey)return;mkKey=key;
+ c.width=W*devicePixelRatio;c.height=H*devicePixelRatio;const g=c.getContext('2d');g.scale(devicePixelRatio,devicePixelRatio);g.clearRect(0,0,W,H);
+ const n=Math.max(1,W),sp=Math.max(1e-6,t1-t0),out=new Float32Array(n),tr=new Float32Array(n),miss=new Uint8Array(n),has=new Uint8Array(n);
+ const slo=((S.latest.meta||{}).ttft_slo)||((at(S.snaps,t1)||{}).win||{inference:{}}).inference.ttft_slo;
+ for(const r of S.series){const i=Math.min(n-1,Math.max(0,Math.floor((r.t-t0)/sp*n)));out[i]=Math.max(out[i],r.out||0);tr[i]=Math.max(tr[i],r.tr||0);has[i]=1;
+  if(slo&&r.ttft99!=null&&r.ttft99>slo)miss[i]=1;}
+ const mo=Math.max(1,...out),mt=Math.max(1,...tr);
+ for(let i=0;i<n;i++){if(!has[i])continue;
+  const ho=out[i]/mo*(H-6),ht=tr[i]/mt*(H-6);
+  g.fillStyle='rgba(57,135,229,.55)';g.fillRect(i,H-ho,1,ho);
+  g.fillStyle='rgba(217,89,38,.8)';g.fillRect(i,H-ht*.5,1,ht*.5);
+  if(miss[i]){g.fillStyle='#e66767';g.fillRect(i,0,1,4);}}
+}
+$('rng').addEventListener('input',e=>{follow=false;cur=+e.target.value;const [,t1]=span();if(t1-cur<0.5)follow=true;render();});
+$('follow').onclick=()=>{follow=true;playing=false;render();};
+$('play').onclick=()=>{if(follow&&!playing){const [t0,t1]=span();cur=Math.max(t0,t1-300);follow=false;}playing=!playing;render();};
+addEventListener('keydown',e=>{if(e.target.tagName==='SELECT')return;
+ if(e.key==='End'){follow=true;playing=false;render();e.preventDefault();}
+ else if(e.key==='Home'){follow=false;cur=span()[0];render();e.preventDefault();}
+ else if(e.key===' '){$('play').click();e.preventDefault();}
+ else if(e.key==='ArrowLeft'||e.key==='ArrowRight'){const d=(e.shiftKey?60:5)*(e.key==='ArrowLeft'?-1:1);follow=false;cur+=d;const [,t1]=span();if(cur>=t1)follow=true;render();e.preventDefault();}});
+let lastPlay=performance.now();
+setInterval(()=>{const now=performance.now(),dt=(now-lastPlay)/1000;lastPlay=now;if(!playing)return;
+ cur+=dt*(+$('spd').value);const [,t1]=span();if(cur>=t1){cur=t1;playing=false;follow=true;}render();},100);
 
 function header(){
- const L=S.latest,m=L.meta||{},w=L.window||{},f=L.finetuning||{};
+ const L=V.latest,m=L.meta||{},w=L.window||{},f=L.finetuning||{};
  const mp=String(m.model||''),hf=mp.match(/models--([^/]+?)--([^/]+)/);
  const sv=Array.isArray(m.served_model_name)?m.served_model_name[0]:m.served_model_name;
  $('model').textContent=(hf?hf[1]+'/'+hf[2]:mp.split('/').filter(Boolean).slice(-2).join('/')||'…')+(sv?`  (served as ${sv})`:'');
@@ -115,17 +205,18 @@ function header(){
  else st=`<span class="ok">● running</span>${f.backward_in_flight?' <span class="mu">· backward in flight</span>':''}`;
  $('ftstate').innerHTML=st;
  const live=S.ok&&L.connected;
+ if(REPLAY){$('conn').innerHTML=`<span class="dot" style="background:var(--cache)"></span>replay · exported ${new Date(REPLAY.exported_unix_time*1000).toLocaleString()}`;$('rec').textContent=REPLAY.dir||'';return;}
  $('conn').innerHTML=live?'<span class="dot" style="background:var(--ok)"></span>live':`<span class="dot" style="background:var(--bad)"></span>${esc(S.ok?(L.error||'server unreachable'):'dserve-top unreachable')}`;
  $('rec').textContent=(L.top&&L.top.recording_dir)||L.dir||'';
 }
 
 function wave(){
- const svg=$('wave'),W=svg.clientWidth||800,H=104,base=H+6,maxT=Math.max(512,(S.latest.meta||{}).max_num_batched_tokens||2048);
+ const svg=$('wave'),W=svg.clientWidth||800,H=104,base=H+6,maxT=Math.max(512,(V.latest.meta||{}).max_num_batched_tokens||2048);
  const h=t=>t<=0?0:Math.max(2,Math.sqrt(t)/Math.sqrt(maxT)*H);
- const codes=(S.latest.meta||{}).admit_codes||{};
+ const codes=(V.latest.meta||{}).admit_codes||{};
  let x=W-2,lastNum=1e9,lastCode=1e9,o=`<line x1="0" y1="${base}" x2="${W}" y2="${base}" stroke="${C.line}"/>`;
- for(let i=S.steps.length-1;i>=0&&x>0;i--){
-  const e=S.steps[i],t=new Date(e.t*1000).toLocaleTimeString();
+ for(let i=V.steps.length-1;i>=0&&x>0;i--){
+  const e=V.steps[i],t=new Date(e.t*1000).toLocaleTimeString();
   if(e.k==='d'){
    const lab='d×'+e.n,w=Math.max(18,lab.length*6.2+8),hh=h(e.dc);x-=w+3;
    const tipt=`plain decode × ${e.n} steps\nbatch ${e.dc} requests (latest)\nGPU ${fmt(e.ms,1)} ms total · ${fmt(e.ms/e.n,2)} ms/step\n${t} → ${new Date(e.te*1000).toLocaleTimeString()}`;
@@ -150,18 +241,18 @@ function wave(){
   }
  }
  svg.innerHTML=o;
- const l=[...S.steps].reverse().find(e=>e.k==='x');
+ let l=null;for(let i=V.steps.length-1;i>=0;i--)if(V.steps[i].k==='x'){l=V.steps[i];break;}
  if(l)$('last').innerHTML=`last  prefill <span class="hi">${l.pf}</span> · FT <span class="hi">${l.ft}</span>${l.a?` (<span class="hi">${l.a}</span> ${esc(codes[l.a]||'')})`:''} · decode <span class="hi">${l.dc}</span> · <span class="hi">${fmt(l.ms,1)}</span> ms${l.g==null?'':l.g?' · graph':' · eager'}`;
  $('codes').innerHTML=Object.entries(codes).filter(([k])=>k).map(([k,v])=>`<span class="hi">${k}</span> ${esc(v.split(/[ :(]/)[0])}`).join(' · ');
 }
 
 function lineChart(id,keys,scale,slo,unit,k){
- const svg=$(id),W=svg.clientWidth||800,H=100,L=40,top=6,now=S.latest.now||Date.now()/1000,t0=now-range;
- const rows=S.series.filter(r=>r.t>=t0);
+ const svg=$(id),W=svg.clientWidth||800,H=100,L=40,top=6,now=V.latest.now||Date.now()/1000,t0=now-range;
+ const rows=V.series.filter(r=>r.t>=t0);
  let mx=slo?slo*1.15:0;rows.forEach(r=>keys.forEach(kk=>{if(r[kk]!=null)mx=Math.max(mx,r[kk]*scale)}));mx=mx||1;
  const X=t=>L+(t-t0)/range*(W-L-6),Y=v=>top+H-Math.min(v,mx)/mx*H;
  let o='';[0,.5,1].forEach(f=>{const v=mx*f;o+=`<line x1="${L}" x2="${W}" y1="${Y(v)}" y2="${Y(v)}" stroke="${C.grid}"/><text x="${L-4}" y="${Y(v)+3}" fill="${C.mute}" text-anchor="end">${fmt(v,v<1?2:0)}</text>`;});
- for(let s=0;s<=4;s++){const t=t0+range*s/4;o+=`<text x="${X(t)}" y="${H+top+14}" fill="${C.mute}" text-anchor="${s===0?'start':s===4?'end':'middle'}">${s===4?'now':'-'+dur(range*(1-s/4))}</text>`;}
+ for(let s=0;s<=4;s++){const t=t0+range*s/4;o+=`<text x="${X(t)}" y="${H+top+14}" fill="${C.mute}" text-anchor="${s===0?'start':s===4?'end':'middle'}">${s===4?(follow&&!REPLAY?'now':new Date(t*1000).toLocaleTimeString()):'-'+dur(range*(1-s/4))}</text>`;}
  if(slo)o+=`<line x1="${L}" x2="${W}" y1="${Y(slo)}" y2="${Y(slo)}" stroke="${C.mute}" stroke-dasharray="5 4"/><text x="${W-4}" y="${Y(slo)-4}" fill="${C.mute}" text-anchor="end">SLO ${fmt(slo,slo<1?2:0)}${unit}</text>`;
  keys.forEach((kk,i)=>{const col=i?C.p99:C.inf;const pts=rows.filter(r=>r[kk]!=null);
   if(pts.length>1)o+=`<polyline fill="none" stroke="${col}" stroke-width="1.6" stroke-linejoin="round" points="${pts.map(r=>X(r.t)+','+Y(r[kk]*scale)).join(' ')}"/>`;
@@ -171,8 +262,8 @@ function lineChart(id,keys,scale,slo,unit,k){
 }
 
 function charts(){
- const w=(S.latest.window||{}).inference||{},m=S.latest.meta||{};
- const rows=S.series.filter(r=>r.t>=(S.latest.now||0)-range);
+ const w=(V.latest.window||{}).inference||{},m=V.latest.meta||{};
+ const rows=V.series.filter(r=>r.t>=(V.latest.now||0)-range);
  const nt=rows.reduce((a,r)=>a+r.nt,0),nf=rows.reduce((a,r)=>a+r.nf,0);
  $('ttft_hdr').textContent=`SLO ${m.ttft_slo??w.ttft_slo??'–'} s · ${nt} first tokens in range`;
  $('tpot_hdr').textContent=`${nf} finished in range`;
@@ -183,8 +274,8 @@ function charts(){
 function bar(f,n=18,col=C.ft){f=Math.max(0,Math.min(1,f||0));const k=Math.round(f*n);return `<span style="color:${col}">${'█'.repeat(k)}</span><span style="color:#2f2f2c">${'█'.repeat(n-k)}</span>`;}
 
 function ft(){
- const f=S.latest.finetuning||{},w=S.latest.window||{},fw=w.finetune||{},now=S.latest.now||0;
- const last10=S.series.filter(r=>r.t>now-10),tr=last10.reduce((a,r)=>a+r.tr,0)/10;
+ const f=V.latest.finetuning||{},w=V.latest.window||{},fw=w.finetune||{},now=V.latest.now||0;
+ const last10=V.series.filter(r=>r.t>now-10),tr=last10.reduce((a,r)=>a+r.tr,0)/10;
  const ep=f.total_epochs?((f.store_epoch??f.epoch??0)+1):null,frac=f.corpus_samples?(f.samples_trained_this_epoch||0)/f.corpus_samples:0;
  const tokEpoch=f.corpus_tokens_per_epoch||0,remain=tokEpoch*(1-frac),etaE=tr>0&&tokEpoch?remain/tr:null,etaAll=etaE!=null&&f.total_epochs?etaE+tokEpoch*Math.max(0,f.total_epochs-ep)/tr:null;
  $('ft').innerHTML=`<div>epoch <span class="hi">${ep??'–'}</span> / ${f.total_epochs??'–'} ${bar(frac,16)} <span class="hi">${fmt(frac*100,0)}%</span></div>`+
@@ -192,7 +283,7 @@ function ft(){
   `<div class="mu">trained <span class="hi">${big(f.tokens_trained)}</span> tok · <span class="hi">${fmt(tr,0)}</span> tok/s</div>`+
   `<div class="mu">ETA epoch <span class="hi">${etaE!=null?dur(etaE):'–'}</span> · all epochs <span class="hi">${etaAll!=null?dur(etaAll):'–'}</span></div>`;
  $('loss').textContent=fmt(f.mean_loss_last_20,3);
- const pts=S.series.filter(r=>r.loss!=null&&r.t>=now-1800),svg=$('lossc'),W=svg.clientWidth||300,H=74;
+ const pts=V.series.filter(r=>r.loss!=null&&r.t>=now-1800),svg=$('lossc'),W=svg.clientWidth||300,H=74;
  if(pts.length>1){let mx=-1e9,mn=1e9;pts.forEach(r=>{mx=Math.max(mx,r.loss);mn=Math.min(mn,r.loss)});const span=mx-mn||1,t0=pts[0].t,t1=pts[pts.length-1].t||t0+1;
   svg.innerHTML=`<text x="0" y="10" fill="${C.mute}">${fmt(mx,2)}</text><text x="0" y="${H}" fill="${C.mute}">${fmt(mn,2)}</text><text x="${W}" y="${H+12}" fill="${C.mute}" text-anchor="end">last ${dur(t1-t0)}</text>`+
    `<polyline fill="none" stroke="${C.ft}" stroke-width="1.6" points="${pts.map(r=>(34+(r.t-t0)/(t1-t0||1)*(W-36))+','+(4+(mx-r.loss)/span*(H-6))).join(' ')}"/>`;}
@@ -207,7 +298,7 @@ function ft(){
 }
 
 function gpu(){
- const now=S.latest.now||0,r=S.series.filter(x=>x.t>now-10),n=Math.max(1,r.length);
+ const now=V.latest.now||0,r=V.series.filter(x=>x.t>now-10),n=Math.max(1,r.length);
  const fi=r.reduce((a,x)=>a+x.fi,0)/n,ff=r.reduce((a,x)=>a+x.ff,0)/n,bw=r.reduce((a,x)=>a+x.bw,0)/n;
  const row=(l,v,c)=>`<div class="row" style="flex-wrap:nowrap;align-items:center"><span style="width:150px">${l}</span><span style="flex:1">${bar(v,40,c)}</span><span class="hi" style="width:44px;text-align:right">${fmt(v*100,0)}%</span></div>`;
  $('gpu').innerHTML=`<div class="mu" style="margin-bottom:2px">GPU busy, last 10 s (rank 0 kernel time ÷ wall; forward and backward overlap)</div>`+row('inference forward',fi,C.inf)+row('FT forward',ff,C.ft)+row('LoRA backward',bw,'#1baf7a');
@@ -216,7 +307,7 @@ function gpu(){
 }
 
 function mem(){
- const M=(S.latest.window||{}).memory||{},ranks=Object.keys(M).filter(k=>k.startsWith('rank')).sort();
+ const M=(V.latest.window||{}).memory||{},ranks=Object.keys(M).filter(k=>k.startsWith('rank')).sort();
  if(!ranks.length)return;
  const pick=(g,pre)=>{const e=Object.entries(g).find(([k])=>k.startsWith(pre));return e?e[1]:0;};
  const CAT=[['weights','#3987e5',g=>g.model_weights||0],['KV cache','#d95926',g=>g.kv_cache||0],
@@ -238,7 +329,7 @@ function mem(){
  $('mem').innerHTML=o;
 }
 function adapters(){
- const L=S.latest,M=(L.window||{}).memory||{},ranks=Object.keys(M).filter(k=>k.startsWith('rank')).sort();
+ const L=V.latest,M=(L.window||{}).memory||{},ranks=Object.keys(M).filter(k=>k.startsWith('rank')).sort();
  if(!ranks.length)return;
  const lo=M[ranks[0]].lora||{},ads=lo.adapters||[],served=(L.models||[]).filter(m=>m.parent);
  const ago=M[ranks[0]].unix_time&&L.now?Math.max(0,L.now-M[ranks[0]].unix_time):null;
@@ -261,13 +352,13 @@ rank ${a.rank} · ${a.cpu_mib} MiB in host RAM${a.pinned?'\npinned (never evicte
 }
 let lastTbt=null;
 function kpi(){
- const L=S.latest,now=L.now||0,w=(L.window||{}).inference||{},t=(L.window||{}).totals||{},f=L.finetuning||{};
+ const L=V.latest,now=L.now||0,w=(L.window||{}).inference||{},t=(L.window||{}).totals||{},f=L.finetuning||{};
  const slo=w.ttft_slo,mslo=w.max_tbt_slo;
- const tv=S.series.filter(r=>r.t>now-60).flatMap(r=>r.tv||[]).sort((a,b)=>a-b);
+ const tv=V.series.filter(r=>r.t>now-60).flatMap(r=>r.tv||[]).sort((a,b)=>a-b);
  const p99=tv.length?tv[Math.min(tv.length-1,Math.ceil(.99*tv.length)-1)]:null;
  const met=t.first_tokens?t.ttft_slo_met/t.first_tokens:null;
- if(w.tbt_slo_attainment!=null)lastTbt=w.tbt_slo_attainment;
- const r10=S.series.filter(r=>r.t>now-10),n=Math.max(1,r10.length);
+ if(w.tbt_slo_attainment!=null)lastTbt=w.tbt_slo_attainment;else if(!follow)lastTbt=null;
+ const r10=V.series.filter(r=>r.t>now-10),n=Math.max(1,r10.length);
  const out=r10.reduce((a,r)=>a+r.out,0)/n,tr=r10.reduce((a,r)=>a+r.tr,0)/n;
  const col=(v,good)=>v==null?'':good?'ok':'bad';
  const tile=(lab,val,cls,sub)=>`<div class="k"><span class="mu">${lab}</span><b class="${cls}">${val}</b><small>${sub}</small></div>`;
@@ -279,9 +370,24 @@ function kpi(){
   tile('FT trained',big(tr)+'/s','','tokens · last 10 s')+
   tile('loss',fmt(f.mean_loss_last_20,3),'','mean of last 20');
 }
-function render(){try{header();wave();charts();ft();gpu();kpi();mem();adapters();}catch(e){console.error(e);}}
-addEventListener('resize',render);
-poll();setInterval(poll,300);
+function render(){try{view();header();wave();charts();ft();gpu();kpi();mem();adapters();scrub();}catch(e){console.error(e);}}
+addEventListener('resize',()=>{mkKey='';render();});
+async function boot(){
+ const emb=document.getElementById('ds-embedded');
+ if(emb){  // an exported file: replay its history, no server
+  try{
+   const bin=Uint8Array.from(atob(emb.textContent.trim()),c=>c.charCodeAt(0));
+   const txt=await new Response(new Blob([bin]).stream().pipeThrough(new DecompressionStream('gzip'))).text();
+   const d=JSON.parse(txt);REPLAY=d;
+   absorb({...d,now:null,history_s:null,connected:false});
+   S.latest={meta:d.meta,t_start:d.t_start,dir:d.dir,top:d.top,connected:false};S.ok=true;
+   $('dl').style.display='none';document.title='dserve-top · replay';
+  }catch(e){$('conn').textContent='could not read the embedded data: '+e;console.error(e);}
+  render();return;
+ }
+ poll();setInterval(poll,300);
+}
+document.readyState==='loading'?addEventListener('DOMContentLoaded',boot):boot();
 </script>
 </body>
 </html>

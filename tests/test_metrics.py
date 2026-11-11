@@ -258,6 +258,16 @@ def part_idle(root):
     C.ok("final_flush writes the window in progress, synchronously",
          last.get("final") is True
          and last["gpu_time_s"]["forward"]["inference_only"]["steps"] == 1)
+    import glob as _g
+    import gzip as _gz
+    try:
+        lines = [json.loads(x) for q in sorted(_g.glob(os.path.join(root, "steps.*.jsonl.gz")))
+                 for x in _gz.open(q, "rt")]
+        ok, info = len(lines) == 2 and all(e["k"] == "x" for e in lines), f"{len(lines)} entries"
+    except (EOFError, OSError) as e:
+        ok, info = False, repr(e)
+    C.ok("…and closes the step log (complete gzip, no process exit needed)", ok, info)
+    m.on_step(feats(t_in=30), 0.03)                    # after it: dropped, no error
     m.close()
 
 

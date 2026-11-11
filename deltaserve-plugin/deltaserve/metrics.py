@@ -575,11 +575,17 @@ class MetricsRecorder:
             snap = self.snapshot()
             self._last = snap
             self._win = _Window(self._clock(), self.max_tbt_slo)
+            self.feed.flush_open_run()
         try:
             with open(os.path.join(self.root, "summary.jsonl"), "a") as f:
                 f.write(json.dumps({**snap, "final": True}) + "\n")
         except OSError:
             pass
+        # Drain the writer and close its files now: the step log's gzip
+        # trailer would otherwise be lost with the process (a truncated
+        # steps.*.jsonl.gz). Later events are dropped.
+        self._closed = True
+        self._w.close(timeout=3.0)
 
     def close(self) -> None:
         if self._closed:

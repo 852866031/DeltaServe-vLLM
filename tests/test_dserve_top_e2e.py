@@ -161,6 +161,27 @@ def main():
         check(f"memory snapshot for {tp} GPU(s)", all(f"rank{r}" in mem for r in range(tp)),
               str(sorted(mem)))
         check("FT status in the feed", (st.get("finetuning") or {}).get("backwards_done", 0) > 0)
+        check("history for the scrubber: status snapshots + memory",
+              len(st.get("snaps", [])) >= 5 and st.get("mems"), f"{len(st.get('snaps', []))} snaps")
+        with urllib.request.urlopen(f"http://127.0.0.1:{tport}/api/export", timeout=60) as r:
+            html, cd = r.read(), r.headers.get("Content-Disposition", "")
+        import base64
+        import re
+        m = re.search(rb'id="ds-embedded" type="application/gzip-base64">([^<]*)<', html)
+        emb = json.loads(gzip.decompress(base64.b64decode(m.group(1)))) if m else {}
+        check("single-HTML export of the live run (≤ 50 MB, steps + series + memory)",
+              cd.startswith("attachment;") and len(html) <= 50 * 2**20
+              and any(e["k"] == "x" and e.get("a") for e in emb.get("steps", []))
+              and emb.get("series") and emb.get("mems"),
+              f"{len(html) / 1024:.0f} KiB, {len(emb.get('steps', []))} steps")
+        if chrome:
+            ex = tmp / "export.html"
+            ex.write_bytes(html)
+            dom = subprocess.run([chrome, "--headless=new", "--disable-gpu", "--no-sandbox",
+                                  "--virtual-time-budget=5000", "--dump-dom", f"file://{ex}"],
+                                 capture_output=True, text=True, timeout=60).stdout
+            check("the export replays offline", "replay · exported" in dom
+                  and "GPU slot" in dom and "waiting for steps" not in dom, str(ex))
         bench.wait(600)
         # On-demand adapters: register a second inference adapter at runtime
         # and use it — with max_loras=2 (FT pinned) it must take slot 1.

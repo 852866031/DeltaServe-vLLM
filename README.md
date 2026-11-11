@@ -770,11 +770,29 @@ three times a second and is read-only:
 | At a glance (top row) | TTFT p99 over the last minute (green / red against the SLO), TTFT SLO met since start, TBT SLO met this window, inference and FT tokens/s, loss |
 | Memory | one bar per GPU (one shared legend): weights, KV cache, LoRA adapter slots, FT buffers, other, cached / CUDA graphs, backward child + other processes, free; the LoRA line lists the GPU slots (vLLM preallocates `max_loras` slots sized for `max_lora_rank` and every LoRA-capable module), details in the Adapters panel |
 
+**Time scrubber and export.** The bar at the bottom covers everything `dserve-top`
+has seen (the last `--history-hours`, default 12): a strip of inference (blue) and FT
+(orange) load with red ticks where the per-second TTFT p99 broke the SLO. Drag it
+(or `←` / `→`, `Shift` for a minute) and every panel shows that moment: the batches
+up to it, the charts ending at it, the FT status, memory and adapters as they were.
+`▶` plays from the cursor (1× / 10× / 60×); **`⏭ LIVE`** (`End`) jumps back and
+follows the newest data again. The history stays when the server stops; a new
+server run starts a fresh one.
+
+**`⤓ HTML`** downloads the history as one self-contained HTML file (data gzip'd
+and embedded) that replays offline with the same scrubber — attach it to an issue
+or mail it. It is capped at 50 MB; above that the oldest part is dropped. Sizes
+measured on Qwen3-14B TP=2 at 3 req/s with FT running: about 0.18 KiB per second
+of run (step stream 65 B/s, per-second rows 51 B/s, status snapshots 23 B/s,
+gzip'd, then base64), so the default 12 h of history exports to about 8 MB, and
+50 MB holds about 75 h; a busier server writes more steps (≈ 20–30 h at 6× the
+non-decode steps). The button shows the current estimate.
+
 Server side this is `/telemetry/data` (the feed: steps since a sequence number,
 per-second rows since a time, window, memory, FT status) and `/telemetry/start` /
 `stop` / `memory`. While telemetry records, the step stream is also written to
 `steps.*.jsonl.gz` in the metrics dir, rolling under `telemetry.steps_log_max_mb`
-(256 MB) — the data a later replay will read.
+(256 MB).
 
 ### Saving the trained adapter
 
@@ -899,8 +917,8 @@ tests/run_all.sh /tmp/ds-tests 'test_qwen3_*'  # a subset
 | Configs: every template + preset loads in the current layout, templates fully commented, old `finetune` layout + converter | `test_config_loader` | CPU |
 | System metrics: TTFT / TBT / token counts on a simulated clock, step kinds and the mixed-step split, backward rows, windows, idle ticker, final flush, histogram accuracy, hot-path cost, the child's ack fields, the route | `test_metrics` | CPU |
 | **System metrics end to end**: real server + streaming clients; server TTFT vs client TTFT, tokens vs usage, backward rows vs status, memory vs checkpoint size and vLLM's KV log, the report script | `test_metrics_e2e` (`--tp2` for Qwen3-14B on 2 GPUs) | 1 / 2 GPUs + weights |
-| `dserve-top` + its feed: decode folding, per-second rows, the rolling step log; against a fake server: starts / stops the recording, SSH guide, page served, feed merged, headless-Chrome render | `test_dserve_top` | CPU |
-| **`dserve-top` end to end**: a real server with telemetry off; dserve-top switches recording on, the feed carries real admission codes, per-GPU memory, the step log; stops on exit | `test_dserve_top_e2e` (`--tp2`) | 1 / 2 GPUs + weights |
+| `dserve-top` + its feed: decode folding, per-second rows, the rolling step log; against a fake server: starts / stops the recording, SSH guide, page served, feed merged, headless-Chrome render; history kept after the server goes, incremental snapshots, gzip; export (whole history, 50 MB cap drops the oldest), offline replay, scrubbing back / End to live in Chrome | `test_dserve_top` | CPU |
+| **`dserve-top` end to end**: a real server with telemetry off; dserve-top switches recording on, the feed carries real admission codes, per-GPU memory, the step log; HTML export replays offline; stops on exit | `test_dserve_top_e2e` (`--tp2`) | 1 / 2 GPUs + weights |
 | **Every template launches as shipped** (serves, trains, saves the adapter, writes the backward log) | `test_templates_launch` | GPUs of each template + weights |
 | **Checkpoints / status / fail-safes end to end**: real server, saved adapter == the served trained slot (vLLM and HF PEFT), profiling failure, resume, Llama-3.2-1B remat == served forward | `test_adapter_save_e2e` (`--tp 2` for the HTTP phase on 2 GPUs) | 1 / 2 GPUs + weights |
 | Activation hooks | `test_accumulate_hooks` | CPU |

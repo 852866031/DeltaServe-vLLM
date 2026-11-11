@@ -168,6 +168,9 @@ class FakeDServe:
                 outer.calls.append(("GET", u.path))
                 if u.path == "/health":
                     return self._j(200, {})
+                if u.path == "/v1/models":
+                    return self._j(200, {"data": [{"id": "qwen3-14b", "parent": None},
+                                                  {"id": "toy-lora", "parent": "qwen3-14b"}]})
                 if u.path == "/telemetry/data":
                     q = urllib.parse.parse_qs(u.query)
                     if outer.rec is None:
@@ -316,6 +319,106 @@ def run_top(fake, root, extra_env=None, server_port=None, until="Ctrl-C to quit"
     return p, port, "".join(out)
 
 
+def _embedded(html: bytes) -> dict:
+    import base64
+    import re
+    m = re.search(rb'<script id="ds-embedded" type="application/gzip-base64">([^<]*)</script>',
+                  html)
+    return json.loads(gzip.decompress(base64.b64decode(m.group(1)))) if m else {}
+
+
+def part_scrub_export(root, port, chrome):
+    print("\n   history, scrubbing, single-HTML export")
+    _, b = get(port, "/api/state?steps_since=0&series_since=0")
+    st = json.loads(b)
+    C.ok("state carries status snapshots, memory and model history",
+         len(st["snaps"]) >= 2 and len(st["mems"]) >= 1 and len(st["models_h"]) >= 1
+         and "buffer_capacity" in st["snaps"][-1]["ft"],
+         f"{len(st['snaps'])} snaps, {len(st['mems'])} mem, {len(st['models_h'])} models")
+    C.ok("snapshots ≥ 2 s apart; memory kept only on change",
+         all(b2["t"] - a2["t"] >= 1.99 for a2, b2 in zip(st["snaps"], st["snaps"][1:]))
+         and len(st["mems"]) < len(st["snaps"]))
+    i = len(st["snaps"]) // 2
+    _, b = get(port, f"/api/state?steps_since=0&series_since=0&snaps_since={st['snaps'][i]['t']}"
+                     f"&mems_since=1e18&models_since=1e18")
+    inc = json.loads(b)
+    C.ok("snapshot / memory / model lists are incremental too",
+         all(x["t"] > st["snaps"][i]["t"] for x in inc["snaps"]) and inc["mems"] == []
+         and inc["models_h"] == [])
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/api/state?steps_since=0",
+                                 headers={"Accept-Encoding": "gzip"})
+    with urllib.request.urlopen(req, timeout=5) as r:
+        enc, raw = r.headers.get("Content-Encoding"), r.read()
+    C.ok("large state responses are gzip'd", enc == "gzip"
+         and json.loads(gzip.decompress(raw))["steps"], f"{len(raw)} B")
+    C.ok("page offers the export with a size estimate",
+         st.get("export_estimate_mb") is not None, f"~{st.get('export_estimate_mb')} MB")
+
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/export", timeout=30) as r:
+        cd, html = r.headers.get("Content-Disposition", ""), r.read()
+    d = _embedded(html)
+    C.ok("export: an HTML attachment with the data embedded",
+         cd.startswith("attachment;") and ".html" in cd and html.startswith(b"<!doctype html>")
+         and d.get("format") == 1, f"{cd} · {len(html) / 1024:.0f} KiB")
+    _, b = get(port, "/api/state?steps_since=0&series_since=0")
+    now = json.loads(b)
+    C.ok("export holds the whole history (steps, series, snapshots, memory, models)",
+         d["steps"] and d["steps"][0]["s"] == now["steps"][0]["s"]
+         and len(d["series"]) >= len(now["series"]) - 3 and d["snaps"] and d["mems"]
+         and d["models_h"] and d["meta"], f"{len(d['steps'])} steps, {len(d['series'])} s")
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/export?max_mb=500", timeout=30) as r:
+        C.ok("export size is capped at 50 MB whatever is asked", len(r.read()) <= 50 * 2**20)
+    page_kib = len(html) - len(html.split(b'<script id="ds-embedded"')[1]) if b"ds-embedded" in html else 0
+    lim = (len(html) - (len(html) - page_kib) // 2) / 2**20     # page + about half the data
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/export?max_mb={lim:.4f}",
+                                timeout=30) as r:
+        small = r.read()
+    ds = _embedded(small)
+    C.ok("over the cap the OLDEST part is dropped, newest kept",
+         len(small) <= lim * 2**20 and 0 < len(ds["series"]) < len(d["series"])
+         and ds["series"][-1]["t"] >= d["series"][-1]["t"] and ds["mems"],
+         f"{len(small)} B ≤ {lim * 2**20:.0f} B, {len(ds['series'])} of {len(d['series'])} s, "
+         f"newest kept {ds['series'][-1]['t'] >= d['series'][-1]['t']}, mems {len(ds['mems'])}")
+    if not chrome:
+        return
+    f = os.path.join(root, "export.html")
+    open(f, "wb").write(html)
+    dump = lambda path, ms=4000: subprocess.run(  # noqa: E731
+        [chrome, "--headless=new", "--disable-gpu", "--no-sandbox", "--disable-web-security",
+         f"--user-data-dir={os.path.join(root, 'chrome-prof')}",
+         f"--virtual-time-budget={ms}", "--dump-dom", "file://" + path],
+        capture_output=True, text=True, timeout=60).stdout
+    dom = dump(f)
+    C.ok("the exported file replays offline in Chrome (every panel, at the end)",
+         "replay · exported" in dom and "waiting for steps" not in dom
+         and "waiting for the per-GPU" not in dom and "GPU slot" in dom
+         and "■ END" in dom and 'id="dl"' in dom and "display: none" in dom.split('id="dl"')[1].split(">")[0],
+         f)
+    # drag the cursor to the middle: the page must show the past, not the end
+    g = os.path.join(root, "export_scrub.html")
+    open(g, "wb").write(html.replace(b"</body>", b"""<script>setTimeout(()=>{const r=document.getElementById('rng');
+r.value=(+r.min + +r.max)/2;r.dispatchEvent(new Event('input'));
+document.body.dataset.cur=String(Math.round(+r.value));
+const w=document.getElementById('wave');document.body.dataset.wave=String(w.querySelectorAll('g').length);},1500)</script></body>"""))
+    dom2 = dump(g)
+    import re
+    lab = re.search(r'id="tlab"[^>]*>(.*?)</span>\s*<button', dom2, re.S)
+    C.ok("scrubbing back shows the past: −mm:ss label, ⏭ END button, earlier batches",
+         lab and "−" in lab.group(1) and "⏭ END" in dom2 and 'data-cur="' in dom2,
+         re.sub("<[^>]+>", "", lab.group(1)) if lab else "")
+    # live page: scrubbing away stops following, End jumps back
+    h = os.path.join(root, "live_scrub.html")
+    pg = urllib.request.urlopen(f"http://127.0.0.1:{port}/").read()
+    pg = pg.replace(b"</body>", b"""<script>setTimeout(()=>{const r=document.getElementById('rng');
+r.value=+r.min;r.dispatchEvent(new Event('input'));document.body.dataset.a=document.getElementById('follow').textContent;
+dispatchEvent(new KeyboardEvent('keydown',{key:'End'}));document.body.dataset.b=document.getElementById('follow').textContent;},2500)</script></body>""")
+    open(h, "wb").write(pg.replace(b"fetch(`/api/state", f"fetch(`http://127.0.0.1:{port}/api/state".encode()))
+    dom3 = dump(h, 5000)
+    C.ok("live page: dragging back leaves LIVE, End returns to it",
+         'data-a="⏭ LIVE"' in dom3 and 'data-b="● LIVE"' in dom3,
+         re.findall(r'data-[ab]="[^"]*"', dom3))
+
+
 def part_c(root, keep):
     print("\nC. dserve-top against a (fake) dserve server")
     fake = FakeDServe(root)
@@ -381,6 +484,7 @@ def part_c(root, keep):
              and "waiting for steps" not in dom and "waiting for the adapter" not in dom
              and "waiting for the per-GPU" not in dom and "GPU slot" in dom
              and "TTFT p99" in dom, shot)
+    part_scrub_export(root, port, chrome)
     p.send_signal(signal.SIGINT)
     p.wait(15)
     C.ok("on exit it stops the recording it started",
@@ -421,7 +525,11 @@ def part_c(root, keep):
     fake3.close()
     time.sleep(3)
     _, b = get(port3, "/api/state?steps_since=0&series_since=0")
-    C.ok("notices the server going away", json.loads(b)["connected"] is False)
+    gone = json.loads(b)
+    C.ok("notices the server going away", gone["connected"] is False)
+    C.ok("…and keeps the history to scrub (steps, series, snapshots)",
+         len(gone["steps"]) > 5 and len(gone["series"]) >= 1 and len(gone["snaps"]) >= 1,
+         f"{len(gone['steps'])} steps, {len(gone['series'])} s, {len(gone['snaps'])} snaps")
     fake4 = FakeDServe(os.path.join(root, "c2"), port=sport)
     t0 = time.time()
     while time.time() - t0 < 15 and fake4.rec is None:

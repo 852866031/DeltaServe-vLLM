@@ -40,8 +40,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 PAGE = Path(__file__).with_name("top_page.html")
-MAX_STEPS = 20000
-MAX_SERIES = 3600
+EXPORT_MAX_MB = 50.0
+MAX_STEPS = 1_000_000      # step entries kept (≈ 55 h at 5 / s; bounds RAM under heavy load)
+GZ_B64_RATIO = 0.12 * 4 / 3  # measured: gzip ≈ 0.12 × the JSON, base64 × 4/3
 
 
 class DServe:
@@ -66,19 +67,69 @@ class DServe:
                 return e.code, {}
 
 
-class Feed:
-    """The poller's merged view of the server's live feed."""
 
-    def __init__(self) -> None:
+def _bsearch(items: list[dict], t: float, key: str = "t") -> int:
+    """First index with items[i][key] > t (items sorted by key)."""
+    lo, hi = 0, len(items)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if items[mid][key] <= t:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+def _compact_window(w: dict) -> dict:
+    """The parts of the server's window the page reads (not memory: that is
+    kept separately, only when it changes)."""
+    inf, ft, tot = w.get("inference") or {}, w.get("finetune") or {}, w.get("totals") or {}
+    return {"inference": {k: inf.get(k) for k in
+                          ("ttft_slo", "max_tbt_slo", "tbt_slo_attainment")},
+            "finetune": {k: ft.get(k) for k in
+                         ("backward_gpu_ms_mean", "backward_wall_ms_mean")},
+            "totals": {k: tot.get(k) for k in ("first_tokens", "ttft_slo_met", "requests")}}
+
+
+class Feed:
+    """Everything dserve-top has seen from the server, for the live page and
+    for scrubbing back (``history_s`` of it): the step stream, the
+    per-second series, status snapshots every 2 s, and memory / adapter /
+    model-list snapshots when they change. Kept after the server goes away;
+    reset when a new server run (another ``t_start``) connects."""
+
+    SNAP_EVERY = 2.0
+
+    def __init__(self, history_s: float = 12 * 3600) -> None:
         self.lock = threading.Lock()
-        self.steps: list[dict] = []
-        self.series: list[dict] = []
-        self.latest: dict = {}
+        self.history_s = history_s
+        self._reset()
         self.connected = False
         self.error: str | None = None
         self.last_ok = 0.0
+
+    def _reset(self) -> None:
+        self.steps: list[dict] = []
+        self.series: list[dict] = []
+        self.snaps: list[dict] = []          # {t, ft, win}
+        self.mems: list[dict] = []           # {t, memory}
+        self.models_h: list[dict] = []       # {t, models}
+        self.latest: dict = {}
         self.server_t_start = None
-        self.models: list[dict] = []        # GET /v1/models (base + adapters)
+        self._mem_key = None
+        self._models_key = None
+        self.raw_bytes = 0                   # appended JSON bytes (export estimate)
+
+    @property
+    def models(self) -> list[dict]:
+        return self.models_h[-1]["models"] if self.models_h else []
+
+    @models.setter
+    def models(self, value: list[dict]) -> None:
+        key = json.dumps(value, sort_keys=True)
+        if key != self._models_key:
+            self._models_key = key
+            self.models_h.append({"t": time.time(), "models": value})
 
     @property
     def last_seq(self) -> int:
@@ -91,31 +142,116 @@ class Feed:
     def merge(self, d: dict) -> None:
         with self.lock:
             if self.server_t_start is not None and d.get("t_start") != self.server_t_start:
-                self.steps, self.series = [], []          # server / recording restarted
+                self._reset()                     # a new server run
             self.server_t_start = d.get("t_start")
+            now = float(d.get("now") or time.time())
             new = d.get("steps") or []
             if new:
                 first = new[0]["s"]
                 while self.steps and self.steps[-1]["s"] >= first:
-                    self.steps.pop()                      # the re-sent open decode run
+                    self.steps.pop()              # the re-sent open decode run
                 self.steps.extend(new)
-                if len(self.steps) > 2 * MAX_STEPS:
-                    del self.steps[:len(self.steps) - MAX_STEPS]
-            ser = d.get("series") or []
+                self.raw_bytes += 105 * len(new)
+            ser = [r for r in (d.get("series") or []) if r["t"] > self.last_t]
             if ser:
-                self.series.extend(r for r in ser if r["t"] > self.last_t)
-                if len(self.series) > 2 * MAX_SERIES:
-                    del self.series[:len(self.series) - MAX_SERIES]
+                self.series.extend(ser)
+                self.raw_bytes += 230 * len(ser)
+            win = d.get("window") or {}
+            if not self.snaps or now - self.snaps[-1]["t"] >= self.SNAP_EVERY:
+                self.snaps.append({"t": now, "ft": d.get("finetuning") or {},
+                                   "win": _compact_window(win)})
+                self.raw_bytes += 600
+            mem = win.get("memory") or {}
+            key = json.dumps({k: (v.get("gib"), v.get("lora")) if isinstance(v, dict)
+                              and "gib" in v else v for k, v in mem.items()},
+                             sort_keys=True, default=str)
+            if mem and key != self._mem_key:
+                self._mem_key = key
+                self.mems.append({"t": now, "memory": mem})
+                self.raw_bytes += len(key)
             self.latest = {k: v for k, v in d.items() if k not in ("steps", "series")}
             self.connected, self.error, self.last_ok = True, None, time.time()
+            self._prune(now)
 
-    def state(self, steps_since: int, series_since: float, limit: int = 3000) -> dict:
+    def _prune(self, now: float) -> None:
+        cut = now - self.history_s
+        for name in ("steps", "series", "snaps"):
+            arr = getattr(self, name)
+            if arr and arr[0]["t"] < cut - 600:            # amortized
+                del arr[:_bsearch(arr, cut)]
+        if len(self.steps) > MAX_STEPS + MAX_STEPS // 10:
+            del self.steps[:len(self.steps) - MAX_STEPS]
+        for arr in (self.mems, self.models_h):             # keep the one in force
+            i = _bsearch(arr, cut)
+            if i > 1:
+                del arr[:i - 1]
+
+    def state(self, steps_since: int, series_since: float, snaps_since: float,
+              mems_since: float, models_since: float) -> dict:
         with self.lock:
-            st = [e for e in self.steps[-limit:] if e["s"] >= steps_since]
-            se = [r for r in self.series if r["t"] > series_since]
-            return {**self.latest, "steps": st, "series": se, "models": self.models,
+            i = 0
+            if self.steps and steps_since > self.steps[0]["s"]:
+                i = max(0, min(len(self.steps), steps_since - self.steps[0]["s"]))
+                while i > 0 and self.steps[i - 1]["s"] >= steps_since:
+                    i -= 1
+            return {**self.latest,
+                    "steps": self.steps[i:],
+                    "series": self.series[_bsearch(self.series, series_since):],
+                    "snaps": self.snaps[_bsearch(self.snaps, snaps_since):],
+                    "mems": self.mems[_bsearch(self.mems, mems_since):],
+                    "models_h": self.models_h[_bsearch(self.models_h, models_since):],
+                    "models": self.models,                 # the current list
                     "connected": self.connected, "error": self.error,
-                    "last_ok": self.last_ok}
+                    "last_ok": self.last_ok,
+                    "export_estimate_mb": round((self.raw_bytes * GZ_B64_RATIO + 40000) / 2**20, 2),
+                    "history_s": self.history_s}
+
+    def export(self, info: dict, max_mb: float = EXPORT_MAX_MB) -> tuple[bytes, dict]:
+        """A single self-contained HTML: the page + this history, gzip'd and
+        base64-embedded (the page replays it with the same scrubber). Over
+        ``max_mb`` the oldest part is dropped."""
+        import base64
+        import gzip
+
+        with self.lock:
+            data = {"format": 1, "exported_unix_time": time.time(), "top": dict(info),
+                    "meta": self.latest.get("meta"), "t_start": self.latest.get("t_start"),
+                    "dir": self.latest.get("dir"), "steps": list(self.steps),
+                    "series": list(self.series), "snaps": list(self.snaps),
+                    "mems": list(self.mems), "models_h": list(self.models_h)}
+        page = PAGE.read_text()
+        limit = int(max_mb * 2**20)
+
+        def build(d):
+            blob = base64.b64encode(gzip.compress(
+                json.dumps(d, separators=(",", ":")).encode(), 6)).decode()
+            return page.replace("</body>", '<script id="ds-embedded" type="application/'
+                                f'gzip-base64">{blob}</script>\n</body>', 1).encode()
+
+        html = build(data)
+        trimmed_from = None
+        if len(html) > limit and data["series"]:
+            t0, t1 = data["series"][0]["t"], data["series"][-1]["t"]
+            lo, hi = t0, t1                                   # keep [cut, t1]
+            for _ in range(12):
+                cut = (lo + hi) / 2
+                d = {**data, **{k: [x for x in data[k] if x["t"] >= cut]
+                                for k in ("steps", "series", "snaps")},
+                     **{k: data[k][max(0, _bsearch(data[k], cut) - 1):]
+                        for k in ("mems", "models_h")}}
+                h = build(d)
+                if len(h) > limit:
+                    lo = cut
+                else:
+                    hi, html, trimmed_from = cut, h, cut
+            if trimmed_from is None:                          # nothing fits: newest only
+                trimmed_from = t1
+                html = build({**data, **{k: data[k][-1:] for k in
+                                         ("steps", "series", "snaps", "mems", "models_h")}})
+        meta = {"bytes": len(html), "trimmed_from": trimmed_from,
+                "span_s": (data["series"][-1]["t"] - data["series"][0]["t"])
+                if data["series"] else 0}
+        return html, meta
 
 
 class Link:
@@ -221,10 +357,18 @@ def make_handler(feed: Feed, info: dict):
         def log_message(self, *a):          # quiet
             pass
 
-        def _send(self, code, body: bytes, ctype: str):
+        def _send(self, code, body: bytes, ctype: str, headers: dict | None = None,
+                  compress: bool = True):
+            if (compress and len(body) > 4096
+                    and "gzip" in (self.headers.get("Accept-Encoding") or "")):
+                import gzip
+                body = gzip.compress(body, 5)
+                headers = {**(headers or {}), "Content-Encoding": "gzip"}
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Cache-Control", "no-store")
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -245,10 +389,24 @@ def make_handler(feed: Feed, info: dict):
                 return self._send(200, msg.encode(), "text/plain; charset=utf-8")
             if u.path == "/api/state":
                 q = urllib.parse.parse_qs(u.query)
-                body = feed.state(int(q.get("steps_since", ["0"])[0]),
-                                  float(q.get("series_since", ["0"])[0]))
+                g = lambda k, d="0": q.get(k, [d])[0]  # noqa: E731
+                body = feed.state(int(g("steps_since")), float(g("series_since")),
+                                  float(g("snaps_since")), float(g("mems_since")),
+                                  float(g("models_since")))
                 body["top"] = info
                 return self._send(200, json.dumps(body).encode(), "application/json")
+            if u.path == "/api/export":
+                q = urllib.parse.parse_qs(u.query)
+                mb = min(EXPORT_MAX_MB, float(q.get("max_mb", [EXPORT_MAX_MB])[0]))
+                html, meta = feed.export(info, mb)
+                model = str((feed.latest.get("meta") or {}).get("served_model_name") or "run")
+                name = f"dserve-top-{model}-{time.strftime('%Y%m%d-%H%M%S')}.html"
+                print(f"dserve-top: exported {len(html) / 2**20:.1f} MB "
+                      f"({meta['span_s'] / 60:.0f} min{' , oldest part trimmed' if meta['trimmed_from'] else ''})",
+                      flush=True)
+                return self._send(200, html, "text/html; charset=utf-8",
+                                  {"Content-Disposition": f'attachment; filename="{name}"'},
+                                  compress=False)
             self._send(404, b"not found", "text/plain")
 
     return H
@@ -320,6 +478,8 @@ def main(argv=None) -> int:
     ap.add_argument("--keep-recording", action="store_true",
                     help="leave a recording dserve-top started running on exit")
     ap.add_argument("--poll", type=float, default=0.25, help="seconds between polls")
+    ap.add_argument("--history-hours", type=float, default=12.0,
+                    help="how far back the page can scrub (kept in memory; default 12)")
     ap.add_argument("--no-wait", action="store_true",
                     help="exit if the server is not reachable now (default: serve "
                          "the page and wait for it)")
@@ -332,7 +492,7 @@ def main(argv=None) -> int:
         except Exception as e:  # noqa: BLE001
             print(f"dserve-top: cannot reach the server at {a.server} ({e}).")
             return 1
-    feed = Feed()
+    feed = Feed(history_s=a.history_hours * 3600)
     stop = threading.Event()
     info = {"server": a.server, "recording_dir": None, "started_by_top": False}
     link = Link(srv, a, info)
