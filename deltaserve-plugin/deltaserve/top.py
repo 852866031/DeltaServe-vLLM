@@ -15,7 +15,7 @@ Run it on the GPU machine, next to the server. It
    stops a recording it started;
 2. polls the live feed (GET /telemetry/data) ~4×/s into its own buffers — one
    poller however many browser tabs are open — and refreshes the per-GPU
-   memory snapshot every 30 s;
+   memory / adapter snapshot and the model list every 10 s;
 3. serves the dashboard page on ``--port`` (127.0.0.1 only) and prints how to
    open it through an SSH tunnel.
 
