@@ -25,6 +25,8 @@ svg text{font-family:inherit;font-size:10px}
 .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px;vertical-align:-1px}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px}
 .kpi{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.kpi.top{grid-template-columns:repeat(6,minmax(0,1fr));margin-bottom:12px}
+@media (max-width:900px){.kpi.top{grid-template-columns:repeat(3,minmax(0,1fr))}}
 .kpi .k{background:#1f1f1d;border-radius:4px;padding:7px 8px}
 .kpi .k b{display:block;font-size:20px;font-weight:500;color:var(--ink);margin-top:2px}
 .kpi .k small{color:var(--mute);font-size:10px}
@@ -39,6 +41,7 @@ svg text{font-family:inherit;font-size:10px}
     <div><span class="hi">dserve-top</span> <span class="mu">▸</span> <span id="model" class="hi">…</span> <span class="mu">▸</span> TP=<span id="tp">?</span> <span class="mu">▸</span> recording <span id="up" class="hi">–</span> <span class="mu">▸</span> FT <span id="ftstate">…</span></div>
     <div><span id="conn"><span class="dot" style="background:var(--mute)"></span>connecting</span> <span class="mu">· <span id="rec"></span></span></div>
   </div>
+  <div id="kpi" class="kpi top"></div>
   <div class="grid">
     <div class="col">
       <div class="box"><span class="tt">ENGINE · batches (newest →) · height = tokens (√)</span>
@@ -66,7 +69,6 @@ svg text{font-family:inherit;font-size:10px}
         <div id="ft2" style="margin-top:6px"></div>
       </div>
       <div class="box"><span class="tt">THROUGHPUT (tokens/s) · last 10 s</span><div id="thr"></div></div>
-      <div class="box grow"><span class="tt">AT A GLANCE</span><div id="kpi" class="kpi"></div></div>
     </div>
   </div>
   <div class="box"><span class="tt">MEMORY (GiB)</span><div id="mem" class="mu">waiting for the per-GPU snapshot…</div></div>

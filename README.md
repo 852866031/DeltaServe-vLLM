@@ -764,7 +764,7 @@ three times a second and is read-only:
 | TTFT, TPOT | p50 / p99 per second (TTFT by first token, TPOT per finished request) against the SLO, over 1 / 5 / 30 / 60 min |
 | Finetuning progress | epoch, samples, tokens trained and tokens/s, ETA, loss curve, backward GPU / wall ms and pause share, buffer fill, admission and backward state, why finetuning stopped if it did |
 | Throughput | inference output / prompt and FT forwarded / trained tokens per second |
-| At a glance | TTFT p99 over the last minute (green / red against the SLO), TTFT SLO met since start, TBT SLO met this window, inference and FT tokens/s, loss |
+| At a glance (top row) | TTFT p99 over the last minute (green / red against the SLO), TTFT SLO met since start, TBT SLO met this window, inference and FT tokens/s, loss |
 | Memory | per GPU: weights, KV cache, FT buffers, other, cached / CUDA graphs, backward child + other processes, free |
 
 Server side this is `/telemetry/data` (the feed: steps since a sequence number,
