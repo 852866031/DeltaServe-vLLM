@@ -112,7 +112,7 @@ def main():
              "--port", str(tport), "--dir", str(rec), "--interval", "5"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
         out = ""
-        while "Ctrl-C to quit" not in out:
+        while "connected;" not in out:
             line = top.stdout.readline()
             if not line:
                 break

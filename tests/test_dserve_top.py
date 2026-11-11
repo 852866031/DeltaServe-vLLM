@@ -142,7 +142,7 @@ class FakeDServe:
     """The /health and /telemetry/* routes of deltaserve/api.py over a real
     MetricsRecorder, plus a thread producing synthetic co-serving traffic."""
 
-    def __init__(self, root, active=False):
+    def __init__(self, root, active=False, port=None):
         self.root = root
         self.calls = []
         self.rec = None
@@ -204,9 +204,12 @@ class FakeDServe:
                     return self._j(200 if outer.rec else 409, {})
                 self._j(404, {})
 
-        with socket.socket() as s:
-            s.bind(("127.0.0.1", 0))
-            self.port = s.getsockname()[1]
+        if port is None:
+            with socket.socket() as s:
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+        self.port = port
+        ThreadingHTTPServer.allow_reuse_address = True
         self.httpd = ThreadingHTTPServer(("127.0.0.1", self.port), Hd)
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
         threading.Thread(target=self._traffic, daemon=True).start()
@@ -278,6 +281,7 @@ class FakeDServe:
     def close(self):
         self.stop_evt.set()
         self.httpd.shutdown()
+        self.httpd.server_close()
         if self.rec:
             self.rec.close()
 
@@ -287,13 +291,18 @@ def get(port, path):
         return r.status, r.read()
 
 
-def run_top(fake, root, extra_env=None):
+def free_port():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
+        return s.getsockname()[1]
+
+
+def run_top(fake, root, extra_env=None, server_port=None, until="Ctrl-C to quit"):
+    port = free_port()
     env = dict(os.environ, **(extra_env or {}))
+    sp = server_port if server_port is not None else fake.port
     p = subprocess.Popen([sys.executable, "-m", "deltaserve.top", "--server",
-                          f"http://127.0.0.1:{fake.port}", "--port", str(port),
+                          f"http://127.0.0.1:{sp}", "--port", str(port),
                           "--dir", os.path.join(root, "rec"), "--interval", "2"],
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                          env=env)
@@ -302,7 +311,7 @@ def run_top(fake, root, extra_env=None):
     while time.time() - t0 < 20:
         line = p.stdout.readline()
         out.append(line)
-        if "Ctrl-C to quit" in line:
+        if until in line:
             break
     return p, port, "".join(out)
 
@@ -311,7 +320,10 @@ def part_c(root, keep):
     print("\nC. dserve-top against a (fake) dserve server")
     fake = FakeDServe(root)
     p, port, out = run_top(fake, root, {"SSH_CONNECTION": "10.0.0.5 51234 10.1.2.3 2222",
-                                        "USER": "alice", "LOGNAME": "alice"})
+                                        "USER": "alice", "LOGNAME": "alice"},
+                           until="connected;")
+    C.ok("the SSH guide is the first thing printed",
+         out.lstrip().startswith("dserve-top — open the dashboard"), out.lstrip()[:50])
     print("    " + out.replace("\n", "\n    ").rstrip())
     C.ok("started the recording (telemetry was off)",
          any(c[:2] == ("POST", "/telemetry/start") for c in fake.calls) and fake.rec is not None
@@ -372,8 +384,8 @@ def part_c(root, keep):
 
     print("\n   telemetry already on (config)")
     fake2 = FakeDServe(os.path.join(root, "b"), active=True)
-    p2, port2, out2 = run_top(fake2, os.path.join(root, "b"))
-    C.ok("does not start a second recording", "already records" in out2
+    p2, port2, out2 = run_top(fake2, os.path.join(root, "b"), until="connected;")
+    C.ok("does not start a second recording", "the server records telemetry" in out2
          and not any(c[:2] == ("POST", "/telemetry/start") for c in fake2.calls))
     p2.send_signal(signal.SIGINT)
     p2.wait(15)
@@ -382,10 +394,44 @@ def part_c(root, keep):
          and fake2.rec is not None)
     fake2.close()
 
-    print("\n   server down")
-    r = subprocess.run([sys.executable, "-m", "deltaserve.top", "--server",
+    print("\n   started before the server; server restart")
+    sport = free_port()
+    p3, port3, out3 = run_top(None, os.path.join(root, "c"), server_port=sport,
+                              until="waiting for the DeltaServe server")
+    code, page = get(port3, "/")
+    _, b = get(port3, "/api/state?steps_since=0&series_since=0")
+    st = json.loads(b)
+    C.ok("serves the page and says it is waiting while no server runs",
+         code == 200 and st["connected"] is False and "waiting" in (st["error"] or ""),
+         str(st["error"]))
+    fake3 = FakeDServe(os.path.join(root, "c"), port=sport)
+    t0 = time.time()
+    while time.time() - t0 < 15 and fake3.rec is None:
+        time.sleep(0.2)
+    time.sleep(1.5)
+    _, b = get(port3, "/api/state?steps_since=0&series_since=0")
+    st = json.loads(b)
+    C.ok("connects once the server comes up and starts recording",
+         fake3.rec is not None and st["connected"] and st["top"]["started_by_top"])
+    fake3.close()
+    time.sleep(3)
+    _, b = get(port3, "/api/state?steps_since=0&series_since=0")
+    C.ok("notices the server going away", json.loads(b)["connected"] is False)
+    fake4 = FakeDServe(os.path.join(root, "c2"), port=sport)
+    t0 = time.time()
+    while time.time() - t0 < 15 and fake4.rec is None:
+        time.sleep(0.2)
+    C.ok("reconnects after a server restart and records again",
+         fake4.rec is not None
+         and any(c[:2] == ("POST", "/telemetry/start") for c in fake4.calls))
+    p3.send_signal(signal.SIGINT)
+    p3.wait(15)
+    C.ok("on exit stops the recording on the restarted server",
+         any(c[:2] == ("POST", "/telemetry/stop") for c in fake4.calls))
+    fake4.close()
+    r = subprocess.run([sys.executable, "-m", "deltaserve.top", "--no-wait", "--server",
                         "http://127.0.0.1:1"], capture_output=True, text=True, timeout=20)
-    C.ok("clear error when the server is unreachable",
+    C.ok("--no-wait: clear error when the server is unreachable",
          r.returncode == 1 and "cannot reach the server" in r.stdout, r.stdout[:80])
     return shot
 

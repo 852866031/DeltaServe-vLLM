@@ -8,9 +8,11 @@
 
 Run it on the GPU machine, next to the server. It
 
-1. asks the server to start recording telemetry (POST /telemetry/start) unless
-   it already records (telemetry.metrics_dir in its config) — into ``--dir``,
-   default ``./dserve-top/<time>``; on exit it stops a recording it started;
+1. waits for the server if it is not up yet (start dserve-top first if you
+   like), then asks it to record telemetry (POST /telemetry/start) unless it
+   already does (telemetry.metrics_dir in its config) — into ``--dir``,
+   default ``./dserve-top/<time>``; again after a server restart; on exit it
+   stops a recording it started;
 2. polls the live feed (GET /telemetry/data) ~4×/s into its own buffers — one
    poller however many browser tabs are open — and refreshes the per-GPU
    memory snapshot every 30 s;
@@ -116,19 +118,80 @@ class Feed:
                     "last_ok": self.last_ok}
 
 
-def poll_loop(srv: DServe, feed: Feed, stop: threading.Event, every: float) -> None:
+class Link:
+    """dserve-top's connection to the server: waits for it, starts the
+    recording when the server is not recording (again after a restart), and
+    remembers whether it started it (to stop it on exit)."""
+
+    def __init__(self, srv: DServe, a, info: dict) -> None:
+        self.srv, self.a, self.info = srv, a, info
+        self.live = False
+        self.started = False
+        self._said = None
+
+    def _say(self, msg: str) -> None:
+        if msg != self._said:                       # print each state change once
+            self._said = msg
+            print(f"dserve-top: {msg}", flush=True)
+
+    def connect(self, feed: "Feed") -> bool:
+        base = self.srv.base
+        try:
+            code, d = self.srv.call("GET", "/telemetry/data?steps_since="
+                                    "9223372036854775807&series_since=1e18")
+        except Exception:  # noqa: BLE001 — not up yet
+            feed.connected, feed.error = False, f"waiting for the DeltaServe server at {base} …"
+            self._say(f"waiting for the DeltaServe server at {base} …")
+            return False
+        if code == 404:
+            feed.connected = False
+            feed.error = (f"{base} is up but has no /telemetry routes — finetuning off "
+                          "(finetune_param.enable_finetuning) or an old plugin")
+            self._say(feed.error)
+            return False
+        if code != 200:
+            feed.connected, feed.error = False, f"server answered HTTP {code}; retrying"
+            self._say(feed.error)
+            return False
+        if d.get("active"):
+            self.started = self.started and bool(d.get("runtime"))
+            self.info.update(recording_dir=d.get("dir"), started_by_top=self.started)
+            self._say(f"connected; the server records telemetry → {d.get('dir')}")
+            self.live = True
+            return True
+        rec_dir = os.path.abspath(self.a.dir or os.path.join(
+            "dserve-top", time.strftime("%Y%m%d-%H%M%S")))
+        code, r = self.srv.call("POST", "/telemetry/start",
+                                {"dir": rec_dir, "interval_s": self.a.interval})
+        if code != 200 or not r.get("active"):
+            feed.connected, feed.error = False, f"could not start recording: {r}"
+            self._say(feed.error)
+            return False
+        self.started = bool(r.get("started"))
+        self.info.update(recording_dir=r.get("dir", rec_dir), started_by_top=self.started)
+        self._say(f"connected; started telemetry recording → {r.get('dir', rec_dir)}")
+        self.live = True
+        return True
+
+
+def poll_loop(link: Link, feed: Feed, stop: threading.Event, every: float) -> None:
+    srv = link.srv
     last_mem = 0.0
     while not stop.is_set():
+        if not link.live:
+            if not link.connect(feed):
+                stop.wait(2.0)
+                continue
+            last_mem = 0.0
         try:
             code, d = srv.call(
                 "GET", f"/telemetry/data?steps_since={feed.last_seq}"
                        f"&series_since={feed.last_t}")
             if code == 200 and d.get("active"):
                 feed.merge(d)
-            else:
-                feed.connected = False
-                feed.error = d.get("error") or ("not recording" if code == 200
-                                                 else f"HTTP {code}")
+            else:                                   # stopped / restarted: reconnect
+                link.live = False
+                continue
             if time.time() - last_mem > 10:
                 # adapters come and go (on-demand loads, LRU): refresh the
                 # per-GPU memory / adapter snapshot and the API's model list
@@ -140,9 +203,13 @@ def poll_loop(srv: DServe, feed: Feed, stop: threading.Event, every: float) -> N
                         feed.models = [{"id": x.get("id"), "parent": x.get("parent"),
                                         "root": x.get("root")}
                                        for x in m.get("data", [])]
-        except Exception as e:  # noqa: BLE001 — keep polling through restarts
+        except Exception:  # noqa: BLE001 — server gone: wait for it again
+            link.live = False
             feed.connected = False
-            feed.error = f"{type(e).__name__}: {e}"
+            feed.error = f"lost the server at {srv.base}; waiting for it …"
+            link._say(feed.error)
+            stop.wait(1.0)
+            continue
         stop.wait(every)
 
 
@@ -189,8 +256,8 @@ def ssh_guide(port: int) -> str:
     alt = port + 10000 if port + 10000 <= 65535 else port - 10000
     lines = [
         "",
-        "  Open the dashboard from your laptop (the page is served on this machine,",
-        f"  127.0.0.1:{port} only):",
+        "  dserve-top — open the dashboard from your laptop over SSH",
+        f"  (the page is served on this machine, 127.0.0.1:{port} only)",
         "",
         "  1. On your LAPTOP (a new local terminal, not this SSH session), run:",
         "",
@@ -238,49 +305,32 @@ def main(argv=None) -> int:
     ap.add_argument("--keep-recording", action="store_true",
                     help="leave a recording dserve-top started running on exit")
     ap.add_argument("--poll", type=float, default=0.25, help="seconds between polls")
+    ap.add_argument("--no-wait", action="store_true",
+                    help="exit if the server is not reachable now (default: serve "
+                         "the page and wait for it)")
     a = ap.parse_args(argv)
 
     srv = DServe(a.server)
-    try:
-        code, _ = srv.call("GET", "/health")
-    except Exception as e:  # noqa: BLE001
-        print(f"dserve-top: cannot reach the server at {a.server} ({e}).\n"
-              f"  Start it first (eval-tp/launch_deltaserve.py …) or pass --server.")
-        return 1
-    code, d = srv.call("GET", "/telemetry/data?steps_since=9223372036854775807"
-                              "&series_since=1e18")
-    if code == 404:
-        print(f"dserve-top: {a.server} has no /telemetry routes — is finetuning "
-              "enabled on it (finetune_param.enable_finetuning) and the plugin "
-              "up to date?")
-        return 1
-    started = False
-    rec_dir = d.get("dir")
-    if not d.get("active"):
-        rec_dir = os.path.abspath(a.dir or os.path.join(
-            "dserve-top", time.strftime("%Y%m%d-%H%M%S")))
-        code, r = srv.call("POST", "/telemetry/start",
-                           {"dir": rec_dir, "interval_s": a.interval})
-        if code != 200 or not r.get("active"):
-            print(f"dserve-top: could not start recording: {r}")
+    if a.no_wait:
+        try:
+            srv.call("GET", "/health")
+        except Exception as e:  # noqa: BLE001
+            print(f"dserve-top: cannot reach the server at {a.server} ({e}).")
             return 1
-        started = bool(r.get("started"))
-        rec_dir = r.get("dir", rec_dir)
-        print(f"dserve-top: started telemetry recording → {rec_dir}")
-    else:
-        print(f"dserve-top: the server already records telemetry → {rec_dir}")
-
     feed = Feed()
     stop = threading.Event()
-    th = threading.Thread(target=poll_loop, args=(srv, feed, stop, a.poll), daemon=True)
-    th.start()
-    info = {"server": a.server, "recording_dir": rec_dir, "started_by_top": started}
+    info = {"server": a.server, "recording_dir": None, "started_by_top": False}
+    link = Link(srv, a, info)
     httpd = bind(a.bind, a.port, make_handler(feed, info))
     port = httpd.server_address[1]
-    print(f"dserve-top: dashboard on http://{a.bind}:{port}  (server {a.server})")
     print(ssh_guide(port), flush=True)
-    print("  Ctrl-C to quit" + (" (stops the recording it started)"
-                                if started and not a.keep_recording else ""), flush=True)
+    print(f"dserve-top: dashboard served on http://{a.bind}:{port} · watching the "
+          f"server at {a.server} (the page works before it is up)")
+    print("dserve-top: Ctrl-C to quit (stops a recording dserve-top started"
+          + (", unless --keep-recording)" if not a.keep_recording else " — kept)"),
+          flush=True)
+    th = threading.Thread(target=poll_loop, args=(link, feed, stop, a.poll), daemon=True)
+    th.start()
 
     def shutdown(*_):
         threading.Thread(target=httpd.shutdown, daemon=True).start()
@@ -292,10 +342,10 @@ def main(argv=None) -> int:
     finally:
         stop.set()
         httpd.server_close()
-        if started and not a.keep_recording:
+        if link.started and not a.keep_recording:
             try:
                 srv.call("POST", "/telemetry/stop", {})
-                print(f"\ndserve-top: recording stopped (kept in {rec_dir})")
+                print(f"\ndserve-top: recording stopped (kept in {info['recording_dir']})")
             except Exception as e:  # noqa: BLE001
                 print(f"\ndserve-top: could not stop the recording: {e}")
     return 0

@@ -743,7 +743,9 @@ difference within run-to-run noise (0.6B, 3 + 3 runs: output tok/s +0.3 %, TPOT 
 dserve-top                       # on the GPU machine, next to a running server (:8000)
 ```
 
-It works whether or not the server's config turns telemetry on: if the server is not
+Start it before or after the server: it serves the page right away and waits for the
+server (and reconnects after a restart). It works whether or not the server's config
+turns telemetry on: if the server is not
 recording, `dserve-top` starts the recording (into `./dserve-top/<time>`, or `--dir`)
 and stops it again when you quit. It serves the dashboard on `127.0.0.1:8090` (next
 free port) and prints how to open it from your laptop, filled in with the address you
