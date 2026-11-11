@@ -333,6 +333,11 @@ def part_c(root, keep):
          and f"http://localhost:" in out)
     code, page = get(port, "/")
     C.ok("serves the page", code == 200 and b"dserve-top" in page and b"/api/state" in page)
+    code, hz = get(port, "/healthz")
+    C.ok("/healthz says dserve-top is up and the server connected",
+         code == 200 and hz.startswith(b"dserve-top OK") and b"connected" in hz, hz.decode())
+    C.ok("guide prints the safer tunnel command",
+         "ExitOnForwardFailure=yes" in out and "/healthz" in out)
     node = shutil.which("node")
     if node:
         import re

@@ -215,6 +215,7 @@ def poll_loop(link: Link, feed: Feed, stop: threading.Event, every: float) -> No
 
 def make_handler(feed: Feed, info: dict):
     page = PAGE.read_bytes()
+    seen: set = set()
 
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):          # quiet
@@ -231,7 +232,17 @@ def make_handler(feed: Feed, info: dict):
         def do_GET(self):
             u = urllib.parse.urlparse(self.path)
             if u.path in ("/", "/index.html"):
+                peer = self.client_address[0]
+                if peer not in seen:
+                    seen.add(peer)
+                    print(f"dserve-top: a browser opened the dashboard (via {peer})",
+                          flush=True)
                 return self._send(200, page, "text/html; charset=utf-8")
+            if u.path == "/healthz":
+                ok = feed.connected
+                msg = ("dserve-top OK · server " + ("connected" if ok else
+                       f"not connected ({feed.error})") + "\n")
+                return self._send(200, msg.encode(), "text/plain; charset=utf-8")
             if u.path == "/api/state":
                 q = urllib.parse.parse_qs(u.query)
                 body = feed.state(int(q.get("steps_since", ["0"])[0]),
@@ -261,13 +272,17 @@ def ssh_guide(port: int) -> str:
         "",
         "  1. On your LAPTOP (a new local terminal, not this SSH session), run:",
         "",
-        f"       ssh -N -L {local}:localhost:{port}{extra} {target}",
+        f"       ssh -N -o ExitOnForwardFailure=yes -L {local}:localhost:{port}{extra} {target}",
         "",
-        "     -N opens only the tunnel (no shell); leave it running. If you normally",
+        "     It prints nothing while the tunnel is up (-N: tunnel only, no shell); leave",
+        "     it running. It exits with an error if the local port is taken. Add -v to",
+        "     watch it connect. If you normally",
         "     go through a jump host, add  -J <jump-host>  (or reuse your ~/.ssh/config",
         f"     alias:  ssh -N -L {local}:localhost:{port} <alias>).",
         "",
         f"  2. In your laptop's browser open:   http://localhost:{local}",
+        "     (dserve-top prints 'a browser opened the dashboard' here when it works.)",
+        f"     Check from the laptop without a browser:  curl -s http://localhost:{local}/healthz",
         "",
         f"  Port {local} already used on your laptop? Pick another local port, e.g.",
         f"     ssh -N -L {alt}:localhost:{port}{extra} {target}   →  http://localhost:{alt}",
