@@ -24,6 +24,12 @@ svg text{font-family:inherit;font-size:10px}
 .kv{display:grid;grid-template-columns:auto 1fr;gap:1px 10px}
 .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px;vertical-align:-1px}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px}
+.kpi{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.kpi .k{background:#1f1f1d;border-radius:4px;padding:7px 8px}
+.kpi .k b{display:block;font-size:20px;font-weight:500;color:var(--ink);margin-top:2px}
+.kpi .k small{color:var(--mute);font-size:10px}
+.kpi .k b.ok{color:var(--ok)}.kpi .k b.bad{color:var(--bad)}
+.col{display:flex;flex-direction:column}.col>.box.grow{flex:1}
 #tip{position:fixed;pointer-events:none;background:#0b0b0b;border:1px solid var(--line);border-radius:4px;padding:6px 8px;color:var(--ink);display:none;z-index:9;white-space:pre;max-width:420px}
 </style>
 </head>
@@ -34,7 +40,7 @@ svg text{font-family:inherit;font-size:10px}
     <div><span id="conn"><span class="dot" style="background:var(--mute)"></span>connecting</span> <span class="mu">· <span id="rec"></span></span></div>
   </div>
   <div class="grid">
-    <div>
+    <div class="col">
       <div class="box"><span class="tt">ENGINE · batches (newest →) · height = tokens (√)</span>
         <svg id="wave" width="100%" height="150" role="img" aria-label="Engine batches"></svg>
         <div id="last" class="mu" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">waiting for steps…</div>
@@ -52,7 +58,7 @@ svg text{font-family:inherit;font-size:10px}
         <svg id="tpot" width="100%" height="120" role="img" aria-label="Per-request TPOT p50 and p99 over time"></svg>
       </div>
     </div>
-    <div>
+    <div class="col">
       <div class="box"><span class="tt">FINETUNING PROGRESS</span>
         <div id="ft"></div>
         <div style="margin-top:8px">loss <span id="loss" class="hi">–</span> <span class="mu">(mean of last 20 backwards)</span></div>
@@ -60,6 +66,7 @@ svg text{font-family:inherit;font-size:10px}
         <div id="ft2" style="margin-top:6px"></div>
       </div>
       <div class="box"><span class="tt">THROUGHPUT (tokens/s) · last 10 s</span><div id="thr"></div></div>
+      <div class="box grow"><span class="tt">AT A GLANCE</span><div id="kpi" class="kpi"></div></div>
     </div>
   </div>
   <div class="box"><span class="tt">MEMORY (GiB)</span><div id="mem" class="mu">waiting for the per-GPU snapshot…</div></div>
@@ -222,7 +229,27 @@ function mem(){
  $('mem').innerHTML=o;
 }
 
-function render(){try{header();wave();charts();ft();gpu();mem();}catch(e){console.error(e);}}
+let lastTbt=null;
+function kpi(){
+ const L=S.latest,now=L.now||0,w=(L.window||{}).inference||{},t=(L.window||{}).totals||{},f=L.finetuning||{};
+ const slo=w.ttft_slo,mslo=w.max_tbt_slo;
+ const tv=S.series.filter(r=>r.t>now-60).flatMap(r=>r.tv||[]).sort((a,b)=>a-b);
+ const p99=tv.length?tv[Math.min(tv.length-1,Math.ceil(.99*tv.length)-1)]:null;
+ const met=t.first_tokens?t.ttft_slo_met/t.first_tokens:null;
+ if(w.tbt_slo_attainment!=null)lastTbt=w.tbt_slo_attainment;
+ const r10=S.series.filter(r=>r.t>now-10),n=Math.max(1,r10.length);
+ const out=r10.reduce((a,r)=>a+r.out,0)/n,tr=r10.reduce((a,r)=>a+r.tr,0)/n;
+ const col=(v,good)=>v==null?'':good?'ok':'bad';
+ const tile=(lab,val,cls,sub)=>`<div class="k"><span class="mu">${lab}</span><b class="${cls}">${val}</b><small>${sub}</small></div>`;
+ $('kpi').innerHTML=
+  tile('TTFT p99',p99==null?'–':fmt(p99,2)+' s',col(p99,slo==null||p99<=slo),`last 1 min · ${tv.length} req`)+
+  tile('TTFT SLO met',met==null?'–':fmt(met*100,1)+'%',col(met,met>=.99),`since start · SLO ${slo??'–'} s`)+
+  tile('TBT SLO met',lastTbt==null?'–':fmt(lastTbt*100,1)+'%',col(lastTbt,lastTbt>=.99),`this window · max ${mslo?fmt(mslo*1000,0)+' ms':'–'}`)+
+  tile('inference out',big(out)+'/s','','tokens · last 10 s')+
+  tile('FT trained',big(tr)+'/s','','tokens · last 10 s')+
+  tile('loss',fmt(f.mean_loss_last_20,3),'','mean of last 20');
+}
+function render(){try{header();wave();charts();ft();gpu();kpi();mem();}catch(e){console.error(e);}}
 addEventListener('resize',render);
 poll();setInterval(poll,300);
 </script>

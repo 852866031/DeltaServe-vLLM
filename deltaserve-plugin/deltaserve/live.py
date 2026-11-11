@@ -113,6 +113,10 @@ class _Sec:
         return {"t": self.t,
                 "ttft50": r(_pct(self.ttft, 50)), "ttft99": r(_pct(self.ttft, 99)),
                 "nt": len(self.ttft),
+                # raw TTFTs (≤ 64, evenly sampled): exact percentiles over
+                # any span client-side (the dashboard's 1-minute p99)
+                "tv": [round(x, 4) for x in (self.ttft if len(self.ttft) <= 64
+                       else sorted(self.ttft)[::-(-len(self.ttft) // 64)])],
                 "tpot50": r(_pct(self.tpot, 50), 5), "tpot99": r(_pct(self.tpot, 99), 5),
                 "nf": len(self.tpot),
                 "out": self.out, "inp": self.inp, "tr": self.tr, "ftf": self.ftf,

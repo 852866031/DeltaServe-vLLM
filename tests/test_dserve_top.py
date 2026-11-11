@@ -100,6 +100,14 @@ def part_a():
     C.ok("per-second row", r["t"] == 10 and r["nt"] == 2 and r["ttft50"] == 0.05
          and r["ttft99"] == 0.3 and r["out"] == 7 and r["inp"] == 40 and r["tr"] == 256
          and r["ftf"] == 128 and r["loss"] == 2.0 and r["fi"] == 0.01, json.dumps(r))
+    C.ok("raw TTFTs ride along for client-side percentiles", r["tv"] == [0.05, 0.3])
+    many = LiveFeed()
+    for i in range(500):
+        many.first_token(20.5, i / 1000)
+    many.tick(22)
+    tv = many.series_since(0)[0]["tv"]
+    C.ok("…at most 64 per second, spanning the range", len(tv) <= 64
+         and tv[0] == 0.0 and tv[-1] >= 0.49, f"{len(tv)} values")
     C.ok("idle seconds filled", [x["t"] for x in rows] == [10, 11, 12, 13]
          and rows[1]["nt"] == 0 and rows[1]["ttft50"] is None)
     C.ok("series_since", [x["t"] for x in fs.series_since(11)] == [12, 13])
