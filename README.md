@@ -239,12 +239,11 @@ step, inference latency against the SLO, finetuning progress, throughput, adapte
 and GPU memory. You can scrub back through the run, download it as one HTML file
 that replays offline, and stop the server from it.
 
-**[▶ Open an example run](https://raw.githack.com/852866031/DeltaServe-vLLM/main/docs/dserve-top-example.html)**:
-72 s of Qwen3-14B TP=2 on 2× RTX 5090 at about 3 req/s with finetuning running, exported
-from `dserve-top` as one HTML file (53 KB). It opens in the browser with no server: scrub
-the timeline, press `▶`, hover anything. The same file is
-[`docs/dserve-top-example.html`](docs/dserve-top-example.html) if you would rather open
-it locally.
+![dserve-top on Qwen3-14B TP=2 under load](docs/figures/dserve_top_qwen3_14b_tp2.png)
+
+The same run as an exported file: [`docs/dserve-top-example.html`](docs/dserve-top-example.html)
+(53 KB, 72 s of Qwen3-14B TP=2 at about 3 req/s with finetuning running). Download it and
+open it in a browser; it replays with no server: scrub the timeline, press `▶`, hover anything.
 
 ### Recorded system metrics
 
