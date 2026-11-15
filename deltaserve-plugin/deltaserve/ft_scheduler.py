@@ -153,6 +153,9 @@ class FinetuneScheduler(AsyncScheduler):
         # `self._estimator`; until then admission stays the fixed coordinator
         # budget but the estimator is still trained online.
         self._estimator = MergedExecutionEstimator()
+        self._estimator.set_margin(
+            str(getattr(ft_cfg, "admission_margin", "legacy") or "legacy"),
+            float(getattr(ft_cfg, "admission_margin_k", 1.5)))
         self._tracker = StepExecutionTracker()
         # [mixed-fwd-cuda-graph] mixed FT batches replay graphs while FT-only
         # batches stay eager → two different cost models; split the FT regime

@@ -309,6 +309,24 @@ class FinetuneConfig:
     Independent of the standard 0.9 × ttft_slo TTFT margin, which still
     applies everywhere."""
 
+    admission_margin: str = "legacy"
+    """How the step-time prediction is inflated before the SLO admission checks.
+
+    ``"legacy"`` (default): ×(1 + 1.5·RMSE) with the RMSE in seconds, as in the
+    original DeltaServe tracker. With the RMSEs seen in practice (a few ms) this
+    is a 0.2-0.8 % factor, i.e. effectively no margin.
+    ``"relative"``: ×(1 + ``admission_margin_k`` · relRMSE), relRMSE the
+    regime's RMS relative error on its fit data (e.g. 0.05 = 5 %): the
+    headroom scales with the step.
+    ``"absolute"``: + ``admission_margin_k`` · RMSE seconds, the same headroom
+    for every step.
+    Applies to every margined prediction (the baseline-without-FT checks and
+    each candidate in the iterative admission loop)."""
+
+    admission_margin_k: float = 1.5
+    """Multiplier of the error in ``admission_margin`` = relative / absolute
+    (ignored by ``legacy``, which keeps its fixed 1.5)."""
+
     profile_on_launch: bool = True
     """Run the offline execution-time profiling pass at launch (before serving)
     to seed the SLO estimator. When False, the estimator starts cold and relies

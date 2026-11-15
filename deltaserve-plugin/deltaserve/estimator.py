@@ -334,7 +334,49 @@ class MergedExecutionEstimator:
     def __init__(self) -> None:
         self._params: dict[str, StepParams] = {r: StepParams() for r in REGIMES}
         self._rmse: dict[str, float | None] = {r: None for r in REGIMES}
+        # Relative RMSE per regime: RMS of (pred - actual) / actual on the fit
+        # data, i.e. the typical error as a fraction of the step time.
+        self._rel_rmse: dict[str, float | None] = {r: None for r in REGIMES}
+        # Admission safety margin (slo.admission_margin / _k); see
+        # ``set_margin``. "legacy" = the original ×(1 + 1.5·RMSE[s]).
+        self.margin_mode = "legacy"
+        self.margin_k = 1.5
         self._warned_unfitted = False
+
+    MARGIN_MODES = ("legacy", "relative", "absolute")
+
+    def set_margin(self, mode: str = "legacy", k: float = 1.5) -> None:
+        """Choose how ``predict`` inflates its estimate for admission.
+
+        - ``legacy``: ×(1 + 1.5·RMSE) with the RMSE in seconds, as in the
+          original DeltaServe tracker. With RMSEs of a few ms this is a
+          0.2-0.8 % factor: effectively no margin.
+        - ``relative``: ×(1 + k·relRMSE), relRMSE the regime's RMS relative
+          error: the margin scales with the step, so a long step gets the
+          same protection in % as a short one.
+        - ``absolute``: + k·RMSE seconds: the same headroom for every step.
+        """
+        if mode not in self.MARGIN_MODES:
+            raise ValueError(f"slo.admission_margin must be one of "
+                             f"{self.MARGIN_MODES}, got {mode!r}")
+        self.margin_mode = mode
+        self.margin_k = float(k)
+
+    def _with_margin(self, pred: float, regime: str) -> float:
+        mode = self.margin_mode
+        if mode == "legacy":
+            rmse = self._rmse[regime]
+            if rmse:
+                pred *= 1.0 + 1.5 * rmse   # pessimistic safety margin (DeltaServe)
+        elif mode == "relative":
+            rel = self._rel_rmse[regime]
+            if rel:
+                pred *= 1.0 + self.margin_k * rel
+        else:  # absolute
+            rmse = self._rmse[regime]
+            if rmse:
+                pred += self.margin_k * rmse
+        return pred
 
     @property
     def is_ready(self) -> bool:
@@ -349,6 +391,7 @@ class MergedExecutionEstimator:
                            "delta": p.delta, "epsilon": p.epsilon, "c": p.c}
                        for r, p in self._params.items()},
             "rmse": dict(self._rmse),
+            "rel_rmse": dict(self._rel_rmse),
         }
 
     def import_state(self, state: dict) -> None:
@@ -358,6 +401,7 @@ class MergedExecutionEstimator:
             if r in self._params:
                 self._params[r] = StepParams(**coefs)
                 self._rmse[r] = (state.get("rmse") or {}).get(r)
+                self._rel_rmse[r] = (state.get("rel_rmse") or {}).get(r)
 
     @property
     def fit_rmse(self) -> float | None:
@@ -421,8 +465,8 @@ class MergedExecutionEstimator:
         ``regime="eager"`` for hypothetical-with-FT predictions (because
         adding FT always forces eager).
 
-        ``apply_margin`` (default True) adds the pessimistic ×(1 + 1.5·RMSE)
-        safety margin used for conservative SLO admission. Pass False to get
+        ``apply_margin`` (default True) adds the admission safety margin
+        (``set_margin``; by default the original ×(1 + 1.5·RMSE)). Pass False to get
         the RAW model prediction (no margin) — used by estimator-accuracy
         validation, which scores the model itself against the measured time."""
         if not self.is_ready:
@@ -433,9 +477,8 @@ class MergedExecutionEstimator:
             return 0.0
         selected_regime, p = self._select(features, regime=regime)
         pred = p.eval(features)
-        rmse = self._rmse[selected_regime]
-        if apply_margin and rmse:
-            pred *= 1.0 + 1.5 * rmse   # pessimistic safety margin (DeltaServe)
+        if apply_margin:
+            pred = self._with_margin(pred, selected_regime)
         return max(0.0, float(pred))
 
     # ---------------- fitting ----------------
@@ -464,11 +507,13 @@ class MergedExecutionEstimator:
             msg_parts.append(f"excluded {n_contended} contended prefill")
         for r in REGIMES:
             X, y = buckets[r]
-            self._params[r], self._rmse[r] = self._fit_regime(
-                X, y, self._params[r], r)
+            (self._params[r], self._rmse[r],
+             self._rel_rmse[r]) = self._fit_regime(X, y, self._params[r], r)
             rmse_str = (f"{self._rmse[r]:.4f}" if self._rmse[r] is not None
                         else "n/a")
-            msg_parts.append(f"{r}={len(y)}(rmse={rmse_str})")
+            rel = self._rel_rmse[r]
+            msg_parts.append(f"{r}={len(y)}(rmse={rmse_str}"
+                             + (f", rel={rel:.3f}" if rel is not None else "") + ")")
         dprint(f"[estimator] fit: " + ", ".join(msg_parts))
         return self._params
 
@@ -510,16 +555,20 @@ class MergedExecutionEstimator:
     @classmethod
     def _fit_regime(cls, X: list[list[float]], y: list[float],
                     prev: StepParams,
-                    regime: str) -> tuple[StepParams, float | None]:
+                    regime: str
+                    ) -> tuple[StepParams, float | None, float | None]:
         if len(y) < MIN_FIT_SAMPLES:
             if len(y) > 0:
                 dprint(f"[estimator] {regime} regime has {len(y)} samples "
                        f"(<{MIN_FIT_SAMPLES}); keeping previous params")
-            return prev, None
+            return prev, None, None
         A = np.asarray(X, dtype=float)
         b = np.asarray(y, dtype=float)
         coef, *_ = np.linalg.lstsq(A, b, rcond=None)
         params = cls._scatter_coefs(coef, regime)
         preds = A @ coef
         rmse = float(np.sqrt(np.mean((preds - b) ** 2)))
-        return params, rmse
+        pos = b > 1e-6
+        rel = (float(np.sqrt(np.mean(((preds[pos] - b[pos]) / b[pos]) ** 2)))
+               if pos.any() else None)
+        return params, rmse, rel

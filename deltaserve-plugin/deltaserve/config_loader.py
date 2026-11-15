@@ -81,6 +81,7 @@ FINETUNE_SECTIONS: dict[str, tuple[str, ...]] = {
     ),
     "slo": (
         "ttft_slo", "avg_tbt_slo", "max_tbt_slo", "decode_only_ft_safety_margin",
+        "admission_margin", "admission_margin_k",
         "profile_on_launch", "profile_num_repeats", "validate_estimator",
         "estimator_validation_path", "estimator_state_save_path",
         "estimator_state_load_path",
