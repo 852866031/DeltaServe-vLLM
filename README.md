@@ -40,7 +40,7 @@ vLLM's own `--additional-config`. Without it, the server is plain vLLM.
 2. [How it works](#how-it-works)
 3. [Supported models](#supported-models)
 4. [Telemetry and live monitoring (`dserve-top`)](#telemetry-and-live-monitoring-dserve-top)
-   - [system metrics](#recorded-system-metrics) · [quick start](#dserve-top-quick-start) · [over SSH](#opening-the-page-over-ssh) · [reading the page](#reading-the-page) · [going back in time](#going-back-in-time) · [exporting a run](#exporting-a-run)
+   - [system metrics](#recorded-system-metrics) · [overhead](#overhead) · [quick start](#dserve-top-quick-start) · [over SSH](#opening-the-page-over-ssh) · [reading the page](#reading-the-page) · [going back in time](#going-back-in-time) · [exporting a run](#exporting-a-run)
 5. [Features](#features)
    - [Forward pass](#forward-pass)
    - [Backward pass](#backward-pass)
@@ -280,13 +280,44 @@ percentiles are within 2 % (mean, max and SLO attainment are exact). The cost is
 about 75 µs per 256-request step, writes happen on a background thread, and the window
 in progress is written when the server is asked to stop.
 
-Measured overhead (`eval-tp/bench_metrics_overhead.py`: interleaved on/off runs under
-`vllm bench serve` load with finetuning running, plus every recorder call timed in
-the EngineCore): **0.32 %** of the engine thread on Qwen3-0.6B (host-bound, ~2.3 ms
-steps; 7 µs per step) and **0.05 %** on Qwen3-14B TP=2 (7 µs per step); slowest single
-call 0.4 ms. Throughput, TTFT / TPOT / ITL percentiles and FT tokens/s on vs off: every
-difference within run-to-run noise (0.6B, 3 + 3 runs: output tok/s +0.3 %, TPOT p50
-−0.1 %; 14B: all within ±0.15 %).
+### Overhead
+
+Recording costs about **0.6 % of the engine thread** and has no measurable effect on
+throughput, decode latency or finetuning; the one visible change is **+1.6–1.8 ms on the
+median TTFT**. A `dserve-top` attached and polling adds nothing measurable on top.
+
+Measured with `eval-tp/bench_metrics_overhead.py --order ABTTBA --num-prompts 2400` on
+Qwen3-0.6B (one RTX 5090, CUDA graphs): six interleaved runs, two each of recording off
+(B), recording on (A), and recording on with `dserve-top` polling the server (T), under
+the same closed-loop load (`vllm bench serve`, 32 concurrent, 512 tokens in / 128 out,
+~56 req/s, 2400 requests) with finetuning running. The 0.6B engine is host-bound
+(~2.3 ms steps), so engine-thread overhead shows most here: a worst case for larger
+models.
+
+| Δ vs recording off (mean of 2 runs) | recording on | + `dserve-top` |
+|---|---|---|
+| throughput (req/s, output tok/s) | +0.3 % | +0.5 % |
+| TPOT p50 / p99 | −0.2 % / −9 % | −0.2 % / −10 % |
+| ITL p50 / p99 | −0.1 % / −1.3 % | −0.0 % / −1.0 % |
+| FT tokens/s | −1.8 % | −0.4 % |
+| TTFT p50 | +3.2 % (56.3 → 58.1 ms) | +2.8 % (→ 57.9 ms) |
+| TTFT p99 | noise: 80–136 ms across all six runs, no consistent sign (off 112 / 122, on 136 / 129, with `dserve-top` 106 / 80) | |
+| recorder CPU on the engine thread | 0.57 %, 17 µs per step | 0.58–0.59 %, 15–16 µs per step |
+
+Where the time goes (every recorder call timed in the EngineCore): per step ~5 µs for
+token / request bookkeeping and ~9 µs for the step record and the live feed; each
+`dserve-top` poll (~4/s) is answered in ~80 µs, and its memory / adapter snapshot every
+10 s in ~90 µs; the slowest single call 0.3 ms. Files are written on a background thread.
+
+Disk: at this load (56 req/s) the recording grows ~17 MB per hour, mostly `requests.csv`
+(one row per request); the step log is ~0.7 MB per hour (plain decode steps fold into one
+entry) and is capped by `telemetry.steps_log_max_mb` (256 MB, rolling). `dserve-top` keeps
+its history in RAM up to `--history-hours` (12 h); an export is ~0.65 MB per hour of run
+(Qwen3-14B TP=2 at 3 req/s).
+
+Larger models have not been re-measured since the live feed was added. Before it, the
+same accounting on Qwen3-14B TP=2 gave 0.05 % of the engine thread (7 µs per step); the
+per-step work is host-side and does not grow with the model, while the steps do.
 
 ### `dserve-top`: quick start
 
