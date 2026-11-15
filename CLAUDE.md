@@ -10,7 +10,7 @@ breaking inference TTFT / TBT.
 
 It is a **vLLM general plugin** (`deltaserve-plugin/`, import `deltaserve`) on
 **stock, unpatched vLLM** (`vllm-upstream/`, submodule pinned at the v0.33.0 release,
-`4ba787ec9`; branch `vllm-v0.33`, env `deltaserve-v033`). vLLM
+`4ba787ec9`; branch `vllm-v0.33`). vLLM
 supplies multi-LoRA batching, paged KV, the scheduler and the multi-process engine;
 the plugin adds activation capture, the backward process, the FT-admission
 scheduler + estimator, and the interrupt/pause machinery.
@@ -56,9 +56,11 @@ over (checked statically against main).
 - **One file per model family** in `bwd_services/` (`llama3.py`, `qwen3.py`); shared
   logic lives in `bwd_services/common/`. Never route a new family through another
   family's file.
-- **Env:** conda env `deltaserve-v033` (`/mnt/storage/conda/envs/deltaserve-v033`, vLLM v0.33.0, torch 2.14, no torchaudio; the pre-upgrade env `deltaserve-plugin` stays for the old pin):
-  vllm editable from `vllm-upstream/` + the plugin editable. Weights in
-  `HF_HOME=/mnt/storage/huggingface`, `HF_HUB_OFFLINE=1`.
+- **Host facts live in `CLAUDE.local.md`** (git-ignored, one per checkout): GPUs, the
+  conda env (vLLM editable from `vllm-upstream/` + the plugin editable), `HF_HOME`
+  (weights are read with `HF_HUB_OFFLINE=1`), output dirs, limits. On a host without
+  one, find out (`nvidia-smi`, `conda env list`, where the weights are), write it, and
+  tell the user. Size runs to the host: TP and memory settings follow its GPUs.
 - **Tests are scripts:** `python tests/test_x.py`, or `tests/run_all.sh <out_dir> [glob]`.
 - Long-running servers / benchmarks (`launch_deltaserve.py`, `auto_benchmark_tp.py`,
   `cleanup_validate.sh`): give the user the command and the expected output rather
@@ -106,7 +108,7 @@ Co-serving is switched on per launch with `--additional-config '{"deltaserve": {
 - **`_maybe_pause` stays outside every captured region** and runs at every backward
   boundary (between the per-layer graphs, inside the LM-head chunk loop). It is how
   the child yields the GPU; `pause_until_prefill_done` holds it until the prefill
-  completes on the GPU (no MPS daemon on this box).
+  completes on the GPU (needed when no MPS daemon runs).
 - **Persistent buffers live outside the CUDA-graph pool** (LoRA grads, attention ctx,
   activation buffers) — pool aliasing produced NaNs in the original.
 - **TP lock-step:** the backward trigger is *broadcast* on `SchedulerOutput`; never
@@ -185,7 +187,7 @@ for Llama-3 (only Qwen3 has the save call sites).
 ## Useful commands
 
 ```bash
-P=/mnt/storage/conda/envs/deltaserve-v033/bin/python
+P=<the env's python, from CLAUDE.local.md>
 $P eval-tp/launch_deltaserve.py --family qwen3-14b --dry-run          # resolved vllm serve cmd
 $P eval-tp/auto_benchmark_tp.py --family qwen3-14b --tp 2 --co --tight-half --kill-stale
 eval-tp/cleanup_validate.sh <tag> tight-half loose-half production-600-800   # A/B vs eval-tp/output/cleanup/00_base

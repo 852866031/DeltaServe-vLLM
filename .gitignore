@@ -37,6 +37,7 @@ eval-tp/output/
 
 # ---- local / editor / agent state ----
 .claude/
+CLAUDE.local.md
 .vscode/
 .idea/
 *.swp
