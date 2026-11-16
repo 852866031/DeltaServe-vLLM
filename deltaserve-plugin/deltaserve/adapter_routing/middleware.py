@@ -17,10 +17,15 @@ from deltaserve.route_middleware import (  # noqa: F401 — re-exported
 
 
 def install(app, cfg) -> None:
-    """Called by the plugin, only with adapter routing on."""
+    """Called by the plugin, only with adapter routing on: the route
+    middleware with the router client, the pool's LoRA resolver, and the
+    invalidation of what vLLM cached about pool adapters."""
+    from deltaserve.adapter_routing.resolver import install_resolver, make_invalidator
     from deltaserve.adapter_routing.service import RouterClient, socket_path
     from deltaserve.adapter_routing.stages import index_dir
 
     client = RouterClient(socket_path(index_dir(cfg)),
                           timeout_s=cfg.route_timeout_ms / 1e3)
-    install_middleware(app, client.route, cfg.route_model_name)
+    resolver = install_resolver(cfg)
+    install_middleware(app, client.route, cfg.route_model_name,
+                       before_model=make_invalidator(app, resolver))

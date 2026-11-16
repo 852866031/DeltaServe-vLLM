@@ -80,7 +80,7 @@ async def routing_disabled(text) -> RouteDecision:
     return RouteDecision(None, None, DISABLED)
 
 
-ROUTED_PATHS = ("/v1/chat/completions", "/v1/completions")
+ROUTED_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/responses")
 
 
 def _content_text(content) -> str:
@@ -89,7 +89,8 @@ def _content_text(content) -> str:
         return content
     if isinstance(content, list):
         return "\n".join(p.get("text", "") for p in content
-                         if isinstance(p, dict) and p.get("type") == "text")
+                         if isinstance(p, dict)
+                         and p.get("type") in ("text", "input_text"))
     return ""
 
 
@@ -97,10 +98,15 @@ def extract_text(body: dict) -> str | None:
     """The text a request is routed on.
 
     - chat: the last user message (the task being asked now);
-    - completions: the prompt string (the first one of a list).
+    - completions: the prompt string (the first one of a list);
+    - responses: the ``input`` string, or the last user message of its list.
 
     None when there is no text to encode (e.g. a token-id prompt)."""
     messages = body.get("messages")
+    if messages is None and "input" in body:
+        if isinstance(body["input"], str):
+            return body["input"] or None
+        messages = body["input"]
     if isinstance(messages, list):
         for m in reversed(messages):
             if isinstance(m, dict) and m.get("role") == "user":
@@ -120,8 +126,12 @@ class AdapterRouteMiddleware:
     """``route_fn(text) -> RouteDecision`` may be sync (run in a thread) or async."""
 
     def __init__(self, app, route_fn, route_model_name: str, base_model_name,
-                 paths=ROUTED_PATHS) -> None:
+                 paths=ROUTED_PATHS, before_model=None) -> None:
         self.app, self.route_fn = app, route_fn
+        # Called with the model name every generation request ends up with
+        # (after routing): lets the server drop what it cached about an
+        # adapter that has since changed. Must not raise.
+        self.before_model = before_model
         self.route_model_name = route_model_name
         # str, or a callable evaluated per request (the app's state is only
         # complete once the server has started).
@@ -169,6 +179,12 @@ class AdapterRouteMiddleware:
                            if k.lower() != b"content-length"]
                 headers.append((b"content-length", str(len(body)).encode()))
                 scope = {**scope, "headers": headers}
+            if self.before_model is not None and isinstance(data, dict) \
+                    and isinstance(data.get("model"), str):
+                try:
+                    self.before_model(data["model"])
+                except Exception:  # noqa: BLE001 — never fail a request on this
+                    pass
 
         sent = False
 
@@ -211,7 +227,8 @@ class AdapterRouteMiddleware:
         return await self.app(scope, replay, send_with_headers)
 
 
-def install_middleware(app, route_fn, route_model_name: str) -> None:
+def install_middleware(app, route_fn, route_model_name: str,
+                       before_model=None) -> None:
     """Add the middleware to vLLM's FastAPI app (before the server starts)."""
 
     def base_model_name() -> str:
@@ -221,4 +238,4 @@ def install_middleware(app, route_fn, route_model_name: str) -> None:
 
     app.add_middleware(AdapterRouteMiddleware, route_fn=route_fn,
                        route_model_name=route_model_name,
-                       base_model_name=base_model_name)
+                       base_model_name=base_model_name, before_model=before_model)

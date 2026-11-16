@@ -590,6 +590,24 @@ def test_engine_config():
         check("adapter routing without LoRA serving is refused",
               "enable_lora" in (error_of(lambda: AdapterRoutingEngine(
                   eng, vllm_config(d, lora=False), start_service=False)) or ""))
+        t0 = r.placement._last_inference
+        r.note_request(SimpleNamespace(lora_request=None))
+        check("every request tells the indexing placement that inference is active",
+              t0 is None and r.placement._last_inference is not None
+              and r.placement.choose(True) == "cpu")
+        check("no router service → indexing has no GPU executor",
+              "gpu" not in r.shared_indexer._factory())
+        vc_gpu = vllm_config(d, finetuning=False)
+        vc_gpu.adapter_routing_config.router_gpu = 0
+        rg = AdapterRoutingEngine(eng, vc_gpu, start_service=False)
+        rg.service = SimpleNamespace(stop=lambda: None, is_alive=lambda: True)
+        ex = rg.shared_indexer._factory()
+        check("router encoder on a GPU → indexing gets a GPU executor that "
+              "borrows it", "gpu" in ex and ex["gpu"].device == "gpu")
+        vc_gpu.adapter_routing_config.indexing_on_gpu = False
+        check("indexing_on_gpu: false keeps indexing on the CPU",
+              "gpu" not in rg.shared_indexer._factory())
+        rg.shutdown()
         w = Path(d) / "w"
         w.mkdir()
         e = r.pool.register("a", str(w))

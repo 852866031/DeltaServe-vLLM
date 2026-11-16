@@ -209,11 +209,9 @@ def attach_router(app: FastAPI):
         from deltaserve.config import AdapterRoutingConfig
 
         cfg = AdapterRoutingConfig(**routing)
+        # Route middleware + the pool's LoRA resolver (pool adapters become
+        # servable by name) + cache invalidation.
         install(app, cfg)
-        # Pool adapters become servable by name (vLLM's LoRA resolver hook).
-        from deltaserve.adapter_routing.resolver import install_resolver
-
-        install_resolver(cfg)
         app.include_router(routing_router)
         logger.info("Adapter routing on: requests with model=%r are routed.",
                     routing.get("route_model_name", "auto"))

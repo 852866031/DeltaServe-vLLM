@@ -192,6 +192,63 @@ def test_through_vllm():
               and "nope" not in server1.lora_requests)
 
 
+def test_invalidation():
+    green("API-server cache invalidation:")
+    from deltaserve.adapter_routing.resolver import (
+        PoolLoRAResolver,
+        make_invalidator,
+    )
+    from vllm.lora.request import LoRARequest
+
+    with tempfile.TemporaryDirectory() as d:
+        pool = make_pool(d, ["a", "b", "c"])
+        resolver = PoolLoRAResolver(d)
+        table = {n: resolver.lookup(n) for n in ("a", "b", "c")}
+        table["static"] = LoRARequest(lora_name="static", lora_int_id=3,
+                                      lora_path=str(Path(d)))
+        app = SimpleNamespace(state=SimpleNamespace(
+            openai_serving_models=SimpleNamespace(lora_requests=table)))
+        before = make_invalidator(app, resolver)
+
+        for n in ("a", "b", "c", "static", "unknown"):
+            before(n)
+        check("unchanged adapters stay cached", set(table) == {"a", "b", "c", "static"})
+
+        os.utime(Path(d) / "pool.json", ns=(1, 1))
+        pool.remove("a")
+        before("a")
+        check("an adapter removed from the pool is dropped from the table "
+              "(vLLM then answers 'model does not exist')",
+              "a" not in table and resolver.lookup("a") is None)
+
+        new = Path(d) / "weights" / "b-v2"
+        new.mkdir()
+        old_id = table["b"].lora_int_id
+        os.utime(Path(d) / "pool.json", ns=(2, 2))
+        pool.admit("b", str(new))
+        before("b")
+        fresh = resolver.lookup("b")
+        check("a new version (other path, other id) is dropped, so the next "
+              "request resolves the new one",
+              "b" not in table and fresh.lora_path == str(new)
+              and fresh.lora_int_id != old_id)
+        os.utime(Path(d) / "pool.json", ns=(3, 3))
+        pool.retire("c")
+        before("c")
+        check("a retired adapter stays cached (it is still servable by name)",
+              "c" in table)
+        before("static")
+        check("adapters that are not the pool's are never touched",
+              "static" in table)
+        app.state.openai_serving_models = None
+        ok = True
+        try:
+            before("b")
+        except Exception:  # noqa: BLE001
+            ok = False
+        check("before the server finished starting the hook does nothing", ok)
+
+
 def test_install():
     green("install_resolver:")
     from deltaserve.adapter_routing.resolver import RESOLVER_NAME, install_resolver
@@ -221,6 +278,7 @@ def main():
     green("=== pool adapters via vLLM's LoRA resolver ===")
     test_resolver()
     test_through_vllm()
+    test_invalidation()
     test_install()
     print()
     if _failed:

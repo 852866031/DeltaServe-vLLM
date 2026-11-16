@@ -27,6 +27,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -63,12 +64,12 @@ SENTENCES = [
 ]
 
 
-def http(port, path, body=None, timeout=120):
+def http(port, path, body=None, timeout=120, method=None):
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}",
         data=None if body is None else json.dumps(body).encode(),
         headers={"Content-Type": "application/json"},
-        method="GET" if body is None else "POST")
+        method=method or ("GET" if body is None else "POST"))
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read()
@@ -384,6 +385,88 @@ def external_main(args, out: Path) -> None:
               bool(failed) and failed[0]["stage"] == "failed"
               and "no adapter weights" in failed[0]["error"]
               and auto("Translate to English: Guten Abend.", "ext-translate"))
+        # ---- indexing borrows the GPU encoder when inference is quiet ----
+        def big(name, n):
+            p = out / f"{name}.txt"
+            items = [f"item number {i} of the {name} collection, described at "
+                     f"some length so the encoder has work to do" for i in range(n)]
+            p.write_text("".join(f"Describe {x}.\n" for x in items))
+            return str(p)
+
+        def job_detail(name, timeout=240):
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < timeout:
+                _, _, st = http(port, "/adapters")
+                for j in st["jobs"]["finished"]:
+                    if j["name"] == name:
+                        return j, time.monotonic() - t0
+                time.sleep(0.25)
+            return None, timeout
+
+        if args.router_gpu is not None or args.router_device != "cpu":
+            time.sleep(4.0)                       # inference quiet
+            http(port, "/adapters", {"name": "ext-quiet", "path": str(toy),
+                                     "data_path": big("quiet", 1200)})
+            j, took = job_detail("ext-quiet")
+            d1 = (j or {}).get("detail", {}).get("indexing", {})
+            print(f"    quiet:  indexed 1200 samples in {took:.1f} s  {d1}")
+            check("no inference → indexing ran on the GPU encoder",
+                  j is not None and j["error"] is None
+                  and d1.get("chunks", {}).get("gpu", 0) > 0
+                  and d1["chunks"]["gpu"] >= 5 * max(1, d1["chunks"].get("cpu", 0)))
+
+            stop_load = threading.Event()
+            sent = []
+
+            def load():
+                while not stop_load.is_set():
+                    s9, _, _ = http(port, "/v1/completions", {
+                        "model": "qwen3-0.6b", "prompt": "Hello there",
+                        "max_tokens": 2, "temperature": 0}, timeout=60)
+                    sent.append(s9)
+                    time.sleep(0.2)
+
+            th = threading.Thread(target=load, daemon=True)
+            th.start()
+            time.sleep(1.0)
+            http(port, "/adapters", {"name": "ext-busy", "path": str(toy),
+                                     "data_path": big("busy", 300)})
+            j, took = job_detail("ext-busy")
+            stop_load.set()
+            th.join(5)
+            d2 = (j or {}).get("detail", {}).get("indexing", {})
+            print(f"    busy:   indexed 300 samples in {took:.1f} s  {d2}  "
+                  f"({len(sent)} inference requests meanwhile, "
+                  f"{sum(x == 200 for x in sent)} ok)")
+            check("inference active → indexing stayed on the CPU",
+                  j is not None and j["error"] is None
+                  and d2.get("chunks", {}).get("cpu", 0) > 0
+                  and d2["chunks"].get("gpu", 0) <= d2["chunks"]["cpu"] // 4
+                  and sent and all(x == 200 for x in sent))
+
+        # ---- /v1/responses, and an adapter removed while cached ----
+        s8, h8, _ = http(port, "/v1/responses", {
+            "model": "auto", "input": "Translate to English: Guten Morgen.",
+            "max_output_tokens": 4})
+        print(f"    /v1/responses auto → status {s8}, "
+              f"adapter {h8.get('x-deltaserve-adapter')}")
+        check("an auto request on /v1/responses is routed as well",
+              h8.get("x-deltaserve-routing") == "routed"
+              and h8.get("x-deltaserve-adapter") == "ext-translate")
+        byname = [http(port, "/v1/completions", {
+            "model": "ext-poem", "prompt": "A poem:", "max_tokens": 2,
+            "temperature": 0})[0] for _ in range(6)]
+        s7, _, r7 = http(port, "/adapters/ext-poem", None, method="DELETE")
+        time.sleep(1.5)
+        gone = [http(port, "/v1/completions", {
+            "model": "ext-poem", "prompt": "A poem:", "max_tokens": 2,
+            "temperature": 0})[0] for _ in range(6)]
+        print(f"    ext-poem by name: before removal {byname}, after {gone}")
+        check("DELETE /adapters/ext-poem: every API server stops serving it by "
+              "name although it had it cached",
+              s7 == 200 and all(x == 200 for x in byname)
+              and all(x == 404 for x in gone))
+
         status, headers, body = http(port, "/v1/completions", {
             "model": "qwen3-0.6b", "prompt": "Hello", "max_tokens": 2,
             "temperature": 0})

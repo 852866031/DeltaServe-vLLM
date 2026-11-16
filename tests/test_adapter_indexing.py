@@ -374,6 +374,26 @@ def test_runner():
               r.done and r.chunks["gpu"] > 0 and r.chunks["cpu"] > 0
               and np.allclose(r.indexer.centroid(), ref, atol=1e-6))
 
+        class Flaky(FakeExec):
+            def poll(self, timeout=0.0):
+                self.job = None
+                raise RuntimeError("router service did not answer")
+
+        cpu, gpu = FakeExec("cpu"), Flaky("gpu")
+        r = IndexingRunner(Indexer(texts, fp), {"cpu": cpu, "gpu": gpu},
+                           governor=Gov(),
+                           placement=IndexingPlacement(3.0, clock=lambda: now["t"]),
+                           chunk_samples={"cpu": 4, "gpu": 8})
+        for _ in range(400):
+            if r.done:
+                break
+            r.step()
+        check("a failing GPU executor: the chunk is redone on the CPU and the "
+              "job finishes there",
+              r.done and r.error is None and gpu.submitted == 1
+              and r.chunks["gpu"] == 0 and r.chunks["cpu"] == 10
+              and np.allclose(r.indexer.centroid(), ref, atol=1e-6))
+
         cpu = FakeExec("cpu")
         r = IndexingRunner(Indexer(texts, fp), {"cpu": cpu}, governor=Gov(),
                            chunk_samples=8)

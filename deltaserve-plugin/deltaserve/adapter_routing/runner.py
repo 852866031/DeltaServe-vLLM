@@ -49,6 +49,57 @@ class IndexingPlacement:
         return "gpu"
 
 
+class RouterEncodeExecutor:
+    """The GPU executor: indexing chunks are encoded by the router service's
+    resident encoder (indexing *borrows* it — nothing else is loaded on the
+    GPU). The service runs a chunk only when no route request is waiting.
+    ``cancel`` stops waiting for the chunk in flight: its result is dropped,
+    and the runner hands the same samples to the CPU."""
+
+    device, loaded = "gpu", True
+
+    def __init__(self, socket: str, timeout_s: float = 30.0) -> None:
+        from deltaserve.adapter_routing.service import RouterClient
+
+        self._client = RouterClient(socket, timeout_s=timeout_s)
+        self._timeout = timeout_s
+        self._seq = 0
+        self._job = None            # [seq, Event, embeddings, error]
+
+    def submit(self, texts: list, threads: int = 0) -> None:
+        self._seq += 1
+        job = [self._seq, threading.Event(), None, None]
+        self._job = job
+
+        def run():
+            try:
+                job[2] = self._client.encode(texts, self._timeout)
+            except Exception as e:  # noqa: BLE001 — surfaced by poll()
+                job[3] = e
+            job[1].set()
+
+        threading.Thread(target=run, daemon=True, name="deltaserve-gpu-chunk").start()
+
+    def poll(self, timeout: float = 0.0):
+        job = self._job
+        if job is None or not job[1].wait(timeout):
+            return None
+        self._job = None
+        if job[3] is not None:
+            raise job[3]
+        return job[2]
+
+    def cancel(self) -> None:
+        self._job = None
+
+    def unload(self) -> None:
+        """Nothing to free: the encoder is the router service's."""
+
+    def stop(self) -> None:
+        self._job = None
+        self._client.close()
+
+
 class IndexingRunner:
     def __init__(self, indexer, executors: dict, governor=None, placement=None,
                  chunk_samples: int | dict = 16, recheck_s: float = 0.5,
@@ -66,6 +117,7 @@ class IndexingRunner:
         self.chunks = {d: 0 for d in self.executors}
         self.discarded = 0
         self.error: str | None = None
+        self._gpu_off_until = 0.0     # after a GPU executor failure: CPU only
         # Shared executors (one encoder process for every job) are not ours to stop.
         self.stop_executors, self.on_exit = stop_executors, on_exit
         self._thread = None
@@ -75,7 +127,8 @@ class IndexingRunner:
     def _device(self) -> str:
         if self.placement is None:
             return "cpu" if "cpu" in self.executors else next(iter(self.executors))
-        dev = self.placement.choose("gpu" in self.executors)
+        gpu = "gpu" in self.executors and time.monotonic() >= self._gpu_off_until
+        dev = self.placement.choose(gpu)
         return dev if dev in self.executors else next(iter(self.executors))
 
     def step(self) -> float:
@@ -93,7 +146,19 @@ class IndexingRunner:
                 self._inflight = None
                 self.discarded += 1
                 return 0.0
-            emb = self.executors[cur].poll(self.poll_s)
+            try:
+                emb = self.executors[cur].poll(self.poll_s)
+            except Exception as e:  # noqa: BLE001
+                if cur != "gpu" or "cpu" not in self.executors:
+                    raise
+                # The router service could not encode it: redo it on the CPU
+                # and leave the GPU alone for a while.
+                dprint(f"[indexing] {self.name}: GPU chunk failed ({e}); "
+                       f"continuing on the CPU")
+                self._gpu_off_until = time.monotonic() + 30.0
+                self._inflight = None
+                self.discarded += 1
+                return 0.0
             if emb is None:
                 return 0.0
             self._inflight = None

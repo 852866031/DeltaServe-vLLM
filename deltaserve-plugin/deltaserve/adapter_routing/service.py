@@ -168,74 +168,100 @@ class Router:
 
 
 class RouteBatcher:
-    """Turns concurrent route requests into encoder batches.
+    """One thread owns the encoder and serves two kinds of work.
 
-    A single thread owns the encoder. When it is free it takes EVERYTHING that
-    is waiting (up to ``max_batch``) and encodes it in one call. So a request
+    **Route requests** come first. When the encoder is free it takes EVERYTHING
+    that is waiting (up to ``max_batch``) and encodes it in one call: a request
     arriving at an idle service is encoded at once, alone — no added latency —
     and under load the requests that queued up while the encoder was busy share
     one batch, which costs little more than a single request on a GPU.
-    ``wait_s`` > 0 additionally holds a batch open that long to let it fill."""
+    ``wait_s`` > 0 additionally holds a batch open that long to let it fill.
+
+    **Indexing chunks** (``encode``) borrow the encoder only when no route
+    request is waiting, one small chunk at a time, so a route request waits for
+    at most one chunk."""
 
     def __init__(self, router: Router, max_batch: int = 16,
                  wait_s: float = 0.0) -> None:
-        import queue
+        from collections import deque
 
         self.router = router
         self.max_batch, self.wait_s = max(1, int(max_batch)), float(wait_s)
-        self._q: "queue.Queue" = queue.Queue()
-        self._empty = queue.Empty
+        self._cv = threading.Condition()
+        self._routes: "deque" = deque()
+        self._chunks: "deque" = deque()
         self.batches = 0
         self.largest = 0
+        self.chunks = 0
         self._stop = False
         self._thread = threading.Thread(target=self._loop, daemon=True,
                                         name="router-batcher")
         self._thread.start()
 
-    def submit(self, text) -> RouteDecision:
-        """Blocks until this text's decision is ready; raises what the encoder
-        raised."""
-        item = [text, threading.Event(), None, None]
-        self._q.put(item)
+    def _wait(self, queue, payload):
+        item = [payload, threading.Event(), None, None]
+        with self._cv:
+            queue.append(item)
+            self._cv.notify()
         item[1].wait()
         if item[3] is not None:
             raise item[3]
         return item[2]
 
+    def submit(self, text) -> RouteDecision:
+        """Blocks until this text's decision is ready; raises what the encoder
+        raised."""
+        return self._wait(self._routes, text)
+
+    def encode(self, texts: list):
+        """Embeddings of an indexing chunk ([n, dim]); runs when no route
+        request is waiting."""
+        return self._wait(self._chunks, list(texts))
+
     def _loop(self) -> None:
         while True:
-            first = self._q.get()
-            if first is None:
-                return
-            batch = [first]
-            deadline = time.monotonic() + self.wait_s
-            while len(batch) < self.max_batch:
+            with self._cv:
+                while not (self._routes or self._chunks or self._stop):
+                    self._cv.wait()
+                if self._stop and not (self._routes or self._chunks):
+                    return
+                if self._routes and self.wait_s > 0 \
+                        and len(self._routes) < self.max_batch:
+                    deadline = time.monotonic() + self.wait_s
+                    while len(self._routes) < self.max_batch:
+                        left = deadline - time.monotonic()
+                        if left <= 0:
+                            break
+                        self._cv.wait(left)
+                batch, chunk = [], None
+                while self._routes and len(batch) < self.max_batch:
+                    batch.append(self._routes.popleft())
+                if not batch:
+                    chunk = self._chunks.popleft()
+            if batch:
                 try:
-                    left = deadline - time.monotonic()
-                    nxt = (self._q.get(timeout=left) if left > 0
-                           else self._q.get_nowait())
-                except self._empty:
-                    break
-                if nxt is None:
-                    self._stop = True
-                    break
-                batch.append(nxt)
-            try:
-                decisions = self.router.route_many([it[0] for it in batch])
-                for it, d in zip(batch, decisions):
-                    it[2] = d
-            except Exception as e:  # noqa: BLE001 — handed to every waiter
+                    decisions = self.router.route_many([it[0] for it in batch])
+                    for it, d in zip(batch, decisions):
+                        it[2] = d
+                except Exception as e:  # noqa: BLE001 — handed to every waiter
+                    for it in batch:
+                        it[3] = e
+                self.batches += 1
+                self.largest = max(self.largest, len(batch))
                 for it in batch:
-                    it[3] = e
-            self.batches += 1
-            self.largest = max(self.largest, len(batch))
-            for it in batch:
-                it[1].set()
-            if self._stop:
-                return
+                    it[1].set()
+            else:
+                try:
+                    chunk[2] = self.router.encoder.encode(chunk[0])
+                except Exception as e:  # noqa: BLE001
+                    chunk[3] = e
+                self.chunks += 1
+                chunk[1].set()
 
     def stop(self) -> None:
-        self._q.put(None)
+        with self._cv:
+            self._stop = True
+            self._cv.notify()
         self._thread.join(timeout=5.0)
 
 
@@ -251,9 +277,11 @@ def _handle(conn, router: Router, batcher: RouteBatcher) -> None:
                     d = batcher.submit(msg[1])
                     reply = ("ok", d.adapter, d.score, d.reason, d.confidence,
                              d.candidates)
+                elif msg[0] == "encode":
+                    reply = ("ok", batcher.encode(msg[1]))
                 elif msg[0] == "ping":
                     reply = ("ok", len(router.index), router.requests,
-                             batcher.batches, batcher.largest)
+                             batcher.batches, batcher.largest, batcher.chunks)
                 else:
                     reply = ("error", f"unknown request {msg[0]!r}")
             except Exception as e:  # noqa: BLE001 — reported to the client
@@ -369,6 +397,26 @@ class RouterClient:
             self.failures += 1
             return RouteDecision(None, None, UNAVAILABLE)
         return RouteDecision(*reply[1:])
+
+    def encode(self, texts: list, timeout_s: float = 30.0):
+        """Embeddings of an indexing chunk from the service's encoder. Unlike
+        ``route`` this RAISES when the service cannot answer (the caller falls
+        back to the CPU)."""
+        with self._lock:
+            try:
+                if self._conn is None:
+                    self._conn = Client(self.path, family="AF_UNIX",
+                                        authkey=_authkey(self.path))
+                self._conn.send(("encode", list(texts)))
+                if not self._conn.poll(timeout_s):
+                    raise TimeoutError("router service did not answer")
+                reply = self._conn.recv()
+            except Exception:
+                self._close()
+                raise
+        if reply[0] != "ok":
+            raise RuntimeError(f"router service: {reply[1]}")
+        return reply[1]
 
     def ping(self) -> tuple | None:
         with self._lock:

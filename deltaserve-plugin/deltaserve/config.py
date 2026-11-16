@@ -799,6 +799,14 @@ class AdapterRoutingConfig:
     """CPU list the CPU indexer is pinned to, e.g. ``"8-15"``; keep it disjoint
     from the cores the vLLM processes use. None = no pinning."""
 
+    indexing_on_gpu: bool = True
+    """Let indexing borrow the router service's encoder when that encoder is
+    on a GPU and inference is quiet. False = indexing stays on the CPU."""
+
+    indexing_gpu_chunk_samples: int = 8
+    """Samples per indexing chunk on the GPU. A route request waits for at
+    most one chunk, so keep it small (8 short samples take a few ms)."""
+
     indexing_gpu_after_quiet_s: float = 3.0
     """Indexing moves to the GPU only after inference has been quiet this long
     (and back to the CPU the moment a request arrives)."""
@@ -815,6 +823,7 @@ class AdapterRoutingConfig:
         for name in ("encoder_max_tokens", "max_active_adapters",
                      "indexing_max_samples", "indexing_chunk_samples",
                      "indexing_cpu_max_threads", "route_batch_max",
+                     "indexing_gpu_chunk_samples",
                      "route_min_pool"):
             if int(getattr(self, name)) < 1:
                 raise ValueError(f"adapter_routing.{name} must be >= 1")

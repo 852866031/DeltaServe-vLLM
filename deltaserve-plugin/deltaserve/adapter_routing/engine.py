@@ -157,8 +157,26 @@ class AdapterRoutingEngine:
             self.service.start()
 
         # One encoder process for every job of this server.
-        self.shared_indexer = SharedIndexer(
-            lambda: IndexingStage.make_executors(cfg))
+        # Inference seen recently → indexing stays on the CPU; quiet → it may
+        # borrow the router service's encoder when that one is on a GPU.
+        from deltaserve.adapter_routing.runner import IndexingPlacement
+
+        self.placement = IndexingPlacement(cfg.indexing_gpu_after_quiet_s)
+
+        def executors():
+            from deltaserve.adapter_routing.runner import RouterEncodeExecutor
+            from deltaserve.adapter_routing.service import (
+                router_placement,
+                socket_path,
+            )
+
+            ex = dict(IndexingStage.make_executors(cfg))
+            if self.service is not None and cfg.indexing_on_gpu \
+                    and router_placement(cfg)[0] != "cpu":
+                ex["gpu"] = RouterEncodeExecutor(socket_path(self.dir))
+            return ex
+
+        self.shared_indexer = SharedIndexer(executors, placement=self.placement)
         # Jobs that do not train — an existing adapter being indexed and
         # published. They need nothing of the finetuning machinery or of the
         # engine loop, so they run on their own driver thread, next to a
@@ -292,7 +310,10 @@ class AdapterRoutingEngine:
             job=job.name, load=load, prewarm=load)
 
     def note_request(self, request) -> None:
-        """Count a request that uses a pool adapter (drives GPU-slot retention)."""
+        """Every request the engine receives: inference is active (indexing
+        leaves the GPU), and a request that uses a pool adapter is counted
+        (drives GPU-slot retention and auto-retirement)."""
+        self.placement.note_inference()
         lora = getattr(request, "lora_request", None)
         name = getattr(lora, "lora_name", None)
         if name is None or name not in self.pool:

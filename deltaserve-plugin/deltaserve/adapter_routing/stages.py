@@ -48,8 +48,10 @@ class SharedIndexer:
     server, used by one job at a time. Without it each job would start its own
     process and load the encoder again."""
 
-    def __init__(self, factory) -> None:
+    def __init__(self, factory, placement=None) -> None:
         self._factory = factory
+        # One view of "is inference active" for every job of the server.
+        self.placement = placement
         self._lock = threading.Lock()
         self._executors = None
         self._busy = False
@@ -178,10 +180,13 @@ class IndexingStage(Stage):
             reserve_cores=cfg.indexing_cpu_reserve_cores,
             min_free_memory_bytes=int(cfg.indexing_min_free_memory_gb * (1 << 30)),
             cpus=parse_cpu_list(cfg.indexing_cpus))
+        placement = getattr(self._shared, "placement", None) \
+            or IndexingPlacement(cfg.indexing_gpu_after_quiet_s)
         self.runner = IndexingRunner(
-            self._indexer, executors, governor=governor,
-            placement=IndexingPlacement(cfg.indexing_gpu_after_quiet_s),
-            chunk_samples=cfg.indexing_chunk_samples, name=job.name, **share)
+            self._indexer, executors, governor=governor, placement=placement,
+            chunk_samples={"cpu": cfg.indexing_chunk_samples,
+                           "gpu": cfg.indexing_gpu_chunk_samples},
+            name=job.name, **share)
         self.runner.start()
         return True
 

@@ -110,6 +110,14 @@ def test_extract_text():
           extract_text({"prompt": ["a", "b"]}) == "a")
     check("token-id prompt → none", extract_text({"prompt": [1, 2, 3]}) is None)
     check("nothing to route on → none", extract_text({}) is None)
+    check("responses API: a string input", extract_text({"input": "hi there"}) == "hi there")
+    check("responses API: the last user message of an input list",
+          extract_text({"input": [
+              {"role": "user", "content": "first"},
+              {"role": "assistant", "content": "ok"},
+              {"role": "user", "content": [
+                  {"type": "input_text", "text": "translate this"},
+                  {"type": "input_image", "image_url": "x"}]}]}) == "translate this")
 
 
 def test_router():
@@ -364,6 +372,93 @@ def test_batching():
             svc.close()
 
 
+def test_indexing_borrows_the_encoder():
+    green("indexing chunks borrow the router's encoder:")
+    from deltaserve.adapter_routing.runner import RouterEncodeExecutor
+    from deltaserve.adapter_routing.service import (
+        RouteBatcher,
+        Router,
+        RouterClient,
+        socket_path,
+    )
+
+    order = []
+
+    class Enc(FakeEncoder):
+        def encode(self, texts):
+            order.append(("chunk" if texts[0].startswith("sample") else "route",
+                          len(texts)))
+            return super().encode(texts)
+
+    with tempfile.TemporaryDirectory() as d:
+        f = str(Path(d) / "centroids.npz")
+        write_index(f, ["translate", "sql"])
+        enc = Enc(delay=0.03)
+        b = RouteBatcher(Router(enc, f, 0.5, 0.0), max_batch=8)
+        got = {}
+
+        def chunk(i):
+            got[i] = b.encode([f"sample {i} a", f"sample {i} b"])
+
+        def route(i):
+            got[f"r{i}"] = b.submit("translate this")
+
+        ts = [threading.Thread(target=chunk, args=(i,)) for i in range(4)]
+        [t.start() for t in ts]
+        time.sleep(0.045)                      # chunks are being worked through
+        rs = [threading.Thread(target=route, args=(i,)) for i in range(3)]
+        [t.start() for t in rs]
+        [t.join() for t in ts + rs]
+        check("a chunk returns the embeddings of its samples, in order",
+              got[0].shape == (2, DIM) and all(k in got for k in range(4)))
+        first_route = next(i for i, (k, _) in enumerate(order) if k == "route")
+        chunks_after = sum(1 for k, _ in order[first_route:] if k == "chunk")
+        check(f"route requests jump ahead of waiting chunks ({order})",
+              chunks_after >= 1 and first_route <= 2)
+        check("chunks are never merged with route requests or each other",
+              all(n == 2 for k, n in order if k == "chunk") and b.chunks == 4)
+        b.stop()
+
+        path = socket_path(d)
+        svc = Service(Router(FakeEncoder(), f, 0.5, 0.0), path)
+        try:
+            ex = RouterEncodeExecutor(path, timeout_s=5.0)
+            check("the GPU executor reports itself as always loaded",
+                  ex.device == "gpu" and ex.loaded)
+            ex.submit(["sample x", "sample y", "sample z"])
+            t0, emb = time.time(), None
+            while emb is None and time.time() - t0 < 5:
+                emb = ex.poll(0.05)
+            check("executor: a chunk goes over the socket and comes back",
+                  emb is not None and emb.shape == (3, DIM))
+            ex.submit(["sample q"])
+            ex.cancel()
+            time.sleep(0.2)
+            check("a cancelled chunk's result is dropped", ex.poll(0.0) is None)
+            ex.submit(["sample again"])
+            t0, emb = time.time(), None
+            while emb is None and time.time() - t0 < 5:
+                emb = ex.poll(0.05)
+            check("...and the executor is usable for the next chunk",
+                  emb is not None and emb.shape == (1, DIM))
+            check("ping counts the chunks", RouterClient(path).ping()[4] >= 2)
+        finally:
+            svc.close()
+        ex.submit(["sample after shutdown"])
+        failed = False
+        t0 = time.time()
+        while time.time() - t0 < 5:
+            try:
+                if ex.poll(0.05) is not None:
+                    break
+            except Exception:  # noqa: BLE001
+                failed = True
+                break
+        check("with the service gone the executor raises (the runner then uses "
+              "the CPU)", failed)
+        ex.stop()
+
+
 def test_placement():
     green("which device holds the encoder:")
     from deltaserve.adapter_routing.service import (
@@ -550,6 +645,26 @@ def test_middleware():
     async def aroute(text):
         return RouteDecision("async-adapter", 0.8)
 
+    names = []
+    mwh = AdapterRouteMiddleware(None, route, "auto", "base-model",
+                                 before_model=names.append)
+    run(call(mwh, body))
+    run(call(mwh, {"model": "my-adapter", "prompt": "x"}, path="/v1/completions"))
+    run(call(mwh, {"model": "auto", "input": "translate this"},
+             path="/v1/responses"))
+    check("the before-model hook sees every request's final model name; "
+          "/v1/responses is routed too",
+          names == ["dserve-routing-translate", "my-adapter",
+                    "dserve-routing-translate"])
+
+    def bad_hook(name):
+        raise RuntimeError("hook exploded")
+
+    mwx = AdapterRouteMiddleware(None, route, "auto", "base-model",
+                                 before_model=bad_hook)
+    seen, out = run(call(mwx, body))
+    check("a failing hook never fails the request", out["status"] == 200)
+
     mwa = AdapterRouteMiddleware(None, aroute, "pick", "base-model")
     seen, out = run(call(mwa, {"model": "pick", "prompt": "x"},
                          path="/v1/completions"))
@@ -728,6 +843,7 @@ def main():
     test_router()
     test_service_and_client()
     test_batching()
+    test_indexing_borrows_the_encoder()
     test_placement()
     test_middleware()
     test_routing_off()

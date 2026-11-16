@@ -80,6 +80,29 @@ class PoolLoRAResolver(LoRAResolver):
         return self.lookup(lora_name)
 
 
+def make_invalidator(app, resolver: PoolLoRAResolver):
+    """vLLM's API server caches a resolved adapter (name → LoRARequest) for
+    good. This returns a function for the route middleware to call with every
+    request's model name: when that name is a pool adapter the server has
+    cached and the pool has since removed it or replaced it with a new version
+    (another path / LoRA id), the cached entry is dropped, so vLLM resolves it
+    again — and gets the new version, or "model does not exist"."""
+
+    def before_model(name: str) -> None:
+        models = getattr(app.state, "openai_serving_models", None)
+        cached = None if models is None else models.lora_requests.get(name)
+        if not isinstance(cached, PoolLoRARequest):
+            return                       # not ours (or not cached): untouched
+        current = resolver.lookup(name)
+        if current is None or current.lora_int_id != cached.lora_int_id \
+                or current.lora_path != cached.lora_path:
+            models.lora_requests.pop(name, None)
+            dprint(f"[adapter-pool] '{name}' changed in the pool: dropped from "
+                   f"this API server's adapter table")
+
+    return before_model
+
+
 def install_resolver(cfg) -> PoolLoRAResolver:
     """Register the pool resolver in this API server process and switch on
     vLLM's resolve-unknown-adapter path. Must run before vLLM builds its model
