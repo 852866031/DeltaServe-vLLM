@@ -44,6 +44,7 @@ throttles:
   match_prefill_workload_factor: 0.5
 
 slo:
+  admission_margin: legacy           # pinned: reproduces the published runs (the default is now relative)
   # --- Estimator-accuracy validation ---
   validate_estimator: true             # forces async OFF + per-batch CSV append
   # Path is resolved relative to THIS file's dir (configs/preset/), so this lands at

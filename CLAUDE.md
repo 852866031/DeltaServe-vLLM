@@ -183,7 +183,8 @@ Tests: `test_metrics` (CPU), `test_metrics_e2e`, `test_templates_launch` (GPU).
 **Admission margin (2026-11-15):** `slo.admission_margin` = `legacy` (default, the
 original ×(1+1.5·RMSE[s]) ≈ no margin) | `relative` (×(1+k·relRMSE)) | `absolute`. On the
 stress timeline (`eval-tp/margin_ab.py`, 14B TP=2) FT steps over `max_tbt_slo`: legacy
-10.2 % → relative k=1.5 2.0 %, FT −1 %. Not yet made the default (presets reproduce runs).
+10.2 % → relative k=1.5 2.0 %, FT −1 %. `relative` is the default; every preset pins
+`legacy` (presets reproduce runs). Untested with admission phase `both`.
 
 Open: the live backward-graph vs eager A/B under TP on the real models; mixed-batch
 forward graphs for Llama-3 (only Qwen3 has the save call sites); relative vs absolute

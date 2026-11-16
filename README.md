@@ -658,7 +658,7 @@ applies. The throttles shape admission further:
 | **Step-time estimator** (`slo.profile_on_launch`, `profile_num_repeats`) | 6-parameter model `T ≈ α·S + β·T_in + γ·T_ft + δ·B_d + ε·K + c`, with separate coefficients for 5 regimes (inference prefill, FT-only, decode-only, decode with backward running, FT-mixed). Seeded by a profiling pass at launch, refit online every 256 steps | profiling on |
 | `slo.coserving_admission_phase` | `prefill`: FT rides only steps that carry inference prefill (or idle steps). `both`: FT may also ride decode-only / mixed steps (`BothPhaseFinetuneScheduler`) | `prefill` |
 | `slo.decode_only_ft_safety_margin` | with `both`: scale `max_tbt_slo` on decode-only steps | `0.7` |
-| `slo.admission_margin` / `admission_margin_k` | how much the step-time prediction is inflated before the SLO gate: `legacy` = ×(1 + 1.5·RMSE in seconds), ≈ 0.2 % in practice; `relative` = ×(1 + k·relative RMSE of the regime); `absolute` = + k·RMSE. See [The admission margin](#the-admission-margin) | `legacy` / `1.5` |
+| `slo.admission_margin` / `admission_margin_k` | how much the step-time prediction is inflated before the SLO gate: `legacy` = ×(1 + 1.5·RMSE in seconds), ≈ 0.2 % in practice; `relative` = ×(1 + k·relative RMSE of the regime); `absolute` = + k·RMSE. See [The admission margin](#the-admission-margin) | `relative` / `1.5` (presets pin `legacy`) |
 | `throttles.ft_tokens_admission_constrain_factor` | cap FT tokens at `factor × inference-prefill tokens` per step (`-1` = off) | `-1` |
 | `throttles.match_prefill_workload_factor` | leaky bucket: admit one FT sample once accumulated prefill × factor covers its length (`0` = off) | `0` |
 | `throttles.fwd_token_throttle_enable` / `fwd_token_throttle` | pause the backward when the batch's total tokens ≥ threshold | off / 1024 |
@@ -684,9 +684,9 @@ limit). Two interleaved runs per arm:
 
 | `admission_margin` | FT steps over 50 ms | by how much | actual ÷ admitted prediction, p50 · p95 | TTFT met | FT tokens/s |
 |---|---|---|---|---|---|
-| `legacy` (default) | **21 / 205 (10.2 %)** | 0.5–3.5 ms | 0.98 · 1.06 | 100 % | 57 |
+| `legacy` (presets) | **21 / 205 (10.2 %)** | 0.5–3.5 ms | 0.98 · 1.06 | 100 % | 57 |
 | `relative`, k = 1.0 | 7 / 207 (3.4 %) | 0.1–1.5 ms | 0.96 · 1.03 | 100 % | 56 |
-| `relative`, k = 1.5 | **4 / 205 (2.0 %)** | 0.0–2.2 ms | 0.94 · 1.02 | 100 % | **56** |
+| `relative`, k = 1.5 (default) | **4 / 205 (2.0 %)** | 0.0–2.2 ms | 0.94 · 1.02 | 100 % | **56** |
 | `absolute`, k = 1.5 | 3 / 194 (1.5 %) | 0.2–1.4 ms | 0.93 · 1.01 | 100 % | 54 |
 
 `relative` with k = 1.5 cuts the steps that break the TBT limit by 5× for −1 % FT
@@ -696,6 +696,9 @@ or FT-only steps. At a fixed 50 ms limit `absolute` is about the same thing (1.5
 1.6 ms RMSE ≈ 5 % of 48 ms); the two differ when the step at the limit is much longer
 or shorter than the steps the RMSE was measured on (another `max_tbt_slo`, model or
 GPU), where an error in seconds no longer matches the step and a relative one does.
+`relative` with k = 1.5 is the default; the presets under `configs/preset/` pin `legacy` so
+they reproduce the published runs. Tested with admission phase `prefill`; with `both` the
+margin also inflates decode-only predictions (≈ 4.7 % relative error there), untested.
 Steps without FT are not affected; inference-only prefill steps exceeded 50 ms on their
 own in 72–80 % of the cases in every arm, which no admission setting can change.
 

@@ -309,15 +309,18 @@ class FinetuneConfig:
     Independent of the standard 0.9 × ttft_slo TTFT margin, which still
     applies everywhere."""
 
-    admission_margin: str = "legacy"
+    admission_margin: str = "relative"
     """How the step-time prediction is inflated before the SLO admission checks.
 
-    ``"legacy"`` (default): ×(1 + 1.5·RMSE) with the RMSE in seconds, as in the
-    original DeltaServe tracker. With the RMSEs seen in practice (a few ms) this
-    is a 0.2-0.8 % factor, i.e. effectively no margin.
-    ``"relative"``: ×(1 + ``admission_margin_k`` · relRMSE), relRMSE the
-    regime's RMS relative error on its fit data (e.g. 0.05 = 5 %): the
-    headroom scales with the step.
+    ``"relative"`` (default): ×(1 + ``admission_margin_k`` · relRMSE), relRMSE
+    the regime's RMS relative error on its fit data (e.g. 0.033 = 3.3 %): the
+    headroom scales with the step. On Qwen3-14B TP=2 it cut FT-carrying steps
+    over ``max_tbt_slo`` from 10 % to 2 % for -1 % FT (README, "The admission
+    margin"; ``eval-tp/margin_ab.py``).
+    ``"legacy"``: ×(1 + 1.5·RMSE) with the RMSE in seconds, as in the original
+    DeltaServe tracker. With the RMSEs seen in practice (a few ms) this is a
+    0.2-0.8 % factor, i.e. effectively no margin. The presets pin it, so they
+    reproduce the published runs.
     ``"absolute"``: + ``admission_margin_k`` · RMSE seconds, the same headroom
     for every step.
     Applies to every margined prediction (the baseline-without-FT checks and

@@ -51,6 +51,7 @@ throttles:
   match_prefill_workload_factor: 0
 
 slo:
+  admission_margin: legacy           # pinned: reproduces the published runs (the default is now relative)
   ttft_slo: 2                      # arxiv: an 8k prefill alone is ~1.5 s (chunked 2048), 16k ~3.1 s
   avg_tbt_slo: 0.02
   max_tbt_slo: 0.05

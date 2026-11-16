@@ -52,6 +52,7 @@ throttles:
   match_prefill_workload_factor: 0
 
 slo:
+  admission_margin: legacy           # pinned: reproduces the published runs (the default is now relative)
   ttft_slo: 0.4
   avg_tbt_slo: 0.02
   max_tbt_slo: 0.045                # [mixed-fwd-cuda-graph A/B] tighter TBT target to buy back the TBT cost of denser FT admission

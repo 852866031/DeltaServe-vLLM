@@ -65,6 +65,7 @@ throttles:
   match_prefill_workload_factor: 0
 
 slo:
+  admission_margin: legacy           # pinned: reproduces the published runs (the default is now relative)
   ttft_slo: 0.2                      # time-to-first-token target (seconds)
   avg_tbt_slo: 0.1                   # avg time-between-tokens target (seconds)
   max_tbt_slo: 0.12                   # max single-step time while admitting FT (seconds)

@@ -48,6 +48,7 @@ throttles:
   match_prefill_workload_factor: 0
 
 slo:
+  admission_margin: legacy           # pinned: reproduces the published runs (the default is now relative)
   ttft_slo: 0.25
   # TBT targets are 2x the 14B ones: a pure Qwen3-32B decode step is already 20 ms and a mixed
   # step with 25 fine-tuning tokens 48 ms, so max_tbt_slo 0.05 admitted almost no fine-tuning.

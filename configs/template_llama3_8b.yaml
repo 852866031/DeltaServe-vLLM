@@ -73,7 +73,7 @@ slo:
   profile_on_launch: true            # profile synthetic batches at launch to fit the estimator (~1-2 min)
   profile_num_repeats: 2             # recorded passes per profiling shape
   decode_only_ft_safety_margin: 0.7  # ("both" phase only) max_tbt_slo × this on decode-only steps
-  admission_margin: legacy           # prediction margin for SLO admission: legacy = ×(1+1.5·RMSE[s]) (≈ none), relative = ×(1+k·relative error), absolute = +k·RMSE
+  admission_margin: relative         # prediction margin for SLO admission: relative = ×(1+k·relative error); absolute = +k·RMSE; legacy = ×(1+1.5·RMSE[s]) (≈ none, the original)
   admission_margin_k: 1.5            # k for relative / absolute
   # estimator_state_save_path: ../logs/llama3-8b/estimator.json   # keep the fitted estimator for the next launch
   # estimator_state_load_path: ../logs/llama3-8b/estimator.json   # ... and restore it
