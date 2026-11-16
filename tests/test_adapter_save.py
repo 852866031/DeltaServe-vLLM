@@ -305,6 +305,52 @@ def test_switch_adapter():
           and same(svc.export_lora_state(), ft))
 
 
+def test_publish_keeps_no_graph():
+    green("publishing to the served slot builds no autograd graph:")
+    import inspect
+
+    from deltaserve.bwd_services.common.trainer import LoraSftTrainerService
+    from deltaserve.bwd_services.llama3 import Llama3BackwardService
+
+    svc, _ = H.build_synthetic_service(
+        Llama3BackwardService, hidden=HID, n_layers=LAYERS, Hq=4, Hkv=2, Hd=8,
+        inter=48, vocab=50, r=R, lr=1e-3)
+    layers = {}
+    for i in range(LAYERS):
+        layers[i] = {}
+        for proj in "qkvo":
+            pa, pb = svc.lora[i][proj]["A"], svc.lora[i][proj]["B"]
+            layers[i][proj] = {
+                "a": torch.zeros(2, 1, pa.shape[0], pa.shape[1], dtype=torch.float16),
+                "b": torch.zeros(2, 1, pb.shape[0], pb.shape[1], dtype=torch.float16)}
+    svc.lora_buffers = {"slot": 1, "layers": layers}
+    with torch.no_grad():
+        svc.lora[1]["q"]["B"].add_(0.5)
+    assert torch.is_grad_enabled()
+    for _ in range(3):
+        svc._publish_to_served()
+    bufs = [t for d in layers.values() for p in d.values() for t in p.values()]
+    check("the masters still require grad (they are what is trained)",
+          all(svc.lora[i][p][ab].requires_grad for i in range(LAYERS)
+              for p in "qkvo" for ab in "AB"))
+    check("after publishing, no served buffer carries a grad_fn or requires grad",
+          all(t.grad_fn is None and not t.requires_grad for t in bufs))
+    b = layers[1]["q"]["b"][1, 0]
+    want = (svc.lora[1]["q"]["B"].detach() * svc.scaling).to(torch.float16)
+    check("...and the published values are the masters' (alpha/r baked into B)",
+          torch.allclose(b.float(), want.float(), atol=1e-3)
+          and float(layers[1]["q"]["b"][0].abs().sum()) == 0.0)
+    src = inspect.getsource(LoraSftTrainerService)
+    i = src.index("def _publish_to_served")
+    check("_publish_to_served is decorated with torch.no_grad()",
+          src[:i].rstrip().endswith("@torch.no_grad()"))
+    new = {k: v.clone() + 0.25 for k, v in svc.shared["ft"].items()}
+    svc.switch_adapter(new, {"learning_rate": 1e-3, "weight_decay": 0.0,
+                             "gamma": 1.0, "lora_scaling": svc.scaling})
+    check("switching adapters publishes without a graph either",
+          all(t.grad_fn is None and not t.requires_grad for t in bufs))
+
+
 def test_engine_export_and_ready():
     green("engine-side export + what 'ready' does:")
     from safetensors.torch import load_file
@@ -379,6 +425,7 @@ def main():
     test_write()
     test_trainer_export()
     test_switch_adapter()
+    test_publish_keeps_no_graph()
     test_engine_export_and_ready()
     print()
     if _failed:

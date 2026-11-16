@@ -539,7 +539,6 @@ class LoraSftTrainerService(BackwardService):
 
         return loss, n_valid
 
-    @torch.no_grad()
     def switch_adapter(self, ft: dict, hparams: dict) -> dict:
         """[ft-job] Start training ANOTHER adapter (the next finetuning job)
         without rebuilding anything: the new weights are copied INTO the
@@ -616,6 +615,11 @@ class LoraSftTrainerService(BackwardService):
         return {key: self.lora[layer][proj][ab].detach().float().cpu().clone()
                 for (layer, proj, ab), key in self._lora_keys.items()}
 
+    # no_grad is load-bearing: the masters require grad, and copying them into
+    # the served buffers with autograd on makes every publish extend a graph
+    # that keeps the previous ones alive (about 150 MiB per backward on
+    # Qwen3-14B, until the backward child runs out of memory).
+    @torch.no_grad()
     def _publish_to_served(self) -> None:
         """Write the trained fp32 master into vLLM's served LoRA stacked buffers
         (DeltaServe's load-time refresh): per (layer, proj), clamp + cast to the

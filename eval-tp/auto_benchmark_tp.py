@@ -139,6 +139,9 @@ async def main() -> int:
                          "estimator trace to output/step_trace<suffix>.csv "
                          "(finetune.step_trace_path; near-zero cost, see "
                          "analyze_step_trace.py)")
+    ap.add_argument("--request-model", default=None,
+                    help="The `model` every request names (default: the inference "
+                         "adapter). E.g. `auto` to exercise adapter routing.")
     ap.add_argument("--kill-stale", action="store_true",
                     help="Kill leftover GPU-resident processes from a previous run "
                          "instead of refusing to launch.")
@@ -256,7 +259,8 @@ async def main() -> int:
         warmup_rows = timeline_rows[:warmup_n]
         print(f"[bench-tp] warmup rows: {len(warmup_rows)}", flush=True)
 
-        model = spec.infer_lora_name   # requests target the inference adapter
+        # requests target the inference adapter unless --request-model says otherwise
+        model = args.request_model or spec.infer_lora_name
         if args.co:
             if not await start_finetuning(server):
                 print("[bench-tp] could not open FT admission; aborting", flush=True)
