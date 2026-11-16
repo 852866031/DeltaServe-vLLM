@@ -654,8 +654,22 @@ class AdapterRoutingConfig:
     request naming an adapter or the base model is never touched."""
 
     router_device: str = "cpu"
-    """Device of the router service's encoder: ``"cpu"`` or a CUDA device such
-    as ``"cuda:0"`` (resident on the GPU, about 1.5 GB)."""
+    """Device of the router service's encoder when ``router_gpu`` is not set:
+    ``"cpu"``, or a CUDA device such as ``"cuda:0"`` counted within the GPUs
+    the engine can see."""
+
+    router_gpu: int | None = None
+    """Put the router service's encoder on this PHYSICAL GPU (the nvidia-smi
+    index); it stays resident there (about 1.5 GB). Takes precedence over
+    ``router_device``. May be a card the model does not use at all — with
+    tensor parallelism that keeps the encoder off every rank's GPU."""
+
+    route_batch_max: int = 16
+    """Most route requests encoded together. Requests that arrive while the
+    encoder is busy are batched; one arriving at an idle service is not delayed."""
+
+    route_batch_wait_ms: float = 0.0
+    """Extra time a batch is held open to let it fill (0 = never wait)."""
 
     route_timeout_ms: float = 200.0
     """How long an API server waits for the router's answer before serving the
@@ -687,6 +701,13 @@ class AdapterRoutingConfig:
     pool_hit_half_life_s: float = 300.0
     """Half-life of an adapter's hit count: GPU slots are kept by this decayed
     frequency (0 = never decays, i.e. plain hit counts)."""
+
+    adapters: list | None = None
+    """Existing adapters to make auto-routable without training, each a mapping
+    ``{path, name?, data_path?, centroid_path?, prewarm?}``: ``data_path`` is
+    the dataset its centroid is built from (a job with stages
+    ``[init, indexing, ready]``), ``centroid_path`` a ready-made centroid
+    (.npy) instead. Without either it is servable by name only."""
 
     index_path: str | None = None
     """Directory of a centroid index built offline (adapters registered
@@ -725,14 +746,32 @@ class AdapterRoutingConfig:
             raise ValueError("adapter_routing.encoder must not be empty")
         for name in ("encoder_max_tokens", "max_pool_adapters",
                      "indexing_max_samples", "indexing_chunk_samples",
-                     "indexing_cpu_max_threads"):
+                     "indexing_cpu_max_threads", "route_batch_max"):
             if int(getattr(self, name)) < 1:
                 raise ValueError(f"adapter_routing.{name} must be >= 1")
         for name in ("indexing_cpu_reserve_cores", "indexing_min_free_memory_gb",
                      "indexing_gpu_after_quiet_s", "pool_protected_slots",
-                     "pool_hit_half_life_s", "route_timeout_ms"):
+                     "pool_hit_half_life_s", "route_timeout_ms",
+                     "route_batch_wait_ms"):
             if float(getattr(self, name)) < 0:
                 raise ValueError(f"adapter_routing.{name} must be >= 0")
+        seen = set()
+        for a in self.adapters or []:
+            if not isinstance(a, dict) or not a.get("path"):
+                raise ValueError(
+                    "adapter_routing.adapters: each entry needs a 'path'")
+            unknown = set(a) - {"path", "name", "data_path", "centroid_path",
+                                "prewarm"}
+            if unknown:
+                raise ValueError(f"adapter_routing.adapters: unknown key(s) "
+                                 f"{sorted(unknown)}")
+            if a.get("name"):
+                if a["name"] in seen:
+                    raise ValueError(f"adapter_routing.adapters: duplicate name "
+                                     f"'{a['name']}'")
+                seen.add(a["name"])
+        if self.router_gpu is not None and int(self.router_gpu) < 0:
+            raise ValueError("adapter_routing.router_gpu must be a GPU index >= 0")
         if not -1.0 <= float(self.fallback_score_threshold) <= 1.0:
             raise ValueError(
                 "adapter_routing.fallback_score_threshold is a cosine in [-1, 1]")

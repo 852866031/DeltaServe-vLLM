@@ -52,7 +52,8 @@ class IndexingPlacement:
 class IndexingRunner:
     def __init__(self, indexer, executors: dict, governor=None, placement=None,
                  chunk_samples: int | dict = 16, recheck_s: float = 0.5,
-                 poll_s: float = 0.05, name: str = "indexing") -> None:
+                 poll_s: float = 0.05, name: str = "indexing",
+                 stop_executors: bool = True, on_exit=None) -> None:
         self.indexer, self.executors = indexer, dict(executors)
         self.governor, self.placement = governor, placement
         self.chunk = (chunk_samples if isinstance(chunk_samples, dict)
@@ -65,6 +66,8 @@ class IndexingRunner:
         self.chunks = {d: 0 for d in self.executors}
         self.discarded = 0
         self.error: str | None = None
+        # Shared executors (one encoder process for every job) are not ours to stop.
+        self.stop_executors, self.on_exit = stop_executors, on_exit
         self._thread = None
         self._stop = threading.Event()
 
@@ -139,11 +142,14 @@ class IndexingRunner:
         except Exception as e:  # noqa: BLE001 — surfaced through the stage
             self.error = f"{type(e).__name__}: {e}"
         finally:
-            for ex in self.executors.values():
-                try:
-                    ex.stop()
-                except Exception:  # noqa: BLE001
-                    pass
+            if self.stop_executors:
+                for ex in self.executors.values():
+                    try:
+                        ex.stop()
+                    except Exception:  # noqa: BLE001
+                        pass
+            if self.on_exit is not None:
+                self.on_exit()
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._loop, daemon=True,

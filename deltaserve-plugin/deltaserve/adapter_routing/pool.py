@@ -26,8 +26,10 @@ the CPU tier (the request waits for a slot, as with vLLM's own ``max_loras``).
 Pure Python + numpy (through the centroid index); no torch / vLLM import.
 """
 
+import functools
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass
 
@@ -78,6 +80,15 @@ class PoolFull(Exception):
     pass
 
 
+def _locked(fn):
+    """The pool is used from the engine loop and from the job driver thread."""
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return fn(self, *args, **kwargs)
+    return wrapper
+
+
 class AdapterPool:
     def __init__(self, backend, index: CentroidIndex | None = None,
                  capacity: int = 32, gpu_slots: int = 1, protected: int = 0,
@@ -92,6 +103,7 @@ class AdapterPool:
         self.entries: dict[str, PoolEntry] = {}
         self.evictions = 0
         self.cold_loads = 0
+        self._lock = threading.RLock()
         # Where the registry is kept (the API servers' resolver reads it);
         # written after every change when set.
         self.directory = directory
@@ -114,12 +126,15 @@ class AdapterPool:
         if self.directory:
             self.save(self.directory)
 
+    @_locked
     def register(self, name: str, path: str, centroid=None,
                  job: str | None = None, prewarm: bool = True,
-                 lora_int_id: int | None = None) -> PoolEntry:
-        """Add an adapter (a job that reached ``ready``, or one listed in the
-        config with a centroid built offline). It is loaded to the CPU tier and,
-        with ``prewarm``, into a GPU slot if one is free — never by evicting."""
+                 lora_int_id: int | None = None, load: bool = True) -> PoolEntry:
+        """Add an adapter (a job that reached ``ready``). With ``load`` it is
+        loaded to the CPU tier and, with ``prewarm``, into a GPU slot if one is
+        free — never by evicting. ``load=False`` only registers it: the weights
+        stay on disk until the first request for it (lowest cost; nothing is
+        asked of the engine)."""
         if name in self.entries:
             raise ValueError(f"adapter '{name}' is already in the pool")
         if len(self.entries) >= self.capacity:
@@ -131,10 +146,11 @@ class AdapterPool:
                       centroid=centroid, lora_int_id=lora_int_id)
         self.entries[name] = e
         try:
-            self._to_cpu(e)
+            if load:
+                self._to_cpu(e)
             if centroid is not None:
                 self.index.add(name, centroid)
-            if prewarm and self._in_tier(GPU) < self.gpu_slots:
+            if load and prewarm and self._in_tier(GPU) < self.gpu_slots:
                 self._activate(e)
         except Exception:
             self.entries.pop(name, None)
@@ -144,6 +160,7 @@ class AdapterPool:
         self._autosave()
         return e
 
+    @_locked
     def remove(self, name: str) -> None:
         """Take an adapter out of the pool entirely."""
         e = self._get(name)
@@ -203,6 +220,7 @@ class AdapterPool:
             return None
         return min(cands, key=lambda e: (self._score(e, now), e.name)).name
 
+    @_locked
     def ensure_gpu(self, name: str, in_use=()) -> bool:
         """Bring an adapter into a GPU slot, evicting by frequency if needed.
         False if no slot can be freed right now."""
@@ -221,6 +239,7 @@ class AdapterPool:
         return True
 
     # ---------------------------------------------------------------- hits
+    @_locked
     def note_hit(self, name: str, in_use=()) -> PoolEntry:
         """A request uses this adapter (routed or named): bump its score and
         make it usable — cold-load it if it was offloaded, give it a GPU slot
@@ -243,6 +262,7 @@ class AdapterPool:
         return self.index.route(embedding, threshold)
 
     # ----------------------------------------------------------- operator
+    @_locked
     def offload(self, name: str) -> PoolEntry:
         """Drop the adapter's weights from GPU and RAM. It stays routable and
         is loaded back from disk on its next hit."""
@@ -252,6 +272,7 @@ class AdapterPool:
         self._autosave()
         return e
 
+    @_locked
     def disable(self, name: str) -> PoolEntry:
         """Stop selecting this adapter: out of the centroid index, out of its
         GPU slot. Its weights stay in RAM unless it is also offloaded."""
@@ -263,6 +284,7 @@ class AdapterPool:
         self._autosave()
         return e
 
+    @_locked
     def enable(self, name: str) -> PoolEntry:
         e = self._get(name)
         e.enabled = True
@@ -274,6 +296,7 @@ class AdapterPool:
     def routable_names(self) -> list[str]:
         return list(self.index.names)
 
+    @_locked
     def status(self) -> dict:
         now = self._clock()
         return {
@@ -286,6 +309,7 @@ class AdapterPool:
         }
 
     # --------------------------------------------------------- persistence
+    @_locked
     def save(self, directory: str) -> None:
         """Write the registry (names, paths, LoRA ids, flags) next to the
         centroid index: a restart finds the same pool, and the API servers'
@@ -302,6 +326,7 @@ class AdapterPool:
         os.replace(tmp, os.path.join(directory, REGISTRY_FILE))
         self.index.save(os.path.join(directory, ROUTABLE_FILE))
 
+    @_locked
     def restore(self, directory: str, centroids: CentroidIndex | None = None) -> int:
         """Re-register the adapters of a saved registry, with the LoRA ids
         they had (centroids from the given index). Returns how many."""

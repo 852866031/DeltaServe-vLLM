@@ -227,6 +227,190 @@ def test_service_and_client():
             client.close()
 
 
+def test_batching():
+    green("request batching in the router service:")
+    from deltaserve.adapter_routing.service import (
+        RouteBatcher,
+        Router,
+        RouterClient,
+        socket_path,
+    )
+
+    class CountingEncoder(FakeEncoder):
+        def __init__(self, delay=0.0):
+            super().__init__(delay)
+            self.sizes = []
+
+        def encode(self, texts):
+            self.sizes.append(len(texts))
+            return super().encode(texts)
+
+    with tempfile.TemporaryDirectory() as d:
+        f = str(Path(d) / "centroids.npz")
+        write_index(f, ["translate", "sql"])
+
+        enc = CountingEncoder()
+        r = Router(enc, f, threshold=0.5, reload_s=0.0)
+        ds = r.route_many(["translate a", "", "sql b", "a poem", None])
+        check("route_many: one encoder call for the texts that need encoding",
+              enc.sizes == [3] and [x.adapter for x in ds]
+              == ["dserve-routing-translate", None, "dserve-routing-sql", None, None])
+        check("...and per-item fallback reasons",
+              [x.reason for x in ds]
+              == ["", "no-text", "", "below-threshold", "no-text"])
+
+        enc = CountingEncoder(delay=0.05)
+        b = RouteBatcher(Router(enc, f, 0.5, 0.0), max_batch=8)
+        t0 = time.time()
+        one = b.submit("translate this")
+        alone = time.time() - t0
+        check("a request to an idle service is encoded alone, at once "
+              f"({alone * 1e3:.0f} ms for a 50 ms encode)",
+              one.adapter == "dserve-routing-translate" and enc.sizes == [1]
+              and alone < 0.12)
+
+        n = 24
+        results = [None] * n
+
+        def worker(i):
+            text = f"sql query {i}" if i % 2 else f"translate {i}"
+            results[i] = (text, b.submit(text))
+
+        ts = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+        t0 = time.time()
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        took = time.time() - t0
+        calls = enc.sizes[1:]
+        check(f"24 concurrent requests → {len(calls)} encoder calls "
+              f"(sizes {calls}), not 24",
+              sum(calls) == n and len(calls) <= 6)
+        check("no batch exceeds route_batch_max", max(calls) <= 8)
+        check("every caller gets the decision for ITS text (no cross-wiring)",
+              all(dec.adapter == ("dserve-routing-sql" if "sql" in text
+                                  else "dserve-routing-translate")
+                  for text, dec in results))
+        check(f"batched: {took * 1e3:.0f} ms total; serial would be "
+              f"{n * 50} ms", took < n * 0.05 * 0.5)
+        check("batch statistics are kept", b.largest == max(calls)
+              and b.batches == len(enc.sizes))
+        b.stop()
+
+        enc1 = CountingEncoder(delay=0.01)
+        b1 = RouteBatcher(Router(enc1, f, 0.5, 0.0), max_batch=1)
+        ts = [threading.Thread(target=b1.submit, args=("translate",))
+              for _ in range(6)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        check("route_batch_max = 1 keeps the old one-at-a-time behaviour",
+              enc1.sizes == [1] * 6)
+        b1.stop()
+
+        class Broken(FakeEncoder):
+            def encode(self, texts):
+                raise RuntimeError("cuda out of memory")
+
+        bb = RouteBatcher(Router(Broken(), f, 0.5, 0.0))
+        errs = []
+
+        def bad():
+            try:
+                bb.submit("translate")
+            except RuntimeError as e:
+                errs.append(str(e))
+
+        ts = [threading.Thread(target=bad) for _ in range(3)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        check("an encoder failure reaches every waiting request (nobody hangs)",
+              errs == ["cuda out of memory"] * 3)
+        bb.stop()
+
+        encw = CountingEncoder()
+        bw = RouteBatcher(Router(encw, f, 0.5, 0.0), max_batch=8, wait_s=0.15)
+        ts = [threading.Thread(target=bw.submit, args=("translate",))
+              for _ in range(4)]
+        for t in ts:
+            t.start()
+            time.sleep(0.02)
+        [t.join() for t in ts]
+        check("route_batch_wait_ms holds a batch open so staggered requests "
+              f"share it (sizes {encw.sizes})", encw.sizes == [4])
+        bw.stop()
+
+        enc = CountingEncoder(delay=0.03)
+        path = socket_path(d)
+        svc = Service(Router(enc, f, 0.5, 0.0), path)
+        try:
+            out = []
+
+            def client(i):
+                c = RouterClient(path, timeout_s=5.0)
+                for _ in range(5):
+                    out.append(c.route("sql" if i % 2 else "translate").adapter)
+                c.close()
+
+            ts = [threading.Thread(target=client, args=(i,)) for i in range(8)]
+            [t.start() for t in ts]
+            [t.join() for t in ts]
+            ping = RouterClient(path).ping()
+            check("through the socket: 8 API-server clients × 5 requests, all "
+                  f"correct, in {len(enc.sizes)} encoder calls",
+                  len(out) == 40 and out.count("dserve-routing-sql") == 20
+                  and len(enc.sizes) < 40)
+            check("ping reports batching (batches, largest batch)",
+                  ping is not None and ping[2] == len(enc.sizes) and ping[3] > 1)
+        finally:
+            svc.close()
+
+
+def test_placement():
+    green("which device holds the encoder:")
+    from deltaserve.adapter_routing.service import (
+        apply_router_placement,
+        router_placement,
+    )
+    from deltaserve.config import AdapterRoutingConfig
+
+    def cfg(**kw):
+        return AdapterRoutingConfig(enable_adapter_routing=True, **kw)
+
+    check("default: CPU, every GPU hidden from the service",
+          router_placement(cfg()) == ("cpu", ""))
+    check("router_gpu: 3 → the service sees only physical GPU 3, as cuda:0",
+          router_placement(cfg(router_gpu=3)) == ("cuda:0", "3"))
+    check("router_gpu wins over router_device",
+          router_placement(cfg(router_gpu=1, router_device="cpu")) == ("cuda:0", "1"))
+    check("router_device cuda:N is used as is (within the engine's GPUs)",
+          router_placement(cfg(router_device="cuda:1")) == ("cuda:1", None))
+    check("negative GPU index rejected",
+          error_raised(lambda: cfg(router_gpu=-1)))
+    check("batch size 0 rejected", error_raised(lambda: cfg(route_batch_max=0)))
+    keep = os.environ.get("CUDA_VISIBLE_DEVICES")
+    try:
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+        dev = apply_router_placement(cfg(router_gpu=1))
+        check("applying it restricts the process to that card",
+              dev == "cuda:0" and os.environ["CUDA_VISIBLE_DEVICES"] == "1")
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+        apply_router_placement(cfg(router_device="cuda:1"))
+        check("router_device leaves the visible GPUs alone",
+              os.environ["CUDA_VISIBLE_DEVICES"] == "0,1")
+    finally:
+        if keep is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = keep
+
+
+def error_raised(fn):
+    try:
+        fn()
+    except Exception:  # noqa: BLE001
+        return True
+    return False
+
+
 async def call(mw, body, path="/v1/chat/completions", method="POST",
                split=False, app=None):
     """Run one request through the middleware; returns what the app saw and
@@ -543,6 +727,8 @@ def main():
     test_extract_text()
     test_router()
     test_service_and_client()
+    test_batching()
+    test_placement()
     test_middleware()
     test_routing_off()
     test_end_to_end()

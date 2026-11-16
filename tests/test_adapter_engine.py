@@ -352,6 +352,221 @@ def test_closed_loop():
         st.IndexingStage.make_executors = keep
 
 
+class CountingExec(FakeExec):
+    """Counts what an indexing job costs."""
+
+    made = []
+
+    def __init__(self):
+        super().__init__()
+        self.loaded = False
+        self.submits, self.samples, self.unloads, self.stopped = 0, 0, 0, False
+        CountingExec.made.append(self)
+
+    def submit(self, texts, threads):
+        self.submits += 1
+        self.samples += len(texts)
+        self.loaded = True
+        super().submit(texts, threads)
+
+    def unload(self):
+        self.unloads += 1
+        self.loaded = False
+
+    def stop(self):
+        self.stopped = True
+
+
+def run_jobs(routing, timeout=20):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        routing.tick_jobs()
+        if routing.jobs.current is None and not routing.jobs.queue:
+            routing.tick_jobs()
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_external_adapters():
+    green("existing adapters, no training: jobs [init, indexing, ready]:")
+    from deltaserve.adapter_routing import stages as st
+    from deltaserve.adapter_routing.engine import AdapterRoutingEngine
+    from deltaserve.adapter_routing.pool import ROUTABLE_FILE
+    from deltaserve.adapter_routing.resolver import PoolLoRAResolver
+    from deltaserve.adapter_routing.service import Router
+    from deltaserve.adapter_routing.stages import SharedIndexer
+
+    keep = st.IndexingStage.make_executors
+    st.IndexingStage.make_executors = staticmethod(lambda cfg: {"cpu": CountingExec()})
+    CountingExec.made.clear()
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            def corpus(name, word, n=10):
+                p = Path(d) / f"{name}.txt"
+                p.write_text("".join(f"{word} example number {i} " + "x" * (i * 3)
+                                     + "\n" for i in range(n)))
+                return str(p)
+
+            src = source_adapter(d)
+            rpc_calls = []
+            engine = FakeEngineCore(lora_state(0))
+            engine.model_executor.collective_rpc = (
+                lambda method, *a, **k: rpc_calls.append(method) or [])
+            vc = vllm_config(d, finetuning=False)
+            routing = AdapterRoutingEngine(engine, vc, start_service=False,
+                                           start_driver=False)
+
+            j1 = routing.submit_adapter(src, name="translate-adapter",
+                                        data_path=corpus("tr", "translate"))
+            j2 = routing.submit_adapter(src, data_path=corpus("sq", "sql"))
+            np.save(Path(d) / "c.npy", np.eye(DIM, dtype=np.float32)[5])
+            j3 = routing.submit_adapter(src, name="with-centroid",
+                                        centroid_path=str(Path(d) / "c.npy"))
+            j4 = routing.submit_adapter(src, name="name-only")
+            check("with a dataset → [init, indexing, ready]; with a centroid or "
+                  "nothing → [init, ready]",
+                  list(j1["stages"]) == ["init", "indexing", "ready"]
+                  and list(j3["stages"]) == ["init", "ready"]
+                  and list(j4["stages"]) == ["init", "ready"])
+            check("a given name is kept; an unnamed adapter is dserve-routing-…",
+                  j1["name"] == "translate-adapter"
+                  and j2["name"].startswith("dserve-routing-"))
+            check("works with finetuning off (no scheduler, no backward child)",
+                  run_jobs(routing))
+            fin = {j["name"]: j for j in routing.status()["jobs"]["finished"]}
+            check("all four jobs finished without error",
+                  len(fin) == 4 and all(j["error"] is None and j["stage"] == "done"
+                                        for j in fin.values()))
+
+            check("no export from the workers, nothing asked of the engine "
+                  "(weights load on first use)",
+                  rpc_calls == [] and engine.added == [])
+            check("no copy: the pool points at the adapter where it already is",
+                  all(e.path == src for e in routing.pool.entries.values())
+                  and fin["translate-adapter"]["saved_path"] == src
+                  and not os.path.exists(routing.adapter_dir("translate-adapter")))
+            check("all on the disk tier until used",
+                  all(e.tier == "disk" for e in routing.pool.entries.values()))
+            check("ONE encoder process served every job, and was unloaded "
+                  f"afterwards (created {len(CountingExec.made)})",
+                  len(CountingExec.made) == 1 and CountingExec.made[0].unloads >= 1
+                  and not CountingExec.made[0].stopped)
+            check("exactly the 20 dataset samples were encoded",
+                  CountingExec.made[0].samples == 20)
+            check("the name-only adapter is in the pool but not selectable",
+                  "name-only" in routing.pool
+                  and sorted(routing.pool.routable_names())
+                  == sorted([j1["name"], j2["name"], "with-centroid"]))
+
+            router = Router(FakeEncoder(), str(Path(routing.dir) / ROUTABLE_FILE),
+                            threshold=0.5, reload_s=0.0)
+            check("requests are routed between the two indexed adapters",
+                  router.route("translate this please").adapter == "translate-adapter"
+                  and router.route("write a sql query").adapter == j2["name"])
+            res = PoolLoRAResolver(routing.dir)
+            ids = {n: res.lookup(n).lora_int_id for n in routing.pool.entries}
+            check("every one resolves for the API servers, each with its own id",
+                  len(set(ids.values())) == 4)
+            routing.note_request(SimpleNamespace(
+                lora_request=SimpleNamespace(lora_name="translate-adapter")))
+            check("the first request for it loads it into the engine",
+                  [a[0] for a in engine.added] == ["translate-adapter"]
+                  and routing.pool.entries["translate-adapter"].tier == "gpu")
+
+            n = CountingExec.made[0].samples
+            vc2 = vllm_config(d, finetuning=False)
+            vc2.adapter_routing_config.adapters = [
+                {"path": src, "name": "translate-adapter",
+                 "data_path": str(Path(d) / "tr.txt")},
+                {"path": str(Path(d) / "missing"), "name": "broken",
+                 "data_path": str(Path(d) / "tr.txt")},
+                {"path": src, "name": "late", "data_path": corpus("po", "poem", 6)}]
+            routing2 = AdapterRoutingEngine(FakeEngineCore(lora_state(0)), vc2,
+                                            start_service=False, start_driver=False)
+            check("restart with the adapters listed in the config",
+                  run_jobs(routing2))
+            fin2 = {j["name"]: j for j in routing2.status()["jobs"]["finished"]}
+            check("an adapter whose centroid is already built is NOT re-encoded; "
+                  "only the new one is",
+                  sum(x.samples for x in CountingExec.made) == n + 6
+                  and fin2["translate-adapter"]["error"] is None)
+            check("a bad entry fails its own job with a clear error; the others "
+                  "still go through",
+                  fin2["broken"]["stage"] == "failed"
+                  and "no adapter weights" in fin2["broken"]["error"]
+                  and "late" in routing2.pool.routable_names()
+                  and "broken" not in routing2.pool)
+            check("the earlier pool is still there after the restart",
+                  {"translate-adapter", j2["name"], "with-centroid", "name-only",
+                   "late"} <= set(routing2.pool.entries))
+
+            Path(d, "tr.txt").write_text("translate something new\n" * 3)
+            routing2.submit_adapter(src, name="translate-adapter",
+                                    data_path=str(Path(d) / "tr.txt"))
+            run_jobs(routing2)
+            check("a changed dataset is indexed again",
+                  sum(x.samples for x in CountingExec.made) == n + 6 + 3)
+            err = error_of(lambda: routing2.submit_adapter(
+                str(Path(d) / "elsewhere"), name="late"))
+            check("a name already used for another path is refused",
+                  err is not None and "another path" in err)
+            routing2.submit_adapter(src, name="warm", prewarm=True)
+            eng2 = routing2.engine
+            before = len(eng2.added)
+            run_jobs(routing2)
+            check("prewarm: true loads the adapter at registration",
+                  len(eng2.added) == before + 1 and eng2.added[-1][0] == "warm")
+            routing.shutdown()
+            routing2.shutdown()
+            check("shutdown stops the shared encoder process",
+                  all(x.stopped for x in CountingExec.made))
+
+            sh = SharedIndexer(lambda: {"cpu": CountingExec()})
+            a = sh.acquire()
+            check("the shared encoder is used by one job at a time",
+                  a is not None and sh.acquire() is None)
+            sh.release()
+            check("...and handed to the next job without creating another",
+                  sh.acquire() is a and sh.created == 1)
+    finally:
+        st.IndexingStage.make_executors = keep
+
+
+def test_adapters_config():
+    green("adapter_routing.adapters config:")
+    import yaml
+
+    from deltaserve.config import AdapterRoutingConfig
+    from deltaserve.config_loader import adapter_routing_config, load_yaml_config
+
+    ok = AdapterRoutingConfig(adapters=[{"path": "/a", "name": "x",
+                                         "data_path": "/d", "prewarm": True}])
+    check("a list of {path, name?, data_path?, centroid_path?, prewarm?}",
+          ok.adapters[0]["name"] == "x")
+    check("an entry without a path is rejected",
+          error_of(lambda: AdapterRoutingConfig(adapters=[{"name": "x"}])) is not None)
+    check("an unknown key is rejected",
+          "unknown" in (error_of(lambda: AdapterRoutingConfig(
+              adapters=[{"path": "/a", "dataset": "/d"}])) or ""))
+    check("duplicate names are rejected",
+          "duplicate" in (error_of(lambda: AdapterRoutingConfig(
+              adapters=[{"path": "/a", "name": "x"},
+                        {"path": "/b", "name": "x"}])) or ""))
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "cfg.yaml"
+        p.write_text(yaml.safe_dump({"adapter_routing": {
+            "enable_adapter_routing": True,
+            "adapters": [{"name": "x", "path": "ad/x", "data_path": "data/x.txt",
+                          "centroid_path": "/abs/c.npy"}]}}))
+        cfg = adapter_routing_config(load_yaml_config(p, verbose=False))
+        a = cfg.adapters[0]
+        check("relative paths of listed adapters are resolved against the YAML",
+              a["path"] == str((Path(d) / "ad/x").resolve())
+              and a["data_path"] == str((Path(d) / "data/x.txt").resolve())
+              and a["centroid_path"] == "/abs/c.npy" and a["name"] == "x")
+
+
 def test_engine_config():
     green("engine object:")
     from deltaserve.adapter_routing.engine import AdapterRoutingEngine, VllmLoRABackend
@@ -426,6 +641,8 @@ def test_real_service():
 def main():
     green("=== adapter routing: engine wiring ===")
     test_closed_loop()
+    test_external_adapters()
+    test_adapters_config()
     test_engine_config()
     test_real_service()
     print()

@@ -109,7 +109,20 @@ class InitStage(Stage):
     name = "init"
 
     def poll(self, job, ctx) -> bool:
-        store = ctx.store
+        store = getattr(ctx, "store", None)
+        if store is None:
+            # A job that does not train (an existing adapter being indexed):
+            # nothing is loaded or tokenized, the inputs only have to exist.
+            import os
+
+            spec = job.spec
+            if not spec.adapter_path or not os.path.isfile(os.path.join(
+                    spec.adapter_path, "adapter_model.safetensors")):
+                raise RuntimeError(f"no adapter weights at {spec.adapter_path}")
+            if "indexing" in spec.stages and not (
+                    spec.data_path and os.path.isfile(spec.data_path)):
+                raise RuntimeError(f"no dataset at {spec.data_path}")
+            return True
         if store.data_path is not None and len(store) == 0:
             raise RuntimeError(
                 f"finetuning dataset has no usable sample: {store.data_path}")
@@ -356,8 +369,13 @@ class FtJobManager:
             jobs.append(self.current)
         return {j.name for j in jobs}
 
-    def submit(self, spec: FinetuneJobSpec) -> FinetuneJob:
+    def submit(self, spec: FinetuneJobSpec,
+               replace_finished: bool = False) -> FinetuneJob:
+        """``replace_finished``: a job that already finished under this name is
+        superseded (the same adapter submitted again, e.g. with a new dataset)."""
         spec.validate(self.adapter_routing)
+        if replace_finished and spec.name:
+            self.finished = [j for j in self.finished if j.name != spec.name]
         taken = self._names()
         name = spec.name or generate_adapter_name(spec.auto_routing, taken)
         if name in taken:

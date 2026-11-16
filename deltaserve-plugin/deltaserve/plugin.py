@@ -285,6 +285,26 @@ def _patch_engine_core() -> None:
 
         EngineCore.deltaserve_save_estimator_state = deltaserve_save_estimator_state
 
+    if not hasattr(EngineCore, "deltaserve_adapters"):
+        def deltaserve_adapters(self) -> dict:
+            """Utility behind GET /adapters: the adapter pool and its jobs."""
+            routing = getattr(self, "_ds_routing", None)
+            return {"error": "adapter routing is off"} if routing is None \
+                else routing.status()
+
+        def deltaserve_add_adapter(self, spec: dict) -> dict:
+            """Utility behind POST /adapters: add an existing adapter."""
+            routing = getattr(self, "_ds_routing", None)
+            if routing is None:
+                return {"error": "adapter routing is off"}
+            try:
+                return {"job": routing.submit_adapter(**spec)}
+            except Exception as e:  # noqa: BLE001 — reported to the caller
+                return {"error": f"{type(e).__name__}: {e}"}
+
+        EngineCore.deltaserve_adapters = deltaserve_adapters
+        EngineCore.deltaserve_add_adapter = deltaserve_add_adapter
+
     if not hasattr(EngineCore, "deltaserve_ft_jobs"):
         def deltaserve_ft_jobs(self) -> dict:
             """Utility behind GET /ft_jobs: the finetuning jobs and their stages."""

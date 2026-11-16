@@ -1,0 +1,511 @@
+#!/usr/bin/env python
+"""Live end-to-end run of adapter routing on one GPU (Qwen3-0.6B, TP=1).
+
+Launches a real ``vllm serve`` with finetuning + adapter routing on, and a
+finetuning job with stages [init, training, indexing, ready] on a small
+translation corpus. Then, over HTTP:
+
+  * before the job is ready, ``model: "auto"`` is answered by the base model
+    (fallback header);
+  * the job runs through its stages and reaches 'ready' (GET /ft_jobs);
+  * the trained adapter is on disk and differs from the one it started from;
+  * ``model: "auto"`` with a translation prompt is now routed to the job's
+    adapter (response headers + the response's ``model`` field);
+  * a request naming the base model is untouched.
+
+    CUDA_VISIBLE_DEVICES=1 python tests/test_adapter_routing_live.py
+    ... --api-servers 2      # several API server processes
+    ... --router-device cuda:0      # or --router-gpu <physical index>
+
+Needs a GPU; the server log goes to <out dir>/server.log (printed on failure).
+"""
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+_REPO = Path(__file__).resolve().parent.parent
+_PRESET = _REPO / "configs" / "serving_config_finetuning_qwen3_0.6b.yaml"
+
+_passed = 0
+_failed = 0
+_TTY = sys.stdout.isatty()
+_GREEN = "\033[92m" if _TTY else ""
+_RED = "\033[91m" if _TTY else ""
+_RESET = "\033[0m" if _TTY else ""
+
+
+def check(name, cond):
+    global _passed, _failed
+    if cond:
+        _passed += 1
+        print(f"  {_GREEN}[PASS]{_RESET} {name}", flush=True)
+    else:
+        _failed += 1
+        print(f"  {_RED}[FAIL]{_RESET} {name}", flush=True)
+    return bool(cond)
+
+
+SENTENCES = [
+    "Guten Morgen, wie geht es dir?", "Das Wetter ist heute schön.",
+    "Ich möchte einen Kaffee bestellen.", "Wo ist der Bahnhof?",
+    "Wir fahren morgen nach Berlin.", "Das Buch liegt auf dem Tisch.",
+    "Kannst du mir bitte helfen?", "Ich habe meinen Schlüssel verloren.",
+    "Der Zug kommt um acht Uhr an.", "Sie arbeitet in einem Krankenhaus.",
+]
+
+
+def http(port, path, body=None, timeout=120):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        data=None if body is None else json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="GET" if body is None else "POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+            return r.status, {k.lower(): v for k, v in r.headers.items()}, \
+                (json.loads(raw) if raw else None)
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            payload = raw.decode(errors="replace")
+        return e.code, {k.lower(): v for k, v in e.headers.items()}, payload
+    except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
+        return None, {}, str(e)
+
+
+def stop_tree(server: subprocess.Popen) -> None:
+    """Stop the launcher AND everything under it. The launcher starts
+    ``vllm serve`` in its own session, so killing the launcher's process group
+    would leave the server (and its GPU memory) behind."""
+    import psutil
+
+    try:
+        root = psutil.Process(server.pid)
+        procs = root.children(recursive=True) + [root]
+    except psutil.NoSuchProcess:
+        procs = []
+    for p in procs:
+        try:
+            p.send_signal(signal.SIGTERM)
+        except psutil.NoSuchProcess:
+            pass
+    _, alive = psutil.wait_procs(procs, timeout=30)
+    for p in alive:
+        try:
+            p.kill()
+        except psutil.NoSuchProcess:
+            pass
+    psutil.wait_procs(alive, timeout=10)
+    try:
+        server.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def write_config(out: Path, args) -> Path:
+    import yaml
+
+    cfg = yaml.safe_load(_PRESET.read_text())
+    ft = cfg["finetune"]
+    src_adapter = (_PRESET.parent / ft.pop("finetuning_lora_path")).resolve()
+    ft.pop("data_path")
+    ft.pop("num_epochs")
+    ft["start_on_launch"] = True
+    cfg["slo"]["profile_on_launch"] = False
+    corpus = out / "translate.txt"
+    corpus.write_text("".join(
+        f"Translate to English: {s} (example {i})\n"
+        for i in range(args.repeats) for s in SENTENCES))
+    cfg["ft_job"] = {
+        "stages": ["init", "training", "indexing", "ready"],
+        "auto_routing": True,
+        "adapter_path": str(src_adapter),
+        "data_path": str(corpus),
+        "num_epochs": args.epochs,
+    }
+    cfg["adapter_routing"] = {
+        "enable_adapter_routing": True,
+        "index_path": str(out / "index"),
+        "router_device": args.router_device,
+        "router_gpu": args.router_gpu,
+        "fallback_score_threshold": 0.0,
+        "route_timeout_ms": 5000,
+        "indexing_cpus": args.indexing_cpus,
+    }
+    cfg["adapters"]["lora_path_0"] = str(
+        (_PRESET.parent / cfg["adapters"]["lora_path_0"]).resolve())
+    cfg["lora"]["max_loras"] = 4
+    cfg["server"]["api_server_count"] = args.api_servers
+    path = out / "config.yaml"
+    path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+    return path, src_adapter
+
+
+TOPICS = {
+    "ext-translate": [f"Translate to English: {x}" for x in SENTENCES],
+    "ext-sql": [f"Write a SQL query that {x}." for x in (
+        "lists the ten newest orders", "counts users per country",
+        "joins customers and invoices", "finds duplicate email addresses",
+        "returns the average order value per month", "deletes inactive sessions",
+        "selects products that were never sold", "ranks employees by salary",
+        "updates the stock after a sale", "groups page views by day")],
+    "ext-poem": [f"Write a short poem about {x}." for x in (
+        "the sea at night", "autumn leaves", "a quiet mountain", "city rain",
+        "the first snow", "an old lighthouse", "spring flowers", "a lost letter",
+        "the morning sun", "a sleeping cat")],
+}
+
+
+def external_main(args, out: Path) -> None:
+    """Finetuning OFF: existing adapters are indexed and routed, no training."""
+    import yaml
+
+    cfg = yaml.safe_load(_PRESET.read_text())
+    toy = (_PRESET.parent / cfg["adapters"]["lora_path_0"]).resolve()
+    toy_ft = (_PRESET.parent / cfg["finetune"]["finetuning_lora_path"]).resolve()
+    cfg["finetune"] = {"enable_finetuning": False}
+    for sec in ("throttles", "slo", "debug"):
+        cfg.pop(sec, None)
+    data = {}
+    for name, lines in TOPICS.items():
+        data[name] = out / f"{name}.txt"
+        data[name].write_text("".join(f"{t} (example {i})\n"
+                                      for i in range(args.repeats) for t in lines))
+    cfg["adapter_routing"] = {
+        "enable_adapter_routing": True, "index_path": str(out / "index"),
+        "router_device": args.router_device, "router_gpu": args.router_gpu,
+        "fallback_score_threshold": 0.0, "route_timeout_ms": 5000,
+        "indexing_cpus": args.indexing_cpus,
+        "adapters": [
+            {"name": "ext-translate", "path": str(toy),
+             "data_path": str(data["ext-translate"])},
+            {"name": "ext-sql", "path": str(toy_ft),
+             "data_path": str(data["ext-sql"])}],
+    }
+    cfg["adapters"]["lora_path_0"] = str(toy)
+    cfg["lora"]["max_loras"] = 4
+    cfg["server"]["api_server_count"] = args.api_servers
+    config = out / "config.yaml"
+    config.write_text(yaml.safe_dump(cfg, sort_keys=False))
+    log_path = out / "server.log"
+    print(f"=== existing adapters, no training, live (GPU "
+          f"{os.environ['CUDA_VISIBLE_DEVICES']}, TP={args.tp}, "
+          f"{args.api_servers} API server(s)) ===\n    out dir: {out}")
+    env = dict(os.environ, HF_HUB_OFFLINE="1", VLLM_USE_FLASHINFER_SAMPLER="0",
+               TOKENIZERS_PARALLELISM="false",
+               VLLM_USE_V2_MODEL_RUNNER="0")   # v2 + LoRA + CUDA graphs fails upstream
+    env.setdefault("HF_HOME", "/mnt/storage/huggingface")
+    log = open(log_path, "w")
+    server = subprocess.Popen(
+        [sys.executable, str(_REPO / "eval-tp/launch_deltaserve.py"),
+         "--family", "qwen3-0.6b", "--config", str(config), "--tp", str(args.tp),
+         "--port", str(args.port)],
+        stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+    port, ok = args.port, False
+
+    def routable(names, timeout=300):
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            status, _, st = http(port, "/adapters")
+            if status == 200:
+                idx = {a["name"] for a in st["adapters"] if a["indexed"]}
+                if set(names) <= idx:
+                    return st, time.monotonic() - t0
+            time.sleep(0.5)
+        return None, timeout
+
+    def auto(prompt, want):
+        last = None
+        for _ in range(20):      # the router re-reads its index within ~1 s
+            status, headers, body = http(port, "/v1/completions", {
+                "model": "auto", "prompt": prompt, "max_tokens": 4,
+                "temperature": 0})
+            last = (status, headers.get("x-deltaserve-adapter"),
+                    headers.get("x-deltaserve-routing-score"),
+                    body.get("model") if isinstance(body, dict) else body)
+            if status == 200 and last[1] == want:
+                break
+            time.sleep(0.5)
+        print(f"    auto {prompt[:42]!r:46} → {last}")
+        return last[0] == 200 and last[1] == want and last[3] == want
+
+    try:
+        t0 = time.monotonic()
+        while True:
+            status, _, _ = http(port, "/health", timeout=5)
+            if status == 200:
+                break
+            if server.poll() is not None or time.monotonic() - t0 > args.timeout:
+                check("server became healthy", False)
+                return
+            time.sleep(2)
+        check(f"server healthy after {time.monotonic() - t0:.0f} s "
+              f"(finetuning off)", True)
+        status, _, jobs = http(port, "/ft_jobs")
+        check("no finetuning routes on this server (GET /ft_jobs → 404)",
+              status == 404)
+
+        st, took = routable(["ext-translate", "ext-sql"])
+        if not check(f"both listed adapters are indexed and in the pool "
+                     f"({took:.1f} s after the server was healthy)", st is not None):
+            print(f"    /adapters: {http(port, '/adapters')[2]}")
+            return
+        by = {a["name"]: a for a in st["adapters"]}
+        print(f"    pool: { {n: (a['tier'], a['lora_int_id']) for n, a in by.items()} }")
+        check("registered without loading: both still on the disk tier",
+              all(a["tier"] == "disk" for a in by.values()))
+        fin = {j["name"]: j for j in st["jobs"]["finished"]}
+        check("their jobs ran [init, indexing, ready] with no error; the pool "
+              "uses the adapters where they are (no copy)",
+              all(list(fin[n]["stages"]) == ["init", "indexing", "ready"]
+                  and fin[n]["error"] is None
+                  and fin[n]["saved_path"] == by[n]["path"] for n in by))
+
+        check("a translation request is routed to ext-translate",
+              auto("Translate to English: Wir gehen heute ins Kino.", "ext-translate"))
+        check("a SQL request is routed to ext-sql",
+              auto("Write a SQL query that lists customers without orders.",
+                   "ext-sql"))
+
+        status, _, reply = http(port, "/adapters", {
+            "name": "ext-poem", "path": str(toy),
+            "data_path": str(data["ext-poem"])})
+        check("POST /adapters accepts a third adapter while serving (202)",
+              status == 202 and reply["job"]["name"] == "ext-poem")
+        st, took = routable(["ext-poem"])
+        check(f"it becomes routable without a restart ({took:.1f} s)", st is not None)
+        check("a poem request is now routed to ext-poem",
+              auto("Write a short poem about a river in winter.", "ext-poem"))
+        check("the first two still route correctly",
+              auto("Translate to English: Das ist mein Bruder.", "ext-translate")
+              and auto("Write a SQL query that sums sales by region.", "ext-sql"))
+
+        status, _, reply = http(port, "/adapters", {"name": "bad",
+                                                    "path": str(out / "nope")})
+        time.sleep(1.5)
+        _, _, st = http(port, "/adapters")
+        failed = [j for j in st["jobs"]["finished"] if j["name"] == "bad"]
+        check("a bad adapter path fails its own job with a clear error; the "
+              "server keeps serving",
+              bool(failed) and failed[0]["stage"] == "failed"
+              and "no adapter weights" in failed[0]["error"]
+              and auto("Translate to English: Guten Abend.", "ext-translate"))
+        status, headers, body = http(port, "/v1/completions", {
+            "model": "qwen3-0.6b", "prompt": "Hello", "max_tokens": 2,
+            "temperature": 0})
+        check("a request naming the base model is untouched",
+              status == 200 and body.get("model") == "qwen3-0.6b"
+              and not any(k.startswith("x-deltaserve") for k in headers))
+        ok = _failed == 0
+    finally:
+        stop_tree(server)
+        log.close()
+        if not ok:
+            print(f"\n--- last lines of {log_path} ---")
+            print("\n".join(log_path.read_text(errors="replace").splitlines()[-60:]))
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=8791)
+    ap.add_argument("--api-servers", type=int, default=1)
+    ap.add_argument("--tp", type=int, default=1, help="tensor_parallel_size")
+    ap.add_argument("--router-device", default="cpu")
+    ap.add_argument("--router-gpu", type=int, default=None,
+                    help="physical GPU index for the router's encoder")
+    ap.add_argument("--indexing-cpus", default=None)
+    ap.add_argument("--epochs", type=int, default=1)
+    ap.add_argument("--repeats", type=int, default=4, help="corpus = 10 x this")
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--timeout", type=int, default=900)
+    ap.add_argument("--external", action="store_true",
+                    help="finetuning off: index and route existing adapters")
+    args = ap.parse_args()
+    if not os.environ.get("CUDA_VISIBLE_DEVICES"):
+        raise SystemExit("set CUDA_VISIBLE_DEVICES to the GPU this may use")
+
+    out = Path(args.out or tempfile.mkdtemp(prefix="ds-routing-live-"))
+    out.mkdir(parents=True, exist_ok=True)
+    if args.external:
+        external_main(args, out)
+        return
+    config, src_adapter = write_config(out, args)
+    log_path = out / "server.log"
+    where = (f"GPU {args.router_gpu}" if args.router_gpu is not None
+             else args.router_device)
+    print(f"=== adapter routing, live (GPU {os.environ['CUDA_VISIBLE_DEVICES']}, "
+          f"TP={args.tp}, {args.api_servers} API server(s), router on {where}) ===")
+    print(f"    out dir: {out}")
+
+    env = dict(os.environ, HF_HUB_OFFLINE="1", VLLM_USE_FLASHINFER_SAMPLER="0",
+               TOKENIZERS_PARALLELISM="false")
+    env.setdefault("HF_HOME", "/mnt/storage/huggingface")
+    log = open(log_path, "w")
+    server = subprocess.Popen(
+        [sys.executable, str(_REPO / "eval-tp/launch_deltaserve.py"),
+         "--family", "qwen3-0.6b", "--config", str(config), "--tp", str(args.tp),
+         "--port", str(args.port)],
+        stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+    port = args.port
+    ok = False
+    try:
+        t0 = time.monotonic()
+        early = None
+        while True:
+            status, _, _ = http(port, "/health", timeout=5)
+            if status == 200:
+                break
+            if server.poll() is not None or time.monotonic() - t0 > args.timeout:
+                check("server became healthy", False)
+                return
+            time.sleep(2)
+        check(f"server healthy after {time.monotonic() - t0:.0f} s", True)
+
+        status, headers, body = http(port, "/v1/completions", {
+            "model": "auto", "prompt": "Translate to English: Guten Tag.",
+            "max_tokens": 4, "temperature": 0})
+        early = (status, headers.get("x-deltaserve-routing"),
+                 headers.get("x-deltaserve-routing-reason"),
+                 (body or {}).get("model") if isinstance(body, dict) else body)
+        print(f"    auto request right after startup: {early}")
+        check("an auto request is answered (200) whatever the job's state",
+              status == 200)
+
+        status, _, jobs = http(port, "/ft_jobs")
+        check("GET /ft_jobs works", status == 200 and isinstance(jobs, dict))
+        job = (jobs or {}).get("current") or ((jobs or {}).get("finished") or [None])[0]
+        name = job["name"] if job else None
+        print(f"    job: {name} stage={job and job['stage']}")
+        check("the job has a generated dserve-routing- name and the four stages",
+              bool(name) and name.startswith("dserve-routing-")
+              and list(job["stages"]) == ["init", "training", "indexing", "ready"])
+
+        seen, last, final = set(), None, None
+        t1 = time.monotonic()
+        while time.monotonic() - t1 < args.timeout:
+            status, _, jobs = http(port, "/ft_jobs")
+            if status != 200:
+                break
+            cur = jobs.get("current")
+            if cur is None:
+                final = (jobs.get("finished") or [None])[-1]
+                break
+            if cur["stage"] != last:
+                last = cur["stage"]
+                seen.add(last)
+                print(f"    [{time.monotonic() - t1:5.1f}s] stage: {last} "
+                      f"{cur.get('detail')}", flush=True)
+            # keep the engine stepping: stages advance on scheduler steps
+            http(port, "/v1/completions", {
+                "model": "qwen3-0.6b", "prompt": "Hello", "max_tokens": 1,
+                "temperature": 0}, timeout=60)
+            time.sleep(1.0)
+        print(f"    stages seen while running: {sorted(seen)}")
+        print(f"    final: {final and {k: final[k] for k in ('stage', 'stages', 'error', 'saved_path')}}")
+        if not check("the job finished without error, every stage done",
+                     final is not None and final["error"] is None
+                     and all(v == "done" for v in final["stages"].values())):
+            return
+        check("training and indexing were seen running",
+              any("training" in s for s in seen)
+              or final["stages"]["training"] == "done")
+
+        saved = final["saved_path"]
+        check("trained adapter saved on disk",
+              bool(saved) and os.path.isfile(os.path.join(saved, "adapter_model.safetensors"))
+              and os.path.isfile(os.path.join(saved, "adapter_config.json")))
+        if saved:
+            from safetensors.torch import load_file
+
+            a = load_file(os.path.join(saved, "adapter_model.safetensors"))
+            b = load_file(str(src_adapter / "adapter_model.safetensors"))
+            diff = max(float((a[k].float() - b[k].float()).abs().max()) for k in b)
+            print(f"    max |trained - initial| over all factors: {diff:.3e}")
+            check("same tensors and shapes as the source adapter",
+                  set(a) == set(b) and all(a[k].shape == b[k].shape for k in b))
+            check("the saved weights are trained (differ from the initial ones)",
+                  diff > 0)
+
+        idx = Path(out / "index")
+        check("pool registry and routable index written",
+              (idx / "pool.json").is_file() and (idx / "routable.npz").is_file())
+
+        routed = None
+        for _ in range(20):      # the router re-reads its index within ~1 s
+            status, headers, body = http(port, "/v1/completions", {
+                "model": "auto",
+                "prompt": "Translate to English: Wir gehen heute ins Kino.",
+                "max_tokens": 8, "temperature": 0})
+            routed = (status, headers, body)
+            if headers.get("x-deltaserve-routing") == "routed":
+                break
+            time.sleep(0.5)
+        status, headers, body = routed
+        print(f"    routed request: status={status} "
+              f"{ {k: v for k, v in headers.items() if k.startswith('x-deltaserve')} } "
+              f"model={body.get('model') if isinstance(body, dict) else body}")
+        check("auto + translation prompt → 200", status == 200)
+        check("headers: routed to the job's adapter, with a score",
+              headers.get("x-deltaserve-routing") == "routed"
+              and headers.get("x-deltaserve-adapter") == name
+              and "x-deltaserve-routing-score" in headers)
+        check("the response's model field is the adapter",
+              isinstance(body, dict) and body.get("model") == name)
+
+        status, headers, body = http(port, "/v1/completions", {
+            "model": "auto", "prompt": "What is the capital of Australia?",
+            "max_tokens": 4, "temperature": 0})
+        print(f"    unrelated auto request: "
+              f"{ {k: v for k, v in headers.items() if k.startswith('x-deltaserve')} }")
+        check("an unrelated auto request is also answered", status == 200)
+
+        status, headers, body = http(port, "/v1/completions", {
+            "model": "qwen3-0.6b", "prompt": "Hello", "max_tokens": 2,
+            "temperature": 0})
+        check("a request naming the base model: 200, no routing headers",
+              status == 200
+              and not any(k.startswith("x-deltaserve") for k in headers)
+              and body.get("model") == "qwen3-0.6b")
+
+        status, headers, body = http(port, "/v1/completions", {
+            "model": name, "prompt": "Translate to English: Danke.",
+            "max_tokens": 4, "temperature": 0})
+        check("the adapter is also servable by its name, without routing headers",
+              status == 200 and body.get("model") == name
+              and not any(k.startswith("x-deltaserve") for k in headers))
+        for _ in range(6):       # several requests: with >1 API server each
+            s2, h2, b2 = http(port, "/v1/completions", {   # resolves on its own
+                "model": "auto", "prompt": "Translate to English: Bis morgen.",
+                "max_tokens": 2, "temperature": 0})
+            if s2 != 200 or (b2 or {}).get("model") != name:
+                check(f"repeated routed requests keep working ({s2}, {b2})", False)
+                break
+        else:
+            check("repeated routed requests keep working (all API servers)", True)
+        ok = _failed == 0
+    finally:
+        stop_tree(server)
+        log.close()
+        if not ok:
+            print(f"\n--- last lines of {log_path} ---")
+            lines = log_path.read_text(errors="replace").splitlines()
+            print("\n".join(lines[-60:]))
+
+
+if __name__ == "__main__":
+    main()
+    color = _RED if _failed else _GREEN
+    print(f"\n{color}{_passed} passed, {_failed} failed{_RESET}")
+    sys.exit(1 if _failed else 0)

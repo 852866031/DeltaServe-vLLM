@@ -19,11 +19,18 @@ least-recently-used), so the pool's ``gpu`` tier is its intent, not yet a fact.
 
 import multiprocessing as mp
 import os
+import threading
 
 from deltaserve import dprint
 from deltaserve.adapter_routing.index import CentroidIndex
 from deltaserve.adapter_routing.pool import AdapterPool
-from deltaserve.adapter_routing.stages import INDEX_FILE, index_dir
+from deltaserve.adapter_routing.stages import (
+    INDEX_FILE,
+    IndexingStage,
+    SharedIndexer,
+    index_dir,
+)
+from deltaserve.ft_job import FinetuneJobSpec, FtJobManager
 
 
 class VllmLoRABackend:
@@ -50,9 +57,15 @@ class VllmLoRABackend:
         """vLLM frees a slot by its own least-recently-used eviction."""
 
 
-def _router_service_main(routing_kwargs: dict, device: str) -> None:
-    from deltaserve.adapter_routing.service import build_router, serve
+def _router_service_main(routing_kwargs: dict) -> None:
+    from deltaserve.adapter_routing.service import (
+        apply_router_placement,
+        serve_config,
+    )
     from deltaserve.config import AdapterRoutingConfig
+
+    cfg = AdapterRoutingConfig(**routing_kwargs)
+    device = apply_router_placement(cfg)     # before anything touches CUDA
 
     try:
         from deltaserve.backward_process import arm_parent_death_signal
@@ -60,27 +73,25 @@ def _router_service_main(routing_kwargs: dict, device: str) -> None:
         arm_parent_death_signal("router")
     except Exception:  # noqa: BLE001 — never block the service on this
         pass
-    if device == "cpu":
-        os.environ["CUDA_VISIBLE_DEVICES"] = ""
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    cfg = AdapterRoutingConfig(**routing_kwargs)
-    router, path = build_router(cfg, device)
-    router.encoder.load()
-    router.refresh(force=True)
-    dprint(f"[router] serving on {path} | encoder={cfg.encoder} on {device} | "
-           f"{len(router.index)} adapters")
-    serve(router, path)
+    import signal
+    import sys
+
+    # SIGTERM (engine shutdown, or the whole server being stopped) → unwind
+    # through serve()'s cleanup, which removes the socket file.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    serve_config(cfg, device)
 
 
 class RouterServiceProcess:
     """The router service as a child of the engine."""
 
-    def __init__(self, cfg, device: str) -> None:
+    def __init__(self, cfg) -> None:
         from dataclasses import asdict
 
         from deltaserve.adapter_routing.service import socket_path
 
-        self._args = (asdict(cfg), device)
+        self._args = (asdict(cfg),)
         self._socket = socket_path(index_dir(cfg))
         self._proc = None
 
@@ -115,7 +126,7 @@ class RouterServiceProcess:
 
 class AdapterRoutingEngine:
     def __init__(self, engine, vllm_config, backend=None,
-                 start_service: bool = True) -> None:
+                 start_service: bool = True, start_driver: bool = True) -> None:
         cfg = vllm_config.adapter_routing_config
         lora = vllm_config.lora_config
         if lora is None:
@@ -138,8 +149,88 @@ class AdapterRoutingEngine:
                f"{gpu_slots} GPU slots, index dir {self.dir}")
         self.service = None
         if start_service:
-            self.service = RouterServiceProcess(cfg, cfg.router_device)
+            self.service = RouterServiceProcess(cfg)
             self.service.start()
+
+        # One encoder process for every job of this server.
+        self.shared_indexer = SharedIndexer(
+            lambda: IndexingStage.make_executors(cfg))
+        # Jobs that do not train — an existing adapter being indexed and
+        # published. They need nothing of the finetuning machinery or of the
+        # engine loop, so they run on their own driver thread, next to a
+        # training job, one at a time.
+        self.jobs = FtJobManager(adapter_routing=True)
+        self._jobs_lock = threading.RLock()
+        self._external: dict[str, dict] = {}
+        self._stop = threading.Event()
+        self._driver = None
+        for spec in cfg.adapters or []:
+            try:
+                self.submit_adapter(**spec)
+            except Exception as e:  # noqa: BLE001 — one bad entry must not stop the server
+                dprint(f"[adapter-routing] adapter {spec.get('name') or spec.get('path')}"
+                       f" not added: {e}")
+        if start_driver:
+            self._driver = threading.Thread(target=self._drive, daemon=True,
+                                            name="deltaserve-adapter-jobs")
+            self._driver.start()
+
+    # ------------------------------------------------- jobs that do not train
+    @property
+    def adapter_routing_config(self):
+        return self.cfg
+
+    def submit_adapter(self, path: str, name: str | None = None,
+                       data_path: str | None = None,
+                       centroid_path: str | None = None,
+                       prewarm: bool = False) -> dict:
+        """Add an existing adapter to the pool through a job with stages
+        ``[init, indexing, ready]`` — or ``[init, ready]`` when its centroid is
+        given (``centroid_path``, a .npy vector) or there is no dataset (then it
+        is servable by name only). Nothing is trained, exported or copied, and
+        the weights are loaded only when a request first needs them (unless
+        ``prewarm``)."""
+        stages = ["init", "ready"]
+        if data_path and not centroid_path:
+            stages.insert(1, "indexing")
+        spec = FinetuneJobSpec(name=name or None, stages=tuple(stages),
+                               auto_routing=True, adapter_path=path,
+                               data_path=data_path)
+        with self._jobs_lock:
+            if name and name in self.pool \
+                    and self.pool.entries[name].path != path:
+                raise ValueError(f"adapter '{name}' is already in the pool with "
+                                 f"another path")
+            job = self.jobs.submit(spec, replace_finished=True)
+            self._external[job.name] = {"centroid_path": centroid_path,
+                                        "prewarm": bool(prewarm)}
+            return job.describe()
+
+    def tick_jobs(self) -> None:
+        """Advance the non-training jobs (the driver thread calls this)."""
+        with self._jobs_lock:
+            self.jobs.tick(self)
+            idle = self.jobs.current is None
+        if idle and self.shared_indexer.idle_and_loaded:
+            self.shared_indexer.unload()      # give the encoder's memory back
+
+    def _drive(self) -> None:
+        while not self._stop.wait(0.2):
+            try:
+                self.tick_jobs()
+            except Exception as e:  # noqa: BLE001 — keep the driver alive
+                dprint(f"[adapter-routing] job driver error: {e}")
+
+    def on_job_ready(self, job) -> None:
+        """'ready' of a job that did not train: its adapter IS the one on disk."""
+        import numpy as np
+
+        extra = self._external.get(job.name, {})
+        job.saved_path = job.spec.adapter_path
+        centroid = None
+        if extra.get("centroid_path"):
+            centroid = np.load(extra["centroid_path"]).reshape(-1)
+        self.publish(job, load=bool(extra.get("prewarm")), centroid=centroid)
 
     def _centroids(self) -> CentroidIndex | None:
         """Every centroid built so far (the indexing stage's file)."""
@@ -150,19 +241,28 @@ class AdapterRoutingEngine:
         """Default location of a job's saved adapter."""
         return os.path.join(self.dir, "adapters", name)
 
-    def publish(self, job) -> None:
-        """A finished auto-routable job's adapter joins the pool."""
+    def publish(self, job, load: bool = True, centroid=None) -> None:
+        """A finished auto-routable job's adapter joins the pool. ``load=False``
+        only registers it (weights loaded on first use)."""
         if not job.saved_path:
-            raise RuntimeError(f"{job.name}: the trained adapter was not saved")
-        centroids = self._centroids()
-        centroid = None
-        if centroids is not None and job.name in centroids:
-            centroid = centroids._matrix[centroids.names.index(job.name)].copy()
-        else:
+            raise RuntimeError(f"{job.name}: the adapter was not saved")
+        if centroid is None:
+            centroids = self._centroids()
+            if centroids is not None and job.name in centroids:
+                centroid = centroids._matrix[centroids.names.index(job.name)].copy()
+        if centroid is None:
             dprint(f"[adapter-routing] {job.name} has no centroid (no 'indexing' "
                    f"stage?): servable by name, not auto-routable")
+        if job.name in self.pool:
+            # Known from an earlier run (restored registry): refresh its centroid.
+            entry = self.pool.entries[job.name]
+            if centroid is not None:
+                entry.centroid = centroid
+            if entry.enabled:
+                self.pool.enable(job.name)
+            return
         self.pool.register(job.name, job.saved_path, centroid=centroid,
-                           job=job.name)
+                           job=job.name, load=load)
 
     def note_request(self, request) -> None:
         """Count a request that uses a pool adapter (drives GPU-slot retention)."""
@@ -176,10 +276,16 @@ class AdapterRoutingEngine:
             dprint(f"[adapter-routing] hit on {name} not counted: {e}")
 
     def status(self) -> dict:
-        return {**self.pool.status(),
+        with self._jobs_lock:
+            jobs = self.jobs.status()
+        return {**self.pool.status(), "jobs": jobs,
                 "router_service_alive": bool(self.service and self.service.is_alive()),
                 "index_dir": self.dir}
 
     def shutdown(self) -> None:
+        self._stop.set()
+        if self._driver is not None:
+            self._driver.join(timeout=3.0)
+        self.shared_indexer.stop()
         if self.service is not None:
             self.service.stop()

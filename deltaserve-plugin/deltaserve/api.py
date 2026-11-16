@@ -100,6 +100,47 @@ async def ft_jobs(raw_request: Request):
     return JSONResponse(status_code=200, content=result)
 
 
+routing_router = APIRouter()
+
+
+@routing_router.get("/adapters")
+async def adapters(raw_request: Request):
+    """The adapter pool: every auto-routable adapter with its tier, hit count
+    and state, plus the jobs that are adding adapters."""
+    try:
+        result = await engine_client(raw_request).engine_core.call_utility_async(
+            "deltaserve_adapters")
+    except Exception as e:
+        logger.exception("adapters failed")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    return JSONResponse(status_code=409 if "error" in result else 200,
+                        content=result)
+
+
+@routing_router.post("/adapters")
+async def add_adapter(raw_request: Request):
+    """Add an existing adapter to the pool without training. JSON body:
+    ``{"path": ..., "name"?: ..., "data_path"?: ..., "centroid_path"?: ...,
+    "prewarm"?: bool}``. With ``data_path`` its centroid is built in the
+    background (a job with stages [init, indexing, ready]); it becomes
+    auto-routable when that job is done — watch GET /adapters."""
+    try:
+        body = await raw_request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict) or not body.get("path"):
+        return JSONResponse(status_code=400,
+                            content={"error": "JSON body with 'path' required"})
+    try:
+        result = await engine_client(raw_request).engine_core.call_utility_async(
+            "deltaserve_add_adapter", body)
+    except Exception as e:
+        logger.exception("add_adapter failed")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    return JSONResponse(status_code=400 if "error" in result else 202,
+                        content=result)
+
+
 def attach_router(app: FastAPI):
     """Called after vLLM registers its own routers (plugin wrapper)."""
     ac = getattr(app.state.args, "additional_config", None) or {}
@@ -120,6 +161,7 @@ def attach_router(app: FastAPI):
         from deltaserve.adapter_routing.resolver import install_resolver
 
         install_resolver(cfg)
+        app.include_router(routing_router)
         logger.info("Adapter routing on: requests with model=%r are routed.",
                     routing.get("route_model_name", "auto"))
     elif "deltaserve" in ac or routing:

@@ -141,6 +141,13 @@ def load_yaml_config(path: str | Path, verbose: bool = True) -> dict[str, Any]:
             if "path" in key.lower() and isinstance(val, str) \
                     and not Path(val).is_absolute():
                 body[key] = str((base_dir / val).resolve())
+    # ... and the paths of the adapters listed for routing.
+    for entry in (raw.get(ADAPTER_ROUTING_SECTION) or {}).get("adapters") or []:
+        if isinstance(entry, dict):
+            for key, val in entry.items():
+                if "path" in key.lower() and isinstance(val, str) \
+                        and not Path(val).is_absolute():
+                    entry[key] = str((base_dir / val).resolve())
 
     if verbose:
         print_loaded_config(raw, source=str(path))

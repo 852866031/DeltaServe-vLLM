@@ -7,8 +7,9 @@
 - ``Router``: encoder + centroid index file + fallback threshold → a
   ``RouteDecision``. The index file is re-read when it changes (an adapter was
   indexed, disabled, ...), so the service follows the pool without a restart.
-- ``serve``: the request loop on a unix socket. One encoder, one request at a
-  time — every API server process shares it instead of loading its own copy.
+- ``serve``: the request loop on a unix socket. One encoder shared by every
+  API server process; requests that arrive while it is busy are encoded
+  together as one batch (``RouteBatcher``).
 - ``RouterClient``: what an API server uses. It never raises: a service that is
   down, slow or broken yields a fallback decision (the request is served by the
   base model) and the client reconnects on the next request.
@@ -76,19 +77,103 @@ class Router:
             self.index, self._mtime = CentroidIndex.load(self.index_file), mtime
             dprint(f"[router] index loaded: {len(self.index)} adapters")
 
-    def route(self, text: str | None) -> RouteDecision:
-        self.requests += 1
-        if not text or not text.strip():
-            return RouteDecision(None, None, NO_TEXT)
+    def route_many(self, texts: list) -> list[RouteDecision]:
+        """One decision per text, with ONE encoder call for all of them."""
+        self.requests += len(texts)
         self.refresh()
-        if not len(self.index):
-            return RouteDecision(None, None, NO_ADAPTERS)
-        emb = self.encoder.encode([text])[0]
-        name, score = self.index.route(emb, self.threshold)
-        return RouteDecision(name, score, "" if name else BELOW_THRESHOLD)
+        out: list = [None] * len(texts)
+        todo = []
+        for i, text in enumerate(texts):
+            if not text or not text.strip():
+                out[i] = RouteDecision(None, None, NO_TEXT)
+            elif not len(self.index):
+                out[i] = RouteDecision(None, None, NO_ADAPTERS)
+            else:
+                todo.append(i)
+        if todo:
+            embs = self.encoder.encode([texts[i] for i in todo])
+            for i, emb in zip(todo, embs):
+                name, score = self.index.route(emb, self.threshold)
+                out[i] = RouteDecision(name, score, "" if name else BELOW_THRESHOLD)
+        return out
+
+    def route(self, text: str | None) -> RouteDecision:
+        return self.route_many([text])[0]
 
 
-def _handle(conn, router: Router, lock: threading.Lock) -> None:
+class RouteBatcher:
+    """Turns concurrent route requests into encoder batches.
+
+    A single thread owns the encoder. When it is free it takes EVERYTHING that
+    is waiting (up to ``max_batch``) and encodes it in one call. So a request
+    arriving at an idle service is encoded at once, alone — no added latency —
+    and under load the requests that queued up while the encoder was busy share
+    one batch, which costs little more than a single request on a GPU.
+    ``wait_s`` > 0 additionally holds a batch open that long to let it fill."""
+
+    def __init__(self, router: Router, max_batch: int = 16,
+                 wait_s: float = 0.0) -> None:
+        import queue
+
+        self.router = router
+        self.max_batch, self.wait_s = max(1, int(max_batch)), float(wait_s)
+        self._q: "queue.Queue" = queue.Queue()
+        self._empty = queue.Empty
+        self.batches = 0
+        self.largest = 0
+        self._stop = False
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="router-batcher")
+        self._thread.start()
+
+    def submit(self, text) -> RouteDecision:
+        """Blocks until this text's decision is ready; raises what the encoder
+        raised."""
+        item = [text, threading.Event(), None, None]
+        self._q.put(item)
+        item[1].wait()
+        if item[3] is not None:
+            raise item[3]
+        return item[2]
+
+    def _loop(self) -> None:
+        while True:
+            first = self._q.get()
+            if first is None:
+                return
+            batch = [first]
+            deadline = time.monotonic() + self.wait_s
+            while len(batch) < self.max_batch:
+                try:
+                    left = deadline - time.monotonic()
+                    nxt = (self._q.get(timeout=left) if left > 0
+                           else self._q.get_nowait())
+                except self._empty:
+                    break
+                if nxt is None:
+                    self._stop = True
+                    break
+                batch.append(nxt)
+            try:
+                decisions = self.router.route_many([it[0] for it in batch])
+                for it, d in zip(batch, decisions):
+                    it[2] = d
+            except Exception as e:  # noqa: BLE001 — handed to every waiter
+                for it in batch:
+                    it[3] = e
+            self.batches += 1
+            self.largest = max(self.largest, len(batch))
+            for it in batch:
+                it[1].set()
+            if self._stop:
+                return
+
+    def stop(self) -> None:
+        self._q.put(None)
+        self._thread.join(timeout=5.0)
+
+
+def _handle(conn, router: Router, batcher: RouteBatcher) -> None:
     try:
         while True:
             try:
@@ -96,14 +181,14 @@ def _handle(conn, router: Router, lock: threading.Lock) -> None:
             except (EOFError, OSError, TypeError):   # closed, here or by serve()
                 return
             try:
-                with lock:                      # one encoder, one request at a time
-                    if msg[0] == "route":
-                        d = router.route(msg[1])
-                        reply = ("ok", d.adapter, d.score, d.reason)
-                    elif msg[0] == "ping":
-                        reply = ("ok", len(router.index), router.requests)
-                    else:
-                        reply = ("error", f"unknown request {msg[0]!r}")
+                if msg[0] == "route":
+                    d = batcher.submit(msg[1])
+                    reply = ("ok", d.adapter, d.score, d.reason)
+                elif msg[0] == "ping":
+                    reply = ("ok", len(router.index), router.requests,
+                             batcher.batches, batcher.largest)
+                else:
+                    reply = ("error", f"unknown request {msg[0]!r}")
             except Exception as e:  # noqa: BLE001 — reported to the client
                 reply = ("error", f"{type(e).__name__}: {e}")
             try:
@@ -115,7 +200,8 @@ def _handle(conn, router: Router, lock: threading.Lock) -> None:
 
 
 def serve(router: Router, path: str, stop: threading.Event | None = None,
-          ready: threading.Event | None = None) -> None:
+          ready: threading.Event | None = None, max_batch: int = 16,
+          batch_wait_s: float = 0.0) -> None:
     """Answer route requests on the unix socket ``path`` until ``stop`` is set
     (forever when ``stop`` is None)."""
     try:
@@ -127,7 +213,7 @@ def serve(router: Router, path: str, stop: threading.Event | None = None,
         listener = Listener(path, family="AF_UNIX", authkey=_authkey(path))
     finally:
         os.umask(old)
-    lock = threading.Lock()
+    batcher = RouteBatcher(router, max_batch, batch_wait_s)
     stopping = threading.Event()
     conns = []
 
@@ -141,7 +227,7 @@ def serve(router: Router, path: str, stop: threading.Event | None = None,
                 conn.close()
                 return
             conns.append(conn)
-            threading.Thread(target=_handle, args=(conn, router, lock),
+            threading.Thread(target=_handle, args=(conn, router, batcher),
                              daemon=True).start()
 
     thread = threading.Thread(target=acceptor, daemon=True, name="router-accept")
@@ -161,6 +247,7 @@ def serve(router: Router, path: str, stop: threading.Event | None = None,
             pass
         thread.join(timeout=2.0)
         listener.close()
+        batcher.stop()
         for conn in conns:                  # hang up on every client
             try:
                 conn.close()
@@ -230,6 +317,45 @@ class RouterClient:
             self._close()
 
 
+def router_placement(cfg) -> tuple[str, str | None]:
+    """Where the encoder goes: ``(torch device, CUDA_VISIBLE_DEVICES to set)``.
+
+    ``router_gpu: N`` names a PHYSICAL GPU (the nvidia-smi index): the service
+    process is restricted to that one card, whether or not the model uses it.
+    Otherwise ``router_device`` is used as is (``cpu`` hides every GPU from
+    the service; ``cuda:N`` counts within the GPUs the engine can see)."""
+    if cfg.router_gpu is not None:
+        return "cuda:0", str(int(cfg.router_gpu))
+    if cfg.router_device == "cpu":
+        return "cpu", ""
+    return cfg.router_device, None
+
+
+def apply_router_placement(cfg) -> str:
+    """Apply ``router_placement`` to THIS process (call before any CUDA use);
+    returns the torch device."""
+    device, visible = router_placement(cfg)
+    if visible is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = visible
+    return device
+
+
+def serve_config(cfg, device: str | None = None) -> None:
+    """Run the router service of an ``AdapterRoutingConfig`` in this process."""
+    if device is None:
+        device = apply_router_placement(cfg)
+    router, path = build_router(cfg, device)
+    router.encoder.load()
+    router.refresh(force=True)
+    where = device if cfg.router_gpu is None or device == "cpu" \
+        else f"GPU {cfg.router_gpu}"
+    dprint(f"[router] serving on {path} | encoder={cfg.encoder} on {where} | "
+           f"{len(router.index)} adapters | threshold="
+           f"{cfg.fallback_score_threshold} | batch<={cfg.route_batch_max}")
+    serve(router, path, max_batch=cfg.route_batch_max,
+          batch_wait_s=cfg.route_batch_wait_ms / 1e3)
+
+
 def build_router(cfg, device: str = "cpu") -> tuple[Router, str]:
     """(Router, socket path) for an ``AdapterRoutingConfig``."""
     from deltaserve.adapter_routing.encoder import SentenceEncoder
@@ -251,18 +377,13 @@ def main() -> None:
 
     ap = argparse.ArgumentParser(description="DeltaServe adapter-routing service")
     ap.add_argument("--config", required=True, help="serving YAML")
-    ap.add_argument("--device", default="cpu", help="encoder device (cpu / cuda:N)")
+    ap.add_argument("--device", default=None,
+                    help="override the YAML's placement (cpu / cuda:N)")
     args = ap.parse_args()
     cfg = adapter_routing_config(load_yaml_config(args.config, verbose=False))
     if not cfg.enable_adapter_routing:
         raise SystemExit("adapter_routing.enable_adapter_routing is off")
-    router, path = build_router(cfg, args.device)
-    router.encoder.load()
-    router.refresh(force=True)
-    dprint(f"[router] serving on {path} | encoder={cfg.encoder} on {args.device} "
-           f"| {len(router.index)} adapters | threshold="
-           f"{cfg.fallback_score_threshold}")
-    serve(router, path)
+    serve_config(cfg, args.device)
 
 
 if __name__ == "__main__":
