@@ -249,6 +249,11 @@ class BackwardService:
         that train one override this."""
         return {}
 
+    def switch_adapter(self, ft: dict, hparams: dict) -> dict:
+        """[ft-job] Start training another adapter; services that train one
+        override this."""
+        raise NotImplementedError("this backward service does not train an adapter")
+
     def process_backward(self, activations: dict, sample_lens: list[int],
                          n: int, epoch: int):
         """One backward cycle over the first ``n`` buffered rows (LoRA backward
@@ -328,6 +333,15 @@ class BackwardService:
                            f"total_tokens_per_epoch={self._total_tokens_per_epoch}")
                 elif cmd == "process_activations":
                     self._handle_process_activations(conn, msg)
+                elif cmd == "switch_adapter":
+                    # [ft-job] the next finetuning job's adapter
+                    try:
+                        conn.send({"event": "adapter_switched",
+                                   **self.switch_adapter(msg.get("ft") or {},
+                                                         msg.get("hparams") or {})})
+                    except Exception as e:  # noqa: BLE001 — the job fails, not the child
+                        conn.send({"event": "error",
+                                   "msg": f"{type(e).__name__}: {e}"})
                 elif cmd == "export_lora":
                     # [ft-job] the trained adapter, for saving at 'ready'
                     conn.send({"event": "lora_state",

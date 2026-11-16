@@ -155,6 +155,9 @@ def export_trained_adapter(engine, src_dir: str, dst_dir: str,
     worker's pipe to its backward child."""
     results = engine.model_executor.collective_rpc("deltaserve_export_ft_adapter")
     results = [r for r in results if r is not None]
+    errors = [r["error"] for r in results if isinstance(r, dict)]
+    if errors:
+        raise RuntimeError(f"adapter export failed on a worker: {errors[0]}")
     if not results:
         raise RuntimeError("no worker has a trained adapter to export")
     results.sort(key=lambda r: r[0])

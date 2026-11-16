@@ -87,6 +87,31 @@ async def save_estimator_state(raw_request: Request):
                         content=result)
 
 
+@router.post("/ft_jobs")
+async def submit_ft_job(raw_request: Request):
+    """Queue a finetuning job; jobs run one after another. JSON body with the
+    keys of the ``ft_job`` YAML section: ``adapter_path`` and ``data_path``
+    (required), ``name``, ``stages``, ``num_epochs``, ``learning_rate``,
+    ``weight_decay``, ``gamma``, ``auto_routing``, ``save_path``. The adapter
+    must have the shape of the one the server was launched with (same LoRA
+    tensors, rank, alpha/r). Watch GET /ft_jobs."""
+    try:
+        body = await raw_request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "JSON object body required"})
+    try:
+        result = await engine_client(raw_request).engine_core.call_utility_async(
+            "deltaserve_submit_ft_job", body)
+    except Exception as e:
+        logger.exception("submit_ft_job failed")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    return JSONResponse(status_code=400 if "error" in result else 202,
+                        content=result)
+
+
 @router.get("/ft_jobs")
 async def ft_jobs(raw_request: Request):
     """The finetuning jobs of this server: the running one with the state of

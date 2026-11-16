@@ -404,6 +404,34 @@ class DeltaServeWorker(Worker):
         dprint(f"shared served LoRA buffers (slot={slot}, {len(layers)} layers) "
                f"with backward process: {ack}")
 
+    def deltaserve_switch_ft_adapter(self, path: str, hparams: dict):
+        """[ft-job] The next finetuning job starts: load its adapter (fp32, on
+        this device) and hand it to the backward child, which copies it into
+        its masters and publishes it to the served FT slot. Invoked via
+        collective_rpc on every rank. Returns the child's summary, or
+        ``{"error": ...}`` (e.g. the adapter does not have the launch adapter's
+        shape). With ``hparams["dry_run"]`` the adapter is only checked."""
+        import os
+
+        from safetensors.torch import load_file
+
+        from deltaserve.ft_meta import read_lora_scaling
+
+        # Never raise out of a worker RPC: with several ranks the executor
+        # stops reading at the first failed reply and the others' replies
+        # would be taken for the NEXT call's. Errors are returned instead.
+        try:
+            backward_process = getattr(self, "backward_process", None)
+            if backward_process is None:
+                raise RuntimeError("no backward child on this worker")
+            weights = os.path.join(path, "adapter_model.safetensors")
+            raw = load_file(weights, device=str(self.device))
+            ft_state = {k: v.float() for k, v in raw.items()}
+            return backward_process.switch_adapter(
+                ft_state, {**hparams, "lora_scaling": read_lora_scaling(path)})
+        except Exception as e:  # noqa: BLE001 — reported to the engine
+            return {"error": f"{type(e).__name__}: {e}"}
+
     def deltaserve_export_ft_adapter(self):
         """[ft-job] ``(tp_rank, {PEFT key: CPU tensor})``: this rank's shard of
         the trained FT adapter, or None without a backward child. Invoked via
@@ -413,8 +441,11 @@ class DeltaServeWorker(Worker):
             return None
         from vllm.distributed import get_tensor_model_parallel_rank
 
-        return (int(get_tensor_model_parallel_rank()),
-                backward_process.export_lora())
+        try:        # errors are returned, never raised (see the switch RPC)
+            return (int(get_tensor_model_parallel_rank()),
+                    backward_process.export_lora())
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"{type(e).__name__}: {e}"}
 
     def deltaserve_start_finetuning(self) -> bool:
         """[DeltaServe] Open FT admission. Invoked via collective_rpc from the

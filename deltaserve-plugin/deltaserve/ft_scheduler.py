@@ -203,8 +203,15 @@ class FinetuneScheduler(AsyncScheduler):
         from deltaserve.ft_job import FinetuneJobSpec, FtJobManager
         self._ft_jobs = FtJobManager(adapter_routing=bool(
             self.vllm_config.adapter_routing_config.enable_adapter_routing))
-        if ft_cfg.enable_finetuning:
-            self._ft_jobs.submit(FinetuneJobSpec.from_finetune_config(ft_cfg))
+        # The launch job is already bound (adapter loaded by the worker, dataset
+        # by the injector above). Without a dataset there is none: the server
+        # waits for jobs submitted over HTTP (POST /ft_jobs).
+        self._launch_job = None
+        self._job_switch: dict | None = None    # the next job being prepared
+        self._job_wait = False
+        if ft_cfg.enable_finetuning and ft_cfg.data_path:
+            self._launch_job = self._ft_jobs.submit(
+                FinetuneJobSpec.from_finetune_config(ft_cfg)).name
 
         dprint(
             f"[ft-sched] FinetuneScheduler active | capacity={capacity} "
@@ -234,6 +241,131 @@ class FinetuneScheduler(AsyncScheduler):
 
         save_job_adapter(job, getattr(self, "_ds_engine", None),
                          getattr(self, "_adapter_routing", None))
+
+    # ---- [ft-job] jobs submitted while serving, run one after another -----
+    def submit_ft_job(self, spec: dict) -> dict:
+        """POST /ft_jobs: queue a finetuning job. ``spec`` has the keys of the
+        ``ft_job`` YAML section; training settings default to the launch
+        config's. It starts when the jobs before it are done."""
+        import os
+
+        from deltaserve.ft_job import JOB_FLAT_KEYS, JOB_META_KEYS, FinetuneJobSpec
+
+        ft_cfg = self.vllm_config.finetune_config
+        if not ft_cfg.finetuning_lora_path:
+            raise ValueError("this server was launched without a finetuning "
+                             "adapter (finetune.finetuning_lora_path): it has no "
+                             "finetuning slot to train in")
+        unknown = sorted(set(spec) - set(JOB_META_KEYS) - set(JOB_FLAT_KEYS))
+        if unknown:
+            raise ValueError(f"unknown key(s) {unknown}; known: "
+                             f"{sorted((*JOB_META_KEYS, *JOB_FLAT_KEYS))}")
+        path, data = spec.get("adapter_path"), spec.get("data_path")
+        if not path or not os.path.isfile(
+                os.path.join(path, "adapter_model.safetensors")):
+            raise ValueError(f"no adapter weights at adapter_path={path!r}")
+        if not data or not os.path.isfile(data):
+            raise ValueError(f"no dataset at data_path={data!r}")
+        stages = spec.get("stages") or ["init", "training", "ready"]
+        if "training" not in stages:
+            raise ValueError("a finetuning job needs a 'training' stage (to add an "
+                             "existing adapter without training use POST /adapters)")
+        job_spec = FinetuneJobSpec(
+            name=spec.get("name") or None, stages=tuple(stages),
+            auto_routing=bool(spec.get("auto_routing", False)),
+            adapter_init=spec.get("adapter_init") or "from_path",
+            save_path=spec.get("save_path") or None,
+            adapter_path=path, data_path=data,
+            num_epochs=int(spec.get("num_epochs", ft_cfg.num_epochs)),
+            learning_rate=float(spec.get("learning_rate", ft_cfg.learning_rate)),
+            weight_decay=float(spec.get("weight_decay", ft_cfg.weight_decay)),
+            gamma=float(spec.get("gamma", ft_cfg.gamma)))
+        return self._ft_jobs.submit(job_spec).describe()
+
+    def begin_job(self, job) -> None:
+        """'init' of a job that is not the launch job: tokenize its dataset on
+        a thread (it can be large) while the engine keeps serving."""
+        if job.name == self._launch_job:
+            return
+        import threading
+
+        from deltaserve.finetuning_store import FinetuningStore
+
+        ft_cfg = self.vllm_config.finetune_config
+        state = {"job": job.name, "store": None, "error": None}
+
+        def prepare():
+            try:
+                store = FinetuningStore(
+                    data_path=job.spec.data_path, tokenize=self._build_tokenize(),
+                    adapter=job.spec.adapter_path,
+                    total_epochs=job.spec.num_epochs,
+                    max_saved_finetuning_tokens=ft_cfg.max_saved_finetuning_tokens,
+                    max_prepare=ft_cfg.max_prepare)
+                store.load()
+                state["store"] = store
+            except Exception as e:  # noqa: BLE001 — surfaced through the stage
+                state["error"] = f"{type(e).__name__}: {e}"
+
+        state["thread"] = threading.Thread(target=prepare, daemon=True,
+                                           name="deltaserve-ft-job-prepare")
+        state["thread"].start()
+        self._job_switch = state
+
+    def job_ready_to_train(self, job) -> bool:
+        """'init' is done when the job's dataset is ready AND the finetuning
+        machinery has been switched to its adapter. The switch happens here,
+        between two engine steps, once nothing of the previous job is in
+        flight: every rank's backward child takes the new adapter in place and
+        publishes it to the served slot; then the scheduler takes the new
+        dataset and counters."""
+        if job.name == self._launch_job:
+            return True
+        state = self._job_switch
+        if state is None or state["job"] != job.name:
+            raise RuntimeError("the job was never prepared")
+        if state["error"]:
+            raise RuntimeError(state["error"])
+        if state["store"] is None:
+            return False
+        coord = self._coord
+        if coord.pending_backward or coord.fill_count or coord.reserved_fill:
+            return False                    # the previous job is still settling
+        store = state["store"]
+        if len(store) == 0:
+            raise RuntimeError(
+                f"finetuning dataset has no usable sample: {job.spec.data_path}")
+        engine = getattr(self, "_ds_engine", None)
+        if engine is None:
+            raise RuntimeError("no engine handle to switch the adapter through")
+        hparams = {"learning_rate": job.spec.learning_rate,
+                   "weight_decay": job.spec.weight_decay, "gamma": job.spec.gamma,
+                   "total_tokens_per_epoch": int(store.total_tokens_in_memory)}
+        def all_ranks(hp, what):
+            replies = engine.model_executor.collective_rpc(
+                "deltaserve_switch_ft_adapter", args=(job.spec.adapter_path, hp))
+            errors = [r["error"] for r in (replies or [])
+                      if isinstance(r, dict) and r.get("error")]
+            if errors:
+                raise RuntimeError(f"{what}: {errors[0]}")
+
+        # Two phases, so the ranks cannot end up training different adapters:
+        # every rank checks the adapter first; only then does any rank take it.
+        all_ranks({**hparams, "dry_run": True}, "the adapter was refused")
+        all_ranks(hparams, "the adapter switch failed AFTER the check passed "
+                           "(ranks may disagree; restart the server)")
+        # Every rank trains the new adapter now: the scheduler follows.
+        self._ft_injector.store = store
+        coord.current_epoch = 0
+        coord.corpus_total_tokens = int(store.total_tokens_in_memory)
+        coord.min_sample_len = store.sorted_lengths[0] if store.sorted_lengths else 1
+        coord.admission_open = True
+        coord.epoch_flush_pending = False
+        self._ft_exhausted_logged = False
+        self._job_switch = None
+        dprint(f"[ft-job] {job.name}: switched to its adapter and dataset "
+               f"({len(store)} samples, {job.spec.num_epochs} epoch(s))")
+        return True
 
     def admit_job(self, job) -> None:
         """[ft-job] 'admission': save the trained adapter, then let the pool
@@ -653,6 +785,12 @@ class FinetuneScheduler(AsyncScheduler):
         # a hang ("backward subprocess died" — see coord.poll_backward's
         # stuck-backward warning). After this prints, the engine cleanly
         # idles until the next inference request arrives.
+        if self._ft_jobs.busy:
+            # Finetuning itself has nothing to admit, but a job is waiting on
+            # something else (its dataset being prepared, indexing, the switch
+            # to the next job): keep ticking, without spinning (see schedule()).
+            self._job_wait = True
+            return True
         if not getattr(self, "_ft_exhausted_logged", False):
             store = self._ft_injector.store
             dprint(
@@ -921,6 +1059,14 @@ class FinetuneScheduler(AsyncScheduler):
 
     def schedule(self) -> SchedulerOutput:
         inputs = self._engine_inputs
+        if self._job_wait:
+            # This step exists only to advance a waiting job: wait for a
+            # request (handled at once) or a short while, instead of spinning.
+            self._job_wait = False
+            if inputs is not None:
+                inputs.poll(0.02)
+            else:
+                time.sleep(0.005)
         interruptible = (inputs is not None and not self._profiling_mode
                          and self.vllm_config.finetune_config.forward_interruptible)
         if interruptible:

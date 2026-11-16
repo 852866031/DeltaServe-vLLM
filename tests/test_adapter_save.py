@@ -244,6 +244,67 @@ def test_trainer_export():
               and tuple(back[key].shape) == tuple(ft[key].shape))
 
 
+def test_switch_adapter():
+    green("switching the trainer to the next job's adapter, in place:")
+    from deltaserve.bwd_services.llama3 import Llama3BackwardService
+
+    svc, _ = H.build_synthetic_service(
+        Llama3BackwardService, hidden=HID, n_layers=LAYERS, Hq=4, Hkv=2, Hd=8,
+        inter=48, vocab=50, r=R, lr=1e-3)
+    ft = svc.shared["ft"]
+    masters = {k: svc.lora[k[0]][k[1]][k[2]] for k in svc._lora_keys}
+    old_opt = svc.optimizer
+    svc.current_epoch, svc._epoch_processed_tokens = 3, 999
+    g = torch.Generator().manual_seed(5)
+    new = {k: torch.randn(v.shape, generator=g) for k, v in ft.items()}
+    hp = {"learning_rate": 5e-4, "weight_decay": 0.02, "gamma": 0.5,
+          "lora_scaling": svc.scaling, "total_tokens_per_epoch": 1234}
+    out = svc.switch_adapter(new, hp)
+    check("the new weights are in the masters", out["tensors"] == LAYERS * 8
+          and same(svc.export_lora_state(), new))
+    check("the masters are the SAME tensors (graphs and the served slot stay valid)",
+          all(svc.lora[k[0]][k[1]][k[2]] is p for k, p in masters.items()))
+    check("fresh optimizer with the job's learning rate and weight decay",
+          svc.optimizer is not old_opt
+          and svc.optimizer.param_groups[0]["lr"] == 5e-4
+          and svc.optimizer.param_groups[0]["weight_decay"] == 0.02
+          and svc.scheduler.gamma == 0.5)
+    check("epoch counters reset, corpus size taken",
+          svc.current_epoch == 0 and svc._epoch_processed_tokens == 0
+          and svc._total_tokens_per_epoch == 1234)
+    check("no stale gradients", all(p.grad is None for p in masters.values()))
+
+    before = svc.export_lora_state()
+    bad_rank = {k: torch.randn(v.shape[0], 2 * R) if "lora_B" in k
+                else torch.randn(2 * R, v.shape[1]) for k, v in ft.items()}
+    err = error_of(lambda: svc.switch_adapter(bad_rank, hp))
+    check("another rank is refused, nothing changed",
+          err is not None and "rank" in err and same(svc.export_lora_state(), before))
+    fewer = {k: v for k, v in new.items() if "o_proj" not in k}
+    err = error_of(lambda: svc.switch_adapter(fewer, hp))
+    check("other target modules are refused",
+          err is not None and "target modules" in err
+          and same(svc.export_lora_state(), before))
+    out = svc.switch_adapter(ft, {**hp, "dry_run": True})
+    check("dry run: the adapter is checked, nothing is changed",
+          out.get("dry_run") is True and same(svc.export_lora_state(), before))
+    check("dry run of a bad adapter reports the same refusal",
+          "rank" in (error_of(lambda: svc.switch_adapter(
+              bad_rank, {**hp, "dry_run": True})) or ""))
+    err = error_of(lambda: svc.switch_adapter(new, {**hp, "lora_scaling": 9.0}))
+    check("another alpha/r is refused (it is baked into captured graphs)",
+          err is not None and "alpha/r" in err)
+
+    conn = FakeConn([{"cmd": "switch_adapter", "ft": bad_rank, "hparams": hp},
+                     {"cmd": "switch_adapter", "ft": ft, "hparams": hp},
+                     {"cmd": "shutdown"}])
+    svc.run(conn)
+    ev = [m.get("event") for m in conn.sent]
+    check("the backward child reports a refused adapter and stays alive for "
+          "the next one", ev.count("error") == 1 and ev.count("adapter_switched") == 1
+          and same(svc.export_lora_state(), ft))
+
+
 def test_engine_export_and_ready():
     green("engine-side export + what 'ready' does:")
     from safetensors.torch import load_file
@@ -274,6 +335,10 @@ def test_engine_export_and_ready():
         check("a missing rank is an error",
               "missing a rank" in (error_of(lambda: export_trained_adapter(
                   engine([(1, s[1])]), src, str(Path(d) / "b"))) or ""))
+        check("a worker that reports an error (returned, not raised) fails the export",
+              "export failed on a worker" in (error_of(lambda: export_trained_adapter(
+                  engine([(0, s[0]), {"error": "OSError: pipe closed"}]), src,
+                  str(Path(d) / "e"))) or ""))
         check("no worker with a backward child is an error",
               error_of(lambda: export_trained_adapter(
                   engine([None, None]), src, str(Path(d) / "c"))) is not None)
@@ -313,6 +378,7 @@ def main():
     test_merge()
     test_write()
     test_trainer_export()
+    test_switch_adapter()
     test_engine_export_and_ready()
     print()
     if _failed:

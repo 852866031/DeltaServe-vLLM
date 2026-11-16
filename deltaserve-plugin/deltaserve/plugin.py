@@ -337,6 +337,19 @@ def _patch_engine_core() -> None:
         EngineCore.deltaserve_adapters = deltaserve_adapters
         EngineCore.deltaserve_add_adapter = deltaserve_add_adapter
 
+    if not hasattr(EngineCore, "deltaserve_submit_ft_job"):
+        def deltaserve_submit_ft_job(self, spec: dict) -> dict:
+            """Utility behind POST /ft_jobs: queue a finetuning job."""
+            submit = getattr(self.scheduler, "submit_ft_job", None)
+            if submit is None:
+                return {"error": "finetuning is off on this server"}
+            try:
+                return {"job": submit(spec)}
+            except Exception as e:  # noqa: BLE001 — reported to the caller
+                return {"error": f"{type(e).__name__}: {e}"}
+
+        EngineCore.deltaserve_submit_ft_job = deltaserve_submit_ft_job
+
     if not hasattr(EngineCore, "deltaserve_ft_jobs"):
         def deltaserve_ft_jobs(self) -> dict:
             """Utility behind GET /ft_jobs: the finetuning jobs and their stages."""

@@ -399,6 +399,92 @@ def external_main(args, out: Path) -> None:
             print("\n".join(log_path.read_text(errors="replace").splitlines()[-60:]))
 
 
+def second_job(args, out, port, first, first_saved, src_adapter) -> None:
+    """A second finetuning job, submitted while serving, runs after the first."""
+    from safetensors.torch import load_file
+
+    print("  -- a second job, submitted over HTTP --")
+    data = out / "sql.txt"
+    data.write_text("".join(f"{t}\n" for t in TOPICS["ext-sql"]))
+    status, _, r = http(port, "/ft_jobs", {
+        "name": "job-sql", "adapter_path": str(src_adapter), "data_path": str(data),
+        "stages": ["init", "training", "indexing", "admission", "ready"],
+        "auto_routing": True, "num_epochs": 2, "learning_rate": 2e-5})
+    check("POST /ft_jobs accepts it (202)",
+          status == 202 and r["job"]["name"] == "job-sql")
+    status, _, r = http(port, "/ft_jobs", {
+        "name": "job-bad", "data_path": str(data),
+        "adapter_path": str(_REPO / "adapters" / "qwen3-14b-toy-lora-ft")})
+    check("a job whose adapter has another shape is accepted into the queue",
+          status == 202)
+    status, _, r = http(port, "/ft_jobs", {"adapter_path": "/nope",
+                                           "data_path": str(data)})
+    check("a job with no adapter weights is refused at submission (400)",
+          status == 400 and "adapter" in r.get("error", ""))
+
+    seen, t0, served, final = [], time.monotonic(), 0, None
+    while time.monotonic() - t0 < args.timeout:
+        status, _, jobs = http(port, "/ft_jobs")
+        cur = jobs.get("current")
+        label = None if cur is None else f"{cur['name']}:{cur['stage']}"
+        if label and (not seen or seen[-1] != label):
+            seen.append(label)
+            print(f"    [{time.monotonic() - t0:5.1f}s] {label}", flush=True)
+        s1, _, b1 = http(port, "/v1/completions", {
+            "model": "qwen3-0.6b", "prompt": "Hello", "max_tokens": 1,
+            "temperature": 0}, timeout=60)
+        served += s1 == 200
+        if cur is None and not jobs.get("queued"):
+            final = {j["name"]: j for j in jobs["finished"]}
+            break
+        time.sleep(0.5)
+    check(f"inference kept being served across the job switch ({served} requests)",
+          served >= 3 and final is not None)
+    if final is None:
+        return
+    j2, bad = final.get("job-sql"), final.get("job-bad")
+    print(f"    job-sql: { {k: j2[k] for k in ('stage', 'error', 'saved_path')} }")
+    print(f"    job-bad: { {k: bad[k] for k in ('stage', 'error')} }")
+    check("the second job ran every stage to done",
+          j2 is not None and j2["error"] is None
+          and all(v == "done" for v in j2["stages"].values()))
+    check("the mis-shaped job failed at init with the reason; the server and the "
+          "queue went on",
+          bad is not None and bad["stage"] == "failed" and "init" in bad["error"]
+          and ("shape" in bad["error"] or "LoRA tensors" in bad["error"]
+               or "refused" in bad["error"]))
+    a2 = load_file(os.path.join(j2["saved_path"], "adapter_model.safetensors"))
+    a1 = load_file(os.path.join(first_saved, "adapter_model.safetensors"))
+    a0 = load_file(str(src_adapter / "adapter_model.safetensors"))
+    d20 = max(float((a2[k].float() - a0[k].float()).abs().max()) for k in a0)
+    d21 = max(float((a2[k].float() - a1[k].float()).abs().max()) for k in a0)
+    d10 = max(float((a1[k].float() - a0[k].float()).abs().max()) for k in a0)
+    print(f"    max |job2 - initial| {d20:.3e}  |job2 - job1| {d21:.3e}  "
+          f"|job1 - initial| {d10:.3e}")
+    check("the second adapter was trained from the initial weights (it differs "
+          "from them and from the first job's result)", d20 > 0 and d21 > 0)
+    check("the first job's saved adapter was not touched by the second",
+          first_saved != j2["saved_path"] and d10 > 0)
+    _, _, st = http(port, "/adapters")
+    names = sorted(a["name"] for a in st["adapters"] if a["level"] == "active")
+    check(f"both trained adapters are active in the pool {names}",
+          names == sorted([first, "job-sql"]))
+    for prompt, want in (("Translate to English: Wir gehen heute ins Kino.", first),
+                         ("Write a SQL query that lists customers without orders.",
+                          "job-sql")):
+        got = None
+        for _ in range(20):
+            s3, h3, b3 = http(port, "/v1/completions", {
+                "model": "auto", "prompt": prompt, "max_tokens": 4,
+                "temperature": 0})
+            got = h3.get("x-deltaserve-adapter")
+            if got == want:
+                break
+            time.sleep(0.5)
+        check(f"auto request → {want} ({prompt[:32]!r}…)",
+              got == want and s3 == 200 and b3.get("model") == want)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8791)
@@ -412,6 +498,8 @@ def main() -> None:
     ap.add_argument("--repeats", type=int, default=4, help="corpus = 10 x this")
     ap.add_argument("--out", default=None)
     ap.add_argument("--timeout", type=int, default=900)
+    ap.add_argument("--second-job", action="store_true",
+                    help="then submit a second finetuning job over HTTP")
     ap.add_argument("--external", action="store_true",
                     help="finetuning off: index and route existing adapters")
     args = ap.parse_args()
@@ -576,6 +664,8 @@ def main() -> None:
                 break
         else:
             check("repeated routed requests keep working (all API servers)", True)
+        if args.second_job:
+            second_job(args, out, port, name, saved, src_adapter)
         ok = _failed == 0
     finally:
         stop_tree(server)

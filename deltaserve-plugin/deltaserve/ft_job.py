@@ -109,7 +109,15 @@ class InitStage(Stage):
 
     name = "init"
 
+    def start(self, job, ctx) -> None:
+        begin = getattr(ctx, "begin_job", None)
+        if begin is not None:
+            begin(job)       # a job submitted while serving: prepare its dataset
+
     def poll(self, job, ctx) -> bool:
+        ready = getattr(ctx, "job_ready_to_train", None)
+        if ready is not None and not ready(job):
+            return False     # still preparing / waiting to switch adapters
         store = getattr(ctx, "store", None)
         if store is None:
             # A job that does not train (an existing adapter being indexed):
@@ -402,6 +410,11 @@ class FtJobManager:
         if job.finished:
             self.finished.append(job)
             self.current = self.queue.pop(0) if self.queue else None
+
+    @property
+    def busy(self) -> bool:
+        """A job is running or waiting (the engine keeps ticking for it)."""
+        return self.current is not None or bool(self.queue)
 
     def status(self) -> dict:
         return {

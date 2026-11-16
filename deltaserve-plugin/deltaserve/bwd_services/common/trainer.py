@@ -540,6 +540,75 @@ class LoraSftTrainerService(BackwardService):
         return loss, n_valid
 
     @torch.no_grad()
+    def switch_adapter(self, ft: dict, hparams: dict) -> dict:
+        """[ft-job] Start training ANOTHER adapter (the next finetuning job)
+        without rebuilding anything: the new weights are copied INTO the
+        existing fp32 masters, so every captured graph, the served-slot
+        mapping and the TP groups stay valid. The optimizer and LR schedule
+        are fresh (they step eagerly), the epoch counters reset, and the new
+        weights are published to the served slot.
+
+        The new adapter must have the launch adapter's shape — same LoRA
+        tensors, rank and alpha/r (the scaling is baked into captured graphs).
+        Raises ValueError otherwise; nothing is changed in that case."""
+        if not self._built:
+            raise RuntimeError("the trainer was never built (no adapter at launch)")
+        scaling = float(hparams.get("lora_scaling", self.scaling))
+        if abs(scaling - self.scaling) > 1e-9:
+            raise ValueError(
+                f"the adapter's alpha/r is {scaling}, the launch adapter's is "
+                f"{self.scaling}; they must match")
+        new = {}
+        for key, t in ft.items():
+            m = _LORA_KEY_RE.search(key)
+            if m is None:
+                continue
+            layer, proj, ab = int(m.group(1)), m.group(2), m.group(3)
+            new[(layer, proj, ab)] = lora_shard_slice(
+                proj, ab, t, self.tp_rank, self.tp_size, self.q_size, self.kv_size)
+        have = {(layer, proj, ab): p for layer, d in self.lora.items()
+                for proj, dd in d.items() for ab, p in dd.items()}
+        if set(new) != set(have):
+            raise ValueError(
+                f"the adapter has {len(new)} LoRA tensors, the launch adapter "
+                f"{len(have)} (different target modules or layers)")
+        for k, p in have.items():
+            if tuple(new[k].shape) != tuple(p.shape):
+                raise ValueError(
+                    f"LoRA tensor {k} has shape {tuple(new[k].shape)}, the launch "
+                    f"adapter's is {tuple(p.shape)} (different rank?)")
+        if hparams.get("dry_run"):
+            # Phase 1 of the switch: every rank checks the adapter before any
+            # rank changes anything.
+            return {"tensors": len(have), "dry_run": True}
+        with torch.no_grad():
+            for k, p in have.items():
+                p.copy_(new[k].to(p.device, torch.float32))
+                p.grad = None
+        params = list(have.values())
+        self.optimizer = torch.optim.AdamW(
+            params, lr=float(hparams["learning_rate"]), betas=(0.9, 0.999),
+            weight_decay=float(hparams["weight_decay"]),
+            fused=params[0].is_cuda)
+        self.scheduler = torch.optim.lr_scheduler.StepLR(
+            self.optimizer, step_size=1, gamma=float(hparams["gamma"]))
+        self.current_epoch = 0
+        self._cur_epoch_seen = 0
+        self._epoch_processed_tokens = 0
+        self._total_tokens_per_epoch = int(hparams.get("total_tokens_per_epoch", 0))
+        self._lora_keys = {k: key for key in ft
+                           for k in [self._key_of(key)] if k is not None}
+        self._publish_to_served()
+        dprint(f"[backward] switched to a new adapter: {len(params)} LoRA tensors, "
+               f"lr={hparams['learning_rate']}, wd={hparams['weight_decay']}, "
+               f"gamma={hparams['gamma']}")
+        return {"tensors": len(params)}
+
+    @staticmethod
+    def _key_of(key: str):
+        m = _LORA_KEY_RE.search(key)
+        return None if m is None else (int(m.group(1)), m.group(2), m.group(3))
+
     def export_lora_state(self) -> dict:
         """[ft-job] The trained masters as ``{PEFT key: fp32 CPU tensor}`` — this
         rank's shard under TP (``deltaserve.adapter_save`` merges the ranks).

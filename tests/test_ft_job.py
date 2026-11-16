@@ -282,6 +282,178 @@ def test_manager_and_names():
           routed.name.startswith("dserve-routing-"))
 
 
+def test_online_jobs():
+    green("jobs submitted while serving, run one after another:")
+    import os
+    import time
+
+    from deltaserve.finetuning_store import FinetuningStore
+    from deltaserve.ft_job import FinetuneJobSpec, FtJobManager
+    from deltaserve.ft_scheduler import FinetuneScheduler as FS
+
+    with tempfile.TemporaryDirectory() as d:
+        def adapter(name):
+            p = Path(d) / name
+            p.mkdir()
+            (p / "adapter_model.safetensors").write_bytes(b"x")
+            return str(p)
+
+        def corpus(name, n):
+            p = Path(d) / name
+            p.write_text("".join(f"w{i} a b\n" for i in range(n)))
+            return str(p)
+
+        launch_data = corpus("launch.txt", 3)
+        store0 = FinetuningStore(launch_data, tokenize=lambda t: t.split(),
+                                 total_epochs=1, max_saved_finetuning_tokens=16)
+        store0.load()
+        rpc = []
+
+        class Sched:
+            """What the job code needs of a FinetuneScheduler."""
+            submit_ft_job = FS.submit_ft_job
+            begin_job = FS.begin_job
+            job_ready_to_train = FS.job_ready_to_train
+
+            def __init__(self):
+                self.vllm_config = SimpleNamespace(finetune_config=SimpleNamespace(
+                    finetuning_lora_path=adapter("launch-adapter"), num_epochs=1,
+                    learning_rate=1e-4, weight_decay=0.0, gamma=1.0,
+                    max_saved_finetuning_tokens=16, max_prepare=None))
+                self._ft_jobs = FtJobManager()
+                self._ft_injector = SimpleNamespace(store=store0)
+                self._coord = coord(current_epoch=5, corpus_total_tokens=0,
+                                    min_sample_len=1, admission_open=False,
+                                    epoch_flush_pending=True)
+                self._job_switch = None
+                self._ft_exhausted_logged = True
+                self._ds_engine = SimpleNamespace(model_executor=SimpleNamespace(
+                    collective_rpc=lambda m, args=(), **k: rpc.append((m, args))))
+                self._launch_job = self._ft_jobs.submit(FinetuneJobSpec(
+                    name="launch", adapter_path="/a", data_path=launch_data)).name
+
+            def _build_tokenize(self):
+                return lambda t: t.split()
+
+            store = property(lambda self: self._ft_injector.store)
+            coordinator = property(lambda self: self._coord)
+
+        s = Sched()
+        mgr = s._ft_jobs
+        mgr.tick(s)
+        check("the launch job starts without a switch", mgr.current.stage == "training"
+              and rpc == [])
+
+        a2, d2 = adapter("job2"), corpus("two.txt", 5)
+        j2 = s.submit_ft_job({"adapter_path": a2, "data_path": d2, "name": "second",
+                              "num_epochs": 2, "learning_rate": 3e-4})
+        check("POST /ft_jobs queues a job behind the running one",
+              j2["name"] == "second" and [j.name for j in mgr.queue] == ["second"]
+              and j2["num_epochs"] == 2 and mgr.busy)
+        check("unknown keys, missing weights, missing data, no training stage are "
+              "refused at submission",
+              all(error_of(lambda spec=spec: s.submit_ft_job(spec)) is not None
+                  for spec in ({"adapter_path": a2, "data_path": d2, "bogus": 1},
+                               {"adapter_path": str(Path(d) / "nope"), "data_path": d2},
+                               {"adapter_path": a2, "data_path": str(Path(d) / "no.txt")},
+                               {"adapter_path": a2, "data_path": d2,
+                                "stages": ["init", "ready"]})))
+
+        mgr.tick(s)
+        check("the queued job waits while the first is training",
+              mgr.current.name == "launch" and rpc == [])
+        taken = []
+        while store0.has_next():                       # train the launch job out
+            x = store0.pop_best_under(16, exclude=taken)
+            taken.append(x)
+            store0.claim([x])
+        store0.commit_claimed(taken)
+        mgr.tick(s)
+        check("first job done → the second becomes current",
+              mgr.current is not None and mgr.current.name == "second"
+              and [j.name for j in mgr.finished] == ["launch"])
+
+        s._coord.pending_backward = True               # previous job still settling
+        mgr.tick(s)                                    # init starts: prepare
+        t0 = time.time()
+        while s._job_switch["store"] is None and not s._job_switch["error"] \
+                and time.time() - t0 < 5:
+            time.sleep(0.01)
+        mgr.tick(s)
+        check("its dataset is tokenized on a thread; no switch while a backward "
+              "of the previous job is pending",
+              s._job_switch is not None and s._job_switch["store"] is not None
+              and rpc == [] and mgr.current.stage == "init"
+              and s._ft_injector.store is store0)
+        s._coord.pending_backward = False
+        mgr.tick(s)
+        check("then every rank first CHECKS the adapter, then takes it, with the "
+              "job's hyper-parameters",
+              len(rpc) == 2 and rpc[0][0] == rpc[1][0] == "deltaserve_switch_ft_adapter"
+              and rpc[0][1][1].get("dry_run") is True
+              and not rpc[1][1][1].get("dry_run")
+              and rpc[1][1][0] == a2 and rpc[1][1][1]["learning_rate"] == 3e-4
+              and rpc[1][1][1]["total_tokens_per_epoch"] == 15)
+        new = s._ft_injector.store
+        check("the scheduler takes the new dataset and resets its counters",
+              new is not store0 and len(new) == 5 and new.total_epochs == 2
+              and s._coord.current_epoch == 0 and s._coord.admission_open
+              and not s._coord.epoch_flush_pending
+              and s._coord.corpus_total_tokens == 15
+              and s._ft_exhausted_logged is False)
+        check("the second job is now training", mgr.current.stage == "training")
+
+        bad = s.submit_ft_job({"adapter_path": adapter("job3"),
+                               "data_path": corpus("empty.txt", 0), "name": "third"})
+        for epoch in range(2):                          # two epochs of job 2
+            taken = []
+            while new.has_next():
+                x = new.pop_best_under(16, exclude=taken)
+                taken.append(x)
+                new.claim([x])
+            new.commit_claimed(taken)
+            if epoch == 0:
+                new.advance_epoch()
+        t0 = time.time()
+        while mgr.busy and time.time() - t0 < 5:
+            mgr.tick(s)
+            time.sleep(0.01)
+        fin = {j.name: j for j in mgr.finished}
+        check("a job with an unusable dataset fails at init; the queue moves on "
+              "and the server keeps its current adapter",
+              fin["second"].stage == "done" and fin["third"].failed
+              and "no usable sample" in fin["third"].error and len(rpc) == 2
+              and not mgr.busy and bad["name"] == "third")
+
+        calls = []
+
+        def refuse(m, args=(), **k):       # rank 0 accepts, rank 1 refuses
+            calls.append(args[1].get("dry_run"))
+            return [{"tensors": 8, "dry_run": True},
+                    {"error": "ValueError: rank differs"}]
+
+        s._ds_engine.model_executor.collective_rpc = refuse
+        s.submit_ft_job({"adapter_path": adapter("job4"),
+                         "data_path": corpus("four.txt", 2), "name": "fourth"})
+        keep = s._ft_injector.store
+        t0 = time.time()
+        while mgr.busy and time.time() - t0 < 5:
+            mgr.tick(s)
+            time.sleep(0.01)
+        check("an adapter one rank refuses fails its job in the CHECK phase: no "
+              "rank is told to take it, the dataset is not switched",
+              mgr.finished[-1].failed and "refused" in mgr.finished[-1].error
+              and "rank differs" in mgr.finished[-1].error
+              and calls == [True] and s._ft_injector.store is keep)
+
+        s2 = Sched.__new__(Sched)
+        s2.vllm_config = SimpleNamespace(finetune_config=SimpleNamespace(
+            finetuning_lora_path=None))
+        check("a server launched without a finetuning adapter refuses jobs",
+              "finetuning slot" in (error_of(lambda: s2.submit_ft_job(
+                  {"adapter_path": a2, "data_path": d2})) or ""))
+
+
 def test_yaml_section():
     green("ft_job YAML section:")
     import yaml
@@ -348,6 +520,7 @@ def main():
     test_stage_graph()
     test_training_stage_with_real_store()
     test_manager_and_names()
+    test_online_jobs()
     test_yaml_section()
     print()
     if _failed:

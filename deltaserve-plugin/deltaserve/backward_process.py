@@ -295,6 +295,22 @@ class BackwardProcess:
             raise TimeoutError("[deltaserve] share_weights timed out")
         return self._conn.recv()
 
+    def switch_adapter(self, ft_state: dict, hparams: dict,
+                       timeout: float = 120.0) -> dict:
+        """[ft-job] Hand the child the next job's adapter (CUDA tensors, shared
+        like the launch adapter) and hyper-parameters. Synchronous: call only
+        while no backward is pending. Raises if the child refuses it."""
+        self._shared_refs.extend(ft_state.values())
+        self._conn.send({"cmd": "switch_adapter", "ft": ft_state,
+                         "hparams": hparams})
+        if not self._conn.poll(timeout):
+            raise TimeoutError("[deltaserve] switch_adapter timed out")
+        reply = self._conn.recv()
+        if reply.get("event") != "adapter_switched":
+            raise RuntimeError(f"backward child refused the adapter: "
+                               f"{reply.get('msg', reply.get('event'))}")
+        return reply
+
     def export_lora(self, timeout: float = 120.0) -> dict:
         """[ft-job] The child's trained LoRA masters ``{PEFT key: CPU tensor}``.
         Synchronous: call only while no backward is pending (its ack would be
