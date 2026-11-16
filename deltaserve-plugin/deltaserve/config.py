@@ -726,8 +726,31 @@ class AdapterRoutingConfig:
     reference samples; e5 cosines sit in a narrow high band, so prefer
     ``route_keep_percent``."""
 
-    max_pool_adapters: int = 32
-    """Capacity of the pool of auto-routable adapters."""
+    max_active_adapters: int = 32
+    """Most ACTIVE adapters — the ones auto-routing chooses among. A quality
+    knob, not a hard limit of vLLM's: the more adapters compete, the more often
+    a neighbour is picked. Retired adapters are not counted."""
+
+    when_full: str = "retire_least_used"
+    """What admission does when the active set is full:
+    ``retire_least_used`` (the least used adapter that is not pinned and past
+    its grace period is retired; if there is none the newcomer is admitted
+    retired), ``admit_retired`` (the newcomer is admitted retired) or
+    ``reject``."""
+
+    retire_grace_s: float = 600.0
+    """A newly admitted adapter cannot be auto-retired for this long (it has
+    no usage yet)."""
+
+    admission_min_self_recall: float = 0.0
+    """Admit as retired (servable by name only) when fewer than this share of
+    the candidate's own reference samples would be routed to it. 0 = never
+    (the report is still recorded on the job)."""
+
+    admission_max_stolen: float = 1.0
+    """Admit as retired when the candidate would take more than this share of
+    an existing adapter's reference samples. 1 = never. Adapters that are
+    merely similar are admitted; routing treats them as close candidates."""
 
     pool_protected_slots: int = 1
     """How many of the most-used adapters in LoRA GPU slots can never be
@@ -785,7 +808,11 @@ class AdapterRoutingConfig:
             raise ValueError("adapter_routing.route_model_name must not be empty")
         if not self.encoder:
             raise ValueError("adapter_routing.encoder must not be empty")
-        for name in ("encoder_max_tokens", "max_pool_adapters",
+        if self.when_full not in ("retire_least_used", "admit_retired", "reject"):
+            raise ValueError(
+                "adapter_routing.when_full is one of retire_least_used, "
+                "admit_retired, reject")
+        for name in ("encoder_max_tokens", "max_active_adapters",
                      "indexing_max_samples", "indexing_chunk_samples",
                      "indexing_cpu_max_threads", "route_batch_max",
                      "route_min_pool"):
@@ -795,7 +822,7 @@ class AdapterRoutingConfig:
                      "indexing_gpu_after_quiet_s", "pool_protected_slots",
                      "pool_hit_half_life_s", "route_timeout_ms",
                      "route_batch_wait_ms", "route_close_band",
-                     "route_confidence_slack",
+                     "route_confidence_slack", "retire_grace_s",
                      "route_reference_samples"):
             if float(getattr(self, name)) < 0:
                 raise ValueError(f"adapter_routing.{name} must be >= 0")

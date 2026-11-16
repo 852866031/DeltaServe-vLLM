@@ -141,6 +141,34 @@ async def add_adapter(raw_request: Request):
                         content=result)
 
 
+async def _adapter_op(raw_request: Request, name: str, op: str):
+    try:
+        result = await engine_client(raw_request).engine_core.call_utility_async(
+            "deltaserve_adapter_op", name, op)
+    except Exception as e:
+        logger.exception("adapter %s failed", op)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    return JSONResponse(status_code=400 if "error" in result else 200,
+                        content=result)
+
+
+@routing_router.post("/adapters/{name}/{op}")
+async def adapter_op(name: str, op: str, raw_request: Request):
+    """``retire`` (stop selecting it, free its memory; still servable by name),
+    ``reactivate`` (back through admission), ``pin`` / ``unpin`` (never / again
+    auto-retired)."""
+    if op not in ("retire", "reactivate", "pin", "unpin"):
+        return JSONResponse(status_code=404,
+                            content={"error": f"unknown operation '{op}'"})
+    return await _adapter_op(raw_request, name, op)
+
+
+@routing_router.delete("/adapters/{name}")
+async def remove_adapter(name: str, raw_request: Request):
+    """Take an adapter out of the pool entirely."""
+    return await _adapter_op(raw_request, name, "remove")
+
+
 def attach_router(app: FastAPI):
     """Called after vLLM registers its own routers (plugin wrapper)."""
     ac = getattr(app.state.args, "additional_config", None) or {}

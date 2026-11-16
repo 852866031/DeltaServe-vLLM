@@ -218,3 +218,20 @@ class IndexingStage(Stage):
         dprint(f"[indexing] {job.name} done: centroid added to {path} "
                f"({len(index)} adapters) | {runner.describe()}")
         return True
+
+
+@register_stage
+class AdmissionStage(Stage):
+    """The adapter joins the pool: it is compared with the active adapters,
+    the new pool state (centroid mean, statistics, threshold) is built on the
+    side and published in one step — the pool keeps serving throughout, and a
+    failed admission leaves it as it was. For a job that trained, the adapter
+    is saved first. The report is kept on the job."""
+
+    name = "admission"
+
+    def requirements(self, stage_names):
+        return tuple(s for s in stage_names if s not in (self.name, "ready"))
+
+    def start(self, job, ctx) -> None:
+        ctx.admit_job(job)

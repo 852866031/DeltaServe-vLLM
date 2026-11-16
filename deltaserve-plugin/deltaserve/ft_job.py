@@ -58,7 +58,8 @@ ADAPTER_INIT_METHODS = ("from_path",)
 
 # Stages that exist only while a feature is on: name → the switch to name in
 # the error when a job lists the stage with the feature off.
-GATED_STAGES = {"indexing": "adapter_routing.enable_adapter_routing"}
+GATED_STAGES = {"indexing": "adapter_routing.enable_adapter_routing",
+                "admission": "adapter_routing.enable_adapter_routing"}
 
 
 # ----------------------------------------------------------------- stages
@@ -270,6 +271,7 @@ class FinetuneJob:
     stage_times: dict[str, list] = field(default_factory=dict)
     error: str | None = None
     saved_path: str | None = None     # where 'ready' wrote the trained adapter
+    admission: dict | None = None     # the pool's admission report, once admitted
     created_at: float = field(default_factory=time.time)
 
     def __post_init__(self) -> None:
@@ -343,6 +345,7 @@ class FinetuneJob:
             "auto_routing": self.spec.auto_routing,
             "adapter_path": self.spec.adapter_path,
             "saved_path": self.saved_path,
+            "admission": self.admission,
             "data_path": self.spec.data_path,
             "num_epochs": self.spec.num_epochs,
             "error": self.error,

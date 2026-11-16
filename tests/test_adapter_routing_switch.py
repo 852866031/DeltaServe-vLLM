@@ -69,12 +69,12 @@ def test_config_defaults_and_validation():
     rc = AdapterRoutingConfig()
     check("off by default", rc.enable_adapter_routing is False)
     check("default route name is 'auto'", rc.route_model_name == "auto")
-    check("default pool capacity is 32", rc.max_pool_adapters == 32)
+    check("default pool capacity is 32", rc.max_active_adapters == 32)
     check("unknown key rejected", raises(lambda: AdapterRoutingConfig(no_such_knob=1)))
     check("empty route name rejected",
           raises(lambda: AdapterRoutingConfig(route_model_name="")))
     check("pool capacity 0 rejected",
-          raises(lambda: AdapterRoutingConfig(max_pool_adapters=0)))
+          raises(lambda: AdapterRoutingConfig(max_active_adapters=0)))
     check("threshold outside [-1, 1] rejected",
           raises(lambda: AdapterRoutingConfig(fallback_score_threshold=1.5)))
 

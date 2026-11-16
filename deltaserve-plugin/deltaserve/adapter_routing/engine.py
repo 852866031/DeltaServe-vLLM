@@ -141,9 +141,13 @@ class AdapterRoutingEngine:
             backend if backend is not None else VllmLoRABackend(engine),
             CentroidIndex(cfg.encoder, cfg.encoder_query_prefix,
                           cfg.encoder_max_tokens),
-            capacity=cfg.max_pool_adapters, gpu_slots=gpu_slots,
+            capacity=cfg.max_active_adapters, gpu_slots=gpu_slots,
             protected=cfg.pool_protected_slots,
-            half_life_s=cfg.pool_hit_half_life_s, directory=self.dir)
+            half_life_s=cfg.pool_hit_half_life_s, directory=self.dir,
+            when_full=cfg.when_full, grace_s=cfg.retire_grace_s,
+            min_pool=cfg.route_min_pool,
+            min_self_recall=cfg.admission_min_self_recall,
+            max_stolen=cfg.admission_max_stolen)
         restored = self.pool.restore(self.dir, centroids=self._centroids())
         dprint(f"[adapter-routing] pool: {restored} adapters restored, "
                f"{gpu_slots} GPU slots, index dir {self.dir}")
@@ -185,12 +189,12 @@ class AdapterRoutingEngine:
                        centroid_path: str | None = None,
                        prewarm: bool = False) -> dict:
         """Add an existing adapter to the pool through a job with stages
-        ``[init, indexing, ready]`` — or ``[init, ready]`` when its centroid is
-        given (``centroid_path``, a .npy vector) or there is no dataset (then it
+        ``[init, indexing, admission, ready]`` — without ``indexing`` when its
+        centroid is given (``centroid_path``, a .npy vector) or there is no dataset (then it
         is servable by name only). Nothing is trained, exported or copied, and
         the weights are loaded only when a request first needs them (unless
         ``prewarm``)."""
-        stages = ["init", "ready"]
+        stages = ["init", "admission", "ready"]
         if data_path and not centroid_path:
             stages.insert(1, "indexing")
         spec = FinetuneJobSpec(name=name or None, stages=tuple(stages),
@@ -227,8 +231,9 @@ class AdapterRoutingEngine:
             except Exception as e:  # noqa: BLE001 — keep the driver alive
                 dprint(f"[adapter-routing] job driver error: {e}")
 
-    def on_job_ready(self, job) -> None:
-        """'ready' of a job that did not train: its adapter IS the one on disk."""
+    def admit_job(self, job) -> None:
+        """'admission' of a job that did not train: its adapter IS the one on
+        disk — nothing is exported or copied."""
         import numpy as np
 
         extra = self._external.get(job.name, {})
@@ -237,6 +242,29 @@ class AdapterRoutingEngine:
         if extra.get("centroid_path"):
             centroid = np.load(extra["centroid_path"]).reshape(-1)
         self.publish(job, load=bool(extra.get("prewarm")), centroid=centroid)
+
+    def on_job_ready(self, job) -> None:
+        if job.admission is None:        # a job listed without an admission stage
+            self.admit_job(job)
+
+    def adapter_op(self, name: str, op: str) -> dict:
+        """Operator actions on a pool adapter (the /adapters routes)."""
+        pool = self.pool
+        if op == "retire":
+            pool.retire(name)
+        elif op == "reactivate":
+            return {"admission": pool.reactivate(name)}
+        elif op == "pin":
+            pool.pin(name, True)
+        elif op == "unpin":
+            pool.pin(name, False)
+        elif op == "remove":
+            pool.remove(name)
+            return {"removed": name}
+        else:
+            raise ValueError(f"unknown adapter operation '{op}'")
+        return {"adapter": pool.entries[name].describe(pool._clock(),
+                                                       pool.half_life_s)}
 
     def _centroids(self) -> CentroidIndex | None:
         """Every centroid built so far (the indexing stage's file)."""
@@ -248,8 +276,9 @@ class AdapterRoutingEngine:
         return os.path.join(self.dir, "adapters", name)
 
     def publish(self, job, load: bool = True, centroid=None) -> None:
-        """A finished auto-routable job's adapter joins the pool. ``load=False``
-        only registers it (weights loaded on first use)."""
+        """A finished auto-routable job's adapter goes through the pool's
+        admission (``AdapterPool.admit``). ``load=False`` only registers it
+        (weights loaded on first use)."""
         if not job.saved_path:
             raise RuntimeError(f"{job.name}: the adapter was not saved")
         refs = None
@@ -258,19 +287,9 @@ class AdapterRoutingEngine:
             if centroids is not None and job.name in centroids:
                 centroid = centroids.centroid_of(job.name)
                 refs = centroids.refs.get(job.name)
-        if centroid is None:
-            dprint(f"[adapter-routing] {job.name} has no centroid (no 'indexing' "
-                   f"stage?): servable by name, not auto-routable")
-        if job.name in self.pool:
-            # Known from an earlier run (restored registry): refresh its centroid.
-            entry = self.pool.entries[job.name]
-            if centroid is not None:
-                entry.centroid, entry.refs = centroid, refs
-            if entry.enabled:
-                self.pool.enable(job.name)
-            return
-        self.pool.register(job.name, job.saved_path, centroid=centroid,
-                           job=job.name, load=load, refs=refs)
+        job.admission = self.pool.admit(
+            job.name, job.saved_path, centroid=centroid, refs=refs,
+            job=job.name, load=load, prewarm=load)
 
     def note_request(self, request) -> None:
         """Count a request that uses a pool adapter (drives GPU-slot retention)."""

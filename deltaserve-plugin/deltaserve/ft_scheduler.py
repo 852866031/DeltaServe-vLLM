@@ -235,6 +235,11 @@ class FinetuneScheduler(AsyncScheduler):
         save_job_adapter(job, getattr(self, "_ds_engine", None),
                          getattr(self, "_adapter_routing", None))
 
+    def admit_job(self, job) -> None:
+        """[ft-job] 'admission': save the trained adapter, then let the pool
+        admit it."""
+        self.on_job_ready(job)
+
     def _build_tokenize(self):
         from transformers import AutoTokenizer
 
@@ -906,9 +911,6 @@ class FinetuneScheduler(AsyncScheduler):
             self._coord.inf_req_count += 1
             dprint(f"[engine-recv {_ts()}] #{self._coord.inf_req_count} ADD "
                    f"req={getattr(request, 'request_id', '?')}")
-        routing = getattr(self, "_adapter_routing", None)
-        if routing is not None:
-            routing.note_request(request)   # pool hit count (adapter routing)
         super().add_request(request)
 
     @staticmethod

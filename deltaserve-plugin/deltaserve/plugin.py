@@ -160,6 +160,15 @@ def _patch_config() -> None:
                     FinetuneConfig(**ac.get(DeltaServeConfig.KEY, {})), extra,
                     None if routing is None else AdapterRoutingConfig(**routing))
             configure_vllm_config(self)
+            rc = self.adapter_routing_config
+            lora = getattr(self, "lora_config", None)
+            if rc.enable_adapter_routing and lora is not None:
+                # vLLM keeps only max_cpu_loras adapters in host memory
+                # (default: max_loras) and re-reads the others from disk each
+                # time they are used: room for the whole active set.
+                want = int(rc.max_active_adapters) + int(lora.max_loras)
+                if (lora.max_cpu_loras or 0) < want:
+                    lora.max_cpu_loras = want
             return orig(self)
         return __post_init__
 
@@ -244,6 +253,18 @@ def _patch_engine_core() -> None:
 
     _wrap(EngineCore, "shutdown", shutdown)
 
+    def add_request(orig):
+        def wrapper(self, request, *args, **kwargs):
+            routing = getattr(self, "_ds_routing", None)
+            if routing is not None:
+                # Every request that uses a pool adapter, routed or named,
+                # with or without finetuning: the pool's usage count.
+                routing.note_request(request)
+            return orig(self, request, *args, **kwargs)
+        return wrapper
+
+    _wrap(EngineCore, "add_request", add_request)
+
     def busy_loop(orig):
         def wrapper(self, *args, **kwargs):
             ds = getattr(self, "_ds", None)
@@ -302,6 +323,17 @@ def _patch_engine_core() -> None:
             except Exception as e:  # noqa: BLE001 — reported to the caller
                 return {"error": f"{type(e).__name__}: {e}"}
 
+        def deltaserve_adapter_op(self, name: str, op: str) -> dict:
+            """Utility behind POST /adapters/{name}/{op} and DELETE."""
+            routing = getattr(self, "_ds_routing", None)
+            if routing is None:
+                return {"error": "adapter routing is off"}
+            try:
+                return routing.adapter_op(name, op)
+            except Exception as e:  # noqa: BLE001 — reported to the caller
+                return {"error": f"{type(e).__name__}: {e}"}
+
+        EngineCore.deltaserve_adapter_op = deltaserve_adapter_op
         EngineCore.deltaserve_adapters = deltaserve_adapters
         EngineCore.deltaserve_add_adapter = deltaserve_add_adapter
 

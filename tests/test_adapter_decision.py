@@ -291,9 +291,9 @@ def test_reaches_the_client():
             pool.register(n, f"/p/{n}", centroid=src.centroid_of(n),
                           refs=src.refs[n], load=False)
         from deltaserve.adapter_routing.index import CentroidIndex
-        from deltaserve.adapter_routing.pool import ROUTABLE_FILE
+        from deltaserve.adapter_routing.pool import ROUTABLE_FILE, routable_path
 
-        saved = CentroidIndex.load(Path(d) / ROUTABLE_FILE)
+        saved = CentroidIndex.load(routable_path(d))
         check("the pool publishes reference samples with the routable centroids",
               len(saved.refs) == 8 and saved.refs["a0"].shape == (48, DIM))
 

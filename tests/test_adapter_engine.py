@@ -424,11 +424,11 @@ def test_external_adapters():
             j3 = routing.submit_adapter(src, name="with-centroid",
                                         centroid_path=str(Path(d) / "c.npy"))
             j4 = routing.submit_adapter(src, name="name-only")
-            check("with a dataset → [init, indexing, ready]; with a centroid or "
-                  "nothing → [init, ready]",
-                  list(j1["stages"]) == ["init", "indexing", "ready"]
-                  and list(j3["stages"]) == ["init", "ready"]
-                  and list(j4["stages"]) == ["init", "ready"])
+            check("with a dataset → [init, indexing, admission, ready]; with a "
+                  "centroid or nothing → [init, admission, ready]",
+                  list(j1["stages"]) == ["init", "indexing", "admission", "ready"]
+                  and list(j3["stages"]) == ["init", "admission", "ready"]
+                  and list(j4["stages"]) == ["init", "admission", "ready"])
             check("a given name is kept; an unnamed adapter is dserve-routing-…",
                   j1["name"] == "translate-adapter"
                   and j2["name"].startswith("dserve-routing-"))
@@ -454,8 +454,15 @@ def test_external_adapters():
                   and not CountingExec.made[0].stopped)
             check("exactly the 20 dataset samples were encoded",
                   CountingExec.made[0].samples == 20)
-            check("the name-only adapter is in the pool but not selectable",
+            rep = fin[j2["name"]]["admission"]      # the second one admitted
+            check("each job carries its admission report",
+                  rep["level"] == "active" and rep["self_recall"] is not None
+                  and rep["nearest"] == "translate-adapter"
+                  and fin["translate-adapter"]["admission"]["level"] == "active"
+                  and fin["name-only"]["admission"]["level"] == "retired")
+            check("the name-only adapter is in the pool (retired) but not selectable",
                   "name-only" in routing.pool
+                  and routing.pool.entries["name-only"].level == "retired"
                   and sorted(routing.pool.routable_names())
                   == sorted([j1["name"], j2["name"], "with-centroid"]))
 
@@ -511,7 +518,8 @@ def test_external_adapters():
                 str(Path(d) / "elsewhere"), name="late"))
             check("a name already used for another path is refused",
                   err is not None and "another path" in err)
-            routing2.submit_adapter(src, name="warm", prewarm=True)
+            routing2.submit_adapter(src, name="warm", prewarm=True,
+                                    data_path=corpus("wa", "warm topic", 5))
             eng2 = routing2.engine
             before = len(eng2.added)
             run_jobs(routing2)

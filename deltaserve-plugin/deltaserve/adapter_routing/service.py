@@ -72,6 +72,7 @@ class Router:
         # last published view), then the one this router has routed to most.
         self._tier: dict[str, str] = {}
         self._pool_mtime = None
+        self._published: str | None = None
         self._routed: dict[str, int] = {}
         self._log = decision_log
 
@@ -92,6 +93,8 @@ class Router:
         if reg is not None:
             self._pool_mtime = mtime
             self._tier = {a["name"]: a.get("tier", "") for a in reg["adapters"]}
+            self._published = (os.path.join(directory, reg["routable"])
+                               if reg.get("routable") else None)
 
     def refresh(self, force: bool = False) -> None:
         now = time.monotonic()
@@ -99,15 +102,18 @@ class Router:
             return
         self._checked = now
         self._refresh_pool_view()
+        # The pool's registry names the routable index that is current (one
+        # atomic switch); without a registry the given file is used directly.
+        index_file = self._published or self.index_file
         try:
-            mtime = os.stat(self.index_file).st_mtime_ns
+            mtime = (index_file, os.stat(index_file).st_mtime_ns)
         except OSError:
             if self._mtime is not None:
                 self.index, self._mtime = CentroidIndex(), None
                 self.model = RoutingModel(self.index, *self._model_args)
             return
         if mtime != self._mtime:
-            index = CentroidIndex.load(self.index_file)
+            index = CentroidIndex.load(index_file)
             model = RoutingModel(index, *self._model_args)
             # one assignment each: a batch being routed keeps the snapshot it has
             self.index, self.model, self._mtime = index, model, mtime

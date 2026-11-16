@@ -289,9 +289,9 @@ def external_main(args, out: Path) -> None:
         check("registered without loading: both still on the disk tier",
               all(a["tier"] == "disk" for a in by.values()))
         fin = {j["name"]: j for j in st["jobs"]["finished"]}
-        check("their jobs ran [init, indexing, ready] with no error; the pool "
+        check("their jobs ran [init, indexing, admission, ready] with no error; the pool "
               "uses the adapters where they are (no copy)",
-              all(list(fin[n]["stages"]) == ["init", "indexing", "ready"]
+              all(list(fin[n]["stages"]) == ["init", "indexing", "admission", "ready"]
                   and fin[n]["error"] is None
                   and fin[n]["saved_path"] == by[n]["path"] for n in by))
 
@@ -337,6 +337,42 @@ def external_main(args, out: Path) -> None:
         dlog = out / "index" / "decisions.jsonl"
         check("decisions are logged for calibration",
               dlog.is_file() and len(dlog.read_text().splitlines()) >= 8)
+
+        _, _, st = http(port, "/adapters")
+        used = {a["name"]: a["hits"] for a in st["adapters"]}
+        print(f"    pool: active {st['active']} retired {st['retired']} "
+              f"version {st['version']} hits {used}")
+        check("requests are counted per adapter with finetuning OFF",
+              used.get("ext-translate", 0) >= 2 and used.get("ext-sql", 0) >= 1)
+        fin = {j["name"]: j for j in st["jobs"]["finished"]}
+        rep = fin["ext-poem"]["admission"]
+        print(f"    admission of ext-poem: { {k: rep[k] for k in ('level', 'self_recall', 'nearest', 'nearest_cosine', 'stolen_max')} }")
+        check("the adapter added while serving has an admission report",
+              rep["level"] == "active" and rep["self_recall"] is not None)
+        status, _, r = http(port, "/adapters/ext-math/retire", {})
+        ok_retire = status == 200 and r["adapter"]["level"] == "retired"
+        time.sleep(1.5)
+        s2, h2, b2 = http(port, "/v1/completions", {
+            "model": "auto", "prompt": "Solve for x: 8x - 4 = 20", "max_tokens": 2,
+            "temperature": 0})
+        s3, h3, b3 = http(port, "/v1/completions", {
+            "model": "ext-math", "prompt": "Solve for x: 8x - 4 = 20",
+            "max_tokens": 2, "temperature": 0})
+        print(f"    after retiring ext-math: auto → {h2.get('x-deltaserve-adapter')} "
+              f"({h2.get('x-deltaserve-routing-reason')}), by name → {s3} "
+              f"{b3.get('model') if isinstance(b3, dict) else b3}")
+        check("POST /adapters/ext-math/retire: no longer auto-selected, still "
+              "servable by name",
+              ok_retire and h2.get("x-deltaserve-adapter") != "ext-math"
+              and s3 == 200 and b3.get("model") == "ext-math")
+        status, _, r = http(port, "/adapters/ext-math/reactivate", {})
+        time.sleep(1.5)
+        check("POST /adapters/ext-math/reactivate: back through admission and "
+              "selectable again",
+              status == 200 and r["admission"]["level"] == "active"
+              and auto("Solve for x: 8x - 4 = 20", "ext-math"))
+        status, _, r = http(port, "/adapters/ext-sql/pin", {})
+        check("POST /adapters/ext-sql/pin", status == 200 and r["adapter"]["pinned"])
 
         status, _, reply = http(port, "/adapters", {"name": "bad",
                                                     "path": str(out / "nope")})
@@ -486,7 +522,7 @@ def main() -> None:
 
         idx = Path(out / "index")
         check("pool registry and routable index written",
-              (idx / "pool.json").is_file() and (idx / "routable.npz").is_file())
+              (idx / "pool.json").is_file() and any(idx.glob("routable-*.npz")))
 
         routed = None
         for _ in range(20):      # the router re-reads its index within ~1 s

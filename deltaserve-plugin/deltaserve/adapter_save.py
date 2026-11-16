@@ -129,16 +129,20 @@ def save_job_adapter(job, engine, routing=None) -> str | None:
 
     spec = job.spec
     dst = spec.save_path or (routing.adapter_dir(job.name) if routing else None)
+    if dst is None and job.saved_path is not None:
+        return job.saved_path
     if dst is None:
         dprint(f"[ft-job] {job.name} is ready but NOT saved: set ft_job.save_path "
                f"(or enable adapter routing)")
         return None
-    if engine is None or not spec.adapter_path:
-        raise RuntimeError(f"{job.name}: no engine / source adapter to export from")
-    job.saved_path = export_trained_adapter(engine, spec.adapter_path, dst,
-                                            overwrite=True)
-    dprint(f"[ft-job] {job.name} trained adapter saved to {job.saved_path}")
-    if routing is not None and spec.auto_routing:
+    if job.saved_path is None:           # the admission stage may have saved it
+        if engine is None or not spec.adapter_path:
+            raise RuntimeError(
+                f"{job.name}: no engine / source adapter to export from")
+        job.saved_path = export_trained_adapter(engine, spec.adapter_path, dst,
+                                                overwrite=True)
+        dprint(f"[ft-job] {job.name} trained adapter saved to {job.saved_path}")
+    if routing is not None and spec.auto_routing and job.admission is None:
         routing.publish(job)
     return job.saved_path
 

@@ -221,15 +221,18 @@ def test_offload_disable_remove():
     check("offloading twice is harmless", error_of(lambda: (pool.offload("c"),
                                                             pool.offload("c"))) is None)
 
-    pool.disable("b")
-    check("disabled → out of the index and out of its GPU slot, weights kept in RAM",
-          "b" not in pool.routable_names() and pool.entries["b"].tier == "cpu"
-          and "b" in be.cpu and pool.route(E[1])[0] != "b")
-    check("a disabled adapter cannot be hit",
-          "disabled" in (error_of(lambda: pool.note_hit("b")) or ""))
-    pool.enable("b")
-    check("enable puts it back in the index",
-          pool.route(E[1])[0] == "b" and error_of(lambda: pool.note_hit("b")) is None)
+    pool.retire("b")
+    check("retired → out of the index, no GPU slot, no memory held",
+          "b" not in pool.routable_names() and pool.entries["b"].tier == "disk"
+          and pool.entries["b"].level == "retired"
+          and "b" not in be.cpu and pool.route(E[1])[0] != "b")
+    e = pool.note_hit("b")
+    check("a retired adapter is still servable by name: the hit loads and counts it",
+          e.hits == 1 and "b" in be.cpu and "b" not in pool.routable_names())
+    rep = pool.reactivate("b")
+    check("reactivate goes back through admission and into the index",
+          rep["level"] == "active" and pool.route(E[1])[0] == "b"
+          and pool.entries["b"].level == "active")
 
     pool.remove("a")
     check("remove takes it out of the pool, the index and the backend",
@@ -285,10 +288,10 @@ def test_ids_and_autosave():
         pool.note_hit("a")
         check("offload + cold load keep the adapter's id",
               pool.entries["a"].lora_int_id == LORA_ID_BASE + 1)
-        pool.disable("b")
-        check("registry follows disable / offload",
-              {r["name"]: r["enabled"] for r in read_registry(d)["adapters"]}
-              == {"a": True, "b": False})
+        pool.retire("b")
+        check("registry follows retire / offload",
+              {r["name"]: r["level"] for r in read_registry(d)["adapters"]}
+              == {"a": "active", "b": "retired"})
         pool.remove("a")
         c = pool.register("c", "/p/c")
         check("a removed adapter's id is not handed out again",
@@ -300,13 +303,147 @@ def test_ids_and_autosave():
         check("an old-format registry reads as none", read_registry(d) is None)
 
 
+def test_levels_and_admission():
+    green("active / retired, admission, auto-retire:")
+    import os
+    from pathlib import Path
+
+    from deltaserve.adapter_routing.index import CentroidIndex
+    from deltaserve.adapter_routing.pool import (
+        AdapterPool,
+        PoolFull,
+        read_registry,
+        routable_path,
+    )
+
+    rng = np.random.default_rng(0)
+    common = rng.normal(size=DIM) * 3
+
+    def topic(i, n=40, noise=0.15):
+        base = np.zeros(DIM)
+        base[i % DIM] = 1.0
+        v = common + base + noise * rng.normal(size=(n, DIM))
+        return (v / np.linalg.norm(v, axis=1, keepdims=True)).astype(np.float32)
+
+    def make(cap, d=None, **kw):
+        now = {"t": 1000.0}
+        be = FakeBackend(2)
+        pool = AdapterPool(be, CentroidIndex("enc", "", 512), capacity=cap,
+                           gpu_slots=2, directory=d, clock=lambda: now["t"],
+                           grace_s=600.0, **kw)
+        return pool, be, now
+
+    def admit(pool, name, i, **kw):
+        t = topic(i)
+        return pool.admit(name, f"/p/{name}", centroid=t.mean(0), refs=t[:24], **kw)
+
+    with tempfile.TemporaryDirectory() as d:
+        pool, be, now = make(3, d)
+        r0 = admit(pool, "a", 0)
+        check("first adapter: admitted active, nothing to compare with",
+              r0["level"] == "active" and r0["pool_before"] == 0)
+        r1 = admit(pool, "b", 1)
+        check("admission report: self-recall, nearest adapter, what it takes",
+              r1["level"] == "active" and r1["self_recall"] >= 0.9
+              and r1["nearest"] == "a" and r1["stolen_max"] <= 0.1)
+        check("admission does not load weights unless asked (lazy)",
+              be.log == [] and pool.entries["b"].tier == "disk")
+        v1 = pool.version
+        reg = read_registry(d)
+        check("one published state: the registry names the routable index",
+              reg["version"] == v1 and os.path.isfile(routable_path(d))
+              and Path(routable_path(d)).name == reg["routable"])
+        admit(pool, "c", 2)
+        check("each admission publishes a new version",
+              pool.version == v1 + 1 and read_registry(d)["version"] == v1 + 1)
+        pool.note_hit("a")
+        pool.save(d)
+        check("a usage-only save does not make a new routable version",
+              pool.version == v1 + 1)
+
+        tw = topic(0, noise=0.05)                 # a near-duplicate of 'a'
+        rt = pool.admit("a-twin", "/p/a-twin", centroid=tw.mean(0), refs=tw[:24])
+        check("a full active set within the grace period: nobody can be retired, "
+              "the newcomer is admitted retired",
+              rt["level"] == "retired" and "grace" in rt["reason"]
+              and rt["retired"] is None and len(pool.active_names()) == 3)
+        check("...and the report still says how similar it is to 'a'",
+              rt["nearest"] == "a" and rt["stolen_max"] > 0.2)
+
+        now["t"] += 700                           # past the grace period
+        for _ in range(3):
+            pool.note_hit("b")
+        pool.note_hit("c")
+        pool.pin("a")                             # least used, but pinned
+        v = pool.version
+        r4 = admit(pool, "d", 3)
+        check("full + past grace: the least-used unpinned adapter is retired, "
+              "the newcomer is active",
+              r4["level"] == "active" and r4["retired"] == "c"
+              and sorted(pool.active_names()) == ["a", "b", "d"]
+              and pool.entries["c"].level == "retired")
+        check("newcomer in and victim out are ONE published step",
+              pool.version == v + 1
+              and sorted(CentroidIndex.load(routable_path(d)).names)
+              == ["a", "b", "d"])
+        check("the retired adapter keeps its centroid and reference samples",
+              pool.entries["c"].centroid is not None
+              and pool.entries["c"].refs is not None)
+        rr = pool.reactivate("c")
+        check("reactivating it needs no encoding and is again subject to the cap "
+              "(newcomer 'd' is in its grace period → 'b'… or stays retired)",
+              rr["level"] in ("active", "retired")
+              and len(pool.active_names()) == 3)
+        kept = sorted(f for f in os.listdir(d) if f.startswith("routable-"))
+        check("old routable versions are cleaned up (current + previous kept)",
+              len(kept) <= 2 and Path(routable_path(d)).name in kept)
+
+        p2, _, _ = make(1, when_full="admit_retired")
+        admit(p2, "x", 0)
+        check("when_full: admit_retired → the newcomer waits in retired",
+              admit(p2, "y", 1)["level"] == "retired" and p2.active_names() == ["x"])
+        p3, _, _ = make(1, when_full="reject")
+        admit(p3, "x", 0)
+        err = error_of(lambda: admit(p3, "y", 1))
+        check("when_full: reject → refused, the pool unchanged",
+              err is not None and err.startswith(PoolFull.__name__)
+              and list(p3.entries) == ["x"])
+
+        p4, _, _ = make(8, max_stolen=0.2)
+        admit(p4, "a", 0)
+        admit(p4, "b", 1)
+        r = p4.admit("a-twin", "/p/t", centroid=tw.mean(0), refs=tw[:24])
+        check("optional rule admission_max_stolen: a candidate that takes too "
+              "much of another adapter is admitted retired",
+              r["level"] == "retired" and "takes" in r["reason"])
+        p5, _, _ = make(8)
+        admit(p5, "a", 0)
+        admit(p5, "b", 1)
+        r = p5.admit("a-twin", "/p/t", centroid=tw.mean(0), refs=tw[:24])
+        check("default: adapters that are merely similar are NOT turned away",
+              r["level"] == "active" and r["stolen_max"] > 0.2)
+
+        p6, be6, _ = make(8)
+        e0 = p6.register("v", "/p/v1", centroid=topic(4).mean(0))
+        id0 = e0.lora_int_id
+        r = p6.admit("v", "/p/v2", centroid=topic(4).mean(0), refs=topic(4)[:8])
+        check("a new version under the same name replaces the old one in place, "
+              "with a new LoRA id for the new weights",
+              r["level"] == "active" and p6.entries["v"].path == "/p/v2"
+              and p6.entries["v"].lora_int_id != id0 and len(p6.entries) == 1)
+        r = p6.admit("nocentroid", "/p/n")
+        check("no centroid → retired level (servable by name only)",
+              r["level"] == "retired" and "nocentroid" not in p6.routable_names())
+
+
 def test_save_restore():
     green("registry save / restore:")
     pool, _, _ = make(gpu_slots=1)
     for i, n in enumerate("abc"):
         pool.register(n, f"/p/{n}", centroid=E[i], job=f"job-{n}")
     pool.offload("b")
-    pool.disable("c")
+    pool.retire("c")
+    pool.pin("a")
     with tempfile.TemporaryDirectory() as d:
         pool.save(d)
         from deltaserve.adapter_routing.index import CentroidIndex
@@ -322,8 +459,8 @@ def test_save_restore():
         check("offloaded stays offloaded, others are loaded",
               new.entries["b"].tier == "disk" and new.entries["a"].tier == "gpu"
               and "b" not in be.cpu)
-        check("disabled stays disabled and unroutable",
-              not new.entries["c"].enabled
+        check("retired stays retired and unroutable; a pin survives too",
+              new.entries["c"].level == "retired" and new.entries["a"].pinned
               and sorted(new.routable_names()) == ["a", "b"])
         check("job names carried over", new.entries["a"].job == "job-a")
         check("LoRA ids survive the restart",
@@ -342,6 +479,7 @@ def main():
     test_offload_disable_remove()
     test_route_and_fallback()
     test_ids_and_autosave()
+    test_levels_and_admission()
     test_save_restore()
     print()
     if _failed:

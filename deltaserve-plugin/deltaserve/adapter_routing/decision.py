@@ -143,3 +143,51 @@ class RoutingModel:
             # stable: the best-scoring one wins among equally preferred
             pick = max(close, key=lambda n: (prefer(n), -close.index(n)))
         return Choice(pick, score, conf, margin, close)
+
+
+def admission_report(index: CentroidIndex, name: str, centroid, refs=None,
+                     min_pool: int = 4) -> dict:
+    """What adding ``name`` would do to the pool ``index`` (the active
+    adapters), measured on reference samples — no encoding, no GPU:
+
+    - ``self_recall``: share of the candidate's own reference samples that the
+      new pool sends to it (can it be told apart?);
+    - ``stolen``: per existing adapter, the share of ITS reference samples the
+      candidate would take (``stolen_max`` the worst case, ``stolen_from`` whom);
+    - ``nearest`` / ``nearest_cosine``: the existing adapter closest to it.
+
+    Scores are centred like the router's when the new pool is big enough."""
+    centroid = l2_normalize(np.asarray(centroid, np.float32).reshape(1, -1))[0]
+    others = [n for n in index.names if n != name]
+    report = {"pool_before": len(others), "self_recall": None, "stolen": {},
+              "stolen_max": 0.0, "stolen_from": None, "nearest": None,
+              "nearest_cosine": None}
+    if not others:
+        return report
+    C = np.vstack([index.centroid_of(n) for n in others] + [centroid])
+    if len(C) >= max(2, int(min_pool)):
+        mu = C.mean(0)
+        Cc = l2_normalize(C - mu)
+        tr = lambda x: l2_normalize(x - mu)          # noqa: E731
+    else:
+        Cc, tr = C, (lambda x: x)
+    sims = Cc[:-1] @ Cc[-1]
+    j = int(np.argmax(sims))
+    report["nearest"], report["nearest_cosine"] = others[j], round(float(sims[j]), 4)
+    me = len(C) - 1
+    if refs is not None and len(refs):
+        top = (tr(np.asarray(refs, np.float32)) @ Cc.T).argmax(1)
+        report["self_recall"] = round(float((top == me).mean()), 4)
+    for i, n in enumerate(others):
+        r = index.refs.get(n)
+        if r is None or not len(r):
+            continue
+        S = tr(r) @ Cc.T
+        before = (S[:, :-1].argmax(1) == i)
+        taken = (S.argmax(1) == me) & before
+        share = float(taken.sum() / max(1, before.sum()))
+        if share > 0:
+            report["stolen"][n] = round(share, 4)
+        if share > report["stolen_max"]:
+            report["stolen_max"], report["stolen_from"] = round(share, 4), n
+    return report
