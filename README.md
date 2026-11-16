@@ -658,12 +658,46 @@ applies. The throttles shape admission further:
 | **Step-time estimator** (`slo.profile_on_launch`, `profile_num_repeats`) | 6-parameter model `T ≈ α·S + β·T_in + γ·T_ft + δ·B_d + ε·K + c`, with separate coefficients for 5 regimes (inference prefill, FT-only, decode-only, decode with backward running, FT-mixed). Seeded by a profiling pass at launch, refit online every 256 steps | profiling on |
 | `slo.coserving_admission_phase` | `prefill`: FT rides only steps that carry inference prefill (or idle steps). `both`: FT may also ride decode-only / mixed steps (`BothPhaseFinetuneScheduler`) | `prefill` |
 | `slo.decode_only_ft_safety_margin` | with `both`: scale `max_tbt_slo` on decode-only steps | `0.7` |
+| `slo.admission_margin` / `admission_margin_k` | how much the step-time prediction is inflated before the SLO gate: `legacy` = ×(1 + 1.5·RMSE in seconds), ≈ 0.2 % in practice; `relative` = ×(1 + k·relative RMSE of the regime); `absolute` = + k·RMSE. See [The admission margin](#the-admission-margin) | `legacy` / `1.5` |
 | `throttles.ft_tokens_admission_constrain_factor` | cap FT tokens at `factor × inference-prefill tokens` per step (`-1` = off) | `-1` |
 | `throttles.match_prefill_workload_factor` | leaky bucket: admit one FT sample once accumulated prefill × factor covers its length (`0` = off) | `0` |
 | `throttles.fwd_token_throttle_enable` / `fwd_token_throttle` | pause the backward when the batch's total tokens ≥ threshold | off / 1024 |
 | `throttles.rps_throttle_*` | close FT admission above `close_rps`, reopen below `open_rps` (hysteresis, sliding window, minimum close time) | off |
 | `finetune_param.start_on_launch` | open admission at launch, or wait for `POST /start_finetuning` | `true` (`false` in the shipped YAMLs) |
 | Buffer accounting | FT budget ≤ free activation-buffer space; flush when the next-smallest sample won't fit | always |
+
+#### The admission margin
+
+On a step with running decodes, admission adds FT samples until the predicted step time
+reaches `max_tbt_slo`, so whatever the estimator under-predicts lands as a step over the
+limit. The original margin multiplies the prediction by 1 + 1.5·RMSE with the RMSE in
+**seconds**: with RMSEs of 1–3 ms that is ×1.002–1.005, effectively none. `relative`
+uses the regime's relative error instead (3.3 % for mixed steps on Qwen3-14B TP=2, so
+k = 1.5 adds 5 %).
+
+Measured with `eval-tp/margin_ab.py` on Qwen3-14B TP=2 (2× RTX 5090, production preset,
+`max_tbt_slo` 50 ms, TTFT SLO 0.4 s), replaying `timeline_margin_stress.csv`
+(`scripts/timelines/margin_stress_gen.py`: 275 requests in 120 s, Poisson at 1.5 / 3 req/s
+alternating every 15 s, prompts 16–160 tokens log-uniform, outputs 64–256: decodes are
+always running and prefill shapes vary, the case where FT is packed up to the TBT
+limit). Two interleaved runs per arm:
+
+| `admission_margin` | FT steps over 50 ms | by how much | actual ÷ admitted prediction, p50 · p95 | TTFT met | FT tokens/s |
+|---|---|---|---|---|---|
+| `legacy` (default) | **21 / 205 (10.2 %)** | 0.5–3.5 ms | 0.98 · 1.06 | 100 % | 57 |
+| `relative`, k = 1.0 | 7 / 207 (3.4 %) | 0.1–1.5 ms | 0.96 · 1.03 | 100 % | 56 |
+| `relative`, k = 1.5 | **4 / 205 (2.0 %)** | 0.0–2.2 ms | 0.94 · 1.02 | 100 % | **56** |
+| `absolute`, k = 1.5 | 3 / 194 (1.5 %) | 0.2–1.4 ms | 0.93 · 1.01 | 100 % | 54 |
+
+`relative` with k = 1.5 cuts the steps that break the TBT limit by 5× for −1 % FT
+throughput (within run-to-run noise: the two legacy runs gave 56 and 58): it trims the
+last FT sample on steps already at the limit, while most FT tokens ride steps with room
+or FT-only steps. At a fixed 50 ms limit `absolute` is about the same thing (1.5 × a
+1.6 ms RMSE ≈ 5 % of 48 ms); the two differ when the step at the limit is much longer
+or shorter than the steps the RMSE was measured on (another `max_tbt_slo`, model or
+GPU), where an error in seconds no longer matches the step and a relative one does.
+Steps without FT are not affected; inference-only prefill steps exceeded 50 ms on their
+own in 72–80 % of the cases in every arm, which no admission setting can change.
 
 ### Optimizations
 
