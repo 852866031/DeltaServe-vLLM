@@ -282,9 +282,10 @@ in progress is written when the server is asked to stop.
 
 ### Overhead
 
-Recording costs about **0.6 % of the engine thread** and has no measurable effect on
-throughput, decode latency or finetuning; the one visible change is **+1.6–1.8 ms on the
-median TTFT**. A `dserve-top` attached and polling adds nothing measurable on top.
+Recording costs **0.05 % of the engine thread on Qwen3-14B TP=2** and about 0.6 % on the
+host-bound Qwen3-0.6B. It has no measurable effect on throughput, decode latency or
+finetuning; the one visible change is **+1.6–1.8 ms on the median TTFT on 0.6B** (none
+measurable on 14B). A `dserve-top` attached and polling adds nothing measurable on top.
 
 Measured with `eval-tp/bench_metrics_overhead.py --order ABTTBA --num-prompts 2400` on
 Qwen3-0.6B (one RTX 5090, CUDA graphs): six interleaved runs, two each of recording off
@@ -315,9 +316,18 @@ entry) and is capped by `telemetry.steps_log_max_mb` (256 MB, rolling). `dserve-
 its history in RAM up to `--history-hours` (12 h); an export is ~0.65 MB per hour of run
 (Qwen3-14B TP=2 at 3 req/s).
 
-Larger models have not been re-measured since the live feed was added. Before it, the
-same accounting on Qwen3-14B TP=2 gave 0.05 % of the engine thread (7 µs per step); the
-per-step work is host-side and does not grow with the model, while the steps do.
+On **Qwen3-14B TP=2** (2× RTX 5090; same six-run protocol, 16 concurrent, 512 / 128
+tokens, 1200 requests per run, finetuning running; the server is saturated, so TTFT is
+mostly queueing) the engine is GPU-bound and the cost all but disappears:
+
+| Δ vs recording off (mean of 2 runs) | recording on | + `dserve-top` |
+|---|---|---|
+| throughput | −0.15 % | −0.11 % |
+| TTFT p50 / p99 | +0.24 % / +0.73 % | +0.01 % / +0.49 % |
+| TPOT p50 / p99 | +0.13 % / +0.16 % | +0.12 % / −2.9 % |
+| ITL p50 / p99 | +0.02 % / +0.32 % | +0.07 % / +0.06 % |
+| FT tokens/s | −1.5 % | +0.1 % (noise: the off runs differ by 2.6 %) |
+| recorder CPU on the engine thread | 0.05 %, 14 µs per step | 0.10 %, 25 µs per step (the polls) |
 
 ### `dserve-top`: quick start
 
