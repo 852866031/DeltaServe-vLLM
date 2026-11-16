@@ -244,6 +244,11 @@ class BackwardService:
 
     # -- per-model hooks ---------------------------------------------------
 
+    def export_lora_state(self) -> dict:
+        """[ft-job] The trained adapter as ``{PEFT key: CPU tensor}``; services
+        that train one override this."""
+        return {}
+
     def process_backward(self, activations: dict, sample_lens: list[int],
                          n: int, epoch: int):
         """One backward cycle over the first ``n`` buffered rows (LoRA backward
@@ -323,6 +328,10 @@ class BackwardService:
                            f"total_tokens_per_epoch={self._total_tokens_per_epoch}")
                 elif cmd == "process_activations":
                     self._handle_process_activations(conn, msg)
+                elif cmd == "export_lora":
+                    # [ft-job] the trained adapter, for saving at 'ready'
+                    conn.send({"event": "lora_state",
+                               "state": self.export_lora_state()})
                 else:
                     conn.send({"event": "error", "msg": f"unknown cmd {cmd!r}"})
         finally:

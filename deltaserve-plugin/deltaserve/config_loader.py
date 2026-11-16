@@ -23,6 +23,11 @@ YAML shape (see configs/serving_config_finetuning_qwen3_14b_tp2.yaml)::
       port: 8000
     adapters:     # → returned separately (inference LoRA adapter paths)
       lora_path_0: ../adapters/qwen3-14b-toy-lora
+    adapter_routing:  # → AdapterRoutingConfig (adapter routing; its own on/off switch)
+      enable_adapter_routing: true
+
+    ft_job:       # → the finetuning job: its stages + what it trains
+      stages: [init, training]
 
     model:        # ┐ every other section is a flat dict of EngineArgs field
       model: ...  # │ names; they are merged together and passed straight to
@@ -42,8 +47,9 @@ from typing import Any
 
 import yaml
 
-from deltaserve.config import FinetuneConfig
+from deltaserve.config import FinetuneConfig, AdapterRoutingConfig
 from deltaserve import dprint
+from deltaserve.ft_job import JOB_FLAT_KEYS, JOB_META_KEYS, FinetuneJobSpec
 from vllm.engine.arg_utils import EngineArgs
 
 # Section → the FinetuneConfig fields that belong to it.
@@ -91,7 +97,15 @@ RETIRED_KEYS: dict[str, str] = {
 # as `extras[section]`: `server` (host/port/rank for the API server) and
 # `adapters` (inference LoRA adapter paths, applied per-request by the caller).
 _PASSTHROUGH_SECTIONS = ("server", "adapters")
-_SPECIAL_SECTIONS = (*FINETUNE_SECTIONS, *_PASSTHROUGH_SECTIONS)
+# Adapter routing: one section → one ``AdapterRoutingConfig`` (extra=forbid), carried
+# as its own additional_config entry next to the finetune one.
+ADAPTER_ROUTING_SECTION = "adapter_routing"
+# The finetuning job: its training keys set flat FinetuneConfig fields
+# (``JOB_FLAT_KEYS``), the rest is kept as ``FinetuneConfig.ft_job`` metadata.
+FT_JOB_SECTION = "ft_job"
+ADAPTER_ROUTING_KEY = "deltaserve_adapter_routing"
+_SPECIAL_SECTIONS = (*FINETUNE_SECTIONS, *_PASSTHROUGH_SECTIONS,
+                     ADAPTER_ROUTING_SECTION, FT_JOB_SECTION)
 
 
 def load_yaml_config(path: str | Path, verbose: bool = True) -> dict[str, Any]:
@@ -120,7 +134,8 @@ def load_yaml_config(path: str | Path, verbose: bool = True) -> dict[str, Any]:
             )
 
     base_dir = path.resolve().parent
-    for section in (*FINETUNE_SECTIONS, "adapters"):
+    for section in (*FINETUNE_SECTIONS, "adapters", ADAPTER_ROUTING_SECTION,
+                    FT_JOB_SECTION):
         body = raw.get(section) or {}
         for key, val in body.items():
             if "path" in key.lower() and isinstance(val, str) \
@@ -162,6 +177,25 @@ def finetune_kwargs(config: dict[str, Any]) -> dict[str, Any]:
             if key in out:
                 raise ValueError(f"finetune key '{key}' appears in two sections")
             out[key] = value
+
+    job = config.get(FT_JOB_SECTION)
+    if job:
+        meta: dict[str, Any] = {}
+        for key, value in job.items():
+            if key in JOB_FLAT_KEYS:
+                flat = JOB_FLAT_KEYS[key]
+                if flat in out:
+                    raise ValueError(
+                        f"'{FT_JOB_SECTION}.{key}' and '{SECTION_OF[flat]}."
+                        f"{flat}' set the same thing; keep one")
+                out[flat] = value
+            elif key in JOB_META_KEYS:
+                meta[key] = value
+            else:
+                raise ValueError(
+                    f"unknown '{FT_JOB_SECTION}' key '{key}'; known: "
+                    f"{sorted((*JOB_META_KEYS, *JOB_FLAT_KEYS))}")
+        out["ft_job"] = meta
     return out
 
 
@@ -174,11 +208,29 @@ def finetune_value(config: dict[str, Any], key: str, default: Any = None) -> Any
     return default
 
 
+def adapter_routing_kwargs(config: dict[str, Any]) -> dict[str, Any]:
+    """The ``adapter_routing`` section as ``AdapterRoutingConfig`` kwargs
+    ({} when absent)."""
+    return dict(config.get(ADAPTER_ROUTING_SECTION) or {})
+
+
+def adapter_routing_config(config: dict[str, Any]) -> AdapterRoutingConfig:
+    """The ``AdapterRoutingConfig`` of a loaded config (disabled when there is no
+    ``adapter_routing`` section)."""
+    return AdapterRoutingConfig(**adapter_routing_kwargs(config))
+
+
 def additional_config(config: dict[str, Any], **overrides: Any) -> dict:
     """vLLM ``additional_config`` carrying the finetune sections (+ overrides,
-    e.g. per-run log paths); None values are dropped."""
+    e.g. per-run log paths); None values are dropped. An ``adapter_routing``
+    section rides along as its own entry; without one the result is unchanged."""
     kw = {**finetune_kwargs(config), **overrides}
-    return {"deltaserve": {k: v for k, v in kw.items() if v is not None}}
+    out = {"deltaserve": {k: v for k, v in kw.items() if v is not None}}
+    routing = {k: v for k, v in adapter_routing_kwargs(config).items()
+               if v is not None}
+    if routing:
+        out[ADAPTER_ROUTING_KEY] = routing
+    return out
 
 
 def finetune_cli_args(config: dict[str, Any], **overrides: Any) -> list[str]:
@@ -212,6 +264,11 @@ def split_config(config: dict[str, Any]) -> tuple[dict, FinetuneConfig, dict]:
             engine_kwargs[key] = value
 
     finetune_config = FinetuneConfig(**finetune_kwargs(config))
+    routing = adapter_routing_config(config)   # validates that section too
+    if finetune_config.enable_finetuning:
+        # Fail at launch, not in the engine, on a job that cannot run.
+        FinetuneJobSpec.from_finetune_config(finetune_config).validate(
+            routing.enable_adapter_routing)
     return engine_kwargs, finetune_config, extras
 
 

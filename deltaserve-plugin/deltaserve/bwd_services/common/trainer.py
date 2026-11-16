@@ -58,6 +58,7 @@ class LoraSftTrainerService(BackwardService):
             f"{type(self).__name__} must set the ``family`` class attribute")
         self._built = False
         self.lora: dict = {}            # layer -> {proj -> {"A":Param,"B":Param}}
+        self._lora_keys: dict = {}      # (layer, proj, "A"|"B") -> PEFT key
         self.base: dict = {}            # layer -> {q,k,v,o,gate,up,down,in_ln,post_ln,…}
         self.optimizer = None
         self.scheduler = None
@@ -224,6 +225,7 @@ class LoraSftTrainerService(BackwardService):
             # fp32 master, contiguous so the fused AdamW + IPC publish are happy.
             param = nn.Parameter(shard.detach().clone().float().contiguous())
             self.lora.setdefault(layer, {}).setdefault(proj, {})[ab] = param
+            self._lora_keys[(layer, proj, ab)] = key
             params.append(param)
 
         # ``fused=True`` uses PyTorch's CUDA-fused AdamW kernel — one launch
@@ -538,6 +540,13 @@ class LoraSftTrainerService(BackwardService):
         return loss, n_valid
 
     @torch.no_grad()
+    def export_lora_state(self) -> dict:
+        """[ft-job] The trained masters as ``{PEFT key: fp32 CPU tensor}`` — this
+        rank's shard under TP (``deltaserve.adapter_save`` merges the ranks).
+        The plain PEFT factors: alpha/r is baked in only when publishing."""
+        return {key: self.lora[layer][proj][ab].detach().float().cpu().clone()
+                for (layer, proj, ab), key in self._lora_keys.items()}
+
     def _publish_to_served(self) -> None:
         """Write the trained fp32 master into vLLM's served LoRA stacked buffers
         (DeltaServe's load-time refresh): per (layer, proj), clamp + cast to the

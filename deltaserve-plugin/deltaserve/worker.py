@@ -404,6 +404,18 @@ class DeltaServeWorker(Worker):
         dprint(f"shared served LoRA buffers (slot={slot}, {len(layers)} layers) "
                f"with backward process: {ack}")
 
+    def deltaserve_export_ft_adapter(self):
+        """[ft-job] ``(tp_rank, {PEFT key: CPU tensor})``: this rank's shard of
+        the trained FT adapter, or None without a backward child. Invoked via
+        collective_rpc when a finetuning job reaches 'ready'."""
+        backward_process = getattr(self, "backward_process", None)
+        if backward_process is None:
+            return None
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        return (int(get_tensor_model_parallel_rank()),
+                backward_process.export_lora())
+
     def deltaserve_start_finetuning(self) -> bool:
         """[DeltaServe] Open FT admission. Invoked via collective_rpc from the
         POST /start_finetuning HTTP route. The coordinator is a process-wide

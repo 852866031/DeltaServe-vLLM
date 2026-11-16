@@ -197,12 +197,43 @@ class FinetuneScheduler(AsyncScheduler):
         # the engine hooks before the busy loop. None = no pre-emption.
         self._engine_inputs = None
 
+        # [ft-job] The finetuning job this launch describes (the ``ft_job``
+        # section, or the implicit [init, training] job of the flat settings).
+        # Its stages only observe the store / coordinator — see ft_job.py.
+        from deltaserve.ft_job import FinetuneJobSpec, FtJobManager
+        self._ft_jobs = FtJobManager(adapter_routing=bool(
+            self.vllm_config.adapter_routing_config.enable_adapter_routing))
+        if ft_cfg.enable_finetuning:
+            self._ft_jobs.submit(FinetuneJobSpec.from_finetune_config(ft_cfg))
+
         dprint(
             f"[ft-sched] FinetuneScheduler active | capacity={capacity} "
             f"per_step_budget={self._coord.per_step_budget} "
             f"min_sample_len={self._coord.min_sample_len} | "
             f"corpus={len(self._ft_injector.store)} samples"
         )
+
+    # [ft-job] what a job stage may look at (the stage context is the scheduler).
+    @property
+    def store(self):
+        return self._ft_injector.store
+
+    @property
+    def coordinator(self):
+        return self._coord
+
+    @property
+    def adapter_routing_config(self):
+        return self.vllm_config.adapter_routing_config
+
+    def on_job_ready(self, job) -> None:
+        """[ft-job] 'ready': save the trained adapter (and publish it to the
+        adapter pool). ``_ds_engine`` / ``_adapter_routing`` are set by the
+        plugin once the engine is built."""
+        from deltaserve.adapter_save import save_job_adapter
+
+        save_job_adapter(job, getattr(self, "_ds_engine", None),
+                         getattr(self, "_adapter_routing", None))
 
     def _build_tokenize(self):
         from transformers import AutoTokenizer
@@ -875,6 +906,9 @@ class FinetuneScheduler(AsyncScheduler):
             self._coord.inf_req_count += 1
             dprint(f"[engine-recv {_ts()}] #{self._coord.inf_req_count} ADD "
                    f"req={getattr(request, 'request_id', '?')}")
+        routing = getattr(self, "_adapter_routing", None)
+        if routing is not None:
+            routing.note_request(request)   # pool hit count (adapter routing)
         super().add_request(request)
 
     @staticmethod
@@ -928,6 +962,10 @@ class FinetuneScheduler(AsyncScheduler):
 
         # Reopen FT admission if the backward process finished consuming a buffer.
         self._coord.poll_backward()
+        # [ft-job] advance the job's stages (observation only; no-op once the
+        # job is finished, and never during the launch profiling pass).
+        if not self._profiling_mode:
+            self._ft_jobs.tick(self)
         # Terminal/partial epoch flush fallback (guarded by reserved==0 inside,
         # so it can't race in-flight saves): fires when no further FT forward
         # will carry the flush.

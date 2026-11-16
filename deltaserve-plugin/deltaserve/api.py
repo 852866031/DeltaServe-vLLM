@@ -87,6 +87,19 @@ async def save_estimator_state(raw_request: Request):
                         content=result)
 
 
+@router.get("/ft_jobs")
+async def ft_jobs(raw_request: Request):
+    """The finetuning jobs of this server: the running one with the state of
+    each of its stages, the queued ones and the finished ones."""
+    try:
+        result = await engine_client(raw_request).engine_core.call_utility_async(
+            "deltaserve_ft_jobs")
+    except Exception as e:
+        logger.exception("ft_jobs failed")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    return JSONResponse(status_code=200, content=result)
+
+
 def attach_router(app: FastAPI):
     """Called after vLLM registers its own routers (plugin wrapper)."""
     ac = getattr(app.state.args, "additional_config", None) or {}
@@ -95,3 +108,25 @@ def attach_router(app: FastAPI):
         ac = json.loads(ac)
     if (ac.get("deltaserve") or {}).get("enable_finetuning", False):
         app.include_router(router)
+    routing = ac.get("deltaserve_adapter_routing") or {}
+    if routing.get("enable_adapter_routing", False):
+        # The only place the API server reaches into deltaserve.adapter_routing.
+        from deltaserve.adapter_routing.middleware import install
+        from deltaserve.config import AdapterRoutingConfig
+
+        cfg = AdapterRoutingConfig(**routing)
+        install(app, cfg)
+        # Pool adapters become servable by name (vLLM's LoRA resolver hook).
+        from deltaserve.adapter_routing.resolver import install_resolver
+
+        install_resolver(cfg)
+        logger.info("Adapter routing on: requests with model=%r are routed.",
+                    routing.get("route_model_name", "auto"))
+    elif "deltaserve" in ac or routing:
+        # A DeltaServe server with adapter routing off still answers an
+        # auto-route request: base model + "routing is not enabled" headers.
+        # No routing component is loaded for this.
+        from deltaserve.route_middleware import install_middleware, routing_disabled
+
+        install_middleware(app, routing_disabled,
+                           routing.get("route_model_name") or "auto")

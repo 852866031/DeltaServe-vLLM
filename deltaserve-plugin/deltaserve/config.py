@@ -44,6 +44,13 @@ class FinetuneConfig:
     """Path to the finetuning corpus: one tokenizable sample per non-empty line.
     Loaded + tokenized at startup by the FinetuningStore."""
 
+    ft_job: dict | None = None
+    """Finetuning-job metadata (the ``ft_job:`` YAML section minus the keys
+    that set a flat field above): ``name``, ``stages``, ``auto_routing``,
+    ``adapter_init``. None = the implicit job, stages ``[init, training]``.
+    Parsed by ``deltaserve.ft_job.FinetuneJobSpec``; not part of the
+    compile-cache hash."""
+
     num_epochs: int = 1
     """Number of passes over the finetuning corpus (FinetuningStore.advance_epoch)."""
 
@@ -621,3 +628,111 @@ class FinetuneConfig:
     request (ADD) off the input queue and adds it to the scheduler. Timestamp
     is when the MAIN thread drained the queue, not when the engine process
     received the ZMQ message."""
+
+
+@config
+class AdapterRoutingConfig:
+    """Knobs for adapter routing: requests that ask for it (``model`` equal to
+    ``route_model_name``) get a LoRA adapter chosen from their content, by the
+    ARIADNE recipe — a frozen sentence encoder, one centroid per adapter built
+    from the adapter's training inputs ("indexing"), cosine top-1.
+
+    Its own switch, independent of ``FinetuneConfig.enable_finetuning``. While
+    ``enable_adapter_routing`` is False nothing under ``deltaserve.adapter_routing`` is
+    imported and no routing process, middleware, pool or route exists.
+
+    Travels as ``additional_config["deltaserve_adapter_routing"]`` (the ``adapter_routing:``
+    section of a serving YAML). None of it changes the traced forward, so it is
+    left out of the compile-cache hash."""
+
+    enable_adapter_routing: bool = False
+    """Master switch. False (default) = the server behaves exactly as without
+    this feature."""
+
+    route_model_name: str = "auto"
+    """A request is routed only when its ``model`` field equals this name. A
+    request naming an adapter or the base model is never touched."""
+
+    router_device: str = "cpu"
+    """Device of the router service's encoder: ``"cpu"`` or a CUDA device such
+    as ``"cuda:0"`` (resident on the GPU, about 1.5 GB)."""
+
+    route_timeout_ms: float = 200.0
+    """How long an API server waits for the router's answer before serving the
+    request with the base model instead (reported as a fallback)."""
+
+    encoder: str = "intfloat/e5-large-v2"
+    """Sentence encoder for both the adapter centroids and the request
+    embedding (they must match; the index records which one built it)."""
+
+    encoder_query_prefix: str = "query: "
+    """Text prepended to every encoded input (e5 convention)."""
+
+    encoder_max_tokens: int = 512
+    """Inputs are truncated to this many encoder tokens."""
+
+    fallback_score_threshold: float = 0.0
+    """An auto-routed request whose best cosine score is below this is served
+    by the base model with no adapter (reported to the client as a fallback).
+    NOT calibrated yet: e5 cosines sit in a narrow high band, so the default
+    0.0 never falls back in practice — set it from a calibration run."""
+
+    max_pool_adapters: int = 32
+    """Capacity of the pool of auto-routable adapters."""
+
+    pool_protected_slots: int = 1
+    """How many of the most-used adapters in LoRA GPU slots can never be
+    evicted to make room for another one."""
+
+    pool_hit_half_life_s: float = 300.0
+    """Half-life of an adapter's hit count: GPU slots are kept by this decayed
+    frequency (0 = never decays, i.e. plain hit counts)."""
+
+    index_path: str | None = None
+    """Directory of a centroid index built offline (adapters registered
+    statically, without a finetuning job). None = start with an empty pool."""
+
+    indexing_max_samples: int = 2500
+    """At most this many training inputs are encoded per adapter centroid."""
+
+    indexing_chunk_samples: int = 16
+    """Samples per indexing chunk. The job checkpoints after every chunk and a
+    chunk is the unit that moves between CPU and GPU (or is redone if dropped)."""
+
+    indexing_cpu_max_threads: int = 8
+    """Most CPU threads the CPU indexer may use for one chunk."""
+
+    indexing_cpu_reserve_cores: int = 2
+    """Idle cores the CPU indexer always leaves free; it pauses when fewer
+    than ``reserve + 1`` cores are idle."""
+
+    indexing_min_free_memory_gb: float = 4.0
+    """Host memory that must stay available while the CPU indexer runs; it
+    pauses (and unloads its encoder) below that."""
+
+    indexing_cpus: str | None = None
+    """CPU list the CPU indexer is pinned to, e.g. ``"8-15"``; keep it disjoint
+    from the cores the vLLM processes use. None = no pinning."""
+
+    indexing_gpu_after_quiet_s: float = 3.0
+    """Indexing moves to the GPU only after inference has been quiet this long
+    (and back to the CPU the moment a request arrives)."""
+
+    def __post_init__(self) -> None:
+        if not self.route_model_name:
+            raise ValueError("adapter_routing.route_model_name must not be empty")
+        if not self.encoder:
+            raise ValueError("adapter_routing.encoder must not be empty")
+        for name in ("encoder_max_tokens", "max_pool_adapters",
+                     "indexing_max_samples", "indexing_chunk_samples",
+                     "indexing_cpu_max_threads"):
+            if int(getattr(self, name)) < 1:
+                raise ValueError(f"adapter_routing.{name} must be >= 1")
+        for name in ("indexing_cpu_reserve_cores", "indexing_min_free_memory_gb",
+                     "indexing_gpu_after_quiet_s", "pool_protected_slots",
+                     "pool_hit_half_life_s", "route_timeout_ms"):
+            if float(getattr(self, name)) < 0:
+                raise ValueError(f"adapter_routing.{name} must be >= 0")
+        if not -1.0 <= float(self.fallback_score_threshold) <= 1.0:
+            raise ValueError(
+                "adapter_routing.fallback_score_threshold is a cosine in [-1, 1]")

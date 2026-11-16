@@ -51,15 +51,22 @@ class DeltaServeConfig(Mapping):
     SLO or throttle knob does not recompile."""
 
     KEY = "deltaserve"
+    ADAPTER_ROUTING_KEY = "deltaserve_adapter_routing"
 
-    def __init__(self, finetune, extra: dict) -> None:
+    def __init__(self, finetune, extra: dict, adapter_routing=None) -> None:
         self.finetune = finetune
         self._extra = dict(extra)
+        # AdapterRoutingConfig, or None when the launch carried no adapter-routing
+        # entry (the mapping and its hash are then exactly what they were without it).
+        self.adapter_routing = adapter_routing
 
     def _as_dict(self) -> dict:
         from dataclasses import asdict
 
-        return {**self._extra, self.KEY: asdict(self.finetune)}
+        out = {**self._extra, self.KEY: asdict(self.finetune)}
+        if self.adapter_routing is not None:
+            out[self.ADAPTER_ROUTING_KEY] = asdict(self.adapter_routing)
+        return out
 
     def __getitem__(self, key):
         return self._as_dict()[key]
@@ -68,17 +75,21 @@ class DeltaServeConfig(Mapping):
         return iter(self._as_dict())
 
     def __len__(self) -> int:
-        return len(self._extra) + 1
+        return len(self._extra) + 1 + (self.adapter_routing is not None)
 
     def compute_hash(self) -> str:
         from vllm.utils.hashing import safe_hash
 
+        # Adapter routing is not part of the hash: it never changes the traced forward.
         extra = json.dumps(self._extra, sort_keys=True, default=str)
         return safe_hash(f"{self.finetune.compute_hash()}|{extra}".encode(),
                          usedforsecurity=False).hexdigest()
 
     def __repr__(self) -> str:
-        return f"DeltaServeConfig({self.finetune!r}, extra={self._extra!r})"
+        routing = ("" if self.adapter_routing is None
+                   else f", adapter_routing={self.adapter_routing!r}")
+        return (f"DeltaServeConfig({self.finetune!r}, extra={self._extra!r}"
+                f"{routing})")
 
     def __setstate__(self, state) -> None:
         self.__dict__.update(state)
@@ -97,6 +108,18 @@ def _disabled():
 _DISABLED = None
 
 
+def _adapter_routing_disabled():
+    from deltaserve.config import AdapterRoutingConfig
+
+    global _ADAPTER_ROUTING_DISABLED
+    if _ADAPTER_ROUTING_DISABLED is None:
+        _ADAPTER_ROUTING_DISABLED = AdapterRoutingConfig()
+    return _ADAPTER_ROUTING_DISABLED
+
+
+_ADAPTER_ROUTING_DISABLED = None
+
+
 def _wrap(cls, name: str, make):
     orig = getattr(cls, name)
     if getattr(orig, "_deltaserve", False):
@@ -110,7 +133,7 @@ def _patch_config() -> None:
     from vllm.config import VllmConfig
     from vllm.engine.arg_utils import EngineArgs
 
-    from deltaserve.config import FinetuneConfig
+    from deltaserve.config import FinetuneConfig, AdapterRoutingConfig
     from deltaserve.engine_config import configure_vllm_config
 
     def finetune_config(self):
@@ -119,13 +142,23 @@ def _patch_config() -> None:
 
     VllmConfig.finetune_config = property(finetune_config)
 
+    def adapter_routing_config(self):
+        ac = self.additional_config
+        routing = ac.adapter_routing if isinstance(ac, DeltaServeConfig) else None
+        return routing if routing is not None else _adapter_routing_disabled()
+
+    VllmConfig.adapter_routing_config = property(adapter_routing_config)
+
     def post_init(orig):
         def __post_init__(self):
             ac = self.additional_config
-            if isinstance(ac, dict) and DeltaServeConfig.KEY in ac:
-                extra = {k: v for k, v in ac.items() if k != DeltaServeConfig.KEY}
+            keys = (DeltaServeConfig.KEY, DeltaServeConfig.ADAPTER_ROUTING_KEY)
+            if isinstance(ac, dict) and any(k in ac for k in keys):
+                extra = {k: v for k, v in ac.items() if k not in keys}
+                routing = ac.get(DeltaServeConfig.ADAPTER_ROUTING_KEY)
                 self.additional_config = DeltaServeConfig(
-                    FinetuneConfig(**ac[DeltaServeConfig.KEY]), extra)
+                    FinetuneConfig(**ac.get(DeltaServeConfig.KEY, {})), extra,
+                    None if routing is None else AdapterRoutingConfig(**routing))
             configure_vllm_config(self)
             return orig(self)
         return __post_init__
@@ -178,7 +211,18 @@ def _patch_engine_core() -> None:
         def __init__(self, vllm_config, *args, **kwargs):
             # Before the executor spawns the workers (arrival signal).
             self._ds = attach_engine_hooks(self, vllm_config)
-            return orig(self, vllm_config, *args, **kwargs)
+            orig(self, vllm_config, *args, **kwargs)
+            # [ft-job] the scheduler saves a finished job's adapter through the
+            # engine (worker RPC).
+            if vllm_config.finetune_config.enable_finetuning:
+                self.scheduler._ds_engine = self
+            self._ds_routing = None
+            if vllm_config.adapter_routing_config.enable_adapter_routing:
+                # The only place the engine reaches into deltaserve.adapter_routing.
+                from deltaserve.adapter_routing.engine import AdapterRoutingEngine
+
+                self._ds_routing = AdapterRoutingEngine(self, vllm_config)
+                self.scheduler._adapter_routing = self._ds_routing
         return __init__
 
     _wrap(EngineCore, "__init__", init)
@@ -188,6 +232,9 @@ def _patch_engine_core() -> None:
             ds = getattr(self, "_ds", None)
             if ds is not None:
                 ds.on_shutdown()
+            routing = getattr(self, "_ds_routing", None)
+            if routing is not None:
+                routing.shutdown()          # stops the router service
             try:
                 return orig(self, *args, **kwargs)
             finally:
@@ -237,6 +284,15 @@ def _patch_engine_core() -> None:
             return save_estimator_state(self, path)
 
         EngineCore.deltaserve_save_estimator_state = deltaserve_save_estimator_state
+
+    if not hasattr(EngineCore, "deltaserve_ft_jobs"):
+        def deltaserve_ft_jobs(self) -> dict:
+            """Utility behind GET /ft_jobs: the finetuning jobs and their stages."""
+            jobs = getattr(self.scheduler, "_ft_jobs", None)
+            return {"current": None, "queued": [], "finished": []} \
+                if jobs is None else jobs.status()
+
+        EngineCore.deltaserve_ft_jobs = deltaserve_ft_jobs
 
 
 def _patch_api_server() -> None:
