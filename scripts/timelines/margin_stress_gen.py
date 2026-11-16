@@ -7,12 +7,12 @@ PREDICTED step time reaches ``max_tbt_slo`` (when decodes are running) or the
 TTFT deadline. Whatever the estimator under-predicts then lands as a step over
 the limit. This timeline makes that visible:
 
-- decodes are almost always running (outputs 64-320 tokens), so the max-TBT
+- decodes are almost always running (outputs 64-256 tokens), so the max-TBT
   check is active on nearly every step;
-- prompts are log-uniform in 24-400 tokens, so prefill steps span several-fold
+- prompts are log-uniform in 16-160 tokens, so prefill steps span several-fold
   in time and the estimator's error has to hold across shapes, not at one point
   (the stock timelines are all 50 / 50);
-- arrivals are Poisson with a rate that alternates 2 and 5 req/s every 15 s, so
+- arrivals are Poisson with a rate that alternates 1.5 and 3 req/s every 15 s, so
   the decode population (and the step shape) keeps moving.
 
     python scripts/timelines/margin_stress_gen.py      # → data/timelines/5090/timeline_margin_stress.csv
@@ -34,10 +34,10 @@ def main() -> None:
     ap.add_argument("--out", default=str(_ROOT / "data/timelines/5090/timeline_margin_stress.csv"))
     ap.add_argument("--duration", type=float, default=120.0)
     ap.add_argument("--start", type=float, default=3.0, help="first arrival (s)")
-    ap.add_argument("--rates", default="2,5", help="req/s, alternated every --period")
+    ap.add_argument("--rates", default="1.5,3", help="req/s, alternated every --period")
     ap.add_argument("--period", type=float, default=15.0)
-    ap.add_argument("--prompt", default="24,400", help="log-uniform prompt length range")
-    ap.add_argument("--output", default="64,320", help="uniform output length range")
+    ap.add_argument("--prompt", default="16,160", help="log-uniform prompt length range")
+    ap.add_argument("--output", default="64,256", help="uniform output length range")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     rng = random.Random(a.seed)
