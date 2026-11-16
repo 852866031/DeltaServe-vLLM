@@ -28,10 +28,12 @@ import time
 from multiprocessing.connection import Client, Listener
 
 from deltaserve import dprint
+from deltaserve.adapter_routing.decision import RoutingModel
 from deltaserve.adapter_routing.index import CentroidIndex
 from deltaserve.route_middleware import (  # noqa: F401 — re-exported
     BELOW_THRESHOLD,
     FALLBACK,
+    LOW_CONFIDENCE,
     NO_ADAPTERS,
     NO_TEXT,
     ROUTED,
@@ -54,47 +56,105 @@ def _authkey(path: str) -> bytes:
 
 class Router:
     def __init__(self, encoder, index_file: str, threshold: float = 0.0,
-                 reload_s: float = 1.0) -> None:
+                 reload_s: float = 1.0, keep_percent: float = 100.0,
+                 close_band: float = 0.05, min_pool: int = 4,
+                 decision_log: str | None = None, slack: float = 0.0) -> None:
         self.encoder, self.index_file = encoder, index_file
         self.threshold, self.reload_s = float(threshold), float(reload_s)
+        self._model_args = (float(keep_percent), float(close_band), int(min_pool),
+                            float(slack))
         self.index = CentroidIndex()
+        self.model = RoutingModel(self.index, *self._model_args)
         self._mtime = None
         self._checked = 0.0
         self.requests = 0
+        # Among close candidates: an adapter in a GPU slot first (the pool's
+        # last published view), then the one this router has routed to most.
+        self._tier: dict[str, str] = {}
+        self._pool_mtime = None
+        self._routed: dict[str, int] = {}
+        self._log = decision_log
+
+    def _prefer(self, name: str):
+        return (self._tier.get(name) == "gpu", self._routed.get(name, 0))
+
+    def _refresh_pool_view(self) -> None:
+        from deltaserve.adapter_routing.pool import REGISTRY_FILE, read_registry
+
+        directory = os.path.dirname(self.index_file)
+        try:
+            mtime = os.stat(os.path.join(directory, REGISTRY_FILE)).st_mtime_ns
+        except OSError:
+            return
+        if mtime == self._pool_mtime:
+            return
+        reg = read_registry(directory)
+        if reg is not None:
+            self._pool_mtime = mtime
+            self._tier = {a["name"]: a.get("tier", "") for a in reg["adapters"]}
 
     def refresh(self, force: bool = False) -> None:
         now = time.monotonic()
         if not force and now - self._checked < self.reload_s:
             return
         self._checked = now
+        self._refresh_pool_view()
         try:
             mtime = os.stat(self.index_file).st_mtime_ns
         except OSError:
             if self._mtime is not None:
                 self.index, self._mtime = CentroidIndex(), None
+                self.model = RoutingModel(self.index, *self._model_args)
             return
         if mtime != self._mtime:
-            self.index, self._mtime = CentroidIndex.load(self.index_file), mtime
-            dprint(f"[router] index loaded: {len(self.index)} adapters")
+            index = CentroidIndex.load(self.index_file)
+            model = RoutingModel(index, *self._model_args)
+            # one assignment each: a batch being routed keeps the snapshot it has
+            self.index, self.model, self._mtime = index, model, mtime
+            dprint(f"[router] index loaded: {len(index)} adapters | "
+                   f"{model.describe()}")
+
+    def _record(self, decision: RouteDecision, choice) -> None:
+        if not self._log:
+            return
+        import json
+
+        try:
+            with open(self._log, "a") as f:
+                f.write(json.dumps({
+                    "t": round(time.time(), 3), "outcome": decision.outcome,
+                    "adapter": decision.adapter, "reason": decision.reason,
+                    "score": decision.score, "confidence": decision.confidence,
+                    "margin": None if choice is None else choice.margin,
+                    "candidates": list(decision.candidates)}) + "\n")
+        except OSError:
+            pass
 
     def route_many(self, texts: list) -> list[RouteDecision]:
         """One decision per text, with ONE encoder call for all of them."""
         self.requests += len(texts)
         self.refresh()
+        model = self.model
         out: list = [None] * len(texts)
         todo = []
         for i, text in enumerate(texts):
             if not text or not text.strip():
                 out[i] = RouteDecision(None, None, NO_TEXT)
-            elif not len(self.index):
+            elif not model.names:
                 out[i] = RouteDecision(None, None, NO_ADAPTERS)
             else:
                 todo.append(i)
         if todo:
             embs = self.encoder.encode([texts[i] for i in todo])
             for i, emb in zip(todo, embs):
-                name, score = self.index.route(emb, self.threshold)
-                out[i] = RouteDecision(name, score, "" if name else BELOW_THRESHOLD)
+                c = model.decide(emb, prefer=self._prefer, raw_floor=self.threshold)
+                reason = "" if c.adapter else (
+                    LOW_CONFIDENCE if c.low_confidence else BELOW_THRESHOLD)
+                if c.adapter:
+                    self._routed[c.adapter] = self._routed.get(c.adapter, 0) + 1
+                out[i] = RouteDecision(c.adapter, c.score, reason, c.confidence,
+                                       tuple(c.candidates))
+                self._record(out[i], c)
         return out
 
     def route(self, text: str | None) -> RouteDecision:
@@ -183,7 +243,8 @@ def _handle(conn, router: Router, batcher: RouteBatcher) -> None:
             try:
                 if msg[0] == "route":
                     d = batcher.submit(msg[1])
-                    reply = ("ok", d.adapter, d.score, d.reason)
+                    reply = ("ok", d.adapter, d.score, d.reason, d.confidence,
+                             d.candidates)
                 elif msg[0] == "ping":
                     reply = ("ok", len(router.index), router.requests,
                              batcher.batches, batcher.largest)
@@ -301,7 +362,7 @@ class RouterClient:
         if reply[0] != "ok":
             self.failures += 1
             return RouteDecision(None, None, UNAVAILABLE)
-        return RouteDecision(reply[1], reply[2], reply[3])
+        return RouteDecision(*reply[1:])
 
     def ping(self) -> tuple | None:
         with self._lock:
@@ -350,8 +411,8 @@ def serve_config(cfg, device: str | None = None) -> None:
     where = device if cfg.router_gpu is None or device == "cpu" \
         else f"GPU {cfg.router_gpu}"
     dprint(f"[router] serving on {path} | encoder={cfg.encoder} on {where} | "
-           f"{len(router.index)} adapters | threshold="
-           f"{cfg.fallback_score_threshold} | batch<={cfg.route_batch_max}")
+           f"{len(router.index)} adapters | {router.model.describe()} | "
+           f"batch<={cfg.route_batch_max}")
     serve(router, path, max_batch=cfg.route_batch_max,
           batch_wait_s=cfg.route_batch_wait_ms / 1e3)
 
@@ -365,8 +426,13 @@ def build_router(cfg, device: str = "cpu") -> tuple[Router, str]:
     directory = index_dir(cfg)
     encoder = SentenceEncoder(cfg.encoder, cfg.encoder_query_prefix,
                               cfg.encoder_max_tokens, device)
-    router = Router(encoder, os.path.join(directory, ROUTABLE_FILE),
-                    cfg.fallback_score_threshold)
+    router = Router(
+        encoder, os.path.join(directory, ROUTABLE_FILE),
+        cfg.fallback_score_threshold, keep_percent=cfg.route_keep_percent,
+        close_band=cfg.route_close_band, min_pool=cfg.route_min_pool,
+        slack=cfg.route_confidence_slack,
+        decision_log=(os.path.join(directory, "decisions.jsonl")
+                      if cfg.route_decision_log else None))
     return router, socket_path(directory)
 
 

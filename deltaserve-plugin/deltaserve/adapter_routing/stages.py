@@ -142,7 +142,8 @@ class IndexingStage(Stage):
         cfg = ctx.adapter_routing_config
         if not job.spec.data_path:
             raise RuntimeError("the job has no dataset to index")
-        texts = select_samples(job.spec.data_path, cfg.indexing_max_samples)
+        texts = select_samples(job.spec.data_path, cfg.indexing_max_samples,
+                               input_until=cfg.indexing_input_until)
         if not texts:
             raise RuntimeError(f"no sample to index in {job.spec.data_path}")
         texts.sort(key=len)
@@ -155,7 +156,8 @@ class IndexingStage(Stage):
                    f"dataset, nothing to encode")
             return
         self._indexer = Indexer(texts, self.fp, os.path.join(
-            self.dir, "checkpoints", f"{job.name}.npz"))
+            self.dir, "checkpoints", f"{job.name}.npz"),
+            reference_samples=cfg.route_reference_samples)
         if self._indexer.resumed_from:
             dprint(f"[indexing] {job.name} resumes at "
                    f"{self._indexer.resumed_from}/{len(texts)}")
@@ -204,7 +206,8 @@ class IndexingStage(Stage):
                 raise RuntimeError(
                     f"{path} was built with encoder '{index.encoder}', not "
                     f"'{cfg.encoder}'; centroids of different encoders cannot mix")
-            index.add(job.name, runner.indexer.centroid())
+            index.add(job.name, runner.indexer.centroid(),
+                      refs=runner.indexer.references())
             index.save(path)
             meta = _read_meta(self.dir)
             meta[job.name] = self.fp

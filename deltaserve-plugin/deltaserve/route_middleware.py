@@ -21,6 +21,8 @@ Every routed request is answered with headers saying what happened::
     x-deltaserve-routing: routed | fallback
     x-deltaserve-adapter: <adapter name>          (routed only)
     x-deltaserve-routing-score: <best cosine>     (when one was computed)
+    x-deltaserve-routing-confidence: <pool-relative confidence>   (when computed)
+    x-deltaserve-routing-candidates: <a,b,...>    (several adapters were close)
     x-deltaserve-routing-reason: <why>            (fallback only)
     x-deltaserve-routing-message: <the same, as a sentence>   (fallback only)
 
@@ -43,10 +45,13 @@ NO_ADAPTERS = "no-adapters"
 NO_TEXT = "no-text"
 UNAVAILABLE = "router-unavailable"
 TIMEOUT = "router-timeout"
+LOW_CONFIDENCE = "low-confidence"
 DISABLED = "adapter-routing-disabled"
 MESSAGES = {
     BELOW_THRESHOLD: "no adapter matched this request closely enough; "
                      "served by the base model",
+    LOW_CONFIDENCE: "the best adapter is not a confident match for this "
+                    "request; served by the base model",
     NO_ADAPTERS: "no routable adapter is available; served by the base model",
     NO_TEXT: "the request has no text to route on; served by the base model",
     UNAVAILABLE: "the adapter router is unavailable; served by the base model",
@@ -62,6 +67,8 @@ class RouteDecision:
     adapter: str | None            # None = serve with the base model
     score: float | None = None     # best cosine, when one was computed
     reason: str = ""               # set on a fallback
+    confidence: float | None = None   # the pool-relative confidence, when computed
+    candidates: tuple = ()         # the adapters that scored close to the best
 
     @property
     def outcome(self) -> str:
@@ -183,6 +190,12 @@ class AdapterRouteMiddleware:
         if decision.score is not None:
             extra.append((b"x-deltaserve-routing-score",
                           f"{decision.score:.4f}".encode()))
+        if decision.confidence is not None:
+            extra.append((b"x-deltaserve-routing-confidence",
+                          f"{decision.confidence:.3f}".encode()))
+        if len(decision.candidates) > 1:
+            extra.append((b"x-deltaserve-routing-candidates",
+                          ",".join(decision.candidates).encode()))
         if decision.reason:
             extra.append((b"x-deltaserve-routing-reason", decision.reason.encode()))
             if decision.reason in MESSAGES:

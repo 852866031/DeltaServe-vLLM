@@ -38,12 +38,19 @@ def l2_normalize(x: np.ndarray) -> np.ndarray:
     return x / np.where(n == 0, 1.0, n)
 
 
-def select_samples(data_path: str, max_samples: int, seed: int = 0) -> list[str]:
+def select_samples(data_path: str, max_samples: int, seed: int = 0,
+                   input_until: str | None = None) -> list[str]:
     """The texts an adapter's centroid is built from: the non-empty lines of
     its finetuning corpus (one sample per line), at most ``max_samples`` of
-    them, drawn without replacement in a fixed (seeded) order."""
+    them, drawn without replacement in a fixed (seeded) order.
+
+    ``input_until``: a marker that separates a sample's input from its target
+    (e.g. ``"### Response:"``). Only the text before it is kept — a request
+    carries the input alone, so the centroid should be built from inputs."""
     with open(data_path, encoding="utf-8") as f:
         texts = [line.strip() for line in f]
+    if input_until:
+        texts = [t.split(input_until, 1)[0].strip() for t in texts]
     texts = [t for t in texts if t]
     if len(texts) > max_samples:
         order = np.random.default_rng(seed).permutation(len(texts))[:max_samples]
@@ -70,12 +77,14 @@ class IndexingState:
     cursor: int = 0
     count: int = 0
     sum: np.ndarray | None = None     # float64 [dim]; None until the first chunk
+    refs: np.ndarray | None = None    # float32 [n_ref, dim]; rows before the cursor are set
 
     def save(self, path) -> None:
         _atomic_savez(
             path, fingerprint=np.array(self.fingerprint),
             meta=np.array([self.total, self.cursor, self.count], dtype=np.int64),
-            sum=np.zeros(0) if self.sum is None else self.sum)
+            sum=np.zeros(0) if self.sum is None else self.sum,
+            refs=np.zeros((0, 0), np.float32) if self.refs is None else self.refs)
 
     @classmethod
     def load(cls, path) -> "IndexingState | None":
@@ -83,8 +92,10 @@ class IndexingState:
             with np.load(path, allow_pickle=False) as z:
                 total, cursor, count = (int(v) for v in z["meta"])
                 s = z["sum"].astype(np.float64)
+                r = z["refs"].astype(np.float32) if "refs" in z else None
                 return cls(str(z["fingerprint"]), total, cursor, count,
-                           s if s.size else None)
+                           s if s.size else None,
+                           r if r is not None and r.size else None)
         except (OSError, KeyError, ValueError):
             return None
 
@@ -93,15 +104,27 @@ class Indexer:
     """One adapter's indexing job, resumable chunk by chunk."""
 
     def __init__(self, texts: list[str], fp: str,
-                 checkpoint_path: str | os.PathLike | None = None) -> None:
+                 checkpoint_path: str | os.PathLike | None = None,
+                 reference_samples: int = 0) -> None:
         self.texts = texts
         self.checkpoint_path = checkpoint_path
         self.resumed_from = 0
+        # Reference samples: the embeddings of a few samples, spread evenly over
+        # the (possibly length-sorted) list, kept as they go by. They cost
+        # nothing extra and later calibrate the pool's routing confidence.
+        k = max(0, min(int(reference_samples), len(texts)))
+        pos = np.unique(np.linspace(0, len(texts) - 1, k).round().astype(int)) \
+            if k else np.zeros(0, int)
+        self._ref_row = {int(p): i for i, p in enumerate(pos)}
         state = IndexingState.load(checkpoint_path) if checkpoint_path else None
         if state is not None and (state.fingerprint != fp
                                   or state.total != len(texts)
                                   or not 0 <= state.cursor <= len(texts)):
             state = None      # another dataset / encoder: start over
+        if state is not None and state.cursor > 0 and (
+                (state.refs.shape[0] if state.refs is not None else 0)
+                != len(self._ref_row)):
+            state = None      # another reference-sample setting: start over
         if state is None:
             state = IndexingState(fingerprint=fp, total=len(texts))
         else:
@@ -132,6 +155,13 @@ class Indexer:
                 or start + emb.shape[0] > st.total:
             return False
         emb = l2_normalize(emb)
+        if self._ref_row:
+            if st.refs is None:
+                st.refs = np.zeros((len(self._ref_row), emb.shape[1]), np.float32)
+            for j in range(emb.shape[0]):
+                row = self._ref_row.get(start + j)
+                if row is not None:
+                    st.refs[row] = emb[j]
         st.sum = emb.sum(0) if st.sum is None else st.sum + emb.sum(0)
         st.count += emb.shape[0]
         st.cursor += emb.shape[0]
@@ -144,6 +174,13 @@ class Indexer:
             raise RuntimeError("indexing is not finished")
         return l2_normalize(self.state.sum / self.state.count).astype(np.float32)
 
+    def references(self) -> np.ndarray | None:
+        """The reference-sample embeddings ([n_ref, dim], unit length) of a
+        finished job; None when none were kept."""
+        if not self.done:
+            raise RuntimeError("indexing is not finished")
+        return None if self.state.refs is None else self.state.refs.copy()
+
 
 class CentroidIndex:
     """One centroid per routable adapter, with the encoder that built them."""
@@ -153,6 +190,8 @@ class CentroidIndex:
         self.encoder, self.prefix, self.max_tokens = encoder, prefix, int(max_tokens)
         self.names: list[str] = []
         self._matrix = np.zeros((0, 0), dtype=np.float32)
+        # name → reference-sample embeddings [n, dim] (optional per adapter)
+        self.refs: dict[str, np.ndarray] = {}
 
     def __len__(self) -> int:
         return len(self.names)
@@ -160,8 +199,12 @@ class CentroidIndex:
     def __contains__(self, name: str) -> bool:
         return name in self.names
 
-    def add(self, name: str, centroid: np.ndarray) -> None:
+    def add(self, name: str, centroid: np.ndarray, refs=None) -> None:
         c = l2_normalize(np.asarray(centroid, dtype=np.float32).reshape(1, -1))
+        if refs is not None and len(refs):
+            self.refs[name] = np.asarray(refs, dtype=np.float32)
+        else:
+            self.refs.pop(name, None)
         if len(self.names) and c.shape[1] != self._matrix.shape[1]:
             raise ValueError(
                 f"centroid dim {c.shape[1]} != index dim {self._matrix.shape[1]}")
@@ -177,7 +220,11 @@ class CentroidIndex:
         i = self.names.index(name)
         self.names.pop(i)
         self._matrix = np.delete(self._matrix, i, axis=0)
+        self.refs.pop(name, None)
         return True
+
+    def centroid_of(self, name: str) -> np.ndarray:
+        return self._matrix[self.names.index(name)].copy()
 
     def scores(self, embedding: np.ndarray) -> np.ndarray:
         """Cosine of one embedding against every centroid, in ``names`` order."""
@@ -199,11 +246,14 @@ class CentroidIndex:
         return (self.names[i] if best >= threshold else None), best
 
     def save(self, path) -> None:
+        ref_names = [n for n in self.names if n in self.refs]
         _atomic_savez(
             path, names=np.array(self.names, dtype=str), matrix=self._matrix,
             meta=np.array(json.dumps({"encoder": self.encoder,
                                       "prefix": self.prefix,
-                                      "max_tokens": self.max_tokens})))
+                                      "max_tokens": self.max_tokens,
+                                      "ref_names": ref_names})),
+            **{f"ref_{i}": self.refs[n] for i, n in enumerate(ref_names)})
 
     @classmethod
     def load(cls, path) -> "CentroidIndex":
@@ -212,4 +262,6 @@ class CentroidIndex:
             idx = cls(meta["encoder"], meta["prefix"], meta["max_tokens"])
             idx.names = [str(n) for n in z["names"]]
             idx._matrix = z["matrix"].astype(np.float32)
+            for i, n in enumerate(meta.get("ref_names", [])):
+                idx.refs[n] = z[f"ref_{i}"].astype(np.float32)
         return idx

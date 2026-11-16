@@ -213,6 +213,12 @@ class AdapterRoutingEngine:
             idle = self.jobs.current is None
         if idle and self.shared_indexer.idle_and_loaded:
             self.shared_indexer.unload()      # give the encoder's memory back
+        # The router prefers, among close candidates, adapters that are in a
+        # GPU slot / used most: let it see the pool's view now and then.
+        self._ticks = getattr(self, "_ticks", 0) + 1
+        if getattr(self, "_usage_dirty", False) and self._ticks % 25 == 0:
+            self._usage_dirty = False
+            self.pool.save(self.dir)
 
     def _drive(self) -> None:
         while not self._stop.wait(0.2):
@@ -246,10 +252,12 @@ class AdapterRoutingEngine:
         only registers it (weights loaded on first use)."""
         if not job.saved_path:
             raise RuntimeError(f"{job.name}: the adapter was not saved")
+        refs = None
         if centroid is None:
             centroids = self._centroids()
             if centroids is not None and job.name in centroids:
-                centroid = centroids._matrix[centroids.names.index(job.name)].copy()
+                centroid = centroids.centroid_of(job.name)
+                refs = centroids.refs.get(job.name)
         if centroid is None:
             dprint(f"[adapter-routing] {job.name} has no centroid (no 'indexing' "
                    f"stage?): servable by name, not auto-routable")
@@ -257,12 +265,12 @@ class AdapterRoutingEngine:
             # Known from an earlier run (restored registry): refresh its centroid.
             entry = self.pool.entries[job.name]
             if centroid is not None:
-                entry.centroid = centroid
+                entry.centroid, entry.refs = centroid, refs
             if entry.enabled:
                 self.pool.enable(job.name)
             return
         self.pool.register(job.name, job.saved_path, centroid=centroid,
-                           job=job.name, load=load)
+                           job=job.name, load=load, refs=refs)
 
     def note_request(self, request) -> None:
         """Count a request that uses a pool adapter (drives GPU-slot retention)."""
@@ -272,6 +280,7 @@ class AdapterRoutingEngine:
             return
         try:
             self.pool.note_hit(name)
+            self._usage_dirty = True
         except Exception as e:  # noqa: BLE001 — bookkeeping must not fail serving
             dprint(f"[adapter-routing] hit on {name} not counted: {e}")
 

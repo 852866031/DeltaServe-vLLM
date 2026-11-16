@@ -685,11 +685,46 @@ class AdapterRoutingConfig:
     encoder_max_tokens: int = 512
     """Inputs are truncated to this many encoder tokens."""
 
+    route_keep_percent: float = 90.0
+    """The confidence threshold, as the share of the pool's REFERENCE samples
+    (training data) that pass it; requests below it fall back to the base
+    model. The pool computes the threshold from its reference samples (see
+    ``adapter_routing/decision.py``) and recomputes it when the pool changes.
+    Real requests are less like the training data than the training data is,
+    so fewer of them pass: on the adapter-route benchmark 90 routed 78 % of the
+    requests that had a matching adapter (no loss of task score on those) and
+    sent 58 % of the unmatched ones to the base model; 80 routed 59 % / sent
+    79 % to base. 100 = never fall back on confidence."""
+
+    route_confidence_slack: float = 0.0
+    """Lowers the confidence threshold by this many confidence units (the sum
+    of two z-scores). Real requests are less typical than the training samples
+    the threshold is computed from; with small or templated training sets the
+    gap is large and genuine requests fall back unless this is raised. Set it
+    from the decision log."""
+
+    route_close_band: float = 0.05
+    """Adapters whose (centred) score is within this of the best are "close":
+    the request goes to one of them, preferring one already in a GPU slot,
+    then the most used."""
+
+    route_min_pool: int = 4
+    """Fewer adapters than this in the pool: centring is unreliable, the
+    confidence falls back to the raw score (a weaker signal)."""
+
+    route_reference_samples: int = 64
+    """Training-sample embeddings kept per adapter during indexing, to
+    calibrate the routing confidence (about 256 KB each)."""
+
+    route_decision_log: bool = False
+    """Append every routing decision (no request text) to
+    ``<index dir>/decisions.jsonl`` for offline calibration."""
+
     fallback_score_threshold: float = 0.0
-    """An auto-routed request whose best cosine score is below this is served
-    by the base model with no adapter (reported to the client as a fallback).
-    NOT calibrated yet: e5 cosines sit in a narrow high band, so the default
-    0.0 never falls back in practice — set it from a calibration run."""
+    """A manual, absolute floor on the raw cosine of the best adapter, applied
+    before the confidence check (0.0 = off). Mainly for pools without
+    reference samples; e5 cosines sit in a narrow high band, so prefer
+    ``route_keep_percent``."""
 
     max_pool_adapters: int = 32
     """Capacity of the pool of auto-routable adapters."""
@@ -715,6 +750,12 @@ class AdapterRoutingConfig:
 
     indexing_max_samples: int = 2500
     """At most this many training inputs are encoded per adapter centroid."""
+
+    indexing_input_until: str | None = None
+    """A marker that separates a training sample's input from its target, e.g.
+    ``"### Response:"``. When set, only the text before it is indexed. Requests
+    carry the input alone, so a centroid built from input + target matches
+    them worse; set this whenever the corpus lines contain the target."""
 
     indexing_chunk_samples: int = 16
     """Samples per indexing chunk. The job checkpoints after every chunk and a
@@ -746,15 +787,20 @@ class AdapterRoutingConfig:
             raise ValueError("adapter_routing.encoder must not be empty")
         for name in ("encoder_max_tokens", "max_pool_adapters",
                      "indexing_max_samples", "indexing_chunk_samples",
-                     "indexing_cpu_max_threads", "route_batch_max"):
+                     "indexing_cpu_max_threads", "route_batch_max",
+                     "route_min_pool"):
             if int(getattr(self, name)) < 1:
                 raise ValueError(f"adapter_routing.{name} must be >= 1")
         for name in ("indexing_cpu_reserve_cores", "indexing_min_free_memory_gb",
                      "indexing_gpu_after_quiet_s", "pool_protected_slots",
                      "pool_hit_half_life_s", "route_timeout_ms",
-                     "route_batch_wait_ms"):
+                     "route_batch_wait_ms", "route_close_band",
+                     "route_confidence_slack",
+                     "route_reference_samples"):
             if float(getattr(self, name)) < 0:
                 raise ValueError(f"adapter_routing.{name} must be >= 0")
+        if not 0.0 <= float(self.route_keep_percent) <= 100.0:
+            raise ValueError("adapter_routing.route_keep_percent is in [0, 100]")
         seen = set()
         for a in self.adapters or []:
             if not isinstance(a, dict) or not a.get("path"):

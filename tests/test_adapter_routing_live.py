@@ -140,7 +140,7 @@ def write_config(out: Path, args) -> Path:
         "index_path": str(out / "index"),
         "router_device": args.router_device,
         "router_gpu": args.router_gpu,
-        "fallback_score_threshold": 0.0,
+        "route_keep_percent": 100,      # one adapter: this run tests the pipeline
         "route_timeout_ms": 5000,
         "indexing_cpus": args.indexing_cpus,
     }
@@ -153,18 +153,34 @@ def write_config(out: Path, args) -> Path:
     return path, src_adapter
 
 
+def _vary(templates, items):
+    return [t.format(x) for x in items for t in templates]
+
+
 TOPICS = {
-    "ext-translate": [f"Translate to English: {x}" for x in SENTENCES],
-    "ext-sql": [f"Write a SQL query that {x}." for x in (
-        "lists the ten newest orders", "counts users per country",
-        "joins customers and invoices", "finds duplicate email addresses",
-        "returns the average order value per month", "deletes inactive sessions",
-        "selects products that were never sold", "ranks employees by salary",
-        "updates the stock after a sale", "groups page views by day")],
-    "ext-poem": [f"Write a short poem about {x}." for x in (
-        "the sea at night", "autumn leaves", "a quiet mountain", "city rain",
-        "the first snow", "an old lighthouse", "spring flowers", "a lost letter",
-        "the morning sun", "a sleeping cat")],
+    "ext-translate": _vary(
+        ["Translate to English: {}", "Translate this German sentence into English: {}",
+         "German to English: {}", "What does this mean in English? {}"], SENTENCES),
+    "ext-sql": _vary(
+        ["Write a SQL query that {}.", "Give me the SQL to {}.",
+         "SQL: {}", "How do I {} in SQL?"],
+        ["list the ten newest orders", "count users per country",
+         "join customers and invoices", "find duplicate email addresses",
+         "return the average order value per month", "delete inactive sessions",
+         "select products that were never sold", "rank employees by salary",
+         "update the stock after a sale", "group page views by day"]),
+    "ext-math": _vary(
+        ["Solve for x: {}", "Find x if {}", "Solve the equation {}",
+         "What is x when {}?"],
+        ["3x + 5 = 20", "2x - 7 = 11", "x / 4 + 1 = 6", "5x = 45", "9 - x = 2",
+         "4x + 4 = 28", "x squared = 49", "7x - 3 = 4x + 9", "10 / x = 2",
+         "6x + 1 = 37"]),
+    "ext-poem": _vary(
+        ["Write a short poem about {}.", "Compose a poem on {}.",
+         "A four-line poem about {}, please.", "Write some verses about {}."],
+        ["the sea at night", "autumn leaves", "a quiet mountain", "city rain",
+         "the first snow", "an old lighthouse", "spring flowers", "a lost letter",
+         "the morning sun", "a sleeping cat"]),
 }
 
 
@@ -181,14 +197,18 @@ def external_main(args, out: Path) -> None:
     data = {}
     for name, lines in TOPICS.items():
         data[name] = out / f"{name}.txt"
-        data[name].write_text("".join(f"{t} (example {i})\n"
-                                      for i in range(args.repeats) for t in lines))
+        data[name].write_text("".join(f"{t}\n" for t in lines))
     cfg["adapter_routing"] = {
         "enable_adapter_routing": True, "index_path": str(out / "index"),
         "router_device": args.router_device, "router_gpu": args.router_gpu,
-        "fallback_score_threshold": 0.0, "route_timeout_ms": 5000,
+        "route_timeout_ms": 5000, "route_decision_log": True,
+        # 40 templated lines per adapter: genuine requests sit a few confidence
+        # units below every training sample, unrelated ones tens of units.
+        "route_confidence_slack": 4.0,
         "indexing_cpus": args.indexing_cpus,
         "adapters": [
+            {"name": "ext-math", "path": str(toy),
+             "data_path": str(data["ext-math"])},
             {"name": "ext-translate", "path": str(toy),
              "data_path": str(data["ext-translate"])},
             {"name": "ext-sql", "path": str(toy_ft),
@@ -234,7 +254,9 @@ def external_main(args, out: Path) -> None:
                 "temperature": 0})
             last = (status, headers.get("x-deltaserve-adapter"),
                     headers.get("x-deltaserve-routing-score"),
-                    body.get("model") if isinstance(body, dict) else body)
+                    body.get("model") if isinstance(body, dict) else body,
+                    headers.get("x-deltaserve-routing-confidence"),
+                    headers.get("x-deltaserve-routing-candidates"))
             if status == 200 and last[1] == want:
                 break
             time.sleep(0.5)
@@ -257,8 +279,8 @@ def external_main(args, out: Path) -> None:
         check("no finetuning routes on this server (GET /ft_jobs → 404)",
               status == 404)
 
-        st, took = routable(["ext-translate", "ext-sql"])
-        if not check(f"both listed adapters are indexed and in the pool "
+        st, took = routable(["ext-translate", "ext-sql", "ext-math"])
+        if not check(f"the listed adapters are indexed and in the pool "
                      f"({took:.1f} s after the server was healthy)", st is not None):
             print(f"    /adapters: {http(port, '/adapters')[2]}")
             return
@@ -291,6 +313,30 @@ def external_main(args, out: Path) -> None:
         check("the first two still route correctly",
               auto("Translate to English: Das ist mein Bruder.", "ext-translate")
               and auto("Write a SQL query that sums sales by region.", "ext-sql"))
+
+        _, headers, body = http(port, "/v1/completions", {
+            "model": "auto", "prompt": "Translate to English: Es regnet heute.",
+            "max_tokens": 2, "temperature": 0})
+        check("with four adapters the response carries a pool-relative confidence",
+              "x-deltaserve-routing-confidence" in headers)
+        outs = []
+        for q in ("What is the capital of Australia?",
+                  "Tell me about the history of the Roman empire.",
+                  "Is it going to rain tomorrow?", "Who painted the Mona Lisa?"):
+            _, h, b = http(port, "/v1/completions", {
+                "model": "auto", "prompt": q, "max_tokens": 2, "temperature": 0})
+            outs.append((h.get("x-deltaserve-routing"),
+                         h.get("x-deltaserve-routing-reason"),
+                         h.get("x-deltaserve-routing-confidence"),
+                         h.get("x-deltaserve-adapter"), b.get("model")))
+            print(f"    auto {q[:42]!r:46} → {outs[-1]}")
+        check("unrelated questions now fall back to the base model as "
+              f"low-confidence ({sum(o[1] == 'low-confidence' for o in outs)}/4)",
+              sum(o[1] == "low-confidence" and o[4] == "qwen3-0.6b"
+                  for o in outs) >= 3)
+        dlog = out / "index" / "decisions.jsonl"
+        check("decisions are logged for calibration",
+              dlog.is_file() and len(dlog.read_text().splitlines()) >= 8)
 
         status, _, reply = http(port, "/adapters", {"name": "bad",
                                                     "path": str(out / "nope")})

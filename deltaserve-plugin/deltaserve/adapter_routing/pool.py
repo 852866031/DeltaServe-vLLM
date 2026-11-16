@@ -60,6 +60,7 @@ class PoolEntry:
     score: float = 0.0            # decayed hit count as of ``score_at``
     score_at: float = 0.0
     centroid: object = None       # kept so a disabled adapter can be re-enabled
+    refs: object = None           # its reference-sample embeddings (may be None)
 
     def describe(self, now: float, half_life: float) -> dict:
         return {"name": self.name, "path": self.path, "job": self.job,
@@ -129,7 +130,8 @@ class AdapterPool:
     @_locked
     def register(self, name: str, path: str, centroid=None,
                  job: str | None = None, prewarm: bool = True,
-                 lora_int_id: int | None = None, load: bool = True) -> PoolEntry:
+                 lora_int_id: int | None = None, load: bool = True,
+                 refs=None) -> PoolEntry:
         """Add an adapter (a job that reached ``ready``). With ``load`` it is
         loaded to the CPU tier and, with ``prewarm``, into a GPU slot if one is
         free — never by evicting. ``load=False`` only registers it: the weights
@@ -143,13 +145,13 @@ class AdapterPool:
             lora_int_id = self._next_id
         self._next_id = max(self._next_id, lora_int_id + 1)
         e = PoolEntry(name=name, path=path, job=job, score_at=self._clock(),
-                      centroid=centroid, lora_int_id=lora_int_id)
+                      centroid=centroid, lora_int_id=lora_int_id, refs=refs)
         self.entries[name] = e
         try:
             if load:
                 self._to_cpu(e)
             if centroid is not None:
-                self.index.add(name, centroid)
+                self.index.add(name, centroid, refs=refs)
             if load and prewarm and self._in_tier(GPU) < self.gpu_slots:
                 self._activate(e)
         except Exception:
@@ -289,7 +291,7 @@ class AdapterPool:
         e = self._get(name)
         e.enabled = True
         if e.centroid is not None:
-            self.index.add(name, e.centroid)
+            self.index.add(name, e.centroid, refs=e.refs)
         self._autosave()
         return e
 
@@ -318,7 +320,8 @@ class AdapterPool:
         reg = {"next_id": self._next_id, "adapters": [
             {"name": e.name, "path": e.path, "job": e.job,
              "lora_int_id": e.lora_int_id, "enabled": e.enabled,
-             "offloaded": e.tier == DISK}
+             "offloaded": e.tier == DISK, "tier": e.tier,
+             "score": round(self._score(e, self._clock()), 4)}
             for e in self.entries.values()]}
         tmp = os.path.join(directory, REGISTRY_FILE + ".tmp")
         with open(tmp, "w") as f:
@@ -336,12 +339,13 @@ class AdapterPool:
         keep, self.directory = self.directory, None     # no rewrite per adapter
         try:
             for r in reg["adapters"]:
-                c = None
+                c = refs = None
                 if centroids is not None and r["name"] in centroids:
-                    c = centroids._matrix[centroids.names.index(r["name"])].copy()
+                    c = centroids.centroid_of(r["name"])
+                    refs = centroids.refs.get(r["name"])
                 self.register(r["name"], r["path"], centroid=c, job=r.get("job"),
                               prewarm=not r.get("offloaded"),
-                              lora_int_id=r.get("lora_int_id"))
+                              lora_int_id=r.get("lora_int_id"), refs=refs)
                 if r.get("offloaded"):
                     self.offload(r["name"])
                 if not r.get("enabled", True):
