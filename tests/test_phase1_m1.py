@@ -106,6 +106,9 @@ _PROFILES = {
                ("TP=2 graph / both", "baseline-graph", "ft-both-graph", "decode")),
     ),
 }
+# DSERVE_M1_ROUTING=1: the same gate with adapter routing on and the real
+# requests spread over two adapters (off: the runs are exactly as before).
+_ROUTING = os.environ.get("DSERVE_M1_ROUTING", "0") == "1"
 _PROFILE_NAME = os.environ.get("DSERVE_M1_PROFILE", "tp1")
 _PROFILE = _PROFILES[_PROFILE_NAME]
 _CONFIG = _REPO / "configs" / _PROFILE["config"]
@@ -145,7 +148,8 @@ def _serve(llm, lora) -> list:
     while len(done) < len(_PROMPTS):
         now = time.monotonic() - t0
         while nxt < len(_PROMPTS) and _ARRIVALS[nxt] <= now:
-            eng.add_request(str(nxt), _PROMPTS[nxt], sp, lora_request=lora)
+            eng.add_request(str(nxt), _PROMPTS[nxt], sp, lora_request=(
+                lora[nxt % len(lora)] if isinstance(lora, list) else lora))
             nxt += 1
         if eng.has_unfinished_requests():
             for out in eng.step():
@@ -197,8 +201,29 @@ def run_worker(mode: str) -> None:
             graph_ft_only_batches=graph,
             **common,
         )
-    llm = LLM(**engine_kwargs, additional_config={"deltaserve": ft})
-    lora = LoRARequest("amplified", 1, adapter) if mode.startswith("control") else None
+    extra, loras = {"deltaserve": ft}, None
+    if _ROUTING:
+        # Adapter routing on in EVERY mode (baselines too): the pool engine is
+        # loaded, and the real requests alternate between two adapters, so FT
+        # co-batches with a multi-adapter inference batch.
+        import numpy as np
+
+        from deltaserve.config_loader import ADAPTER_ROUTING_KEY
+
+        infer = str(raw["adapters"]["lora_path_0"])
+        tmp = tempfile.mkdtemp(prefix="m1_routing_")
+        pool = []
+        for i in range(2):
+            c = os.path.join(tmp, f"c{i}.npy")
+            np.save(c, np.random.default_rng(i).normal(size=1024).astype(np.float32))
+            pool.append({"name": f"gate-pool-{i}", "path": infer, "centroid_path": c})
+        extra[ADAPTER_ROUTING_KEY] = {
+            "enable_adapter_routing": True, "index_path": os.path.join(tmp, "index"),
+            "adapters": pool}
+        engine_kwargs["max_loras"] = max(3, int(engine_kwargs.get("max_loras") or 1))
+        loras = [LoRARequest(f"gate-{i}", 11 + i, infer) for i in range(2)]
+    llm = LLM(**engine_kwargs, additional_config=extra)
+    lora = LoRARequest("amplified", 1, adapter) if mode.startswith("control") else loras
     # Untimed warm-up generation (every mode, so the runs stay symmetric): the
     # first backward cycle is slow, and FT can only co-batch once it is done.
     llm.generate(["Warm-up:"], SamplingParams(temperature=0.0, max_tokens=_MAX_TOKENS))
@@ -226,7 +251,7 @@ def run_worker(mode: str) -> None:
 
 def _spawn(mode: str, adapter: Path) -> dict:
     env = dict(os.environ)
-    env.setdefault("HF_HOME", "/mnt/storage/huggingface")
+    env.setdefault("HF_HOME", "/home/jiaxuan/.cache/huggingface")
     env.setdefault("HF_HUB_OFFLINE", "1")
     env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
     fd, result_path = tempfile.mkstemp(suffix=f"_m1_{mode}.json")
@@ -276,7 +301,8 @@ def main():
         return
 
     print(f"{_GREEN}=== Milestone 1: FT injection leaves inference unchanged "
-          f"[{_PROFILE_NAME}: {_CONFIG.name}] ==={_RESET}")
+          f"[{_PROFILE_NAME}: {_CONFIG.name}"
+          f"{', adapter routing on' if _ROUTING else ''}] ==={_RESET}")
     from deltaserve.config_loader import load_yaml_config, split_config
 
     _, ft_cfg, _ = split_config(load_yaml_config(str(_CONFIG)))

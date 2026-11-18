@@ -227,7 +227,7 @@ def external_main(args, out: Path) -> None:
     env = dict(os.environ, HF_HUB_OFFLINE="1", VLLM_USE_FLASHINFER_SAMPLER="0",
                TOKENIZERS_PARALLELISM="false",
                VLLM_USE_V2_MODEL_RUNNER="0")   # v2 + LoRA + CUDA graphs fails upstream
-    env.setdefault("HF_HOME", "/mnt/storage/huggingface")
+    env.setdefault("HF_HOME", "/home/jiaxuan/.cache/huggingface")
     log = open(log_path, "w")
     server = subprocess.Popen(
         [sys.executable, str(_REPO / "eval-tp/launch_deltaserve.py"),
@@ -573,7 +573,7 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8791)
     ap.add_argument("--api-servers", type=int, default=1)
     ap.add_argument("--tp", type=int, default=1, help="tensor_parallel_size")
-    ap.add_argument("--router-device", default="cpu")
+    ap.add_argument("--router-device", default="auto")
     ap.add_argument("--router-gpu", type=int, default=None,
                     help="physical GPU index for the router's encoder")
     ap.add_argument("--indexing-cpus", default=None)
@@ -604,7 +604,7 @@ def main() -> None:
 
     env = dict(os.environ, HF_HUB_OFFLINE="1", VLLM_USE_FLASHINFER_SAMPLER="0",
                TOKENIZERS_PARALLELISM="false")
-    env.setdefault("HF_HOME", "/mnt/storage/huggingface")
+    env.setdefault("HF_HOME", "/home/jiaxuan/.cache/huggingface")
     log = open(log_path, "w")
     server = subprocess.Popen(
         [sys.executable, str(_REPO / "eval-tp/launch_deltaserve.py"),

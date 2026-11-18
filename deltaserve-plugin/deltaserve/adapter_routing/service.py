@@ -362,6 +362,19 @@ class RouterClient:
         self._conn = None
         self._lock = threading.Lock()
         self.failures = 0
+        self.last_error = ""
+        self._logged_at = 0.0
+
+    def _failed(self, why: str) -> None:
+        """Count a request that fell back, and say why — at most every 30 s:
+        the client never raises, so the log is the only place it shows."""
+        self.failures += 1
+        self.last_error = why
+        now = time.monotonic()
+        if now - self._logged_at >= 30.0:
+            self._logged_at = now
+            dprint(f"[router-client] requests fall back to the base model: "
+                   f"{why} ({self.failures} so far)")
 
     def _close(self) -> None:
         if self._conn is not None:
@@ -387,14 +400,14 @@ class RouterClient:
             try:
                 reply = self._call(("route", text))
             except TimeoutError:
-                self.failures += 1
+                self._failed(f"no answer within {self.timeout_s * 1000:.0f} ms")
                 return RouteDecision(None, None, TIMEOUT)
-            except Exception:  # noqa: BLE001 — service down / socket gone
+            except Exception as e:  # noqa: BLE001 — service down / socket gone
                 self._close()
-                self.failures += 1
+                self._failed(f"{type(e).__name__}: {e}")
                 return RouteDecision(None, None, UNAVAILABLE)
         if reply[0] != "ok":
-            self.failures += 1
+            self._failed(f"the router service answered: {reply[1]}")
             return RouteDecision(None, None, UNAVAILABLE)
         return RouteDecision(*reply[1:])
 
@@ -437,13 +450,31 @@ def router_placement(cfg) -> tuple[str, str | None]:
 
     ``router_gpu: N`` names a PHYSICAL GPU (the nvidia-smi index): the service
     process is restricted to that one card, whether or not the model uses it.
-    Otherwise ``router_device`` is used as is (``cpu`` hides every GPU from
-    the service; ``cuda:N`` counts within the GPUs the engine can see)."""
+    Otherwise ``router_device``: ``auto`` is the last GPU the engine can see
+    (the CPU when it sees none); ``cpu`` hides every GPU from the service;
+    ``cuda:N`` counts within the GPUs the engine can see."""
     if cfg.router_gpu is not None:
         return "cuda:0", str(int(cfg.router_gpu))
-    if cfg.router_device == "cpu":
+    device = cfg.router_device
+    if device == "auto":
+        n = visible_gpu_count()
+        device = f"cuda:{n - 1}" if n > 0 else "cpu"
+    if device == "cpu":
         return "cpu", ""
-    return cfg.router_device, None
+    return device, None
+
+
+def visible_gpu_count() -> int:
+    """GPUs this process can see, without creating a CUDA context."""
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is not None:
+        return len([d for d in visible.split(",") if d.strip()])
+    try:
+        import torch
+
+        return int(torch.cuda.device_count())     # NVML: no context is created
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def apply_router_placement(cfg) -> str:
@@ -467,6 +498,11 @@ def serve_config(cfg, device: str | None = None) -> None:
     dprint(f"[router] serving on {path} | encoder={cfg.encoder} on {where} | "
            f"{len(router.index)} adapters | {router.model.describe()} | "
            f"batch<={cfg.route_batch_max}")
+    if device == "cpu":
+        dprint("[router] the encoder is on the CPU: fine for a low request "
+               "rate only (50-130 ms per encode; under load route requests "
+               "time out and fall back to the base model). Prefer a GPU "
+               "(adapter_routing.router_device / router_gpu).")
     serve(router, path, max_batch=cfg.route_batch_max,
           batch_wait_s=cfg.route_batch_wait_ms / 1e3)
 

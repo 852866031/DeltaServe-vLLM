@@ -184,6 +184,8 @@ def test_service_and_client():
         dec = client.route("translate")
         check("service not running → fallback 'router-unavailable', no exception",
               dec.adapter is None and dec.reason == "router-unavailable")
+        check("... and the client keeps why (it is the only trace of a fallback)",
+              client.failures == 1 and bool(client.last_error))
 
         enc = FakeEncoder()
         svc = Service(Router(enc, f, threshold=0.5, reload_s=0.0), path)
@@ -470,8 +472,24 @@ def test_placement():
     def cfg(**kw):
         return AdapterRoutingConfig(enable_adapter_routing=True, **kw)
 
-    check("default: CPU, every GPU hidden from the service",
-          router_placement(cfg()) == ("cpu", ""))
+    keep_vis = os.environ.get("CUDA_VISIBLE_DEVICES")
+    try:
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+        check("default (auto): the last GPU the engine can see",
+              router_placement(cfg()) == ("cuda:1", None))
+        os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+        check("auto with one visible GPU: that GPU",
+              router_placement(cfg()) == ("cuda:0", None))
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        check("auto with no GPU: the CPU",
+              router_placement(cfg()) == ("cpu", ""))
+    finally:
+        if keep_vis is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = keep_vis
+    check("router_device: cpu → CPU, every GPU hidden from the service",
+          router_placement(cfg(router_device="cpu")) == ("cpu", ""))
     check("router_gpu: 3 → the service sees only physical GPU 3, as cuda:0",
           router_placement(cfg(router_gpu=3)) == ("cuda:0", "3"))
     check("router_gpu wins over router_device",

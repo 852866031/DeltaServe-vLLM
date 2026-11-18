@@ -653,10 +653,16 @@ class AdapterRoutingConfig:
     """A request is routed only when its ``model`` field equals this name. A
     request naming an adapter or the base model is never touched."""
 
-    router_device: str = "cpu"
-    """Device of the router service's encoder when ``router_gpu`` is not set:
-    ``"cpu"``, or a CUDA device such as ``"cuda:0"`` counted within the GPUs
-    the engine can see."""
+    router_device: str = "auto"
+    """Device of the router service's encoder when ``router_gpu`` is not set.
+    ``"auto"`` (default): the last GPU the engine can see, or the CPU when it
+    sees none. ``"cuda:N"``: that device, counted within the engine's GPUs.
+    ``"cpu"``: only for low request rates — an encode takes 50-130 ms on an
+    idle CPU (3 ms on a GPU), and under a production load nearly every route
+    request times out and falls back to the base model.
+
+    On a GPU the encoder needs about 2 GB next to the model: leave it that
+    room (``gpu_memory_utilization``), or its encodes run out of memory."""
 
     router_gpu: int | None = None
     """Put the router service's encoder on this PHYSICAL GPU (the nvidia-smi

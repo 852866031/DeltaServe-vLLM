@@ -1212,6 +1212,13 @@ class FinetuneScheduler(AsyncScheduler):
             elif req.num_output_placeholders == 0:
                 # Fresh inject that didn't schedule this step — safe to drop.
                 self.waiting.remove_requests([req])
+                # A request vLLM skipped for the per-batch adapter limit (the
+                # step's inference requests already use max_loras adapters)
+                # is parked in skipped_waiting, not waiting. Left there it
+                # would be scheduled later with no entry in self.requests and
+                # kill the engine (KeyError in _update_after_schedule).
+                if self.skipped_waiting:
+                    self.skipped_waiting.remove_requests([req])
                 del self.requests[req_id]
                 _s = getattr(req, "_ft_sample", None)
                 if _s is not None:
