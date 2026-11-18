@@ -45,12 +45,13 @@ vLLM's own `--additional-config`. Without it, the server is plain vLLM.
    - [Interrupts and pauses](#interrupts-and-pauses-protecting-inference-latency)
    - [Throttles and admission control](#throttles-and-admission-control)
    - [Optimizations](#optimizations)
-4. [Results](#results)
-5. [Repository layout](#repository-layout)
-6. [Installation](#installation)
-7. [Launching a server](#launching-a-server)
-8. [Running experiments](#running-experiments)
-9. [Tests](#tests)
+4. [Finetuning jobs and adapter routing](#finetuning-jobs-and-adapter-routing)
+5. [Results](#results)
+6. [Repository layout](#repository-layout)
+7. [Installation](#installation)
+8. [Launching a server](#launching-a-server)
+9. [Running experiments](#running-experiments)
+10. [Tests](#tests)
 
 ---
 
@@ -247,6 +248,120 @@ applies. The throttles shape admission further:
 | Slice-based activation save | `val[start:start+n]` view instead of `index_select` when FT rows are contiguous | always (falls back to a mask gather) |
 | `disable_log_stats` auto-on | removes a frontend stall (per-step stats saturating the API asyncio loop) that looked like GPU contention | automatic with finetuning |
 | Precision contract | fp32 attention scores/softmax, RMSNorm, LM head, LoRA masters; bf16 bulk GEMMs | `backward_fp32: false` (true = all-fp32 GEMMs) |
+
+---
+
+## Finetuning jobs and adapter routing
+
+Both are off unless configured; with them off the server behaves exactly as
+described above.
+
+### Finetuning jobs
+
+What the backward child trains is a **finetuning job**: a dataset, an adapter to
+start from, and a list of **stages** run by the scheduler. Jobs can be given in
+the YAML (`ft_job:`) or submitted to a running server; one job trains at a
+time, the others wait in a queue and the backward child switches adapter and
+dataset in place between them.
+
+| Stage | What it does |
+|---|---|
+| `init` | checks the adapter and dataset; switches the backward child to them |
+| `training` | the co-served finetuning itself, for `num_epochs` |
+| `indexing` | builds the adapter's routing centroid from its dataset (adapter routing only). Depends only on the data, so it runs next to `training` |
+| `admission` | saves the trained adapter, compares it with the pool, publishes the new pool in one step (adapter routing only) |
+| `ready` | saves the adapter (`ft_job.save_path`, or the pool's directory) |
+
+```bash
+curl localhost:8000/ft_jobs                                   # running, queued, finished
+curl -X POST localhost:8000/ft_jobs -H 'content-type: application/json' -d '{
+  "name": "job-sql", "data_path": "/data/sql.txt", "adapter_path": "/adapters/init",
+  "stages": ["init", "training", "indexing", "admission", "ready"],
+  "auto_routing": true, "num_epochs": 2}'
+```
+
+Without a name a job is called `dserve-<random>` (`dserve-routing-<random>` when
+it is auto-routable). A new stage is a `Stage` subclass registered with
+`deltaserve.ft_job.register_stage`.
+
+### Adapter routing
+
+With `adapter_routing.enable_adapter_routing: true`, a request whose `model` is
+`"auto"` is sent to the pool adapter that fits it best, or to the base model
+when none fits. A request naming an adapter or the base model is never touched.
+With the feature off nothing of it is loaded, and `model: "auto"` is answered by
+the base model with a message saying routing is not enabled.
+
+**How an adapter is chosen** (ARIADNE): each adapter has a *centroid*, the mean
+sentence embedding (e5-large-v2) of its training inputs. The request is embedded
+and compared with every centroid. The decision uses scores centred on the pool's
+mean and a confidence built from the best score and its margin over the second;
+the threshold comes from reference samples kept at indexing time
+(`route_keep_percent`). Low confidence → base model.
+
+Every routed response says what happened:
+
+| Header | Value |
+|---|---|
+| `x-deltaserve-routing` | `routed` or `fallback` |
+| `x-deltaserve-adapter` | the adapter used (when routed) |
+| `x-deltaserve-routing-score` / `-confidence` / `-candidates` | the decision's numbers |
+| `x-deltaserve-routing-reason` / `-message` | why it fell back (`low-confidence`, `no-adapters`, `router-timeout`, `router-unavailable`, …) |
+
+**The pool.** Up to `max_active_adapters` (default 32) *active* adapters are
+candidates for routing; the rest are *retired* — no longer auto-selected, still
+served by name. Adapters enter through a finetuning job, the YAML
+(`adapter_routing.adapters`) or `POST /adapters`; an adapter that comes with a
+dataset but no training goes through `[init, indexing, ready]`. vLLM loads pool
+adapters on demand through its LoRA resolver.
+
+```bash
+curl localhost:8000/adapters                                          # pool + jobs + router status
+curl -X POST localhost:8000/adapters -H 'content-type: application/json' \
+     -d '{"name": "sql", "path": "/adapters/sql", "data_path": "/data/sql.txt"}'
+curl -X POST localhost:8000/adapters/sql/retire                       # or reactivate / pin / unpin
+curl -X DELETE localhost:8000/adapters/sql
+```
+
+**Indexing** is a best-effort job. While inference is active it runs in a CPU
+process that yields to everything else (idle priority, free-memory and idle-core
+checks); when only finetuning is running it borrows the router's GPU encoder,
+and gives it back the moment a request arrives. Its state is a checkpointed
+running sum, so moving between the two costs nothing.
+
+**What it needs on the GPU** (`configs/serving_config_finetuning_qwen3_14b_tp2_adapter_routing.yaml`
+is the worked example for two 32 GB cards):
+
+- **The encoder sits on a GPU** — by default the last one the engine sees
+  (`router_device: auto`; `router_gpu: N` picks a physical card). It needs about
+  2 GB there. `gpu_memory_utilization` is vLLM's whole budget (weights + CUDA
+  graphs + KV cache), so it has to be lowered to leave that room; a sparse
+  `cudagraph_capture_sizes` list gets the KV cache back (19 sizes instead of 51:
+  graph pool 6.8 → 2.6 GiB, KV cache 31,936 → 63,856 tokens at 0.75). A startup
+  self-test reports an encoder that cannot encode a full batch. On the CPU an
+  encode takes 50–130 ms and nearly every route request times out under load.
+- **`lora.max_loras` ≥ adapters in use at once + 1.** A batch holds at most
+  `max_loras` distinct adapters, the finetuning adapter included. With 2,
+  requests routed to different adapters queue behind each other (TTFT p95
+  89 ms → 1.5 s on the production trace); with 5, see below.
+- A route request never fails the request it belongs to: a slow or dead router
+  means the base model. After three failures in a row the API server stops
+  asking for a while (2 s, doubling to 30 s) instead of waiting out the timeout
+  on every request.
+
+Measured on Qwen3-14B TP=2, `production-600-800`, four pool adapters, every
+request `model: "auto"`:
+
+| | ok | TTFT p50 / p95 / p99 (ms) | within 400 ms | backward cycles |
+|---|---|---|---|---|
+| routing off (plain preset) | 534/534 | 77 / 89 / 96 | 100 % | 373 |
+| routing on (routing preset) | 534/534 | 103 / 134 / 140 | 100 % | 354 |
+
+The extra ~25 ms is the route call itself: an encode takes 4–14 ms on an idle
+card (by input length, up to the 512-token cap) and about 25 ms next to the
+model's processes. A decode step that collides with an encode takes ~8 ms
+longer. Saving a trained adapter blocks the engine loop for 200–290 ms on this
+model (once per job).
 
 ---
 
@@ -609,6 +724,11 @@ tests/run_all.sh /tmp/ds-tests 'test_qwen3_*'  # a subset
 | TP on real NCCL | `test_tp_backward_graph_nccl`, `test_tp_trainer_graph_nccl` | 2 GPUs |
 | **Inference is unperturbed by co-serving** (amplified FT adapter + positive control; FT provably co-batched with real prefills and decodes; eager + CUDA graphs) | `test_phase1_m1` (Qwen3-0.6B), `test_tp_inference_leak` (Qwen3-14B TP=2, production preset) | 1 GPU / 2 GPUs + weights |
 | End-to-end engine / server | `test_phase1_m2`, `test_pause_on_arrival`, `test_tp_no_orphans` | GPU(s) + model weights |
+| Finetuning jobs, adapter save | `test_ft_job`, `test_adapter_save` | CPU |
+| Adapter routing: switch, indexing, decision, pool, resolver, route path, engine | `test_adapter_routing_switch`, `test_adapter_indexing`, `test_adapter_decision`, `test_adapter_pool`, `test_adapter_pool_resolver`, `test_adapter_route_path`, `test_adapter_engine` | CPU (+ the e5-large-v2 weights) |
+| Adapter routing end to end on a live server (`--external`, `--second-job`, `--family qwen3-14b --tp 2`) | `test_adapter_routing_live` | GPU(s) + weights |
+| FT requests skipped by the per-batch adapter limit | `test_ft_lora_limit` | 1 GPU + weights |
+| The inference gate with routing on (`DSERVE_M1_ROUTING=1`) | `test_phase1_m1`, `test_tp_inference_leak` | 1 GPU / 2 GPUs + weights |
 
 **Moving to a newer vLLM:** check out the new commit in `vllm-upstream`, reinstall
 with its SHA, and run `tests/run_all.sh`. The plugin depends only on the vLLM APIs

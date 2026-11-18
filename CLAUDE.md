@@ -45,9 +45,9 @@ docs/figures/                   architecture figure + generator (make_architectu
 - **One file per model family** in `bwd_services/` (`llama3.py`, `qwen3.py`); shared
   logic lives in `bwd_services/common/`. Never route a new family through another
   family's file.
-- **Env:** conda env `deltaserve-plugin` (`/mnt/storage/conda/envs/deltaserve-plugin`):
+- **Env:** conda env `deltaserve-plugin` (`/home/jiaxuan/miniconda3/envs/deltaserve-plugin`):
   vllm editable from `vllm-upstream/` + the plugin editable. Weights in
-  `HF_HOME=/mnt/storage/huggingface`, `HF_HUB_OFFLINE=1`.
+  `HF_HOME=/home/jiaxuan/.cache/huggingface`, `HF_HUB_OFFLINE=1`.
 - **Tests are scripts:** `python tests/test_x.py`, or `tests/run_all.sh <out_dir> [glob]`.
 - Long-running servers / benchmarks (`launch_deltaserve.py`, `auto_benchmark_tp.py`,
   `cleanup_validate.sh`): give the user the command and the expected output rather
@@ -106,6 +106,12 @@ Co-serving is switched on per launch with `--additional-config '{"deltaserve": {
 - **Never reduce `grad_x` wholesale** — reduce only the partial (attention / FFN)
   part; the residual passthrough is already full on every rank.
 - **Vocab padding:** use the real local `lm_head.shape[0]`, not `vocab // tp`.
+- **An FT request vLLM did not schedule can be in `waiting` OR `skipped_waiting`**
+  (the latter when the batch already holds `max_loras` adapters). The cleanup in
+  `_schedule_step` removes it from both; left in a queue without its
+  `self.requests` entry it kills the engine. `tests/test_ft_lora_limit.py`.
+- **`_publish_to_served` stays under `torch.no_grad()`** — otherwise every publish
+  grows an autograd graph (150 MiB per backward on Qwen3-14B until the child OOMs).
 
 ## Status (2026-11)
 
@@ -128,6 +134,22 @@ CUDA graphs fails at warmup ("CUDA graphs must be captured on a non-default stre
 plugins disabled or not. Qwen3 defaults to v2 when finetuning is off, so FT-off Qwen3
 + LoRA runs need `VLLM_USE_V2_MODEL_RUNNER=0` (finetuning runs are routed to v1).
 
+**Adapter routing + finetuning jobs** (branch `adapter-routing`, off unless
+configured; README "Finetuning jobs and adapter routing"): `deltaserve/ft_job.py`
+(jobs, stage registry), `adapter_save.py`, `route_middleware.py`,
+`adapter_routing/` (index, decision, pool, router service, resolver, engine).
+Always say "adapter routing" / `adapter_routing`, never bare "routing". Validated
+live on Qwen3-0.6B and Qwen3-14B TP=2 (routing preset
+`serving_config_finetuning_qwen3_14b_tp2_adapter_routing.yaml`): production trace
+534/534, TTFT p99 140 ms; both inference gates pass with routing on. Constraints
+that bite: the encoder needs ~2 GB on its GPU (`gpu_memory_utilization` is vLLM's
+whole budget — lower it, and use sparse CUDA-graph sizes to keep the KV cache);
+`max_loras` ≥ adapters in use at once + 1. Not done: `validation` stage; async
+adapter save (blocks the engine loop 200–290 ms on 14B); recovery when phase 2 of
+an adapter switch fails; the route time is invisible to the SLO estimator
+(`arrival_time` is stamped after the middleware); threshold calibration on a real
+adapter pool.
+
 Open: the live backward-graph vs eager A/B under TP on the real models; a relative
 (not seconds-based) admission margin for the estimator; mixed-batch forward graphs
 for Llama-3 (only Qwen3 has the save call sites).
@@ -135,7 +157,7 @@ for Llama-3 (only Qwen3 has the save call sites).
 ## Useful commands
 
 ```bash
-P=/mnt/storage/conda/envs/deltaserve-plugin/bin/python
+P=/home/jiaxuan/miniconda3/envs/deltaserve-plugin/bin/python
 $P eval-tp/launch_deltaserve.py --family qwen3-14b --dry-run          # resolved vllm serve cmd
 $P eval-tp/auto_benchmark_tp.py --family qwen3-14b --tp 2 --co --tight-half --kill-stale
 eval-tp/cleanup_validate.sh <tag> tight-half loose-half production-600-800   # A/B vs eval-tp/output/cleanup/00_base

@@ -62,9 +62,18 @@ class RouterEncodeExecutor:
         from deltaserve.adapter_routing.service import RouterClient
 
         self._client = RouterClient(socket, timeout_s=timeout_s)
+        self._socket = socket
         self._timeout = timeout_s
         self._seq = 0
         self._job = None            # [seq, Event, embeddings, error]
+
+    @property
+    def ready(self) -> bool:
+        """The service is listening. It loads its encoder after the engine
+        starts, so a job submitted at launch must not count on it yet."""
+        import os
+
+        return os.path.exists(self._socket)
 
     def submit(self, texts: list, threads: int = 0) -> None:
         self._seq += 1
@@ -127,7 +136,8 @@ class IndexingRunner:
     def _device(self) -> str:
         if self.placement is None:
             return "cpu" if "cpu" in self.executors else next(iter(self.executors))
-        gpu = "gpu" in self.executors and time.monotonic() >= self._gpu_off_until
+        gpu = "gpu" in self.executors and time.monotonic() >= self._gpu_off_until \
+            and getattr(self.executors["gpu"], "ready", True)
         dev = self.placement.choose(gpu)
         return dev if dev in self.executors else next(iter(self.executors))
 

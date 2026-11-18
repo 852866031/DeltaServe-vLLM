@@ -670,6 +670,19 @@ class AdapterRoutingConfig:
     ``router_device``. May be a card the model does not use at all — with
     tensor parallelism that keeps the encoder off every rank's GPU."""
 
+    arrival_on_route: bool = True
+    """A request sent to ``model: "auto"`` has arrived when the router service
+    receives it: routing is the first step of serving it, not something that
+    happens before it. From that moment the co-serving machinery treats it
+    like any arrival — the backward child yields the GPU
+    (``finetune.pause_on_arrival``), an FT-only forward is aborted (tier C
+    under TP), and the scheduler starts no new FT-only step until the request
+    reaches the engine. The encode then shares the card with less finetuning
+    work (route p50 24 → 14 ms on Qwen3-14B TP=2) and the request's prefill
+    finds the GPU already yielded. Its ``arrival_time`` — what the TTFT
+    deadline is computed from — is the moment it reached the API server either
+    way. False = finetuning learns of the request when the engine does."""
+
     route_batch_max: int = 16
     """Most route requests encoded together. Requests that arrive while the
     encoder is busy are batched; one arriving at an idle service is not delayed."""

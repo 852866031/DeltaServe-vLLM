@@ -34,7 +34,9 @@ without headers. Pure ASGI (no framework import), so it is testable alone.
 """
 
 import asyncio
+import contextvars
 import json
+import time
 
 from dataclasses import dataclass
 
@@ -122,6 +124,13 @@ def extract_text(body: dict) -> str | None:
     return None
 
 
+# When the request being handled reached the API server (time.time()); read by
+# the plugin's wrapper on vLLM's InputProcessor.process_inputs. A contextvar:
+# the middleware and the endpoint run in the same task.
+REQUEST_ARRIVAL: contextvars.ContextVar = contextvars.ContextVar(
+    "deltaserve_request_arrival", default=None)
+
+
 class AdapterRouteMiddleware:
     """``route_fn(text) -> RouteDecision`` may be sync (run in a thread) or async."""
 
@@ -153,6 +162,11 @@ class AdapterRouteMiddleware:
         if (scope["type"] != "http" or scope.get("method") != "POST"
                 or scope.get("path") not in self.paths):
             return await self.app(scope, receive, send)
+        # The request's arrival: before its body is read and before it is
+        # routed. vLLM stamps arrival_time only when the request reaches its
+        # input processor — after the route — which would hide the route's
+        # time from the TTFT deadline the scheduler computes.
+        REQUEST_ARRIVAL.set(time.time())
 
         chunks, first = [], None
         while True:

@@ -1074,8 +1074,12 @@ class FinetuneScheduler(AsyncScheduler):
             # for an inference arrival so it rides this step instead of queuing
             # behind an FT-only forward.
             grace_s = self.vllm_config.finetune_config.ft_only_admission_grace_ms / 1e3
-            if grace_s > 0 and self.would_step_be_ft_only():
-                inputs.poll(grace_s)
+            if self.would_step_be_ft_only():
+                # [adapter routing] A request being routed has arrived already:
+                # an FT-only step started now would be on the GPU when it
+                # lands. Wait for it instead (bounded).
+                if not inputs.wait_for_routed() and grace_s > 0:
+                    inputs.poll(grace_s)
         output = self._schedule_step()
         if interruptible and self._is_ft_only(output) and inputs.pending():
             # [tier B] A request landed after the drain: undo the FT-only step,

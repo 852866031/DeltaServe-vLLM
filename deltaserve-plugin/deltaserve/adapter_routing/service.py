@@ -265,7 +265,49 @@ class RouteBatcher:
         self._thread.join(timeout=5.0)
 
 
-def _handle(conn, router: Router, batcher: RouteBatcher) -> None:
+class RouteArrival:
+    """A request has arrived when the router service receives it — routing is
+    the first step of serving it. ``started`` / ``finished`` publish that to
+    the co-serving machinery (``FtArrivalSignal``): the backward child yields
+    the GPU, an FT-only forward is aborted, and the scheduler starts no new
+    FT-only step until the request reaches the engine. Inert without the
+    engine's arrival signal or with ``arrival_on_route`` off."""
+
+    def __init__(self, enabled: bool = True) -> None:
+        self._lock = threading.Lock()       # handler threads: one writer at a time
+        self._sig = None
+        self.count = 0
+        name = os.environ.get("DSERVE_FT_ARRIVAL_SHM")
+        if enabled and name:
+            try:
+                from deltaserve.coordinator import FtArrivalSignal
+
+                self._sig = FtArrivalSignal.attach(name)
+            except Exception as e:  # noqa: BLE001 — routing works without it
+                dprint(f"[router] a route is not signalled as an arrival: {e}")
+
+    @property
+    def active(self) -> bool:
+        return self._sig is not None
+
+    def started(self) -> None:
+        if self._sig is not None:
+            with self._lock:
+                self._sig.route_started()
+                self.count += 1
+
+    def finished(self) -> None:
+        if self._sig is not None:
+            with self._lock:
+                self._sig.route_finished()
+
+    def close(self) -> None:
+        sig, self._sig = self._sig, None
+        if sig is not None:
+            sig.close()
+
+
+def _handle(conn, router: Router, batcher: RouteBatcher, arrival=None) -> None:
     try:
         while True:
             try:
@@ -274,7 +316,13 @@ def _handle(conn, router: Router, batcher: RouteBatcher) -> None:
                 return
             try:
                 if msg[0] == "route":
-                    d = batcher.submit(msg[1])
+                    if arrival is not None:
+                        arrival.started()       # the request has arrived
+                    try:
+                        d = batcher.submit(msg[1])
+                    finally:
+                        if arrival is not None:
+                            arrival.finished()  # routed: on to the engine
                     reply = ("ok", d.adapter, d.score, d.reason, d.confidence,
                              d.candidates)
                 elif msg[0] == "encode":
@@ -291,12 +339,15 @@ def _handle(conn, router: Router, batcher: RouteBatcher) -> None:
             except OSError:
                 return
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except OSError:          # the client hung up first (it timed out)
+            pass
 
 
 def serve(router: Router, path: str, stop: threading.Event | None = None,
           ready: threading.Event | None = None, max_batch: int = 16,
-          batch_wait_s: float = 0.0) -> None:
+          batch_wait_s: float = 0.0, arrival=None) -> None:
     """Answer route requests on the unix socket ``path`` until ``stop`` is set
     (forever when ``stop`` is None)."""
     try:
@@ -322,7 +373,8 @@ def serve(router: Router, path: str, stop: threading.Event | None = None,
                 conn.close()
                 return
             conns.append(conn)
-            threading.Thread(target=_handle, args=(conn, router, batcher),
+            threading.Thread(target=_handle,
+                             args=(conn, router, batcher, arrival),
                              daemon=True).start()
 
     thread = threading.Thread(target=acceptor, daemon=True, name="router-accept")
@@ -355,94 +407,167 @@ def serve(router: Router, path: str, stop: threading.Event | None = None,
 
 
 class RouterClient:
-    """An API server's handle on the router service. Thread-safe; never raises."""
+    """An API server's handle on the router service. Thread-safe; never raises.
 
-    def __init__(self, path: str, timeout_s: float = 0.2) -> None:
+    Each calling thread has its own connection, so concurrent requests are not
+    queued behind one another here — they reach the service together and share
+    one encoder batch.
+
+    Circuit breaker: after ``breaker_failures`` failures in a row the client
+    stops asking for ``breaker_cooldown_s`` (doubling up to 30 s while the
+    service stays down) and answers 'router-unavailable' at once; then one
+    request probes the service. Without it every request of a slow or dead
+    service waits the full timeout before falling back."""
+
+    def __init__(self, path: str, timeout_s: float = 0.2,
+                 breaker_failures: int = 3, breaker_cooldown_s: float = 2.0,
+                 clock=time.monotonic) -> None:
         self.path, self.timeout_s = path, float(timeout_s)
-        self._conn = None
-        self._lock = threading.Lock()
+        self._tls = threading.local()
+        self._conns: set = set()
+        self._lock = threading.Lock()          # counters + the set of connections
         self.failures = 0
+        self.skipped = 0                       # answered by the open breaker
         self.last_error = ""
-        self._logged_at = 0.0
+        self._logged_at = -1e9
+        self._clock = clock
+        self._breaker_failures = max(1, int(breaker_failures))
+        self._cooldown0 = float(breaker_cooldown_s)
+        self._cooldown = self._cooldown0
+        self._streak = 0
+        self._open_until = 0.0
+        self._probing = False
 
+    # ------------------------------------------------------------ breaker
     def _failed(self, why: str) -> None:
         """Count a request that fell back, and say why — at most every 30 s:
         the client never raises, so the log is the only place it shows."""
-        self.failures += 1
-        self.last_error = why
-        now = time.monotonic()
-        if now - self._logged_at >= 30.0:
-            self._logged_at = now
+        with self._lock:
+            self.failures += 1
+            self.last_error = why
+            self._streak += 1
+            now = self._clock()
+            opened = self._streak == self._breaker_failures
+            if self._streak >= self._breaker_failures:
+                if self._probing:              # a failed probe: back off longer
+                    self._probing = False
+                    self._cooldown = min(30.0, self._cooldown * 2)
+                self._open_until = now + self._cooldown
+            log = now - self._logged_at >= 30.0 or opened
+            if log:
+                self._logged_at = now
+            n, skipped, cooldown = self.failures, self.skipped, self._cooldown
+        if log:
             dprint(f"[router-client] requests fall back to the base model: "
-                   f"{why} ({self.failures} so far)")
+                   f"{why} ({n} failed, {skipped} not tried"
+                   + (f"; not asking for {cooldown:.0f} s" if opened else "") + ")")
 
+    def _succeeded(self) -> None:
+        if self._streak:
+            with self._lock:
+                self._streak, self._cooldown, self._open_until = 0, self._cooldown0, 0.0
+                self._probing = False
+
+    def _skip(self) -> bool:
+        """True while the breaker is open. When the cooldown is over, exactly
+        one caller gets through to probe; the others keep skipping."""
+        if self._streak < self._breaker_failures:
+            return False
+        with self._lock:
+            now = self._clock()
+            if now >= self._open_until:
+                self._open_until = now + self._cooldown     # this caller probes
+                self._probing = True
+                return False
+            self.skipped += 1
+            return True
+
+    @property
+    def open(self) -> bool:
+        return self._streak >= self._breaker_failures \
+            and self._clock() < self._open_until
+
+    # --------------------------------------------------------- connection
     def _close(self) -> None:
-        if self._conn is not None:
+        conn = getattr(self._tls, "conn", None)
+        if conn is not None:
+            self._tls.conn = None
+            with self._lock:
+                self._conns.discard(conn)
             try:
-                self._conn.close()
+                conn.close()
             except OSError:
                 pass
-            self._conn = None
 
-    def _call(self, msg: tuple):
-        if self._conn is None:
-            self._conn = Client(self.path, family="AF_UNIX",
-                                authkey=_authkey(self.path))
-        self._conn.send(msg)
-        if not self._conn.poll(self.timeout_s):
+    def _connection(self):
+        conn = getattr(self._tls, "conn", None)
+        if conn is None:
+            conn = Client(self.path, family="AF_UNIX", authkey=_authkey(self.path))
+            self._tls.conn = conn
+            with self._lock:
+                self._conns.add(conn)
+        return conn
+
+    def _call(self, msg: tuple, timeout_s: float | None = None):
+        conn = self._connection()
+        conn.send(msg)
+        if not conn.poll(self.timeout_s if timeout_s is None else timeout_s):
             # A late answer would be read as the next request's: drop the link.
             self._close()
             raise TimeoutError
-        return self._conn.recv()
+        return conn.recv()
 
+    # -------------------------------------------------------------- calls
     def route(self, text: str | None) -> RouteDecision:
-        with self._lock:
-            try:
-                reply = self._call(("route", text))
-            except TimeoutError:
-                self._failed(f"no answer within {self.timeout_s * 1000:.0f} ms")
-                return RouteDecision(None, None, TIMEOUT)
-            except Exception as e:  # noqa: BLE001 — service down / socket gone
-                self._close()
-                self._failed(f"{type(e).__name__}: {e}")
-                return RouteDecision(None, None, UNAVAILABLE)
+        if self._skip():
+            return RouteDecision(None, None, UNAVAILABLE)
+        try:
+            reply = self._call(("route", text))
+        except TimeoutError:
+            self._failed(f"no answer within {self.timeout_s * 1000:.0f} ms")
+            return RouteDecision(None, None, TIMEOUT)
+        except Exception as e:  # noqa: BLE001 — service down / socket gone
+            self._close()
+            self._failed(f"{type(e).__name__}: {e}")
+            return RouteDecision(None, None, UNAVAILABLE)
         if reply[0] != "ok":
             self._failed(f"the router service answered: {reply[1]}")
             return RouteDecision(None, None, UNAVAILABLE)
+        self._succeeded()
         return RouteDecision(*reply[1:])
 
     def encode(self, texts: list, timeout_s: float = 30.0):
         """Embeddings of an indexing chunk from the service's encoder. Unlike
         ``route`` this RAISES when the service cannot answer (the caller falls
         back to the CPU)."""
-        with self._lock:
-            try:
-                if self._conn is None:
-                    self._conn = Client(self.path, family="AF_UNIX",
-                                        authkey=_authkey(self.path))
-                self._conn.send(("encode", list(texts)))
-                if not self._conn.poll(timeout_s):
-                    raise TimeoutError("router service did not answer")
-                reply = self._conn.recv()
-            except Exception:
-                self._close()
-                raise
+        try:
+            reply = self._call(("encode", list(texts)), timeout_s)
+        except TimeoutError:
+            raise TimeoutError("router service did not answer") from None
+        except Exception:
+            self._close()
+            raise
         if reply[0] != "ok":
             raise RuntimeError(f"router service: {reply[1]}")
         return reply[1]
 
     def ping(self) -> tuple | None:
-        with self._lock:
-            try:
-                reply = self._call(("ping",))
-            except Exception:  # noqa: BLE001
-                self._close()
-                return None
+        try:
+            reply = self._call(("ping",))
+        except Exception:  # noqa: BLE001
+            self._close()
+            return None
         return tuple(reply[1:]) if reply[0] == "ok" else None
 
     def close(self) -> None:
         with self._lock:
-            self._close()
+            conns, self._conns = list(self._conns), set()
+        self._tls.conn = None
+        for conn in conns:
+            try:
+                conn.close()
+            except OSError:
+                pass
 
 
 def router_placement(cfg) -> tuple[str, str | None]:
@@ -495,6 +620,8 @@ def serve_config(cfg, device: str | None = None) -> None:
     router.refresh(force=True)
     where = device if cfg.router_gpu is None or device == "cpu" \
         else f"GPU {cfg.router_gpu}"
+    if device != "cpu":
+        encoder_self_test(router.encoder, cfg, where)
     dprint(f"[router] serving on {path} | encoder={cfg.encoder} on {where} | "
            f"{len(router.index)} adapters | {router.model.describe()} | "
            f"batch<={cfg.route_batch_max}")
@@ -503,8 +630,39 @@ def serve_config(cfg, device: str | None = None) -> None:
                "rate only (50-130 ms per encode; under load route requests "
                "time out and fall back to the base model). Prefer a GPU "
                "(adapter_routing.router_device / router_gpu).")
+    arrival = RouteArrival(cfg.arrival_on_route)
+    if arrival.active:
+        dprint("[router] a request arrives when it reaches this service: "
+               "finetuning yields the GPU from the start of its route "
+               "(arrival_on_route)")
     serve(router, path, max_batch=cfg.route_batch_max,
-          batch_wait_s=cfg.route_batch_wait_ms / 1e3)
+          batch_wait_s=cfg.route_batch_wait_ms / 1e3, arrival=arrival)
+
+
+def encoder_self_test(encoder, cfg, where: str) -> bool:
+    """Encode one full batch of the longest input at startup. A card that has
+    room for the encoder's weights but not for its activations is found here,
+    with a clear message — otherwise it shows only as requests silently
+    falling back to the base model. Also warms the encoder up."""
+    worst = ["word " * (2 * int(cfg.encoder_max_tokens))] * int(cfg.route_batch_max)
+    try:
+        encoder.encode(worst)
+        return True
+    except Exception as e:  # noqa: BLE001 — reported; the service still starts
+        free = ""
+        try:
+            import torch
+
+            f, t = torch.cuda.mem_get_info()
+            free = f" ({f / 2**30:.1f} of {t / 2**30:.1f} GiB free on that card)"
+        except Exception:  # noqa: BLE001
+            pass
+        dprint(f"[router] WARNING: the encoder cannot encode a full batch on "
+               f"{where}{free}: {type(e).__name__}: {str(e)[:120]}. Routed "
+               f"requests will fall back to the base model. Leave the encoder "
+               f"about 2 GB: lower engine.gpu_memory_utilization, or move it "
+               f"(adapter_routing.router_gpu / router_device).")
+        return False
 
 
 def build_router(cfg, device: str = "cpu") -> tuple[Router, str]:

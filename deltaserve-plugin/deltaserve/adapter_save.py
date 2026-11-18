@@ -139,9 +139,14 @@ def save_job_adapter(job, engine, routing=None) -> str | None:
         if engine is None or not spec.adapter_path:
             raise RuntimeError(
                 f"{job.name}: no engine / source adapter to export from")
+        import time
+
+        t0 = time.monotonic()
         job.saved_path = export_trained_adapter(engine, spec.adapter_path, dst,
                                                 overwrite=True)
-        dprint(f"[ft-job] {job.name} trained adapter saved to {job.saved_path}")
+        # Runs on the engine loop: no step is scheduled for this long.
+        dprint(f"[ft-job] {job.name} trained adapter saved to {job.saved_path} "
+               f"in {(time.monotonic() - t0) * 1e3:.0f} ms (engine loop blocked)")
     if routing is not None and spec.auto_routing and job.admission is None:
         routing.publish(job)
     return job.saved_path

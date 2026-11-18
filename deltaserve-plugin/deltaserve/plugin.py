@@ -265,6 +265,24 @@ def _patch_engine_core() -> None:
 
     _wrap(EngineCore, "add_request", add_request)
 
+    def process_inputs(orig):
+        def wrapper(self, *args, **kwargs):
+            # [adapter routing] arrival_time = when the request reached the API
+            # server (set by the route middleware), not when it left the
+            # router. None outside a routed endpoint: vLLM's own stamp.
+            if len(args) < 5 and kwargs.get("arrival_time") is None:
+                from deltaserve.route_middleware import REQUEST_ARRIVAL
+
+                t = REQUEST_ARRIVAL.get()
+                if t is not None:
+                    kwargs["arrival_time"] = t
+            return orig(self, *args, **kwargs)
+        return wrapper
+
+    from vllm.v1.engine.input_processor import InputProcessor
+
+    _wrap(InputProcessor, "process_inputs", process_inputs)
+
     def busy_loop(orig):
         def wrapper(self, *args, **kwargs):
             ds = getattr(self, "_ds", None)

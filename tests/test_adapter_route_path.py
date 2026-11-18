@@ -237,6 +237,76 @@ def test_service_and_client():
             client.close()
 
 
+def test_client_under_failure():
+    green("router client: circuit breaker, no queueing behind a slow service:")
+    from deltaserve.adapter_routing.service import Router, RouterClient, socket_path
+
+    with tempfile.TemporaryDirectory() as d:
+        path = socket_path(d)
+        now = [0.0]
+        client = RouterClient(path, timeout_s=0.2, breaker_failures=3,
+                              breaker_cooldown_s=2.0, clock=lambda: now[0])
+        for _ in range(3):
+            client.route("translate")
+        check("three failures in a row open the breaker",
+              client.failures == 3 and client.open)
+        t0 = time.monotonic()
+        out = [client.route("translate") for _ in range(50)]
+        check("while open: 'router-unavailable' at once, the service is not asked",
+              all(o.reason == "router-unavailable" for o in out)
+              and client.failures == 3 and client.skipped == 50
+              and time.monotonic() - t0 < 0.1)
+        now[0] = 2.5
+        client.route("translate")
+        check("after the cooldown ONE request probes; it fails → open again, longer",
+              client.failures == 4 and client.open)
+        now[0] = 2.5 + 3.0
+        check("the cooldown doubled (still open after the first one's length)",
+              client.open)
+
+        f = str(Path(d) / "centroids.npz")
+        write_index(f, ["translate", "sql"])
+        svc = Service(Router(FakeEncoder(), f, threshold=0.5, reload_s=0.0), path)
+        try:
+            now[0] = 100.0
+            dec = client.route("translate this")
+            check("service back: the probe is routed and the breaker closes",
+                  dec.adapter == "dserve-routing-translate" and not client.open)
+            check("... and later requests are asked normally",
+                  client.route("translate").adapter == "dserve-routing-translate")
+        finally:
+            svc.close()
+            client.close()
+
+        # A slow service: 8 concurrent requests, each encode 0.3 s, timeout 0.2 s.
+        # With one shared connection they would wait 8 x 0.2 s in a row.
+        svc = Service(Router(FakeEncoder(delay=0.3), f, threshold=0.5,
+                             reload_s=0.0), path)
+        client = RouterClient(path, timeout_s=0.2, breaker_failures=3,
+                              breaker_cooldown_s=5.0)
+        try:
+            res = []
+            def one():
+                t = time.monotonic()
+                r = client.route("translate")
+                res.append((time.monotonic() - t, r.reason))
+            ths = [threading.Thread(target=one) for _ in range(8)]
+            t0 = time.monotonic()
+            [t.start() for t in ths]
+            [t.join(5) for t in ths]
+            wall = time.monotonic() - t0
+            check(f"8 concurrent requests on a too-slow service all fall back within "
+                  f"about one timeout ({wall * 1e3:.0f} ms), not eight",
+                  len(res) == 8 and all(r for _, r in res) and wall < 0.5)
+            t0 = time.monotonic()
+            r = client.route("translate")
+            check("and the next request is not made to wait at all",
+                  r.reason == "router-unavailable" and time.monotonic() - t0 < 0.05)
+        finally:
+            svc.close()
+            client.close()
+
+
 def test_batching():
     green("request batching in the router service:")
     from deltaserve.adapter_routing.service import (
@@ -488,6 +558,22 @@ def test_placement():
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         else:
             os.environ["CUDA_VISIBLE_DEVICES"] = keep_vis
+    from deltaserve.adapter_routing.service import encoder_self_test
+
+    class Enc:
+        def __init__(self, fail): self.fail, self.seen = fail, None
+        def encode(self, texts):
+            self.seen = texts
+            if self.fail:
+                raise RuntimeError("CUDA error: out of memory")
+            return np.zeros((len(texts), 4), np.float32)
+    ok_enc, bad_enc = Enc(False), Enc(True)
+    c = cfg(route_batch_max=6)
+    check("startup self-test encodes one full batch of the longest input",
+          encoder_self_test(ok_enc, c, "GPU 1") and len(ok_enc.seen) == 6
+          and len(ok_enc.seen[0].split()) >= c.encoder_max_tokens)
+    check("an encoder that cannot do it is reported, the service still starts",
+          encoder_self_test(bad_enc, c, "GPU 1") is False)
     check("router_device: cpu → CPU, every GPU hidden from the service",
           router_placement(cfg(router_device="cpu")) == ("cpu", ""))
     check("router_gpu: 3 → the service sees only physical GPU 3, as cuda:0",
@@ -620,6 +706,65 @@ def test_middleware():
           and h.get("x-deltaserve-routing-reason") == "below-threshold"
           and h.get("x-deltaserve-routing-score") == "0.4123"
           and "x-deltaserve-adapter" not in h)
+
+    # arrival_time: stamped when the request reaches the API server, before
+    # the route — the route's time belongs to the request's TTFT.
+    from deltaserve import plugin as _plugin
+    from deltaserve.route_middleware import REQUEST_ARRIVAL
+
+    seen_at = {}
+
+    def slow_route(text):
+        time.sleep(0.05)
+        return RouteDecision("dserve-routing-translate", 0.9)
+
+    class Proc:
+        def process_inputs(self, request_id, prompt, params,
+                           supported_tasks=(), arrival_time=None):
+            return arrival_time
+    make = {}
+    orig_wrap = _plugin._wrap
+    _plugin._wrap = lambda cls, name, mk: make.setdefault(name, mk)
+    try:
+        _plugin.register()
+    finally:
+        _plugin._wrap = orig_wrap
+    wrapped = make["process_inputs"](Proc.process_inputs)
+
+    async def app(scope, receive, send):
+        await receive()
+        seen_at["var"] = REQUEST_ARRIVAL.get()
+        seen_at["stamp"] = wrapped(Proc(), "r", "p", None, supported_tasks=())
+        seen_at["given"] = wrapped(Proc(), "r", "p", None, supported_tasks=(),
+                                   arrival_time=123.0)
+        seen_at["now"] = time.time()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    slow = AdapterRouteMiddleware(app, slow_route, "auto", lambda: "base")
+    t_in = time.time()
+
+    async def drive():
+        msgs = [{"type": "http.request", "body": json.dumps(
+            {"model": "auto", "prompt": "translate"}).encode()}]
+
+        async def receive():
+            return msgs.pop(0)
+
+        async def send(m):
+            pass
+        await slow({"type": "http", "method": "POST", "path": "/v1/completions",
+                    "headers": []}, receive, send)
+    run(drive())
+    check("the request's arrival time is taken before the route "
+          f"({(seen_at['now'] - seen_at['stamp']) * 1e3:.0f} ms earlier than the "
+          "moment it reaches vLLM)",
+          seen_at["var"] is not None and seen_at["stamp"] == seen_at["var"]
+          and t_in <= seen_at["stamp"] <= t_in + 0.02
+          and seen_at["now"] - seen_at["stamp"] >= 0.05)
+    check("an arrival_time given by the caller is kept", seen_at["given"] == 123.0)
+    check("outside a routed endpoint vLLM stamps it itself (nothing passed)",
+          wrapped(Proc(), "r", "p", None, supported_tasks=()) is None)
 
     n = len(calls)
     named = json.dumps({"model":   "my-adapter", "prompt": "translate"},
@@ -860,6 +1005,7 @@ def main():
     test_extract_text()
     test_router()
     test_service_and_client()
+    test_client_under_failure()
     test_batching()
     test_indexing_borrows_the_encoder()
     test_placement()

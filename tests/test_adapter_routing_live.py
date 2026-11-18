@@ -34,7 +34,15 @@ import urllib.request
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
-_PRESET = _REPO / "configs" / "serving_config_finetuning_qwen3_0.6b.yaml"
+# --family picks the model (set in main, before anything reads these):
+#   qwen3-0.6b  one small GPU's worth, TP=1 by default (the default)
+#   qwen3-14b   the adapter-routing production preset; run it with --tp 2
+_FAMILIES = {
+    "qwen3-0.6b": "serving_config_finetuning_qwen3_0.6b.yaml",
+    "qwen3-14b": "serving_config_finetuning_qwen3_14b_tp2_adapter_routing.yaml",
+}
+_BASE = "qwen3-0.6b"
+_PRESET = _REPO / "configs" / _FAMILIES[_BASE]
 
 _passed = 0
 _failed = 0
@@ -147,7 +155,7 @@ def write_config(out: Path, args) -> Path:
     }
     cfg["adapters"]["lora_path_0"] = str(
         (_PRESET.parent / cfg["adapters"]["lora_path_0"]).resolve())
-    cfg["lora"]["max_loras"] = 4
+    cfg["lora"]["max_loras"] = max(4, int(cfg["lora"].get("max_loras") or 0))
     cfg["server"]["api_server_count"] = args.api_servers
     path = out / "config.yaml"
     path.write_text(yaml.safe_dump(cfg, sort_keys=False))
@@ -216,7 +224,7 @@ def external_main(args, out: Path) -> None:
              "data_path": str(data["ext-sql"])}],
     }
     cfg["adapters"]["lora_path_0"] = str(toy)
-    cfg["lora"]["max_loras"] = 4
+    cfg["lora"]["max_loras"] = max(4, int(cfg["lora"].get("max_loras") or 0))
     cfg["server"]["api_server_count"] = args.api_servers
     config = out / "config.yaml"
     config.write_text(yaml.safe_dump(cfg, sort_keys=False))
@@ -231,7 +239,7 @@ def external_main(args, out: Path) -> None:
     log = open(log_path, "w")
     server = subprocess.Popen(
         [sys.executable, str(_REPO / "eval-tp/launch_deltaserve.py"),
-         "--family", "qwen3-0.6b", "--config", str(config), "--tp", str(args.tp),
+         "--family", _BASE, "--config", str(config), "--tp", str(args.tp),
          "--port", str(args.port)],
         stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
     port, ok = args.port, False
@@ -333,7 +341,7 @@ def external_main(args, out: Path) -> None:
             print(f"    auto {q[:42]!r:46} → {outs[-1]}")
         check("unrelated questions now fall back to the base model as "
               f"low-confidence ({sum(o[1] == 'low-confidence' for o in outs)}/4)",
-              sum(o[1] == "low-confidence" and o[4] == "qwen3-0.6b"
+              sum(o[1] == "low-confidence" and o[4] == _BASE
                   for o in outs) >= 3)
         dlog = out / "index" / "decisions.jsonl"
         check("decisions are logged for calibration",
@@ -421,7 +429,7 @@ def external_main(args, out: Path) -> None:
             def load():
                 while not stop_load.is_set():
                     s9, _, _ = http(port, "/v1/completions", {
-                        "model": "qwen3-0.6b", "prompt": "Hello there",
+                        "model": _BASE, "prompt": "Hello there",
                         "max_tokens": 2, "temperature": 0}, timeout=60)
                     sent.append(s9)
                     time.sleep(0.2)
@@ -468,10 +476,10 @@ def external_main(args, out: Path) -> None:
               and all(x == 404 for x in gone))
 
         status, headers, body = http(port, "/v1/completions", {
-            "model": "qwen3-0.6b", "prompt": "Hello", "max_tokens": 2,
+            "model": _BASE, "prompt": "Hello", "max_tokens": 2,
             "temperature": 0})
         check("a request naming the base model is untouched",
-              status == 200 and body.get("model") == "qwen3-0.6b"
+              status == 200 and body.get("model") == _BASE
               and not any(k.startswith("x-deltaserve") for k in headers))
         ok = _failed == 0
     finally:
@@ -497,7 +505,10 @@ def second_job(args, out, port, first, first_saved, src_adapter) -> None:
           status == 202 and r["job"]["name"] == "job-sql")
     status, _, r = http(port, "/ft_jobs", {
         "name": "job-bad", "data_path": str(data),
-        "adapter_path": str(_REPO / "adapters" / "qwen3-14b-toy-lora-ft")})
+        # an adapter of the OTHER model size
+        "adapter_path": str(_REPO / "adapters" / (
+            "qwen3-0.6b-toy-lora-ft" if _BASE == "qwen3-14b"
+            else "qwen3-14b-toy-lora-ft"))})
     check("a job whose adapter has another shape is accepted into the queue",
           status == 202)
     status, _, r = http(port, "/ft_jobs", {"adapter_path": "/nope",
@@ -514,7 +525,7 @@ def second_job(args, out, port, first, first_saved, src_adapter) -> None:
             seen.append(label)
             print(f"    [{time.monotonic() - t0:5.1f}s] {label}", flush=True)
         s1, _, b1 = http(port, "/v1/completions", {
-            "model": "qwen3-0.6b", "prompt": "Hello", "max_tokens": 1,
+            "model": _BASE, "prompt": "Hello", "max_tokens": 1,
             "temperature": 0}, timeout=60)
         served += s1 == 200
         if cur is None and not jobs.get("queued"):
@@ -573,6 +584,7 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8791)
     ap.add_argument("--api-servers", type=int, default=1)
     ap.add_argument("--tp", type=int, default=1, help="tensor_parallel_size")
+    ap.add_argument("--family", choices=sorted(_FAMILIES), default="qwen3-0.6b")
     ap.add_argument("--router-device", default="auto")
     ap.add_argument("--router-gpu", type=int, default=None,
                     help="physical GPU index for the router's encoder")
@@ -586,6 +598,8 @@ def main() -> None:
     ap.add_argument("--external", action="store_true",
                     help="finetuning off: index and route existing adapters")
     args = ap.parse_args()
+    global _BASE, _PRESET
+    _BASE, _PRESET = args.family, _REPO / "configs" / _FAMILIES[args.family]
     if not os.environ.get("CUDA_VISIBLE_DEVICES"):
         raise SystemExit("set CUDA_VISIBLE_DEVICES to the GPU this may use")
 
@@ -608,7 +622,7 @@ def main() -> None:
     log = open(log_path, "w")
     server = subprocess.Popen(
         [sys.executable, str(_REPO / "eval-tp/launch_deltaserve.py"),
-         "--family", "qwen3-0.6b", "--config", str(config), "--tp", str(args.tp),
+         "--family", _BASE, "--config", str(config), "--tp", str(args.tp),
          "--port", str(args.port)],
         stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
     port = args.port
@@ -662,7 +676,7 @@ def main() -> None:
                       f"{cur.get('detail')}", flush=True)
             # keep the engine stepping: stages advance on scheduler steps
             http(port, "/v1/completions", {
-                "model": "qwen3-0.6b", "prompt": "Hello", "max_tokens": 1,
+                "model": _BASE, "prompt": "Hello", "max_tokens": 1,
                 "temperature": 0}, timeout=60)
             time.sleep(1.0)
         print(f"    stages seen while running: {sorted(seen)}")
@@ -725,12 +739,12 @@ def main() -> None:
         check("an unrelated auto request is also answered", status == 200)
 
         status, headers, body = http(port, "/v1/completions", {
-            "model": "qwen3-0.6b", "prompt": "Hello", "max_tokens": 2,
+            "model": _BASE, "prompt": "Hello", "max_tokens": 2,
             "temperature": 0})
         check("a request naming the base model: 200, no routing headers",
               status == 200
               and not any(k.startswith("x-deltaserve") for k in headers)
-              and body.get("model") == "qwen3-0.6b")
+              and body.get("model") == _BASE)
 
         status, headers, body = http(port, "/v1/completions", {
             "model": name, "prompt": "Translate to English: Danke.",

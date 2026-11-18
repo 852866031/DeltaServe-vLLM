@@ -151,6 +151,15 @@ class AdapterRoutingEngine:
         restored = self.pool.restore(self.dir, centroids=self._centroids())
         dprint(f"[adapter-routing] pool: {restored} adapters restored, "
                f"{gpu_slots} GPU slots, index dir {self.dir}")
+        if gpu_slots < 2:
+            dprint(f"[adapter-routing] WARNING: lora.max_loras={lora.max_loras} leaves "
+                   f"{gpu_slots} adapter per batch for routed requests"
+                   + (" (the finetuning adapter takes one)" if ft_slot else "")
+                   + ". Requests routed to different adapters cannot share a "
+                   "batch and queue behind each other (production trace: TTFT "
+                   "p95 89 ms → 1.5 s). Raise lora.max_loras to the number of "
+                   "adapters in use at once"
+                   + (" + 1." if ft_slot else "."))
         self.service = None
         if start_service:
             self.service = RouterServiceProcess(cfg)

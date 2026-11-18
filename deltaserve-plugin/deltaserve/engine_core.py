@@ -20,6 +20,7 @@ finetuning is off, so a plain deployment pays one is None check per hook).
 """
 
 import queue
+import time
 
 from deltaserve import dprint
 from vllm.logger import init_logger
@@ -42,6 +43,33 @@ class EngineInputs:
 
     def pending(self) -> bool:
         return not self._engine.input_queue.empty()
+
+    # A route that takes longer than this is not waited for (the API server
+    # has given up on it by then: route_timeout_ms defaults to 200).
+    ROUTE_WAIT_CAP_S = 0.25
+
+    def wait_for_routed(self) -> bool:
+        """[adapter routing] While a request is inside the router service it
+        has arrived but is not in the input queue yet: wait for it (it lands
+        within the route's few ms). True if a request was handled. Bounded by
+        ``ROUTE_WAIT_CAP_S``; a route that outlives the cap is not waited for
+        again until the router's counters move."""
+        sig = getattr(getattr(self._engine, "_ds", None), "arrival_signal", None)
+        if sig is None:
+            return False
+        counts = sig.route_counts()
+        if counts[0] <= counts[1] or counts == getattr(self, "_route_stuck", None):
+            return False
+        deadline = time.monotonic() + self.ROUTE_WAIT_CAP_S
+        while time.monotonic() < deadline:
+            if self.poll(0.001):
+                return True
+            counts = sig.route_counts()
+            if counts[0] <= counts[1]:
+                # routed: the request is on its way from the API server
+                return self.poll(0.003)
+        self._route_stuck = counts
+        return False
 
     def poll(self, timeout_s: float) -> bool:
         """Wait up to timeout_s for a request; if one lands, handle it and
@@ -87,9 +115,13 @@ class EngineHooks:
         self.engine = engine
         self.arrival_signal = None
         ft = vllm_config.finetune_config
+        rc = vllm_config.adapter_routing_config
         if ft.pause_on_arrival or (
                 ft.forward_interruptible
-                and vllm_config.parallel_config.tensor_parallel_size > 1):
+                and vllm_config.parallel_config.tensor_parallel_size > 1) or (
+                # [adapter routing] the router service publishes arrivals here
+                ft.enable_finetuning and ft.forward_interruptible
+                and rc.enable_adapter_routing and rc.arrival_on_route):
             import os
 
             from deltaserve.coordinator import FtArrivalSignal
