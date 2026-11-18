@@ -64,7 +64,8 @@ indexing, and the adapter handover.
 
 The same picture with the loop added. Inputs are on the left (inference requests,
 the adapter pool, finetuning jobs), responses on the right, and everything in between
-is work the scheduler decides.
+is work the scheduler decides. Orange marks what is new compared with section 2:
+the adapter pool, encoding, indexing and the adapter handover.
 
 The principle: **anything that occupies the GPU or the engine loop is decided by the
 scheduler.** Nothing takes GPU time on its own initiative.
@@ -103,6 +104,11 @@ load what the batch needs, run the forward batch, then let the backward use what
 left. The backward is paused only for the two step kinds that are latency-critical
 for a new request — an encode step and a step containing inference prefill — and
 resumes as soon as the prefill completes. A decode-only step does not pause it.
+
+Two more decisions sit in the scheduler but are not part of building the batch, and
+are taken only when the state changes: whether indexing may use the GPU, and when to
+start an adapter handover. Indexing and the handover then run on their own, outside
+the engine loop.
 
 ## 8. Scheduler decisions
 
