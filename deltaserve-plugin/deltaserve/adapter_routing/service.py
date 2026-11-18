@@ -153,14 +153,35 @@ class Router:
         if todo:
             embs = self.encoder.encode([texts[i] for i in todo])
             for i, emb in zip(todo, embs):
-                c = model.decide(emb, prefer=self._prefer, raw_floor=self.threshold)
-                reason = "" if c.adapter else (
-                    LOW_CONFIDENCE if c.low_confidence else BELOW_THRESHOLD)
-                if c.adapter:
-                    self._routed[c.adapter] = self._routed.get(c.adapter, 0) + 1
-                out[i] = RouteDecision(c.adapter, c.score, reason, c.confidence,
-                                       tuple(c.candidates))
-                self._record(out[i], c)
+                out[i] = self._decide(model, emb)
+        return out
+
+    def _decide(self, model, emb) -> RouteDecision:
+        c = model.decide(emb, prefer=self._prefer, raw_floor=self.threshold)
+        reason = "" if c.adapter else (
+            LOW_CONFIDENCE if c.low_confidence else BELOW_THRESHOLD)
+        if c.adapter:
+            self._routed[c.adapter] = self._routed.get(c.adapter, 0) + 1
+        d = RouteDecision(c.adapter, c.score, reason, c.confidence,
+                          tuple(c.candidates))
+        self._record(d, c)
+        return d
+
+    def route_embeddings(self, embs: list) -> list[RouteDecision]:
+        """One decision per request embedding — the encode happened elsewhere
+        (the engine's encode step). None = it could not be encoded: the base
+        model."""
+        self.requests += len(embs)
+        self.refresh()
+        model = self.model
+        out = []
+        for emb in embs:
+            if emb is None:
+                out.append(RouteDecision(None, None, UNAVAILABLE))
+            elif not model.names:
+                out.append(RouteDecision(None, None, NO_ADAPTERS))
+            else:
+                out.append(self._decide(model, emb))
         return out
 
     def route(self, text: str | None) -> RouteDecision:

@@ -69,18 +69,7 @@ class FtArrivalSignal:
     them; a counter (rather than a flag) lets each worker compare "arrivals
     now" against "arrivals when this FT-only forward started". Single writer,
     8-byte aligned store — a torn read can only make an abort spurious or one
-    poll late, never wrong.
-
-    [adapter routing] A request sent to ``model: "auto"`` is encoded and routed
-    before it reaches the engine, and that is part of serving it: the request
-    has ARRIVED when the router service receives it. Two more counters in the
-    segment, both written by the router service only: routes started and
-    routes finished. ``read()`` — what every reader compares — counts engine
-    ADDs plus routes started, so the backward child yields and an FT-only
-    forward is aborted at the route's start; the request's later ADD is the
-    same arrival seen again, harmless to readers that only compare for change.
-    ``routing_pending()`` (started minus finished) tells the scheduler a
-    request is on its way, so it does not start an FT-only step meanwhile."""
+    poll late, never wrong."""
 
     ENV = "DSERVE_FT_ARRIVAL_SHM"
 
@@ -97,10 +86,9 @@ class FtArrivalSignal:
     def create(cls) -> "FtArrivalSignal":
         from multiprocessing import shared_memory
         name = f"dserve_ft_arrivals_{os.getpid()}"
-        shm = shared_memory.SharedMemory(name=name, create=True, size=24)
+        shm = shared_memory.SharedMemory(name=name, create=True, size=8)
         sig = cls(shm, owner=True)
-        for off in (0, 8, 16):
-            sig._pack.pack_into(shm.buf, off, 0)
+        sig._pack.pack_into(shm.buf, 0, 0)
         return sig
 
     @classmethod
@@ -112,32 +100,11 @@ class FtArrivalSignal:
     def name(self) -> str:
         return self._shm.name
 
-    def _get(self, off: int) -> int:
-        return self._pack.unpack_from(self._shm.buf, off)[0]
-
     def bump(self) -> None:
-        """An ADD reached the engine (engine input thread: one writer)."""
-        self._pack.pack_into(self._shm.buf, 0, self._get(0) + 1)
+        self._pack.pack_into(self._shm.buf, 0, self.read() + 1)
 
     def read(self) -> int:
-        """Arrivals: engine ADDs + routes started."""
-        return self._get(0) + self._get(8)
-
-    def route_started(self) -> None:
-        """The router service received a request (router service only)."""
-        self._pack.pack_into(self._shm.buf, 8, self._get(8) + 1)
-
-    def route_finished(self) -> None:
-        """... and answered it; the request now goes on to the engine."""
-        self._pack.pack_into(self._shm.buf, 16, self._get(16) + 1)
-
-    def route_counts(self) -> tuple[int, int]:
-        return self._get(8), self._get(16)
-
-    def routing_pending(self) -> int:
-        """Requests inside the router service right now."""
-        started, finished = self.route_counts()
-        return max(0, started - finished)
+        return self._pack.unpack_from(self._shm.buf, 0)[0]
 
     def close(self) -> None:
         try:

@@ -11,8 +11,9 @@ Checks
     it produced before the feature existed; with one, the section rides along
     as its own entry and relative paths are resolved;
   * VllmConfig.adapter_routing_config reads it back, routing does not enter the
-    compile-cache hash, and routing-only (finetuning off) leaves the engine
-    config alone;
+    compile-cache hash, and routing-only (finetuning off) changes only the
+    worker class (``deltaserve.route_worker.RouteWorker``: the stock worker +
+    the route encoder) — the scheduler class is untouched;
   * with routing off nothing under ``deltaserve.adapter_routing`` is imported, and no
     module outside that package imports it at module level.
 """
@@ -164,9 +165,14 @@ def test_plugin_wiring():
     check("routing without finetuning: routing on, finetuning off",
           only_routing.adapter_routing_config.enable_adapter_routing
           and not only_routing.finetune_config.enable_finetuning)
-    check("routing without finetuning: worker / scheduler class untouched",
-          only_routing.parallel_config.worker_cls == plain.parallel_config.worker_cls
-          and only_routing.scheduler_config.scheduler_cls
+    check("routing without finetuning: the worker is the stock one + the "
+          "route encoder (RouteWorker)",
+          only_routing.parallel_config.worker_cls
+          == "deltaserve.route_worker.RouteWorker"
+          and plain.parallel_config.worker_cls
+          != "deltaserve.route_worker.RouteWorker")
+    check("routing without finetuning: scheduler class untouched",
+          only_routing.scheduler_config.scheduler_cls
           == plain.scheduler_config.scheduler_cls)
 
     clone = pickle.loads(pickle.dumps(both.additional_config))

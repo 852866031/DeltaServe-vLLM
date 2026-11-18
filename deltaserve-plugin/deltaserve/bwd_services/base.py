@@ -199,9 +199,7 @@ class BackwardService:
         """[pause_on_arrival] True while an inference request that arrived
         during this cycle has not been served yet: from its arrival until the
         worker's pause for its prefill has been released (or 100 ms passed
-        without such a pause — no prefill followed). With adapter routing a
-        request arrives when the router service receives it (see
-        ``FtArrivalSignal``): the child is off the GPU for the encode too."""
+        without such a pause — no prefill followed)."""
         sig = self._arrivals
         if sig == -1:
             sig = None

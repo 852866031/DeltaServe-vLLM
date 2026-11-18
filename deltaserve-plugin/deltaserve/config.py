@@ -683,6 +683,24 @@ class AdapterRoutingConfig:
     deadline is computed from — is the moment it reached the API server either
     way. False = finetuning learns of the request when the engine does."""
 
+    route_encode_max_tokens: int = 1024
+    """Most tokens (requests x the longest one, as padded) one encode step
+    carries: about 3.5 ms + 0.014 ms per token on an RTX 5090, so the default
+    bounds an encode step at about 17 ms. Requests beyond it are encoded by
+    the next step. One request is always taken, whatever its length."""
+
+    adapter_copy_ms: float = 4.5
+    """What a step pays to copy one adapter from host memory into a GPU slot
+    (the adapter was not in a slot when the step was issued). Measured on
+    Qwen3-14B TP=2 (rank 16, q/k/v/o): 4.3 ms. The SLO estimator adds it to a
+    step's predicted time and takes it off the measured one."""
+
+    adapter_read_ms: float = 13.5
+    """What a step pays, on top of ``adapter_copy_ms``, to read one adapter
+    from disk and register it — only when a cold adapter is NOT preloaded
+    (nothing else was running: the request was scheduled at once). Measured on
+    Qwen3-14B TP=2 with the file in the page cache: 11.7 + 1.5 ms."""
+
     route_batch_max: int = 16
     """Most route requests encoded together. Requests that arrive while the
     encoder is busy are batched; one arriving at an idle service is not delayed."""
@@ -840,6 +858,7 @@ class AdapterRoutingConfig:
                 "adapter_routing.when_full is one of retire_least_used, "
                 "admit_retired, reject")
         for name in ("encoder_max_tokens", "max_active_adapters",
+                     "route_encode_max_tokens",
                      "indexing_max_samples", "indexing_chunk_samples",
                      "indexing_cpu_max_threads", "route_batch_max",
                      "indexing_gpu_chunk_samples",

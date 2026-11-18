@@ -219,7 +219,7 @@ def attach_router(app: FastAPI):
         # A DeltaServe server with adapter routing off still answers an
         # auto-route request: base model + "routing is not enabled" headers.
         # No routing component is loaded for this.
-        from deltaserve.route_middleware import install_middleware, routing_disabled
+        from deltaserve.route_middleware import install_middleware
 
-        install_middleware(app, routing_disabled,
+        install_middleware(app, None,
                            routing.get("route_model_name") or "auto")

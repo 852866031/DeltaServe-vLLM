@@ -270,7 +270,9 @@ def external_main(args, out: Path) -> None:
                 break
             time.sleep(0.5)
         print(f"    auto {prompt[:42]!r:46} → {last}")
-        return last[0] == 200 and last[1] == want and last[3] == want
+        # the adapter is reported in the headers; the body's model field is
+        # the base model's name (what the request asked vLLM for)
+        return last[0] == 200 and last[1] == want and last[3] not in (None, want)
 
     try:
         t0 = time.monotonic()
@@ -576,7 +578,7 @@ def second_job(args, out, port, first, first_saved, src_adapter) -> None:
                 break
             time.sleep(0.5)
         check(f"auto request → {want} ({prompt[:32]!r}…)",
-              got == want and s3 == 200 and b3.get("model") == want)
+              got == want and s3 == 200)
 
 
 def main() -> None:
@@ -728,8 +730,23 @@ def main() -> None:
               headers.get("x-deltaserve-routing") == "routed"
               and headers.get("x-deltaserve-adapter") == name
               and "x-deltaserve-routing-score" in headers)
-        check("the response's model field is the adapter",
-              isinstance(body, dict) and body.get("model") == name)
+        check("the response body names the model that was asked for (the "
+              "base model's name): the adapter is reported in the headers only",
+              isinstance(body, dict) and body.get("model") not in (None, name, "auto"))
+        # The adapter was really applied: the same prompt sent to the adapter
+        # by name gives the same greedy output.
+        probe = {"prompt": "Translate to English: Wo ist der Bahnhof?",
+                 "max_tokens": 12, "temperature": 0}
+        _, _, by_route = http(port, "/v1/completions", {"model": "auto", **probe})
+        _, _, by_name = http(port, "/v1/completions", {"model": name, **probe})
+        _, _, by_base = http(port, "/v1/completions",
+                             {"model": body.get("model"), **probe})
+        texts = [(b or {}).get("choices", [{}])[0].get("text") for b in
+                 (by_route, by_name, by_base)]
+        print(f"    same prompt: routed={texts[0]!r} named={texts[1]!r} "
+              f"base={texts[2]!r}")
+        check("a routed request is served with the adapter: same output as "
+              "naming the adapter", texts[0] is not None and texts[0] == texts[1])
 
         status, headers, body = http(port, "/v1/completions", {
             "model": "auto", "prompt": "What is the capital of Australia?",
@@ -756,7 +773,7 @@ def main() -> None:
             s2, h2, b2 = http(port, "/v1/completions", {   # resolves on its own
                 "model": "auto", "prompt": "Translate to English: Bis morgen.",
                 "max_tokens": 2, "temperature": 0})
-            if s2 != 200 or (b2 or {}).get("model") != name:
+            if s2 != 200 or h2.get("x-deltaserve-adapter") != name:
                 check(f"repeated routed requests keep working ({s2}, {b2})", False)
                 break
         else:

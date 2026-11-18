@@ -124,6 +124,11 @@ class StepFeatures:
     # (coordinator.pending_backward). Selects DECODE_BWD for decode-only
     # steps; excludes prefill-carrying steps from the fit (see module doc).
     bwd: bool = False
+    # [adapter routing] Seconds this step spends loading adapters (copying
+    # them into GPU slots, reading a cold one from disk) before its forward.
+    # Not part of what the model predicts: added to the prediction at
+    # admission and taken off the measured duration before the fit.
+    load_s: float = 0.0
 
     @property
     def s(self) -> float:

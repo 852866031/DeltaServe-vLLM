@@ -132,6 +132,19 @@ class DeltaServeModelRunner(GPUModelRunner):
         # had not fired yet would otherwise keep its grant cleared for good.
         self._ft_maybe_resume_backward(coord)
         cfg = self.vllm_config.finetune_config
+        if getattr(self, "_ds_route_hold", False):
+            # [adapter routing] The encode step before this one cleared the
+            # grant and left it cleared: an encode and the prefill it leads to
+            # are one stretch of TTFT-critical work. This step decides. With an
+            # inference prefill the pause simply continues
+            # (``_ft_pause_decision`` takes it over and owns the resume);
+            # without one — the routed request is held for a cold adapter, was
+            # cancelled, did not fit — the child gets the GPU back now.
+            feats = getattr(scheduler_output, "_ft_step_features", None)
+            if feats is None or int(feats.t_in) - int(feats.t_ft) <= 0:
+                self._ds_route_hold = False
+                if not self._throttle_held:
+                    coord.gpu_resume_backward()
         if self._throttle_held:
             # [fwd_token_throttle] Idle-release safety net: the stock method
             # returns early on a 0-token step, which is exactly the state after
@@ -384,6 +397,12 @@ class DeltaServeModelRunner(GPUModelRunner):
                     # the single-token decode step after a burst's first prefill.
                     pause_throttle = inf_prefill + int(feats.b_d) >= thr
             pause_bwd = inf_prefill > 0 or pause_throttle
+        if getattr(self, "_ds_route_hold", False):
+            # [adapter routing] The encode step paused the child for the
+            # prefill in this step (``_ft_before_step`` kept the pause): this
+            # step owns it now, whatever ``pending_backward`` says by now.
+            self._ds_route_hold = False
+            pause_bwd = True
         if self._throttle_held and not pause_throttle:
             coord.gpu_resume_backward()
             self._throttle_held = False

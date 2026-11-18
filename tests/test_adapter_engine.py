@@ -3,19 +3,28 @@
 whole loop on CPU.
 
 A finetuning job with stages [init, training, indexing, ready] runs against a
-stand-in engine (fake LoRA calls, fake worker export, fake encoder). When it
-reaches 'ready' its adapter must be saved, in the pool, resolvable by the API
-servers and selected for a matching ``model: "auto"`` request.
+stand-in engine (fake LoRA calls, fake worker export, fake encode step). When
+it reaches 'ready' its adapter must be saved, in the pool, resolvable by the
+API servers and chosen — inside the engine — for a matching ``model: "auto"``
+request.
 
     python tests/test_adapter_engine.py
-    DSERVE_TEST_REAL_ENCODER=1 python tests/test_adapter_engine.py  # + real router service
+    DSERVE_TEST_REAL_ENCODER=1 python tests/test_adapter_engine.py  # + real e5 on CPU
 
 Checks
   * job → indexing → 'ready' → saved adapter (TP shards merged) → pool →
-    registry + routable index → resolver → router → middleware;
+    registry + routable index → resolver;
+  * the route, closed: middleware (tokenize, base-model request, route
+    payload) → the engine's own ``EngineRouter`` (encode step on the workers,
+    decision from the embeddings, adapter attached) → decision header →
+    x-deltaserve-* response headers;
+  * the pool asks nothing of the engine to load an adapter (vLLM reads it on
+    first use; ``lora_for`` gives name / id / path); an offload is remove_lora;
   * an adapter that is indexed but not ready is NOT routable;
   * hit counting, a restart restoring the same pool with the same LoRA ids,
-    a job without auto_routing, GPU-slot count, LoRA serving required.
+    a job without auto_routing, GPU-slot count, LoRA serving required;
+  * no router service process: ``service`` is None, status reports the
+    engine's router instead.
 """
 
 import asyncio
@@ -128,13 +137,27 @@ def rank_shards(state, tp=2):
     return out
 
 
+def tokenize(text):
+    """Stand-in for the route tokenizer: the text's bytes as token ids."""
+    return list(text.encode())
+
+
 class FakeEngineCore:
     """What the routing engine and the adapter export need of EngineCore."""
 
     def __init__(self, trained):
         self.added, self.removed = [], []
-        self.model_executor = SimpleNamespace(
-            collective_rpc=lambda method, *a, **k: rank_shards(trained))
+        self.encode_steps = []
+
+        def collective_rpc(method, *a, args=(), **k):
+            if method == "deltaserve_route_encode":
+                # The encode step, TP=2: rank 1 holds the encoder.
+                batch = args[0]
+                self.encode_steps.append(len(batch))
+                return [None, topic_embed([bytes(ids).decode() for ids in batch])]
+            return rank_shards(trained)
+
+        self.model_executor = SimpleNamespace(collective_rpc=collective_rpc)
 
     def add_lora(self, req):
         self.added.append((req.lora_name, req.lora_int_id, req.lora_path))
@@ -189,11 +212,28 @@ class SchedulerCtx:
         save_job_adapter(job, self._ds_engine, self._adapter_routing)
 
 
-async def auto_request(mw, text):
-    seen, out = {}, {}
+async def auto_request(mw, routing, registry, text):
+    """One ``model: "auto"`` request through the middleware and the engine's
+    router. Returns (the model the API server asked the engine for, the
+    response headers, the engine request as the scheduler received it)."""
+    from deltaserve.route_middleware import ROUTE_HEADER, ROUTE_PAYLOAD
+
+    seen, out, added = {}, {}, []
+    router = routing.router
+
+    def add(request, *args, **kwargs):          # vLLM's EngineCore.add_request
+        added.append(request)
+        registry.note_headers(request.trace_headers)   # ... and its outputs
+
+    router._add = add
 
     async def app(scope, receive, send):
         seen["body"] = (await receive())["body"]
+        request = SimpleNamespace(request_id="r", lora_request=None,
+                                  trace_headers={ROUTE_HEADER: ROUTE_PAYLOAD.get()})
+        assert router.wants(request)
+        router.hold(request)
+        router.route_pending()                  # the next schedule()
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await send({"type": "http.response.body", "body": b""})
 
@@ -211,7 +251,7 @@ async def auto_request(mw, text):
 
     await mw({"type": "http", "method": "POST", "path": "/v1/chat/completions",
               "headers": []}, receive, send)
-    return json.loads(seen["body"])["model"], out
+    return json.loads(seen["body"])["model"], out, added[0]
 
 
 def test_closed_loop():
@@ -228,7 +268,7 @@ def test_closed_loop():
     from deltaserve.adapter_routing.resolver import PoolLoRAResolver
     from deltaserve.adapter_routing.service import Router
     from deltaserve.ft_job import FinetuneJobSpec, FtJobManager
-    from deltaserve.route_middleware import AdapterRouteMiddleware
+    from deltaserve.route_middleware import AdapterRouteMiddleware, DecisionRegistry
 
     keep = st.IndexingStage.make_executors
     st.IndexingStage.make_executors = staticmethod(lambda cfg: {"cpu": FakeExec()})
@@ -278,8 +318,14 @@ def test_closed_loop():
             check("adapter is in the pool with a pool-range LoRA id",
                   job.name in routing.pool
                   and routing.pool.entries[job.name].lora_int_id == LORA_ID_BASE + 1)
-            check("the engine was asked to load it (name, id, saved path)",
-                  engine.added == [(job.name, LORA_ID_BASE + 1, job.saved_path)])
+            check("nothing was asked of the engine to load it (vLLM reads an "
+                  "adapter when a step first uses it)", engine.added == [])
+            lora = routing.lora_for(job.name)
+            check("the engine's router gets it as a LoRA request (name, id, "
+                  "saved path); an unknown name gives None",
+                  (lora.lora_name, lora.lora_int_id, lora.lora_path)
+                  == (job.name, LORA_ID_BASE + 1, job.saved_path)
+                  and routing.lora_for("not-in-the-pool") is None)
             reg = read_registry(routing.dir)
             check("registry written for the API servers",
                   [(a["name"], a["path"]) for a in reg["adapters"]]
@@ -290,21 +336,36 @@ def test_closed_loop():
                   req is not None and req.lora_int_id == LORA_ID_BASE + 1
                   and req.lora_path == job.saved_path)
             dec = router.route("please translate this sentence")
-            check("the router service now selects it for a matching request",
+            check("the router now selects it for a matching request",
                   dec.adapter == job.name and dec.score > 0.9)
             check("...and still falls back for an unrelated one",
                   router.route("what is the weather").adapter is None)
 
-            mw = AdapterRouteMiddleware(None, router.route, "auto", "org/base")
-            model, headers = asyncio.run(auto_request(mw, "translate: guten tag"))
-            check("model='auto' request leaves the API server naming the new adapter",
-                  model == job.name
-                  and headers.get("x-deltaserve-routing") == "routed"
-                  and headers.get("x-deltaserve-adapter") == job.name)
-            model, headers = asyncio.run(auto_request(mw, "tell me a joke"))
+            reg = DecisionRegistry()
+            mw = AdapterRouteMiddleware(None, tokenize, "auto", "org/base",
+                                        registry=reg)
+            model, headers, request = asyncio.run(auto_request(
+                mw, routing, reg, "translate: guten tag"))
+            check("model='auto' request leaves the API server as a base-model "
+                  "request", model == "org/base")
+            check("the engine's router gives it the new adapter (one encode "
+                  "step on the workers) before it reaches the scheduler",
+                  engine.encode_steps == [1]
+                  and request.lora_request.lora_name == job.name
+                  and request.lora_request.lora_int_id == LORA_ID_BASE + 1
+                  and request.lora_request.lora_path == job.saved_path)
+            check("the response headers name the adapter",
+                  headers.get("x-deltaserve-routing") == "routed"
+                  and headers.get("x-deltaserve-adapter") == job.name
+                  and float(headers.get("x-deltaserve-routing-score", 0)) > 0.9)
+            check("the routed request counts as a use of the adapter",
+                  routing.pool.entries[job.name].hits == 1)
+            model, headers, request = asyncio.run(auto_request(
+                mw, routing, reg, "tell me a joke"))
             check("an unmatched request goes to the base model with the reason",
-                  model == "org/base"
-                  and headers.get("x-deltaserve-routing-reason") == "below-threshold")
+                  model == "org/base" and request.lora_request is None
+                  and headers.get("x-deltaserve-routing-reason") == "below-threshold"
+                  and "x-deltaserve-adapter" not in headers and not reg.waiting)
 
             lr = SimpleNamespace(lora_name=job.name)
             routing.note_request(SimpleNamespace(lora_request=lr))
@@ -312,19 +373,27 @@ def test_closed_loop():
             routing.note_request(SimpleNamespace(lora_request=None))
             routing.note_request(SimpleNamespace(
                 lora_request=SimpleNamespace(lora_name="some-static-adapter")))
-            check("requests using the adapter are counted; others are ignored",
-                  routing.pool.entries[job.name].hits == 2)
+            check("requests naming the adapter are counted too; others are ignored",
+                  routing.pool.entries[job.name].hits == 3)
             status = routing.status()
-            check("status reports the pool",
+            check("status reports the pool and the engine's router (no router "
+                  "service any more)",
                   status["adapters"][0]["name"] == job.name
-                  and status["router_service_alive"] is False)
+                  and "router_service_alive" not in status
+                  and status["router"]["routed"] == 1
+                  and status["router"]["fallbacks"] == 1
+                  and status["router"]["encode_steps"] == 2
+                  and status["router"]["held"] == 0)
 
             engine2 = FakeEngineCore(trained)
             routing2 = AdapterRoutingEngine(engine2, vc, start_service=False)
-            check("server restart: the pool comes back with the same adapter and id, "
-                  "and the engine reloads it",
+            lora2 = routing2.lora_for(job.name)
+            check("server restart: the pool comes back with the same adapter, id "
+                  "and path; nothing is loaded until a request needs it",
                   list(routing2.pool.entries) == [job.name]
-                  and engine2.added == [(job.name, LORA_ID_BASE + 1, job.saved_path)]
+                  and engine2.added == []
+                  and (lora2.lora_int_id, lora2.lora_path)
+                  == (LORA_ID_BASE + 1, job.saved_path)
                   and routing2.pool.routable_names() == [job.name])
 
             job2 = mgr.submit(FinetuneJobSpec(
@@ -477,8 +546,10 @@ def test_external_adapters():
                   len(set(ids.values())) == 4)
             routing.note_request(SimpleNamespace(
                 lora_request=SimpleNamespace(lora_name="translate-adapter")))
-            check("the first request for it loads it into the engine",
-                  [a[0] for a in engine.added] == ["translate-adapter"]
+            check("the first request for it gives it a GPU slot in the pool's "
+                  "view; the engine is not asked to load it (vLLM does, in the "
+                  "step that uses it)",
+                  engine.added == []
                   and routing.pool.entries["translate-adapter"].tier == "gpu")
 
             n = CountingExec.made[0].samples
@@ -521,10 +592,12 @@ def test_external_adapters():
             routing2.submit_adapter(src, name="warm", prewarm=True,
                                     data_path=corpus("wa", "warm topic", 5))
             eng2 = routing2.engine
-            before = len(eng2.added)
             run_jobs(routing2)
-            check("prewarm: true loads the adapter at registration",
-                  len(eng2.added) == before + 1 and eng2.added[-1][0] == "warm")
+            check("prewarm: true reserves a GPU slot in the pool's view at "
+                  "registration (still no load call to the engine)",
+                  routing2.pool.entries["warm"].tier == "gpu"
+                  and routing2.pool.entries["late"].tier != "gpu"
+                  and eng2.added == [])
             routing.shutdown()
             routing2.shutdown()
             check("shutdown stops the shared encoder process",
@@ -578,11 +651,12 @@ def test_adapters_config():
 def test_engine_config():
     green("engine object:")
     from deltaserve.adapter_routing.engine import AdapterRoutingEngine, VllmLoRABackend
+    from deltaserve.adapter_routing.engine_router import EngineRouter
+    from deltaserve.adapter_routing.service import Router
 
     with tempfile.TemporaryDirectory() as d:
         eng = FakeEngineCore(lora_state(0))
-        r = AdapterRoutingEngine(eng, vllm_config(d, finetuning=False, max_loras=4),
-                                 start_service=False)
+        r = AdapterRoutingEngine(eng, vllm_config(d, finetuning=False, max_loras=4))
         check("without finetuning every LoRA slot is the pool's",
               r.pool.gpu_slots == 4)
         check("default backend is the vLLM one",
@@ -595,73 +669,113 @@ def test_engine_config():
         check("every request tells the indexing placement that inference is active",
               t0 is None and r.placement._last_inference is not None
               and r.placement.choose(True) == "cpu")
+        check("no router service process is started (the adapter is chosen "
+              "inside the engine)",
+              r.service is None and "router_service_alive" not in r.status())
+        check("the engine's router: an EngineRouter deciding from embeddings "
+              "with the pool's routable index",
+              isinstance(r.router, EngineRouter) and isinstance(r.decider, Router)
+              and r.router._decide == r.decider.route_embeddings
+              and r.router._lora_for == r.lora_for
+              and r.status()["router"]["held"] == 0)
+        check("the pool's backend tells the router's cache mirror what leaves vLLM",
+              r.router.mirror is not None
+              and r.pool.backend.mirror is r.router.mirror
+              and (r.router.mirror.gpu_slots, r.router.mirror.pinned) == (4, set()))
         check("no router service → indexing has no GPU executor",
               "gpu" not in r.shared_indexer._factory())
         vc_gpu = vllm_config(d, finetuning=False)
         vc_gpu.adapter_routing_config.router_gpu = 0
-        rg = AdapterRoutingEngine(eng, vc_gpu, start_service=False)
-        rg.service = SimpleNamespace(stop=lambda: None, is_alive=lambda: True)
-        ex = rg.shared_indexer._factory()
-        check("router encoder on a GPU → indexing gets a GPU executor that "
-              "borrows it", "gpu" in ex and ex["gpu"].device == "gpu")
-        vc_gpu.adapter_routing_config.indexing_on_gpu = False
-        check("indexing_on_gpu: false keeps indexing on the CPU",
-              "gpu" not in rg.shared_indexer._factory())
+        rg = AdapterRoutingEngine(eng, vc_gpu, start_service=True)
+        check("start_service is ignored; the route encoder lives in a worker, "
+              "so indexing cannot borrow it (CPU executor only, even with "
+              "router_gpu set)",
+              rg.service is None and "gpu" not in rg.shared_indexer._factory())
         rg.shutdown()
+        ft = AdapterRoutingEngine(eng, vllm_config(d, finetuning=True, max_loras=4),
+                                  start_driver=False)
+        from deltaserve.ft_injector import FT_LORA_INT_ID
+
+        check("with finetuning the mirror pins the finetuning adapter's slot",
+              ft.router.mirror.pinned == {FT_LORA_INT_ID}
+              and ft.router.mirror.in_slot(FT_LORA_INT_ID))
+        ft.shutdown()
         w = Path(d) / "w"
         w.mkdir()
         e = r.pool.register("a", str(w))
+        check("registering (load + prewarm) asks nothing of the engine: "
+              "the backend's load is a no-op", eng.added == [] and e.tier == "gpu")
+        r.router.mirror.note_step([e.lora_int_id])
         r.pool.offload("a")
-        check("offload reaches the engine as remove_lora(id)",
-              eng.removed == [e.lora_int_id])
+        check("offload reaches the engine as remove_lora(id), and the mirror "
+              "forgets the adapter",
+              eng.removed == [e.lora_int_id]
+              and not r.router.mirror.in_memory(e.lora_int_id))
         r.shutdown()
 
 
-def test_real_service():
+def test_real_encoder():
     if os.environ.get("DSERVE_TEST_REAL_ENCODER") != "1":
-        green("real router service process: skipped (set DSERVE_TEST_REAL_ENCODER=1)")
+        green("real route encoder in the engine's router: skipped "
+              "(set DSERVE_TEST_REAL_ENCODER=1)")
         return
-    green("real router service process (e5 on CPU):")
-    from deltaserve.adapter_routing.engine import AdapterRoutingEngine
+    green("real e5 on CPU: API-server tokenizer → worker encode step → decision:")
     from deltaserve.adapter_routing.encoder import SentenceEncoder
-    from deltaserve.adapter_routing.service import RouterClient, socket_path
+    from deltaserve.adapter_routing.engine import AdapterRoutingEngine
+    from deltaserve.adapter_routing.middleware import RouteTokenizer
+    from deltaserve.route_middleware import AdapterRouteMiddleware, DecisionRegistry
+    from deltaserve.route_worker import RouteEncodeMixin
+
+    class EncoderRank(RouteEncodeMixin):
+        """The worker that holds the route encoder (no model, no vLLM)."""
+        model_runner = SimpleNamespace()
 
     with tempfile.TemporaryDirectory() as d:
         vc = vllm_config(d)
-        vc.adapter_routing_config.fallback_score_threshold = 0.0
-        routing = AdapterRoutingEngine(FakeEngineCore(lora_state(0)), vc,
-                                       start_service=True)
+        cfg = vc.adapter_routing_config
+        cfg.fallback_score_threshold = 0.0
+        enc = SentenceEncoder(cfg.encoder, cfg.encoder_query_prefix,
+                              cfg.encoder_max_tokens, "cpu")
+        enc.load()
+        rank = EncoderRank()
+        rank._route_encoder, rank._route_device = enc._model, "cpu"
+        rank._route_pad = int(enc._model.config.pad_token_id or 0)
+        engine = FakeEngineCore(lora_state(0))
+        engine.model_executor.collective_rpc = (
+            lambda method, args=(): [None, getattr(rank, method)(*args)])
+        routing = AdapterRoutingEngine(engine, vc, start_driver=False)
+        tok = RouteTokenizer(cfg.encoder, cfg.encoder_query_prefix,
+                             cfg.encoder_max_tokens)
+        reg = DecisionRegistry()
+        mw = AdapterRouteMiddleware(None, tok, "auto", "org/base", registry=reg)
         try:
-            client = RouterClient(socket_path(routing.dir), timeout_s=30.0)
-            t0, pong = time.time(), None
-            while pong is None and time.time() - t0 < 180:
-                pong = client.ping()
-                time.sleep(0.5)
-            check("the engine-spawned router service answers on its socket",
-                  pong is not None and routing.status()["router_service_alive"])
-            check("empty pool → fallback 'no-adapters'",
-                  client.route("translate this").reason == "no-adapters")
-            enc = SentenceEncoder("intfloat/e5-large-v2", "query: ", 512, "cpu")
+            texts = ["Translate to English: Guten Morgen",
+                     "Translate to English: Wo ist der Bahnhof?"]
+            ref = enc.encode(texts)
+            got = rank.deltaserve_route_encode([tok(t) for t in texts])
+            check("tokenizer + worker encode step give the embeddings the index "
+                  "was built with (SentenceEncoder), padding included "
+                  f"(max diff {np.abs(ref - got).max():.1e})",
+                  got.shape == ref.shape and np.allclose(ref, got, atol=1e-4))
+            model, headers, request = asyncio.run(auto_request(
+                mw, routing, reg, "translate this"))
+            check("empty pool → base model, reason 'no-adapters'",
+                  request.lora_request is None
+                  and headers.get("x-deltaserve-routing-reason") == "no-adapters")
             w = Path(d) / "weights"
             w.mkdir()
-            routing.pool.register(
-                "dserve-routing-translate", str(w), centroid=enc.encode(
-                    ["Translate to English: Guten Morgen",
-                     "Translate to English: Wo ist der Bahnhof?"]).mean(0))
-            t0, dec = time.time(), None
-            while time.time() - t0 < 30:
-                dec = client.route("Translate to English: Ich habe Hunger.")
-                if dec.adapter:
-                    break
-                time.sleep(0.5)
-            check("an adapter registered in the pool becomes routable in the "
-                  f"running service (score {dec.score})",
-                  dec.adapter == "dserve-routing-translate")
+            routing.pool.register("dserve-routing-translate", str(w),
+                                  centroid=ref.mean(0))
+            routing.decider.refresh(force=True)
+            model, headers, request = asyncio.run(auto_request(
+                mw, routing, reg, "Translate to English: Ich habe Hunger."))
+            check("an adapter registered in the pool is chosen by the engine's "
+                  f"router (score {headers.get('x-deltaserve-routing-score')})",
+                  model == "org/base"
+                  and headers.get("x-deltaserve-adapter") == "dserve-routing-translate"
+                  and request.lora_request.lora_name == "dserve-routing-translate")
         finally:
             routing.shutdown()
-        time.sleep(0.5)
-        check("shutdown stops the service",
-              not routing.status()["router_service_alive"])
 
 
 def main():
@@ -670,7 +784,7 @@ def main():
     test_external_adapters()
     test_adapters_config()
     test_engine_config()
-    test_real_service()
+    test_real_encoder()
     print()
     if _failed:
         print(f"{_RED}{_failed} failed{_RESET}, {_passed} passed")

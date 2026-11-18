@@ -22,6 +22,8 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 WORKER_CLS = "deltaserve.worker.DeltaServeWorker"
+# Adapter routing without finetuning: the stock worker + the route encoder.
+ROUTE_WORKER_CLS = "deltaserve.route_worker.RouteWorker"
 SCHEDULER_CLS = "deltaserve.ft_scheduler.FinetuneScheduler"
 BOTH_PHASE_SCHEDULER_CLS = (
     "deltaserve.ft_scheduler_both.BothPhaseFinetuneScheduler")
@@ -30,6 +32,9 @@ BOTH_PHASE_SCHEDULER_CLS = (
 def configure_vllm_config(vllm_config) -> None:
     ft = vllm_config.finetune_config
     if not ft.enable_finetuning:
+        if vllm_config.adapter_routing_config.enable_adapter_routing \
+                and vllm_config.parallel_config.worker_cls == "auto":
+            vllm_config.parallel_config.worker_cls = ROUTE_WORKER_CLS
         return
     parallel = vllm_config.parallel_config
     if parallel.worker_cls == "auto":

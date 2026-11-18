@@ -39,16 +39,26 @@ class VllmLoRABackend:
 
     def __init__(self, engine) -> None:
         self.engine = engine
+        self.mirror = None          # the engine's view of vLLM's adapter caches
+        self.preload = None         # EngineRouter.request_preload
 
     def load(self, e) -> None:
-        from vllm.lora.request import LoRARequest
+        """Ask for the adapter to be read into host memory — in the background,
+        by the workers, with the next step the scheduler issues (the cold-start
+        preload, ``engine_router``). Never ``EngineCore.add_lora``: that blocks
+        the engine loop for the read on every rank (26 ms on Qwen3-14B TP=2).
+        vLLM puts it in a GPU slot when a step first uses it."""
+        if self.preload is not None and e.lora_int_id:
+            from vllm.lora.request import LoRARequest
 
-        self.engine.add_lora(LoRARequest(lora_name=e.name,
-                                         lora_int_id=int(e.lora_int_id),
-                                         lora_path=e.path))
+            self.preload(LoRARequest(lora_name=e.name,
+                                     lora_int_id=int(e.lora_int_id),
+                                     lora_path=e.path))
 
     def unload(self, e) -> None:
         self.engine.remove_lora(int(e.lora_int_id))
+        if self.mirror is not None:
+            self.mirror.forget(int(e.lora_int_id))
 
     def activate(self, e) -> None:
         """vLLM puts an adapter in a GPU slot when a batch first uses it."""
@@ -160,10 +170,14 @@ class AdapterRoutingEngine:
                    "p95 89 ms → 1.5 s). Raise lora.max_loras to the number of "
                    "adapters in use at once"
                    + (" + 1." if ft_slot else "."))
+        # The adapter of a routed request is chosen here, in the engine: the
+        # scheduler issues the encode step (see engine_router). No router
+        # service process.
         self.service = None
-        if start_service:
-            self.service = RouterServiceProcess(cfg)
-            self.service.start()
+        self.router = self._make_router(engine, vllm_config)
+        if hasattr(self.pool.backend, "mirror"):
+            self.pool.backend.mirror = self.router.mirror
+            self.pool.backend.preload = self.router.request_preload
 
         # One encoder process for every job of this server.
         # Inference seen recently → indexing stays on the CPU; quiet → it may
@@ -205,6 +219,67 @@ class AdapterRoutingEngine:
             self._driver = threading.Thread(target=self._drive, daemon=True,
                                             name="deltaserve-adapter-jobs")
             self._driver.start()
+
+    # ------------------------------------------------------ routed requests
+    def _make_router(self, engine, vllm_config):
+        from deltaserve.adapter_routing.engine_router import EngineRouter
+        from deltaserve.adapter_routing.pool import ROUTABLE_FILE
+        from deltaserve.adapter_routing.service import Router
+
+        cfg = self.cfg
+        decider = Router(
+            None, os.path.join(self.dir, ROUTABLE_FILE),
+            cfg.fallback_score_threshold, keep_percent=cfg.route_keep_percent,
+            close_band=cfg.route_close_band, min_pool=cfg.route_min_pool,
+            slack=cfg.route_confidence_slack,
+            decision_log=(os.path.join(self.dir, "decisions.jsonl")
+                          if cfg.route_decision_log else None))
+        self.decider = decider
+
+        def encode(batch):
+            """The encode step: every rank is called, one holds the encoder."""
+            replies = engine.model_executor.collective_rpc(
+                "deltaserve_route_encode", args=(batch,))
+            for r in replies:
+                if isinstance(r, dict):
+                    raise RuntimeError(r.get("error", "encode failed"))
+            for r in replies:
+                if r is not None:
+                    return r
+            raise RuntimeError("no worker holds the route encoder")
+
+        from deltaserve.adapter_routing.engine_router import LoraCacheMirror
+
+        lora_cfg = vllm_config.lora_config
+        pinned = ()
+        if vllm_config.finetune_config.enable_finetuning:
+            from deltaserve.ft_injector import FT_LORA_INT_ID
+
+            pinned = (FT_LORA_INT_ID,)
+        mirror = LoraCacheMirror(
+            getattr(lora_cfg, "max_cpu_loras", None) or lora_cfg.max_loras,
+            lora_cfg.max_loras, pinned)
+        return EngineRouter(encode, decider.route_embeddings, self.lora_for,
+                            None, max_tokens=cfg.route_encode_max_tokens,
+                            on_routed=self._on_routed, mirror=mirror)
+
+    def lora_for(self, name: str):
+        """The pool adapter ``name`` as vLLM takes it, or None."""
+        from vllm.lora.request import LoRARequest
+
+        e = self.pool.entries.get(name)
+        if e is None or not e.lora_int_id:
+            return None
+        return LoRARequest(lora_name=e.name, lora_int_id=int(e.lora_int_id),
+                           lora_path=e.path)
+
+    def _on_routed(self, request, decision) -> None:
+        if decision.adapter:
+            self.note_request(request)
+
+    def note_inference(self) -> None:
+        """Inference work is present (indexing leaves the GPU)."""
+        self.placement.note_inference()
 
     # ------------------------------------------------- jobs that do not train
     @property
@@ -337,8 +412,7 @@ class AdapterRoutingEngine:
         with self._jobs_lock:
             jobs = self.jobs.status()
         return {**self.pool.status(), "jobs": jobs,
-                "router_service_alive": bool(self.service and self.service.is_alive()),
-                "index_dir": self.dir}
+                "router": self.router.status(), "index_dir": self.dir}
 
     def shutdown(self) -> None:
         self._stop.set()

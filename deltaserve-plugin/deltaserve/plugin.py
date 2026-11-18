@@ -232,6 +232,7 @@ def _patch_engine_core() -> None:
 
                 self._ds_routing = AdapterRoutingEngine(self, vllm_config)
                 self.scheduler._adapter_routing = self._ds_routing
+                _route_in_scheduler(self.scheduler, self._ds_routing.router)
         return __init__
 
     _wrap(EngineCore, "__init__", init)
@@ -257,31 +258,91 @@ def _patch_engine_core() -> None:
         def wrapper(self, request, *args, **kwargs):
             routing = getattr(self, "_ds_routing", None)
             if routing is not None:
-                # Every request that uses a pool adapter, routed or named,
-                # with or without finetuning: the pool's usage count.
+                router = routing.router
+                if router.wants(request):
+                    # [adapter routing] A routed request: the scheduler chooses
+                    # its adapter (an encode step) before it joins the queue.
+                    if router._add is None:
+                        router._add = functools.partial(orig, self)
+                    routing.note_inference()
+                    router.hold(request, args, kwargs)
+                    return None
+                # Every request that names a pool adapter, with or without
+                # finetuning: the pool's usage count.
                 routing.note_request(request)
+                if router._add is None:
+                    router._add = functools.partial(orig, self)
+                if router.hold_cold(request, args, kwargs):
+                    # [cold start] its adapter is on disk: it joins the next
+                    # step, this one reads the adapter in the background.
+                    return None
             return orig(self, request, *args, **kwargs)
         return wrapper
 
     _wrap(EngineCore, "add_request", add_request)
 
+    def abort_requests(orig):
+        def wrapper(self, request_ids, *args, **kwargs):
+            routing = getattr(self, "_ds_routing", None)
+            if routing is not None:
+                # A held request is not in the scheduler: vLLM's abort would
+                # not find it.
+                routing.router.abort(request_ids)
+            return orig(self, request_ids, *args, **kwargs)
+        return wrapper
+
+    _wrap(EngineCore, "abort_requests", abort_requests)
+
     def process_inputs(orig):
         def wrapper(self, *args, **kwargs):
-            # [adapter routing] arrival_time = when the request reached the API
-            # server (set by the route middleware), not when it left the
-            # router. None outside a routed endpoint: vLLM's own stamp.
-            if len(args) < 5 and kwargs.get("arrival_time") is None:
-                from deltaserve.route_middleware import REQUEST_ARRIVAL
+            from deltaserve.route_middleware import (
+                REQUEST_ARRIVAL,
+                ROUTE_HEADER,
+                ROUTE_PAYLOAD,
+            )
 
+            # [adapter routing] arrival_time = when the request reached the API
+            # server (set by the route middleware). None outside a routed
+            # endpoint: vLLM's own stamp.
+            if len(args) < 5 and kwargs.get("arrival_time") is None:
                 t = REQUEST_ARRIVAL.get()
                 if t is not None:
                     kwargs["arrival_time"] = t
+            # [adapter routing] The route encoder's token ids go into the
+            # engine with the request (trace_headers is the 8th parameter).
+            payload = ROUTE_PAYLOAD.get()
+            if payload is not None:
+                ROUTE_PAYLOAD.set(None)        # one engine request per route
+                if len(args) >= 8:             # given positionally
+                    args = (*args[:7], {**(args[7] or {}), ROUTE_HEADER: payload},
+                            *args[8:])
+                else:
+                    kwargs["trace_headers"] = {
+                        **(kwargs.get("trace_headers") or {}), ROUTE_HEADER: payload}
             return orig(self, *args, **kwargs)
         return wrapper
 
     from vllm.v1.engine.input_processor import InputProcessor
 
     _wrap(InputProcessor, "process_inputs", process_inputs)
+
+    def process_outputs(orig):
+        def wrapper(self, engine_core_outputs, *args, **kwargs):
+            from deltaserve.route_middleware import DECISIONS
+
+            # [adapter routing] The engine's decision for a routed request
+            # rides back on its outputs; the route middleware waits for it.
+            if DECISIONS.waiting:
+                for out in engine_core_outputs:
+                    headers = out.trace_headers
+                    if headers:
+                        DECISIONS.note_headers(headers)
+            return orig(self, engine_core_outputs, *args, **kwargs)
+        return wrapper
+
+    from vllm.v1.engine.output_processor import OutputProcessor
+
+    _wrap(OutputProcessor, "process_outputs", process_outputs)
 
     def busy_loop(orig):
         def wrapper(self, *args, **kwargs):
@@ -376,6 +437,54 @@ def _patch_engine_core() -> None:
                 if jobs is None else jobs.status()
 
         EngineCore.deltaserve_ft_jobs = deltaserve_ft_jobs
+
+
+def _route_in_scheduler(scheduler, router) -> None:
+    """[adapter routing] Make held (routed, adapter not chosen yet) requests
+    part of the scheduler's work: they count as requests — otherwise the
+    engine loop would sleep on them — and every ``schedule()`` starts with
+    the encode step that releases them. Wrapped on the object: any scheduler
+    class, with or without finetuning."""
+    for name in ("has_requests", "has_unfinished_requests"):
+        orig = getattr(scheduler, name)
+        setattr(scheduler, name,
+                (lambda orig: lambda *a, **k: router.pending or orig(*a, **k))(orig))
+    schedule = scheduler.schedule
+    requests = scheduler.requests
+    load_seconds = getattr(scheduler, "_adapter_load_seconds",
+                           lambda copies, reads: 0.0)
+
+    def busy() -> bool:
+        # Inference requests in the scheduler (finetuning samples do not
+        # count: a step with only those is not worth waiting behind).
+        return any(not str(rid).startswith("__ft__") for rid in requests)
+
+    router.busy = busy
+
+    def schedule_routed(*args, **kwargs):
+        router.encode_s = 0.0
+        router.release_cold()
+        router.route_pending()
+        out = schedule(*args, **kwargs)
+        loras = {}
+        for rid in getattr(out, "num_scheduled_tokens", None) or ():
+            req = requests.get(rid)
+            lora = getattr(req, "lora_request", None)
+            if lora is not None:
+                loras[lora.lora_int_id] = lora
+        preload, copies, reads = router.step_issued(loras)
+        if preload:
+            out._ds_preload = preload     # pickled with the output (TP)
+        if copies or reads:
+            out._ds_adapter_load = (copies, reads)
+            feats = getattr(out, "_ft_step_features", None)
+            if feats is not None:
+                # [estimator] the step's adapter load is not the forward's
+                # cost: taken off the measured duration before the fit.
+                feats.load_s = load_seconds(copies, reads)
+        return out
+
+    scheduler.schedule = schedule_routed
 
 
 def _patch_api_server() -> None:

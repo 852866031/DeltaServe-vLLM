@@ -517,6 +517,16 @@ class FinetuneScheduler(AsyncScheduler):
             t_baseline = self._estimator.predict(
                 feats, regime=REGIME_INF_PREFILL)
 
+        # [adapter routing] What this step pays besides its forward:
+        #   t_load   — the adapters it loads before the forward (predicted:
+        #              it has not happened yet). On every check below.
+        #   t_encode — the encode step(s) this schedule() call issued
+        #              (measured: they have happened). Already inside ``now``
+        #              for the TTFT deadline; for TBT it is the extra gap
+        #              between two decode steps.
+        t_load, t_encode = self._adapter_overheads()
+        t_baseline += t_load
+
         now = time.time()
         queue_wait = self._last_step_pred_s if self._async else 0.0
         ttft_deadline = (
@@ -533,7 +543,7 @@ class FinetuneScheduler(AsyncScheduler):
         # SLO without FT, no point even trying to admit.
         if feats.b_d > 0 and self._estimator.is_ready:
             effective_tbt = self._max_tbt_slo * decode_only_margin
-            if t_baseline >= effective_tbt:
+            if t_baseline + t_encode >= effective_tbt:
                 return 0, []
         if ttft_deadline is not None and self._estimator.is_ready:
             if (ttft_deadline - now - queue_wait - t_baseline) <= 0:
@@ -634,11 +644,11 @@ class FinetuneScheduler(AsyncScheduler):
             # replay graphs, FT_MIXED for a step that also carries inference.
             if self._estimator.is_ready:
                 t_with_ft = self._estimator.predict(
-                    hypothetical, regime=hypothetical.regime())
+                    hypothetical, regime=hypothetical.regime()) + t_load
                 # SLO checks on the hypothetical-with-FT prediction.
                 if feats.b_d > 0:
                     effective_tbt = self._max_tbt_slo * decode_only_margin
-                    if t_with_ft > effective_tbt:
+                    if t_with_ft + t_encode > effective_tbt:
                         break
                 if ttft_deadline is not None:
                     if (ttft_deadline - now - queue_wait - t_with_ft) <= 0:
@@ -1074,12 +1084,9 @@ class FinetuneScheduler(AsyncScheduler):
             # for an inference arrival so it rides this step instead of queuing
             # behind an FT-only forward.
             grace_s = self.vllm_config.finetune_config.ft_only_admission_grace_ms / 1e3
-            if self.would_step_be_ft_only():
-                # [adapter routing] A request being routed has arrived already:
-                # an FT-only step started now would be on the GPU when it
-                # lands. Wait for it instead (bounded).
-                if not inputs.wait_for_routed() and grace_s > 0:
-                    inputs.poll(grace_s)
+            if self.would_step_be_ft_only() and grace_s > 0 \
+                    and inputs.poll(grace_s):
+                self._route_held()
         output = self._schedule_step()
         if interruptible and self._is_ft_only(output) and inputs.pending():
             # [tier B] A request landed after the drain: undo the FT-only step,
@@ -1088,8 +1095,39 @@ class FinetuneScheduler(AsyncScheduler):
             # runs).
             self._rollback_ft_step(output)
             inputs.drain()
+            self._route_held()
             output = self._schedule_step()
         return output
+
+    def _adapter_load_seconds(self, copies: int, reads: int) -> float:
+        rc = self.vllm_config.adapter_routing_config
+        return (copies * float(rc.adapter_copy_ms)
+                + reads * float(rc.adapter_read_ms)) / 1e3
+
+    def _adapter_overheads(self) -> tuple[float, float]:
+        """[adapter routing] ``(t_load, t_encode)`` seconds for the step being
+        built — see ``admit_ft_to_step``. The load is counted for every
+        unfinished inference request's adapter that is not in a GPU slot (a
+        slight over-count when one of them does not make this step)."""
+        routing = getattr(self, "_adapter_routing", None)
+        if routing is None:
+            return 0.0, 0.0
+        router = routing.router
+        if router.mirror is None:
+            return 0.0, router.encode_s
+        ids = {r.lora_request.lora_int_id for r in self.requests.values()
+               if r.lora_request is not None
+               and not getattr(r, "is_finetuning", False)}
+        copies, reads = router.mirror.load_cost(ids)
+        return self._adapter_load_seconds(copies, reads), router.encode_s
+
+    def _route_held(self) -> None:
+        """[adapter routing] A request that just landed (tier A / B) may be a
+        routed one, held until its adapter is chosen: run its encode step now,
+        so it rides the step being built."""
+        routing = getattr(self, "_adapter_routing", None)
+        if routing is not None:
+            routing.router.route_pending()
 
     def _schedule_step(self) -> SchedulerOutput:
         # [Phase 4] Drain step durations the runner finished timing (deferred
@@ -1097,6 +1135,9 @@ class FinetuneScheduler(AsyncScheduler):
         # at schedule) with its measured duration (read a few steps later).
         for feats, dur, was_graph, predicted, *_extra in (
                 self._coord.drain_completed_samples()):
+            # [adapter routing] The step's adapter load is not the forward's
+            # cost (admission adds it separately): off the sample.
+            dur -= float(getattr(feats, "load_s", 0.0) or 0.0)
             if dur > 0:
                 self._tracker.add(feats, dur, predicted=predicted,
                                   was_graph=was_graph)

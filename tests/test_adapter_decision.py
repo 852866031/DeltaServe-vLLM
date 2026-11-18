@@ -17,7 +17,11 @@ Checks
   * three outcomes: a clear winner, several close (chosen by preference, the
     choice reported), low confidence → base;
   * small pools and pools without reference samples degrade as documented;
-  * the decision reaches the client: service protocol, response headers, log.
+  * the decision reaches the client: service protocol, log, and — the path a
+    request takes — middleware → route payload → the engine's router (fake
+    encode step + ``Router.route_embeddings``) → decision header → response
+    headers (the body's ``model`` is the base model; the adapter is in the
+    headers and on the engine request).
 """
 
 import asyncio
@@ -265,7 +269,15 @@ def test_reaches_the_client():
         serve,
         socket_path,
     )
-    from deltaserve.route_middleware import AdapterRouteMiddleware
+    from types import SimpleNamespace
+
+    from deltaserve.adapter_routing.engine_router import EngineRouter
+    from deltaserve.route_middleware import (
+        ROUTE_HEADER,
+        ROUTE_PAYLOAD,
+        AdapterRouteMiddleware,
+        DecisionRegistry,
+    )
 
     w = World(seed=3)
 
@@ -327,16 +339,41 @@ def test_reaches_the_client():
                   f"GPU slot ({len(both)} such requests)",
                   len(both) >= 20 and all(x.adapter == "a1" for x in both))
 
+            # The path of a request: the API server tokenizes (here: the
+            # text's bytes), the engine's router encodes the held requests in
+            # one step, decides from the embeddings and attaches the adapter;
+            # the decision returns on the request's trace_headers.
+            reg = DecisionRegistry()
+            enc = Enc()
+
+            def engine_router(added):
+                def add(request, *args, **kwargs):
+                    added.append(request)
+                    reg.note_headers(request.trace_headers)
+
+                return EngineRouter(
+                    lambda batch: enc.encode([bytes(ids).decode() for ids in batch]),
+                    router.route_embeddings,
+                    lambda name: SimpleNamespace(lora_name=name, lora_int_id=1,
+                                                 lora_path=f"/p/{name}"),
+                    add)
+
             async def one(prompt):
-                seen, out = {}, {}
+                seen, out, added = {}, {}, []
+                er = engine_router(added)
 
                 async def app(scope, receive, send):
                     seen["body"] = (await receive())["body"]
+                    er.hold(SimpleNamespace(
+                        request_id="r", lora_request=None,
+                        trace_headers={ROUTE_HEADER: ROUTE_PAYLOAD.get()}))
+                    er.route_pending()
                     await send({"type": "http.response.start", "status": 200,
                                 "headers": []})
                     await send({"type": "http.response.body", "body": b""})
 
-                mw = AdapterRouteMiddleware(app, client.route, "auto", "base")
+                mw = AdapterRouteMiddleware(app, lambda text: list(text.encode()),
+                                            "auto", "base", registry=reg)
                 msgs = [{"type": "http.request", "more_body": False,
                          "body": json.dumps({"model": "auto",
                                              "prompt": prompt}).encode()}]
@@ -350,10 +387,12 @@ def test_reaches_the_client():
 
                 await mw({"type": "http", "method": "POST",
                           "path": "/v1/completions", "headers": []}, receive, send)
-                return json.loads(seen["body"])["model"], out
+                lora = added[0].lora_request
+                return (json.loads(seen["body"])["model"], out,
+                        lora.lora_name if lora is not None else None)
 
             for _ in range(40):
-                model, h = asyncio.run(one("t:0"))
+                model, h, lora = asyncio.run(one("t:0"))
                 if "x-deltaserve-routing-candidates" in h \
                         and h.get("x-deltaserve-routing") == "routed":
                     break
@@ -361,14 +400,18 @@ def test_reaches_the_client():
                   "were close",
                   "x-deltaserve-routing-confidence" in h
                   and set(h["x-deltaserve-routing-candidates"].split(",")[:2])
-                  == {"a0", "a1"} and model == h["x-deltaserve-adapter"])
+                  == {"a0", "a1"})
+            check("the request went on as a base-model request; the adapter is "
+                  "on the engine request and in the header",
+                  model == "base" and lora == h["x-deltaserve-adapter"]
+                  and lora in ("a0", "a1"))
             for _ in range(40):
-                model, h = asyncio.run(one("u:"))
+                model, h, lora = asyncio.run(one("u:"))
                 if h.get("x-deltaserve-routing") == "fallback":
                     break
             check("response headers on a low-confidence fallback: base model, "
                   "reason, message, confidence",
-                  model == "base"
+                  model == "base" and lora is None
                   and h.get("x-deltaserve-routing-reason") == "low-confidence"
                   and "not a confident match" in h.get("x-deltaserve-routing-message", "")
                   and "x-deltaserve-routing-confidence" in h)

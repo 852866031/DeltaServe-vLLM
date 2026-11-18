@@ -22,8 +22,10 @@ import torch
 
 from vllm.v1.worker.gpu_worker import Worker
 
+from deltaserve.route_worker import RouteEncodeMixin
 
-class DeltaServeWorker(Worker):
+
+class DeltaServeWorker(RouteEncodeMixin, Worker):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         if self.parallel_config.distributed_executor_backend == "mp":
