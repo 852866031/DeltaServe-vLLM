@@ -9,7 +9,7 @@ max_tokens=1 prefill-only requests, and are scrubbed + KV-freed in
 update_from_output BEFORE the base loop runs — so they never produce an
 EngineCoreOutput and are invisible to the frontend.
 
-Selected via scheduler_config.scheduler_cls when finetune.enable_finetuning is
+Selected via scheduler_config.scheduler_cls when finetune_param.enable_finetuning is
 set (``deltaserve/engine_config.py``).
 
 With ``forward_interruptible`` it also pre-empts FT-only steps for inference
@@ -45,6 +45,22 @@ from vllm.v1.request import RequestStatus
 def _ts() -> str:
     """Wall-clock HH:MM:SS.mmm for the one-line logs."""
     return time.strftime("%H:%M:%S") + f".{int((time.time() % 1) * 1000):03d}"
+
+
+# [telemetry] FT admission decision per step (``StepFeatures.admit``).
+ADMIT_CODES = {
+    "A": "admitted",
+    "S": "SLO: no headroom / cut short",
+    "F": "buffer: admitted what fit / full",
+    "C": "step budget: admitted what fit / none left",
+    "B": "backward running",
+    "T": "admission closed (throttle / epoch flush)",
+    "X": "finetuning not started / disabled",
+    "E": "corpus finished",
+    "D": "decode-only step (admission phase prefill)",
+    "K": "waiting for prefill credit (match_prefill_workload_factor)",
+    "": "no admission attempted",
+}
 
 
 class FinetuneScheduler(AsyncScheduler):
@@ -137,6 +153,9 @@ class FinetuneScheduler(AsyncScheduler):
         # `self._estimator`; until then admission stays the fixed coordinator
         # budget but the estimator is still trained online.
         self._estimator = MergedExecutionEstimator()
+        self._estimator.set_margin(
+            str(getattr(ft_cfg, "admission_margin", "legacy") or "legacy"),
+            float(getattr(ft_cfg, "admission_margin_k", 1.5)))
         self._tracker = StepExecutionTracker()
         # [mixed-fwd-cuda-graph] mixed FT batches replay graphs while FT-only
         # batches stay eager → two different cost models; split the FT regime
@@ -164,6 +183,13 @@ class FinetuneScheduler(AsyncScheduler):
         # only the int rides on the SchedulerOutput. See step_trace.py.
         _trace_path = getattr(ft_cfg, "step_trace_path", None)
         self._trace = StepTraceWriter(_trace_path) if _trace_path else None
+        # [telemetry] System metrics (deltaserve/metrics.py); None = off.
+        self._metrics = None
+        self._metrics_runtime = False      # started by POST /telemetry/start
+        _mdir = getattr(ft_cfg, "metrics_dir", None)
+        if _mdir:
+            self._new_metrics(_mdir, getattr(ft_cfg, "metrics_interval_s", 10.0))
+            dprint(f"[telemetry] recording system metrics to {_mdir}")
         self._step_seq = 0
         self._trace_ctx: dict[int, tuple] = {}
         self._admit_trace: list | None = None
@@ -193,7 +219,7 @@ class FinetuneScheduler(AsyncScheduler):
 
         # [match_prefill_workload_factor] Leaky-bucket counter of inference
         # prefill tokens we've observed but NOT spent on FT admission. When
-        # ``finetune.match_prefill_workload_factor > 0`` this gates each
+        # ``throttles.match_prefill_workload_factor > 0`` this gates each
         # prefill-step's FT admit: hold off until
         # ``(counter + t_in) * factor`` covers the next FT sample's size,
         # then admit ONE sample + reset. Set to 0 on every successful FT
@@ -571,16 +597,24 @@ class FinetuneScheduler(AsyncScheduler):
         )
 
         # ─── Stage 0: hard preconditions ────────────────────────────────
+        # [telemetry] ``self._last_admit`` = (code, tokens) of this decision —
+        # see ADMIT_CODES; stamped on the step's features for the dashboard.
         if self._profiling_mode:
             return 0, []
-        if self._coord.next_ft_budget() <= 0:
+        coord = self._coord
+        if coord.next_ft_budget() <= 0:
             # ft_started False / pending_backward True / admission_open False /
             # buffer full — coordinator already encodes all the precondition
             # checks; honor its verdict.
+            self._last_admit = (
+                "X" if not coord.ft_started else
+                "B" if coord.pending_backward else
+                "T" if not coord.admission_open else "F", 0)
             return 0, []
         store = self._ft_injector.store
         if not store.has_next() and store.current_epoch >= store.total_epochs - 1:
             # Pool exhausted across remaining epochs — nothing to admit.
+            self._last_admit = ("E", 0)
             return 0, []
 
         # ─── Stage 1: features for the upcoming step (no FT yet) ────────
@@ -597,6 +631,7 @@ class FinetuneScheduler(AsyncScheduler):
         ft_cfg = self.vllm_config.finetune_config
         phase = getattr(ft_cfg, "coserving_admission_phase", "prefill")
         if phase == "prefill" and is_decode_only:
+            self._last_admit = ("D", 0)
             return 0, []
 
         # Decode-only safety margin only applies in "both" mode on decode-only
@@ -649,14 +684,17 @@ class FinetuneScheduler(AsyncScheduler):
         if feats.b_d > 0 and self._estimator.is_ready:
             effective_tbt = self._max_tbt_slo * decode_only_margin
             if t_baseline + t_encode >= effective_tbt:
+                self._last_admit = ("S", 0)
                 return 0, []
             # [avg_tbt_window_s] Already over the average without FT.
             if self._tbt_window is not None and self._tbt_window.average_with(
                     time.monotonic(), feats.b_d,
                     t_baseline + t_encode) >= self._avg_tbt_slo:
+                self._last_admit = ("S", 0)
                 return 0, []
         if ttft_deadline is not None and self._estimator.is_ready:
             if (ttft_deadline - now - queue_wait - t_baseline) <= 0:
+                self._last_admit = ("S", 0)
                 return 0, []
 
         # ─── Stage 4: admission shapers (outer pre-filters) + iterative loop ─
@@ -673,6 +711,7 @@ class FinetuneScheduler(AsyncScheduler):
         if _match_factor > 0 and has_prefill:
             _peek = store.pop_next()
             if _peek is None:
+                self._last_admit = ("E", 0)
                 return 0, []
             credit = (self._unspent_prefill + feats.t_in) * _match_factor
             if credit >= _peek.input_len:
@@ -686,6 +725,7 @@ class FinetuneScheduler(AsyncScheduler):
             else:
                 # Not enough credit yet — accumulate and skip FT this step.
                 self._unspent_prefill += int(feats.t_in)
+                self._last_admit = ("K", 0)
                 return 0, []
 
         # Buffer-space cap (always applies). Proportional cap layers on
@@ -711,6 +751,7 @@ class FinetuneScheduler(AsyncScheduler):
                           - feats.t_in - feats.b_d)
         token_cap = min(token_cap, budget_left)
         if token_cap <= 0:
+            self._last_admit = ("C" if budget_left <= 0 else "F", 0)
             return 0, []
 
         # Iterative greedy admission. Smallest-first via pop_next; each
@@ -723,10 +764,13 @@ class FinetuneScheduler(AsyncScheduler):
         cur_prefill_lens = list(feats.prefill_lens) if feats.prefill_lens \
             else []
 
+        stop = "A"                  # why the loop ended (telemetry)
+        cap_code = "C" if budget_left < buffer_cap else "F"
         while True:
             if max_iterations is not None and len(admitted) >= max_iterations:
                 break
             if cur_t_ft >= token_cap:
+                stop = cap_code
                 break
             # Advance epoch if the current epoch's pool is exhausted.
             if not store.has_next() and not store.advance_epoch():
@@ -735,6 +779,7 @@ class FinetuneScheduler(AsyncScheduler):
             if candidate is None:
                 break
             if cur_t_ft + candidate.input_len > token_cap:
+                stop = cap_code
                 break
 
             # Hypothetical features with this sample added. Subset convention:
@@ -759,6 +804,7 @@ class FinetuneScheduler(AsyncScheduler):
                 if feats.b_d > 0:
                     effective_tbt = self._max_tbt_slo * decode_only_margin
                     if t_with_ft + t_encode > effective_tbt:
+                        stop = "S"
                         break
                     # [avg_tbt_window_s] The average over the last window,
                     # this step included, stays within ``avg_tbt_slo``.
@@ -766,9 +812,11 @@ class FinetuneScheduler(AsyncScheduler):
                             and self._tbt_window.average_with(
                                 time.monotonic(), feats.b_d,
                                 t_with_ft + t_encode) > self._avg_tbt_slo):
+                        stop = "S"
                         break
                 if ttft_deadline is not None:
                     if (ttft_deadline - now - queue_wait - t_with_ft) <= 0:
+                        stop = "S"
                         break
             # (Cold-start: estimator not ready; admit up to token_cap unchecked.
             # Matches the pre-redesign cold-start behavior where the coord
@@ -786,7 +834,11 @@ class FinetuneScheduler(AsyncScheduler):
 
         # ─── Stage 5: commit ────────────────────────────────────────────
         if not admitted:
+            self._last_admit = (stop if stop != "A" else "E", 0)
             return 0, []
+        # admitted: "A" = everything it could take; "S" / "F" / "C" = cut
+        # short by the SLO / the buffer / the step's token budget.
+        self._last_admit = (stop, int(cur_t_ft))
         store.claim(admitted)
         reqs = [self._ft_injector._make_request(s) for s in admitted]
         return int(cur_t_ft), reqs
@@ -888,10 +940,14 @@ class FinetuneScheduler(AsyncScheduler):
         if not self.vllm_config.finetune_config.enable_finetuning:
             return False
         coord = self._coord
+        if coord.pending_backward and coord.ft_disabled_reason is None:
+            # Poll the in-flight backward to completion — also after a POST
+            # /stop_finetuning, or its ack (sample commit, status) is never
+            # collected while the engine idles. Not once finetuning is
+            # disabled (a dead child never acks: that would spin forever).
+            return True
         if not coord.ft_started:
             return False  # FT held closed (awaiting POST /start_finetuning)
-        if coord.pending_backward:
-            return True  # poll the in-flight backward to completion
         if coord.epoch_flush_pending and (
                 coord.fill_count + coord.reserved_fill) > 0:
             return True  # flush flag set at inject → step so the backward fires  # epoch tail awaiting flush
@@ -1054,10 +1110,27 @@ class FinetuneScheduler(AsyncScheduler):
             at[0], at[1], at[2], at[3], at[4], at[5], at[6], at[7], at[8],
             pred_raw, predicted, None, None, pending, None, run_inf, waiting))
 
+    # ─── GET /finetuning_status ───────────────────────────────────────────────
+    def finetuning_status(self) -> dict:
+        """Admission + training progress (EngineCore utility behind GET
+        /finetuning_status). Under TP this is the EngineCore coordinator: it
+        sees every backward through the relayed acks."""
+        st = self._coord.status()
+        store = self._ft_injector.store
+        n = len(store)
+        st.update({
+            "total_epochs": int(store.total_epochs),
+            "store_epoch": int(store.current_epoch),
+            "corpus_samples": int(n),
+            "samples_trained_this_epoch": int(sum(store.trained)) if n else 0,
+            "estimator_fitted": self._estimator.eager_rmse is not None,
+        })
+        return st
+
     # ─── Estimator state carry-over (estimator_state_{save,load}_path) ────────
     def save_estimator_state(self, path: str | None = None) -> str | None:
         """Write the estimator state to ``path`` (explicit request, e.g. POST
-        /save_estimator_state) or to ``finetune.estimator_state_save_path``
+        /save_estimator_state) or to ``slo.estimator_state_save_path``
         (shutdown hooks; best effort and at most once, since a server that is
         stopped by signalling its process group rarely gets that far)."""
         if path is None:
@@ -1118,6 +1191,11 @@ class FinetuneScheduler(AsyncScheduler):
             dprint(f"[ft-sched] estimator stats dump failed: {e}")
         if self._trace is not None:
             self._trace.close()
+        if self._metrics is not None:
+            try:
+                self._metrics.close()
+            except Exception as e:  # noqa: BLE001
+                dprint(f"[telemetry] final flush failed: {e}")
         super().shutdown()
 
     # ─── Offline-profiling helpers (used by EngineCore.profile_execution_model) ──
@@ -1151,10 +1229,7 @@ class FinetuneScheduler(AsyncScheduler):
             req = self.requests.get(req_id)
             if req is None:
                 continue
-            req.status = RequestStatus.FINISHED_LENGTH_CAPPED
-            if req in self.running:
-                self.running.remove(req)
-            self._free_blocks(req)
+            self._retire_request(req)
         # Drop any still queued in waiting.
         leftover = [r for r in self.waiting
                     if r.request_id.startswith("__prof_")]
@@ -1178,13 +1253,29 @@ class FinetuneScheduler(AsyncScheduler):
                    f"req={getattr(request, 'request_id', '?')}")
         super().add_request(request)
 
+    def _retire_request(self, req) -> None:
+        """Finish a request the frontend never sees (an FT sample or a profiling
+        request): free its KV and drop it from the scheduler's state. Mirrors
+        the bookkeeping of Scheduler._free_request that applies to these
+        requests (no connector, no encoder inputs); _free_blocks also removes
+        it from self.requests."""
+        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        if req in self.running:
+            self.running.remove(req)
+        # vLLM >= 0.33 tracks requests still prefilling after a chunk; a chunked
+        # FT sample must not stay there (it would reserve KV blocks forever).
+        inflight = getattr(self, "_inflight_prefills", None)
+        if inflight is not None:
+            inflight.discard(req)
+        self._free_blocks(req)
+
     @staticmethod
     def _is_ft_only(output: SchedulerOutput) -> bool:
         ft_ids = getattr(output, "finetune_req_ids", None)
         return bool(ft_ids) and output.total_num_scheduled_tokens > 0 and (
             len(ft_ids) == len(output.num_scheduled_tokens))
 
-    def schedule(self) -> SchedulerOutput:
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         inputs = self._engine_inputs
         if self._job_wait:
             # This step exists only to advance a waiting job: wait for a
@@ -1201,10 +1292,10 @@ class FinetuneScheduler(AsyncScheduler):
             # for an inference arrival so it rides this step instead of queuing
             # behind an FT-only forward.
             grace_s = self.vllm_config.finetune_config.ft_only_admission_grace_ms / 1e3
-            if self.would_step_be_ft_only() and grace_s > 0 \
+            if grace_s > 0 and self.would_step_be_ft_only() \
                     and inputs.poll(grace_s):
                 self._route_held()
-        output = self._schedule_step()
+        output = self._schedule_step(throttle_prefills)
         if interruptible and self._is_ft_only(output) and inputs.pending():
             # [tier B] A request landed after the drain: undo the FT-only step,
             # admit the arrival(s) and schedule once more (bounded to one retry;
@@ -1213,7 +1304,7 @@ class FinetuneScheduler(AsyncScheduler):
             self._rollback_ft_step(output)
             inputs.drain()
             self._route_held()
-            output = self._schedule_step()
+            output = self._schedule_step(throttle_prefills)
         return output
 
     def _adapter_load_seconds(self, copies: int, reads: int) -> float:
@@ -1246,7 +1337,7 @@ class FinetuneScheduler(AsyncScheduler):
         if routing is not None:
             routing.router.route_pending("arrival")
 
-    def _schedule_step(self) -> SchedulerOutput:
+    def _schedule_step(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # [Phase 4] Drain step durations the runner finished timing (deferred
         # CUDA-event ring) into the tracker. Pairs each step's features (stamped
         # at schedule) with its measured duration (read a few steps later).
@@ -1264,6 +1355,9 @@ class FinetuneScheduler(AsyncScheduler):
                 if self._trace is not None:
                     self._trace_step(feats, dur, was_graph, predicted,
                                      _extra[0] if _extra else None)
+                if self._metrics is not None and not self._profiling_mode:
+                    self._metrics.on_step(feats, dur, was_graph,
+                                          _extra[0] if _extra else None)
 
         # Live refit of the SLO estimator every REFIT_EVERY steps. Skipped during
         # offline profiling (one fit at the end of the pass).
@@ -1320,6 +1414,7 @@ class FinetuneScheduler(AsyncScheduler):
         self._admit_trace = (
             [None, None, None, None, 0, None, None, None, None]
             if self._trace is not None else None)
+        self._last_admit = ("", 0)
         admitted_now, ft_reqs = self.admit_ft_to_step()
         for req in ft_reqs:
             self._enqueue_waiting_request(req)
@@ -1351,7 +1446,8 @@ class FinetuneScheduler(AsyncScheduler):
         # (next_ft_requests advances it via the store's advance_epoch).
         self._coord.current_epoch = self._ft_injector.store.current_epoch
 
-        output = super().schedule()
+        # vLLM >= 0.33 passes the engine's prefill-throttle decision through
+        output = super().schedule(throttle_prefills)
 
         # Partition FT requests. Under async scheduling, schedule(N+1) runs
         # before update_from_output(N), so PRIOR-step FT requests are still in
@@ -1376,11 +1472,19 @@ class FinetuneScheduler(AsyncScheduler):
                 self.waiting.remove_requests([req])
                 # A request vLLM skipped for the per-batch adapter limit (the
                 # step's inference requests already use max_loras adapters)
-                # is parked in skipped_waiting, not waiting. Left there it
-                # would be scheduled later with no entry in self.requests and
-                # kill the engine (KeyError in _update_after_schedule).
-                if self.skipped_waiting:
-                    self.skipped_waiting.remove_requests([req])
+                # is parked in skipped_waiting, not waiting (vLLM < 0.33; from
+                # 0.33 it goes back to the front of ``waiting``, or to
+                # ``kv_holding_waiting`` if it holds KV blocks). Left in a
+                # queue it would be scheduled later with no entry in
+                # self.requests and kill the engine (KeyError in
+                # _update_after_schedule).
+                for name in ("skipped_waiting", "kv_holding_waiting"):
+                    queue = getattr(self, name, None)
+                    if queue:
+                        queue.remove_requests([req])
+                deferred = getattr(self, "deferred_waiting", None)
+                if deferred is not None:
+                    deferred.discard(req)
                 del self.requests[req_id]
                 _s = getattr(req, "_ft_sample", None)
                 if _s is not None:
@@ -1480,6 +1584,8 @@ class FinetuneScheduler(AsyncScheduler):
                     feats, apply_margin=not self._validate_estimator)
                 if self._estimator.is_ready else None)
             output._ft_step_features = feats
+            # [telemetry] the FT admission decision for this step (code, tokens)
+            feats.admit = getattr(self, "_last_admit", ("", 0))
             output._ft_step_was_graph = was_graph
             output._ft_step_predicted = predicted
             # Remember this step's predicted time as the in-flight queue-wait
@@ -1528,10 +1634,7 @@ class FinetuneScheduler(AsyncScheduler):
             req = self.requests.get(req_id)
             if req is None:
                 continue
-            req.status = RequestStatus.FINISHED_LENGTH_CAPPED
-            if req in self.running:
-                self.running.remove(req)
-            self._free_blocks(req)
+            self._retire_request(req)
             self._ft_retired_pending.append(req_id)   # runner may hold state (tier C)
         # Restore the activation-buffer reservation and the in-flight
         # samples list on the coordinator.
@@ -1568,6 +1671,9 @@ class FinetuneScheduler(AsyncScheduler):
         scheduler_output.finetune_req_ids = set()
         scheduler_output._ft_samples = []
         scheduler_output._ft_tokens_reserved = 0
+        if self._metrics is not None and not self._profiling_mode:
+            self._metrics.on_preempt(
+                getattr(scheduler_output, "_ft_step_features", None))
         if self._trace is not None:
             self._trace_rollback(scheduler_output)
         return len(ft_ids)
@@ -1604,17 +1710,90 @@ class FinetuneScheduler(AsyncScheduler):
             req = self.requests.get(req_id)
             if req is None:
                 continue
-            req.status = RequestStatus.FINISHED_LENGTH_CAPPED
-            if req in self.running:
-                self.running.remove(req)
-            self._free_blocks(req)
+            self._retire_request(req)
             self._ft_retired_pending.append(req_id)
 
         # NOTE: estimator samples are recorded in schedule() by draining the
         # coordinator's completed-sample queue — the runner times each step with
         # a deferred CUDA-event ring, so the duration isn't known here (it lands
         # a few steps later, off the hot path).
-        return super().update_from_output(scheduler_output, model_runner_output)
+        outputs = super().update_from_output(scheduler_output, model_runner_output)
+        if self._metrics is not None and not self._profiling_mode:
+            self._metrics.on_outputs(outputs, self.requests)
+            self._metrics.maybe_flush()
+        return outputs
+
+    # ─── [telemetry] recorder lifecycle (config, or dserve-top at runtime) ────
+    def _new_metrics(self, root: str, interval_s: float = 10.0):
+        from deltaserve.ft_scheduler import ADMIT_CODES
+        from deltaserve.metrics import MetricsRecorder
+        ft_cfg = self.vllm_config.finetune_config
+        mc = self.vllm_config.model_config
+        store = self._ft_injector.store
+        meta = {
+            "model": getattr(mc, "model", None),
+            "served_model_name": getattr(mc, "served_model_name", None),
+            "tensor_parallel_size":
+                self.vllm_config.parallel_config.tensor_parallel_size,
+            "max_num_batched_tokens": int(self.max_num_scheduled_tokens),
+            "max_saved_finetuning_tokens": int(ft_cfg.max_saved_finetuning_tokens),
+            "num_epochs": int(store.total_epochs),
+            "corpus_samples": len(store),
+            "admission_phase": getattr(ft_cfg, "coserving_admission_phase", "prefill"),
+            "admit_codes": ADMIT_CODES,
+        }
+        self._metrics = MetricsRecorder(
+            root, interval_s=interval_s,
+            ttft_slo=getattr(ft_cfg, "ttft_slo", None),
+            max_tbt_slo=getattr(ft_cfg, "max_tbt_slo", None),
+            steps_log_max_mb=float(getattr(ft_cfg, "steps_log_max_mb", 256.0)),
+            meta=meta)
+        self._coord.metrics = self._metrics
+        return self._metrics
+
+    def telemetry(self, op: str, arg=None) -> dict:
+        """[telemetry] EngineCore utility (GET /telemetry/data, POST
+        /telemetry/start | stop). ``start`` records into ``arg["dir"]`` unless
+        telemetry is already on; ``stop`` ends only a runtime-started one."""
+        m = self._metrics
+        if op == "data":
+            if m is None:
+                return {"active": False}
+            a = arg or {}
+            return {"active": True, "runtime": self._metrics_runtime,
+                    **m.live(int(a.get("steps_since", 0)),
+                             float(a.get("series_since", 0.0))),
+                    "finetuning": self.finetuning_status()}
+        if op == "start":
+            if m is not None:
+                return {"active": True, "started": False, "dir": m.root,
+                        "runtime": self._metrics_runtime}
+            a = arg or {}
+            m = self._new_metrics(str(a["dir"]), float(a.get("interval_s", 10.0)))
+            self._metrics_runtime = True
+            m.start_serving()
+            dprint(f"[telemetry] recording started at runtime → {m.root}")
+            return {"active": True, "started": True, "dir": m.root, "runtime": True}
+        if op == "stop":
+            if m is None:
+                return {"active": False, "stopped": False}
+            if not self._metrics_runtime:
+                return {"active": True, "stopped": False,
+                        "reason": "telemetry is on in the config"}
+            self._metrics = None
+            self._coord.metrics = None
+            self._metrics_runtime = False
+            m.close()
+            dprint("[telemetry] runtime recording stopped")
+            return {"active": False, "stopped": True, "dir": m.root}
+        return {"error": f"unknown op {op!r}"}
+
+    def metrics_summary(self) -> dict:
+        """[telemetry] GET /system_metrics."""
+        if self._metrics is None:
+            return {"enabled": False,
+                    "error": "telemetry.metrics_dir is not set"}
+        return {"enabled": True, **self._metrics.current()}
 
     def _maybe_log_batch_done(self, scheduler_output) -> None:
         """``print_engine_batch_done``: one line when a non-decode-only batch's
@@ -1649,7 +1828,8 @@ class FinetuneScheduler(AsyncScheduler):
             # collective_rpc that only reaches workers) so this scheduler coord
             # opens admission. One-step lag after the POST is fine.
             _started = getattr(model_runner_output, "finetune_ft_started", None)
-            if _started is not None and _started and not self._coord.ft_started:
+            if (_started is not None and _started and not self._coord.ft_started
+                    and self._coord.ft_disabled_reason is None):
                 self._coord.start_finetuning()
             elif _started is not None and not _started and self._coord.ft_started:
                 # POST /stop_finetuning only reaches the workers as well.

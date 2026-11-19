@@ -427,6 +427,53 @@ def test_ft_mixed_split():
     check("split off again: mixed → EAGER", mixed.regime() == REGIME_EAGER)
 
 
+def test_margin_modes():
+    print("test: admission margin modes (slo.admission_margin)")
+    rng = np.random.default_rng(1)
+    tracker = StepExecutionTracker()
+    # Multiplicative noise (±8 %): the error grows with the step, as on a GPU.
+    for _ in range(300):
+        f = make_eager_features(rng)
+        tracker.add(f, true_time_eager(f) * (1 + 0.08 * rng.standard_normal()),
+                    was_graph=False)
+    est = MergedExecutionEstimator()
+    est.data_fit(tracker)
+    rmse, rel = est._rmse[REGIME_EAGER], est._rel_rmse[REGIME_EAGER]
+    check(f"relative RMSE recorded ({rel:.3f}) ≈ the 8 % noise", rel is not None
+          and 0.05 < rel < 0.12)
+    f = make_eager_features(rng)
+    raw = est.predict(f, regime=REGIME_EAGER, apply_margin=False)
+    check("default mode is legacy", est.margin_mode == "legacy")
+    check("legacy = raw × (1 + 1.5·RMSE[s]), bit-identical",
+          est.predict(f, regime=REGIME_EAGER) == max(0.0, float(raw * (1.0 + 1.5 * rmse))))
+    est.set_margin("relative", 1.5)
+    rp = est.predict(f, regime=REGIME_EAGER)
+    check(f"relative = raw × (1 + 1.5·relRMSE) (+{rp / raw - 1:.1%})",
+          abs(rp - raw * (1 + 1.5 * rel)) < 1e-12)
+    est.set_margin("absolute", 2.0)
+    ap = est.predict(f, regime=REGIME_EAGER)
+    check(f"absolute = raw + 2·RMSE (+{(ap - raw) * 1e3:.2f} ms)",
+          abs(ap - (raw + 2.0 * rmse)) < 1e-12)
+    check("raw prediction ignores the mode",
+          est.predict(f, regime=REGIME_EAGER, apply_margin=False) == raw)
+    try:
+        est.set_margin("bogus")
+        check("unknown mode rejected", False)
+    except ValueError:
+        check("unknown mode rejected", True)
+    st = est.export_state()
+    est2 = MergedExecutionEstimator()
+    est2.import_state(st)
+    check("relative RMSE survives export / import",
+          est2._rel_rmse[REGIME_EAGER] == rel)
+    est3 = MergedExecutionEstimator()
+    est3.import_state({k: v for k, v in st.items() if k != "rel_rmse"})
+    est3.set_margin("relative", 1.5)
+    check("an old state (no rel_rmse) means no relative margin, not a crash",
+          est3.predict(f, regime=REGIME_EAGER)
+          == est3.predict(f, regime=REGIME_EAGER, apply_margin=False))
+
+
 def main():
     test_ft_mixed_split()
     test_decode_bwd_regime()
@@ -437,6 +484,7 @@ def main():
     test_decode_only_regime_isolated_fit()
     test_eager_regime_with_ft_only_decode()
     test_refit_cadence()
+    test_margin_modes()
     print()
     total = _passed + _failed
     color = _GREEN if _failed == 0 else _RED

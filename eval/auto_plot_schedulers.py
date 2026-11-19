@@ -73,7 +73,7 @@ _ROOT = os.path.dirname(_HERE)
 OUTPUT_DIR = os.path.join(_HERE, "output")
 PLOTS_DIR = os.path.join(_HERE, "plots")
 CONFIG_YAML_DEFAULT = os.path.join(
-    _ROOT, "configs", "serving_config_finetuning_llama3.yaml")
+    _ROOT, "configs", "preset", "serving_config_finetuning_llama3.yaml")
 
 # Color per phase; inf-only stays neutral gray so the co-serving phases stand
 # out as the comparison axis. Add a color here if a future phase value lands.

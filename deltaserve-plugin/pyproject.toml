@@ -7,11 +7,17 @@ name = "deltaserve"
 version = "0.1.0"
 description = "DeltaServe co-serving (LoRA-SFT backward interleaved with inference) as a vLLM plugin"
 requires-python = ">=3.10"
-# The vLLM it hooks into: vllm-project/vllm @ 117afeea4 (0.21.1rc1.dev123).
+# The vLLM it hooks into: vllm-project/vllm v0.33.0 (4ba787ec9).
 dependencies = ["vllm", "pyyaml"]
+
+[project.scripts]
+dserve-top = "deltaserve.top:main"
 
 [project.entry-points."vllm.general_plugins"]
 deltaserve = "deltaserve.plugin:register"
 
 [tool.setuptools.packages.find]
 include = ["deltaserve*"]
+
+[tool.setuptools.package-data]
+deltaserve = ["*.html"]

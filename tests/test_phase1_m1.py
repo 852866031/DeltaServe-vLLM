@@ -111,7 +111,7 @@ _PROFILES = {
 _ROUTING = os.environ.get("DSERVE_M1_ROUTING", "0") == "1"
 _PROFILE_NAME = os.environ.get("DSERVE_M1_PROFILE", "tp1")
 _PROFILE = _PROFILES[_PROFILE_NAME]
-_CONFIG = _REPO / "configs" / _PROFILE["config"]
+_CONFIG = _REPO / "configs" / "preset" / _PROFILE["config"]
 _ARRIVALS = _PROFILE["arrivals"]
 _MODES = _PROFILE["modes"]
 _PAIRS = _PROFILE["pairs"]

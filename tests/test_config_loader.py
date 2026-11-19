@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
-_CONFIG = _REPO / "configs" / "serving_config_finetuning_qwen3_0.6b.yaml"
+_CONFIG = _REPO / "configs" / "preset" / "serving_config_finetuning_qwen3_0.6b.yaml"
 
 _passed = 0
 _failed = 0
@@ -55,7 +55,7 @@ def test_loads_and_maps():
     engine_args, extras = engine_args_from_yaml(_CONFIG)
 
     passthrough = ("server", "adapters")
-    ft_sections = ("finetune", "throttles", "slo", "debug")
+    from deltaserve.config_loader import ALL_FINETUNE_SECTIONS as ft_sections
     special = (*ft_sections, *passthrough)
 
     # the four finetune sections -> one flat FinetuneConfig, carried to vLLM in
@@ -142,10 +142,153 @@ def test_error_handling():
         check("missing file raises", True)
 
 
+def test_layout():
+    """Every shipped YAML (templates + presets) loads, in the current layout:
+    no old ``finetune`` section, every finetune key in its own section, and
+    every finetune / adapter path that is set exists (A100 presets carry the
+    A100 box's absolute paths and are only loaded)."""
+    green("layout of every shipped YAML:")
+    import contextlib
+    import io
+    import os
+
+    import yaml
+
+    from deltaserve.config_loader import (
+        FINETUNE_SECTIONS,
+        LEGACY_SECTIONS,
+        SECTION_OF,
+        load_yaml_config,
+        split_config,
+    )
+
+    # each key has exactly one home section
+    homes = [k for keys in FINETUNE_SECTIONS.values() for k in keys]
+    check("no key listed in two sections", len(homes) == len(set(homes)))
+    check("sections: finetune_param, finetune_features, throttles, slo, debug, "
+          "telemetry", tuple(FINETUNE_SECTIONS) == (
+              "finetune_param", "finetune_features", "throttles", "slo",
+              "debug", "telemetry"))
+    from deltaserve.config import FinetuneConfig
+    check("every sectioned key is a FinetuneConfig field",
+          all(k in FinetuneConfig.__dataclass_fields__ for k in homes))
+
+    files = sorted((_REPO / "configs").glob("template_*.yaml")) + \
+        sorted((_REPO / "configs" / "preset").glob("*.yaml"))
+    check(f"found templates + presets ({len(files)})",
+          len(list((_REPO / "configs").glob("template_*.yaml"))) >= 3
+          and len(files) > 10)
+    for path in files:
+        name = path.relative_to(_REPO)
+        raw_text = yaml.safe_load(path.read_text())
+        misplaced = [f"{sec}.{k}" for sec in FINETUNE_SECTIONS
+                     for k in (raw_text.get(sec) or {})
+                     if SECTION_OF.get(k, sec) != sec]
+        legacy = [s for s in LEGACY_SECTIONS if s in raw_text]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            raw = load_yaml_config(path, verbose=False)
+            _, ft, extras = split_config(raw)
+        missing = []
+        if "A100" not in path.name:
+            for k in ("finetuning_lora_path", "data_path"):
+                v = getattr(ft, k)
+                if v and not os.path.exists(v):
+                    missing.append(k)
+            for k, v in (extras.get("adapters") or {}).items():
+                if not os.path.exists(v):
+                    missing.append(k)
+        check(f"{name}: loads, layout current, paths exist",
+              not misplaced and not legacy and not missing
+              and ft.enable_finetuning
+              and "WARNING" not in out.getvalue(),
+              ) if True else None
+        if misplaced or legacy or missing:
+            print(f"      misplaced={misplaced} legacy={legacy} missing={missing}")
+    tmpl = [p for p in files if p.name.startswith("template_")]
+    for path in tmpl:
+        body = [ln for ln in path.read_text().splitlines()
+                if ln.startswith("  ") and ":" in ln and not ln.strip().startswith("#")]
+        uncommented = [ln.strip().split(":")[0] for ln in body if "#" not in ln]
+        allowed = {"host", "port", "tokenizer_mode", "trust_remote_code", "model",
+                   "ttft_slo"}
+        check(f"{path.name}: every setting carries a comment",
+              not (set(uncommented) - allowed), )
+        if set(uncommented) - allowed:
+            print(f"      uncommented: {sorted(set(uncommented) - allowed)}")
+
+
+def test_overrides():
+    """additional_config: an override replaces the YAML value; a None override
+    (the launchers' default for bwd_log_path / step_trace_path) keeps it."""
+    green("overrides:")
+    from deltaserve.config_loader import additional_config
+    cfg = {"telemetry": {"bwd_log_path": "/yaml.csv"},
+           "finetune_param": {"enable_finetuning": True}}
+    ds = additional_config(cfg, bwd_log_path=None, step_trace_path=None)["deltaserve"]
+    check("None override keeps the YAML value", ds.get("bwd_log_path") == "/yaml.csv"
+          and "step_trace_path" not in ds)
+    ds = additional_config(cfg, bwd_log_path="/run.csv")["deltaserve"]
+    check("a real override wins", ds["bwd_log_path"] == "/run.csv")
+
+
+def test_legacy_layout():
+    """The pre-2026-11 single ``finetune`` section still loads to the same
+    FinetuneConfig, with one note (no per-key warnings); the converter splits
+    it and the result loads identically."""
+    green("legacy 'finetune' section:")
+    import contextlib
+    import io
+    import subprocess
+    import tempfile
+
+    from deltaserve.config_loader import finetune_kwargs, load_yaml_config
+
+    old = ("finetune:\n  enable_finetuning: true\n  learning_rate: 0.001\n"
+           "  graph_ft_batches: true\n  save_attn_ctx: true\n"
+           "debug:\n  bwd_log_path: /tmp/x.csv\n  print_scheduler_add: true\n"
+           "model:\n  model: Qwen/Qwen3-0.6B-Base\n")
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+        f.write(old)
+        p_old = f.name
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        kw_old = finetune_kwargs(load_yaml_config(p_old, verbose=False))
+    log = out.getvalue()
+    check("legacy section loads every key",
+          kw_old == {"enable_finetuning": True, "learning_rate": 0.001,
+                     "graph_ft_batches": True, "save_attn_ctx": True,
+                     "bwd_log_path": "/tmp/x.csv", "print_scheduler_add": True})
+    check("one note for the legacy section, no per-key warning for it",
+          log.count("old layout") == 1
+          and "'finetune." not in log)
+    check("a key moved out of debug warns (bwd_log_path → telemetry)",
+          "'debug.bwd_log_path' belongs in section 'telemetry'" in log)
+    conv = subprocess.run([sys.executable, str(_REPO / "scripts/convert_config_layout.py"),
+                           p_old], capture_output=True, text=True)
+    new = conv.stdout
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+        f.write(new)
+        p_new = f.name
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        kw_new = finetune_kwargs(load_yaml_config(p_new, verbose=False))
+    check("converter splits it (finetune_param / finetune_features / telemetry)",
+          conv.returncode == 0 and "finetune_param:" in new
+          and "finetune_features:" in new and "telemetry:" in new
+          and "\nfinetune:" not in new)
+    check("converted file loads identically, silently",
+          kw_new == kw_old and "WARNING" not in out.getvalue()
+          and "old layout" not in out.getvalue())
+
+
 def main():
     green("=== DeltaServe YAML config loader ===")
     test_loads_and_maps()
     test_error_handling()
+    test_layout()
+    test_overrides()
+    test_legacy_layout()
     color = _RED if _failed else _GREEN
     print(f"\n{color}{_passed} passed, {_failed} failed{_RESET}")
     sys.exit(1 if _failed else 0)

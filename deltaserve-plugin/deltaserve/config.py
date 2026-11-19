@@ -40,6 +40,26 @@ class FinetuneConfig:
     shared with the backward process. Analogue of DeltaServe's
     finetune.lora_path / finetuning_adapter (model_rpc.py:134-146)."""
 
+    adapter_save_path: str | None = None
+    """Directory trained-adapter checkpoints are written under (PEFT format:
+    ``adapter_model.safetensors`` with the fp32 masters, the source adapter's
+    ``adapter_config.json``, and ``trainer_state.json``). The periodic saves
+    below go to ``<adapter_save_path>/backward-<N>`` / ``epoch-<E>``; POST
+    /save_adapter without a ``path`` to ``<adapter_save_path>/manual-<time>``.
+    None (default): no periodic saves; POST /save_adapter needs a ``path``."""
+
+    adapter_save_every_backwards: int = 0
+    """Save the trained adapter after every N-th backward cycle (0 = off).
+    Written after the cycle's done-reply, so FT admission is not held for it."""
+
+    adapter_save_every_epoch: bool = False
+    """Save the trained adapter at every finetuning-epoch boundary (the state
+    after the last backward of the epoch, written as ``epoch-<E>``)."""
+
+    adapter_save_keep_last: int = 0
+    """Keep only the newest N periodic ``backward-*`` checkpoints (0 = keep
+    all). Epoch and manual saves are never pruned."""
+
     data_path: str | None = None
     """Path to the finetuning corpus: one tokenizable sample per non-empty line.
     Loaded + tokenized at startup by the FinetuningStore."""
@@ -304,6 +324,27 @@ class FinetuneConfig:
     Independent of the standard 0.9 × ttft_slo TTFT margin, which still
     applies everywhere."""
 
+    admission_margin: str = "relative"
+    """How the step-time prediction is inflated before the SLO admission checks.
+
+    ``"relative"`` (default): ×(1 + ``admission_margin_k`` · relRMSE), relRMSE
+    the regime's RMS relative error on its fit data (e.g. 0.033 = 3.3 %): the
+    headroom scales with the step. On Qwen3-14B TP=2 it cut FT-carrying steps
+    over ``max_tbt_slo`` from 10 % to 2 % for -1 % FT (README, "The admission
+    margin"; ``eval-tp/margin_ab.py``).
+    ``"legacy"``: ×(1 + 1.5·RMSE) with the RMSE in seconds, as in the original
+    DeltaServe tracker. With the RMSEs seen in practice (a few ms) this is a
+    0.2-0.8 % factor, i.e. effectively no margin. The presets pin it, so they
+    reproduce the published runs.
+    ``"absolute"``: + ``admission_margin_k`` · RMSE seconds, the same headroom
+    for every step.
+    Applies to every margined prediction (the baseline-without-FT checks and
+    each candidate in the iterative admission loop)."""
+
+    admission_margin_k: float = 1.5
+    """Multiplier of the error in ``admission_margin`` = relative / absolute
+    (ignored by ``legacy``, which keeps its fixed 1.5)."""
+
     profile_on_launch: bool = True
     """Run the offline execution-time profiling pass at launch (before serving)
     to seed the SLO estimator. When False, the estimator starts cold and relies
@@ -360,6 +401,26 @@ class FinetuneConfig:
     Analyse with ``eval-tp/analyze_step_trace.py``."""
 
     bwd_log_path: str | None = None
+
+    metrics_dir: str | None = None
+    """[telemetry] Record system metrics into this directory (see
+    ``deltaserve/metrics.py``): ``requests.csv`` (per request TTFT, TBT,
+    latency, tokens), ``backward.csv`` (per LoRA backward GPU / wall time,
+    tokens, loss, child memory), ``summary.jsonl`` (every
+    ``metrics_interval_s``: TTFT / TBT percentiles + SLO attainment, inference
+    and FT throughput, GPU time by step kind, memory) and
+    ``memory_rank<r>.json`` (per GPU: weights, KV cache, FT buffers, other).
+    Also served live by GET /system_metrics. None (default): off, nothing
+    recorded."""
+
+    metrics_interval_s: float = 10.0
+    """[telemetry] Seconds per ``summary.jsonl`` window (``metrics_dir``)."""
+
+    steps_log_max_mb: float = 256.0
+    """[telemetry] Size cap of the per-step log ``steps.<n>.jsonl.gz`` in
+    ``metrics_dir`` (every step's composition, GPU time and FT admission,
+    plain decode runs folded): rolling segments, the oldest deleted beyond
+    the cap. 0 = no step log (the dashboard's live stream still works)."""
 
     estimator_state_save_path: str | None = None
     """[estimator] JSON file the SLO estimator's state (fitted per-regime

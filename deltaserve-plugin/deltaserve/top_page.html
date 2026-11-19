@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dserve-top</title>
+<style>
+:root{--bg:#141413;--panel:#1a1a19;--line:#34342f;--grid:#262624;--ink:#f0efec;--ink2:#c3c2b7;--mute:#898781;
+--ft:#d95926;--inf:#3987e5;--dec:#199e70;--p99:#e8a33a;--bad:#e66767;--ok:#3fbf7f;--other:#c98500;--cache:#9085e9;--child:#d55181;--free:#2a2a28}
+*{box-sizing:border-box}
+body{margin:0;overflow-x:hidden;background:var(--bg);color:var(--ink2);font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.wrap{max-width:1500px;margin:0 auto;padding:8px 16px 12px}
+.hdr{display:flex;flex-wrap:nowrap;gap:16px;justify-content:space-between;align-items:center;margin-bottom:8px;white-space:nowrap}
+.hl{flex:none;overflow:hidden;text-overflow:ellipsis;max-width:75%}.hr{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;text-align:right}
+.one{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pair{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px}
+.tr{position:absolute;top:-10px;right:8px;background:var(--bg);padding:0 4px;display:flex;gap:3px}.tr .btn{padding:0 5px;font-size:11px}
+.hi{color:var(--ink)}.mu{color:var(--mute)}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--p99)}
+.grid{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(300px,1fr);gap:10px}
+@media (max-width:900px){.grid{grid-template-columns:minmax(0,1fr)}}
+.box{border:1px solid var(--line);border-radius:6px;padding:11px 10px 6px;position:relative;background:var(--panel);margin-bottom:10px}
+.tt{position:absolute;top:-9px;left:10px;background:var(--bg);padding:0 6px;color:var(--ink2);letter-spacing:.02em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:calc(100% - 24px)}
+.tr~.tt,.box:has(.tr)>.tt{max-width:calc(100% - 190px)}
+.row{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+svg text{font-family:inherit;font-size:10px}
+.btn{background:none;border:1px solid var(--line);color:var(--ink2);border-radius:4px;padding:1px 7px;font:inherit;cursor:pointer}
+.btn.on{border-color:var(--ink2);color:var(--ink)}
+.bar{display:flex;height:14px;gap:2px;border-radius:2px;overflow:hidden;flex:1}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:1px 10px}
+.sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px;vertical-align:-1px}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px}
+.kpi{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.kpi.top{grid-template-columns:repeat(6,minmax(0,1fr));margin-bottom:12px}
+.kpi.top .k{padding:4px 8px}.kpi.top .k b{font-size:17px;margin-top:0;line-height:1.25}.kpi.top .k .l{display:flex;justify-content:space-between;gap:6px;white-space:nowrap;overflow:hidden}
+@media (max-width:900px){.kpi.top{grid-template-columns:repeat(3,minmax(0,1fr))}}
+.kpi .k{background:#1f1f1d;border-radius:4px;padding:7px 8px}
+.kpi .k b{display:block;font-size:20px;font-weight:500;color:var(--ink);margin-top:2px}
+.kpi .k small{color:var(--mute);font-size:10px}
+.kpi .k b.ok{color:var(--ok)}.kpi .k b.bad{color:var(--bad)}
+.col{display:flex;flex-direction:column}.col>.box.grow{flex:1}
+.wrap{padding-bottom:52px}
+.scrub{position:fixed;left:0;right:0;bottom:0;background:#10100f;border-top:1px solid var(--line);z-index:8}
+.scrub .in{max-width:1500px;margin:0 auto;padding:6px 16px;display:flex;align-items:center;gap:8px}
+.track{position:relative;flex:1;height:30px;min-width:120px}
+.track canvas{position:absolute;left:0;top:0;width:100%;height:22px;border-radius:3px;background:#1a1a19}
+.track input{position:absolute;left:0;top:0;width:100%;height:30px;margin:0;background:transparent;-webkit-appearance:none;appearance:none;cursor:pointer}
+.track input::-webkit-slider-runnable-track{height:30px;background:transparent}
+.track input::-webkit-slider-thumb{-webkit-appearance:none;width:3px;height:30px;background:var(--ink);border-radius:1px}
+.track input::-moz-range-track{background:transparent}
+.track input::-moz-range-thumb{width:3px;height:30px;background:var(--ink);border:0;border-radius:1px}
+#follow.live{border-color:var(--ok);color:var(--ok)}
+#follow.off{border-color:var(--p99);color:var(--p99)}
+#stop{border-color:#6b2f2f;color:var(--bad)}#stop:hover:not(:disabled){background:#2a1616}#stop:disabled{opacity:.4;cursor:default}
+a.btn{text-decoration:none}
+select.btn{padding:1px 3px}
+.adt td{white-space:nowrap;padding-right:6px}.adt td:first-child{max-width:14ch;overflow:hidden;text-overflow:ellipsis}
+#tip{position:fixed;pointer-events:none;background:#0b0b0b;border:1px solid var(--line);border-radius:4px;padding:6px 8px;color:var(--ink);display:none;z-index:9;white-space:pre;max-width:420px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hdr">
+    <div class="hl"><span class="hi">dserve-top</span> <span class="mu">▸</span> <span id="model" class="hi">…</span> <span class="mu">▸</span> TP=<span id="tp">?</span> <span class="mu">▸</span> recording <span id="up" class="hi" style="display:inline-block;min-width:7ch">–</span> <span class="mu">▸</span> FT <span id="ftstate">…</span></div>
+    <div class="hr"><span id="conn"><span class="dot" style="background:var(--mute)"></span>connecting</span> <span class="mu">· <span id="rec"></span></span></div>
+  </div>
+  <div id="kpi" class="kpi top"></div>
+  <div class="grid">
+    <div class="col">
+      <div class="box"><span class="tt">ENGINE · batches (newest →) · height = tokens (√)</span>
+        <svg id="wave" width="100%" height="114" role="img" aria-label="Engine batches"></svg>
+        <div id="last" class="mu">waiting for steps…</div>
+        <div class="mu">
+          <span><span class="sw" style="background:var(--ft)"></span>FT <span class="sw" style="background:var(--inf);margin-left:6px"></span>prefill <span class="sw" style="background:var(--dec);margin-left:6px"></span>decode <span style="color:var(--bad);margin-left:6px">✗</span> pre-empted</span><span style="margin-left:6px">·</span> <span id="codes"></span>
+        </div>
+        <div id="gpu" style="margin-top:4px"></div>
+      </div>
+      <div class="pair">
+        <div class="box"><span class="tt">TTFT (s) · <span style="color:var(--inf)">p50</span> <span style="color:var(--p99)">p99</span><span id="ttft_hdr" class="mu"></span></span>
+          <span class="tr"><button class="btn on" data-r="60">1m</button><button class="btn" data-r="300">5m</button><button class="btn" data-r="1800">30m</button><button class="btn" data-r="3600">60m</button></span>
+          <svg id="ttft" width="100%" height="96" role="img" aria-label="TTFT p50 and p99 over time"></svg>
+        </div>
+        <div class="box"><span class="tt">TPOT / request (ms) · <span style="color:var(--inf)">p50</span> <span style="color:var(--p99)">p99</span> · <span id="tpot_hdr" class="mu"></span></span>
+          <svg id="tpot" width="100%" height="96" role="img" aria-label="Per-request TPOT p50 and p99 over time"></svg>
+        </div>
+      </div>
+      <div class="box grow"><span class="tt">MEMORY (GiB)</span><div id="mem" class="mu">waiting for the per-GPU snapshot…</div></div>
+    </div>
+    <div class="col">
+      <div class="box"><span class="tt">FINETUNING PROGRESS</span>
+        <div id="ft"></div>
+        <div style="margin-top:4px">loss <span id="loss" class="hi">–</span> <span class="mu">(mean of last 20 backwards)</span></div>
+        <svg id="lossc" width="100%" height="62" role="img" aria-label="Loss over time"></svg>
+        <div id="ft2" style="margin-top:2px"></div>
+        <div id="thr" style="margin-top:4px"></div>
+      </div>
+      <div class="box grow"><span class="tt">ADAPTERS</span><div id="ad" class="mu">waiting for the adapter snapshot…</div></div>
+    </div>
+  </div>
+</div>
+<div class="scrub"><div class="in">
+  <button id="play" class="btn" title="play from the cursor (space)">▶</button>
+  <select id="spd" class="btn" title="playback speed"><option value="1">1×</option><option value="10">10×</option><option value="60">60×</option></select>
+  <div class="track"><canvas id="marks"></canvas><input id="rng" type="range" min="0" max="1" step="any" value="1" aria-label="time"></div>
+  <span id="tlab" class="mu" style="min-width:150px;text-align:right">–</span>
+  <button id="follow" class="btn live" title="jump back to the newest data and follow it (End)">● LIVE</button>
+  <a id="dl" class="btn" href="/api/export?max_mb=50" download title="the whole history as one HTML file that replays offline (≤ 50 MB; oldest part dropped above that)">⤓ HTML</a>
+  <button id="stop" class="btn" title="stop the server, as Ctrl-C would (asks first). dserve-top keeps running with the history.">■ STOP</button>
+</div></div>
+<div id="tip"></div>
+<script>
+const $=id=>document.getElementById(id);
+const C={ft:'#d95926',inf:'#3987e5',dec:'#199e70',p99:'#e8a33a',bad:'#e66767',grid:'#262624',line:'#34342f',mute:'#898781',ink2:'#c3c2b7'};
+let S={steps:[],series:[],snaps:[],mems:[],models_h:[],latest:{}},range=60,busy=false,REPLAY=null;
+let Q={steps:0,series:0,snaps:0,mems:0,models:0};
+let follow=true,cur=0,playing=false,V={latest:{},steps:[],series:[]},Z=1;
+const fmt=(x,k=1)=>x==null||!isFinite(x)?'–':(+x).toFixed(k);
+const big=n=>n==null?'–':n>=1e6?(n/1e6).toFixed(2)+' M':n>=1e3?(n/1e3).toFixed(1)+' k':String(Math.round(n));
+const dur=s=>{s=Math.max(0,Math.floor(s));const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return (h?h+':':'')+String(m).padStart(h?2:1,'0')+':'+String(x).padStart(2,'0')};
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const bs=(a,t)=>{let lo=0,hi=a.length;while(lo<hi){const m=(lo+hi)>>1;if(a[m].t<=t)lo=m+1;else hi=m;}return lo;};  // first index with .t > t
+document.querySelectorAll('.btn[data-r]').forEach(b=>b.onclick=()=>{range=+b.dataset.r;document.querySelectorAll('.btn[data-r]').forEach(x=>x.classList.toggle('on',x===b));render();});
+const tip=$('tip');
+document.addEventListener('mousemove',e=>{const t=e.target.closest&&e.target.closest('[data-tip]');if(!t){tip.style.display='none';return;}
+ tip.textContent=t.getAttribute('data-tip');tip.style.display='block';const w=tip.offsetWidth,h=tip.offsetHeight;tip.style.left=Math.min(innerWidth-w-8,e.clientX+12)+'px';tip.style.top=Math.min(innerHeight-h-8,e.clientY+14)+'px';});
+
+function reset(){S.steps=[];S.series=[];S.snaps=[];S.mems=[];S.models_h=[];Q={steps:0,series:0,snaps:0,mems:0,models:0};follow=true;}
+function absorb(d){
+ if(S.latest.t_start!==undefined&&d.t_start!==undefined&&d.t_start!==S.latest.t_start)reset();
+ if(d.steps&&d.steps.length){const f=d.steps[0].s;while(S.steps.length&&S.steps[S.steps.length-1].s>=f)S.steps.pop();for(const e of d.steps)S.steps.push(e);Q.steps=S.steps[S.steps.length-1].s;}
+ const add=(k,q)=>{const a=d[k];if(a&&a.length){for(const x of a)if(x.t>Q[q])S[k].push(x);if(S[k].length)Q[q]=S[k][S[k].length-1].t;}};
+ add('series','series');add('snaps','snaps');add('mems','mems');add('models_h','models');
+ // the same retention as dserve-top
+ const cut=(d.now||0)-(d.history_s||1e12);
+ for(const k of ['steps','series','snaps']){const a=S[k];if(a.length&&a[0].t<cut-600)a.splice(0,bs(a,cut));}
+ for(const k of ['steps','series','snaps','mems','models_h'])delete d[k];
+ S.latest=d;
+}
+async function poll(){
+ if(busy||REPLAY)return;busy=true;
+ try{
+  const r=await fetch(`/api/state?steps_since=${Q.steps}&series_since=${Q.series}&snaps_since=${Q.snaps}&mems_since=${Q.mems}&models_since=${Q.models}`,{cache:'no-store'});
+  absorb(await r.json());S.ok=true;
+ }catch(e){S.ok=false;}
+ busy=false;render();
+}
+function span(){  // [tmin, tmax] of the history
+ const a=[S.series[0],S.steps[0],S.snaps[0]].filter(Boolean).map(x=>x.t);
+ const tmax=REPLAY?Math.max(S.series.length?S.series[S.series.length-1].t+1:0,S.snaps.length?S.snaps[S.snaps.length-1].t:0,S.steps.length?(S.steps[S.steps.length-1].te||S.steps[S.steps.length-1].t):0)
+   :(S.latest.now||Date.now()/1000);
+ return [a.length?Math.min(...a):tmax,tmax];
+}
+const at=(a,t)=>{const i=bs(a,t);return i?a[i-1]:null;};
+function view(){
+ const [t0,t1]=span();
+ if(follow)cur=t1;
+ cur=Math.max(t0,Math.min(t1,cur));
+ const T=cur,j=bs(S.steps,T);
+ const series=S.series.slice(bs(S.series,T-3600),bs(S.series,T)),steps=S.steps.slice(Math.max(0,j-3000),j);
+ const md=at(S.models_h,T),models=md?md.models:[];
+ if(follow&&!REPLAY){V={latest:{...S.latest,models},steps,series,T};return;}
+ const sn=at(S.snaps,T)||{},mm=at(S.mems,T);
+ V={latest:{...S.latest,now:T,finetuning:sn.ft||{},window:{...(sn.win||{}),memory:mm?mm.memory:{}},models},steps,series,T};
+}
+function scrub(){
+ const [t0,t1]=span(),rng=$('rng');
+ rng.min=t0;rng.max=Math.max(t1,t0+1e-3);if(document.activeElement!==rng||follow)rng.value=cur;
+ const back=t1-cur;
+ const fl=$('follow');fl.className='btn '+(follow?'live':'off');
+ fl.textContent=REPLAY?(follow?'■ END':'⏭ END'):(follow?'● LIVE':'⏭ LIVE');
+ $('tlab').innerHTML=`<span class="hi">${new Date(cur*1000).toLocaleTimeString()}</span>`+(follow?'':` <span class="warn">−${dur(back)}</span>`)+` <span class="mu">/ ${dur(t1-t0)}</span>`;
+ $('play').textContent=playing?'❚❚':'▶';
+ const est=S.latest.export_estimate_mb;
+ if(!REPLAY){const b=$('stop'),up=!!S.latest.connected;if(stopping&&!up){stopping=false;b.textContent='■ STOP';}if(!stopping){b.disabled=!up;b.title=up?'stop the server, as Ctrl-C would (asks first). dserve-top keeps running with the history.':'no server connected';}}
+ if(!REPLAY)$('dl').textContent=`⤓ HTML${est!=null?' ~'+(est<1?'<1':Math.round(est))+' MB':''}`;
+ marks(t0,t1);
+}
+let mkKey='';
+function marks(t0,t1){  // load + SLO-miss strip behind the slider
+ const c=$('marks'),W=c.clientWidth|0,H=22;if(!W)return;
+ const key=[W,t0,S.series.length,S.series.length?S.series[S.series.length-1].t:0,Math.floor(t1)].join();if(key===mkKey)return;mkKey=key;
+ const pr=devicePixelRatio*Z;c.width=W*pr;c.height=H*pr;const g=c.getContext('2d');g.scale(pr,pr);g.clearRect(0,0,W,H);
+ const n=Math.max(1,W),sp=Math.max(1e-6,t1-t0),out=new Float32Array(n),tr=new Float32Array(n),miss=new Uint8Array(n),has=new Uint8Array(n);
+ const slo=((S.latest.meta||{}).ttft_slo)||((at(S.snaps,t1)||{}).win||{inference:{}}).inference.ttft_slo;
+ for(const r of S.series){const i=Math.min(n-1,Math.max(0,Math.floor((r.t-t0)/sp*n)));out[i]=Math.max(out[i],r.out||0);tr[i]=Math.max(tr[i],r.tr||0);has[i]=1;
+  if(slo&&r.ttft99!=null&&r.ttft99>slo)miss[i]=1;}
+ const mo=Math.max(1,...out),mt=Math.max(1,...tr);
+ for(let i=0;i<n;i++){if(!has[i])continue;
+  const ho=out[i]/mo*(H-6),ht=tr[i]/mt*(H-6);
+  g.fillStyle='rgba(57,135,229,.55)';g.fillRect(i,H-ho,1,ho);
+  g.fillStyle='rgba(217,89,38,.8)';g.fillRect(i,H-ht*.5,1,ht*.5);
+  if(miss[i]){g.fillStyle='#e66767';g.fillRect(i,0,1,4);}}
+}
+$('rng').addEventListener('input',e=>{follow=false;cur=+e.target.value;const [,t1]=span();if(t1-cur<0.5)follow=true;render();});
+$('follow').onclick=()=>{follow=true;playing=false;render();};
+let stopping=false;
+$('stop').onclick=async()=>{
+ const m=(S.latest.meta||{}).served_model_name||'the server';
+ if(!confirm(`Stop ${m}?\n\nThe server shuts down as on Ctrl-C (estimator state and telemetry are saved). Inference requests in flight are dropped. dserve-top keeps running with the history.`))return;
+ const b=$('stop');stopping=true;b.disabled=true;b.textContent='stopping…';
+ try{const r=await fetch('/api/stop',{method:'POST',headers:{'X-DServe-Stop':'1'}});const j=await r.json().catch(()=>({}));
+  if(!r.ok){stopping=false;b.disabled=false;b.textContent='■ STOP';alert('Could not stop the server: '+(j.error||r.status));}
+ }catch(e){stopping=false;b.disabled=false;b.textContent='■ STOP';alert('Could not stop the server: '+e);}
+};
+$('play').onclick=()=>{if(follow&&!playing){const [t0,t1]=span();cur=Math.max(t0,t1-300);follow=false;}playing=!playing;render();};
+addEventListener('keydown',e=>{if(e.target.tagName==='SELECT')return;
+ if(e.key==='End'){follow=true;playing=false;render();e.preventDefault();}
+ else if(e.key==='Home'){follow=false;cur=span()[0];render();e.preventDefault();}
+ else if(e.key===' '){$('play').click();e.preventDefault();}
+ else if(e.key==='ArrowLeft'||e.key==='ArrowRight'){const d=(e.shiftKey?60:5)*(e.key==='ArrowLeft'?-1:1);follow=false;cur+=d;const [,t1]=span();if(cur>=t1)follow=true;render();e.preventDefault();}});
+let lastPlay=performance.now();
+setInterval(()=>{const now=performance.now(),dt=(now-lastPlay)/1000;lastPlay=now;if(!playing)return;
+ cur+=dt*(+$('spd').value);const [,t1]=span();if(cur>=t1){cur=t1;playing=false;follow=true;}render();},100);
+
+function header(){
+ const L=V.latest,m=L.meta||{},w=L.window||{},f=L.finetuning||{};
+ const mp=String(m.model||''),hf=mp.match(/models--([^/]+?)--([^/]+)/);
+ const sv=Array.isArray(m.served_model_name)?m.served_model_name[0]:m.served_model_name;
+ $('model').textContent=(hf?hf[1]+'/'+hf[2]:mp.split('/').filter(Boolean).slice(-2).join('/')||'…')+(sv?`  (served as ${sv})`:'');
+ $('tp').textContent=m.tensor_parallel_size??'?';
+ $('up').textContent=L.now&&L.t_start?dur(L.now-L.t_start):'–';
+ let st;
+ // fixed width: the line must not change length (and wrap) as the state flips
+ if(f.disabled_reason)st=`<span class="bad" data-tip="${esc(f.disabled_reason)}">● disabled</span>`;
+ else if(!f.started)st='<span class="warn">● stopped</span>';
+ else st=`<span class="ok">● running</span> <span class="mu" style="display:inline-block;width:11ch">${f.backward_in_flight?'· backward':'· filling'}</span>`;
+ $('ftstate').innerHTML=st;
+ const live=S.ok&&L.connected;
+ if(REPLAY){$('conn').innerHTML=`<span class="dot" style="background:var(--cache)"></span>replay · exported ${new Date(REPLAY.exported_unix_time*1000).toLocaleString()}`;$('rec').textContent=REPLAY.dir||'';return;}
+ $('conn').innerHTML=live?'<span class="dot" style="background:var(--ok)"></span>live':`<span class="dot" style="background:var(--bad)"></span>${esc(S.ok?(L.error||'server unreachable'):'dserve-top unreachable')}`;
+ const rd=(L.top&&L.top.recording_dir)||L.dir||'';
+ $('rec').textContent=rd.split('/').filter(Boolean).slice(-2).join('/')||'';$('rec').setAttribute('data-tip','recording into\n'+rd);
+}
+
+function wave(){
+ const svg=$('wave'),W=svg.clientWidth||800,H=78,base=H+6,maxT=Math.max(512,(V.latest.meta||{}).max_num_batched_tokens||2048);
+ const h=t=>t<=0?0:Math.max(2,Math.sqrt(t)/Math.sqrt(maxT)*H);
+ const codes=(V.latest.meta||{}).admit_codes||{};
+ let x=W-2,lastNum=1e9,lastCode=1e9,o=`<line x1="0" y1="${base}" x2="${W}" y2="${base}" stroke="${C.line}"/>`;
+ for(let i=V.steps.length-1;i>=0&&x>0;i--){
+  const e=V.steps[i],t=new Date(e.t*1000).toLocaleTimeString();
+  if(e.k==='d'){
+   const lab='d×'+e.n,w=Math.max(18,lab.length*6.2+8),hh=h(e.dc);x-=w+3;
+   const tipt=`plain decode × ${e.n} steps\nbatch ${e.dc} requests (latest)\nGPU ${fmt(e.ms,1)} ms total · ${fmt(e.ms/e.n,2)} ms/step\n${t} → ${new Date(e.te*1000).toLocaleTimeString()}`;
+   lastNum=lastCode=1e9;
+   o+=`<g data-tip="${esc(tipt)}"><rect x="${x}" y="${base-hh}" width="${w}" height="${hh}" fill="${C.dec}" opacity=".5" rx="1"/><rect x="${x}" y="0" width="${w}" height="${base+30}" fill="transparent"/>`+
+      `<text x="${x+w/2}" y="${base-hh-4}" fill="${C.ink2}" text-anchor="middle">${lab}</text></g>`;
+  }else if(e.k==='p'){
+   const w=8;x-=w+3;const hh=h(e.ft||64);
+   o+=`<g data-tip="${esc(`FT-only step pre-empted (tier B/C)\nan inference request arrived\n${e.ft} FT tokens rolled back\n${t}`)}"><rect x="${x}" y="${base-hh}" width="${w}" height="${hh}" fill="none" stroke="${C.bad}" stroke-dasharray="2 2"/><rect x="${x}" y="0" width="${w}" height="${base+30}" fill="transparent"/><text x="${x+w/2}" y="${base+13}" fill="${C.bad}" text-anchor="middle">✗</text></g>`;
+  }else{
+   const w=8;x-=w+3;const tot=e.ft+e.pf+e.dc,ht=h(tot),hf=ht*e.ft/tot,hp=ht*e.pf/tot,hd=ht-hf-hp;let y=base,b='';
+   if(hf>0){b+=`<rect x="${x}" y="${y-hf}" width="${w}" height="${hf}" fill="${C.ft}"/>`;y-=hf+(hp>0||hd>0?1:0);}
+   if(hp>0){b+=`<rect x="${x}" y="${y-hp}" width="${w}" height="${hp}" fill="${C.inf}"/>`;y-=hp+(hd>0?1:0);}
+   if(hd>0)b+=`<rect x="${x}" y="${y-hd}" width="${w}" height="${hd}" fill="${C.dec}"/>`;
+   const cc=e.a==='A'?C.ink2:e.a==='S'?C.p99:C.mute;
+   const tipt=`${e.ft&&e.pf?'mixed step':e.ft?'FT-only step':'inference prefill step'} · ${t}\nprefill ${e.pf} · FT ${e.ft} · decode ${e.dc}\nGPU ${fmt(e.ms,1)} ms · ${e.g==null?'':e.g?'CUDA graph':'eager'}${e.pz?' · backward paused':''}${e.bw?' · backward running':''}\nFT admission: ${e.a||'–'} ${esc(codes[e.a]||'')}${e.at?` (${e.at} tok)`:''}`;
+   const cx=x+w/2,showCode=e.a&&cx<lastCode-8,numW=String(e.at).length*5+4,showNum=e.at&&cx+numW/2<lastNum-numW/2-2;
+   if(showCode)lastCode=cx;if(showNum)lastNum=cx;
+   o+=`<g data-tip="${esc(tipt)}">${b}<rect x="${x}" y="0" width="${w}" height="${base+30}" fill="transparent"/>`+
+      (showCode?`<text x="${cx}" y="${base+13}" fill="${cc}" text-anchor="middle">${e.a}</text>`:'')+
+      (showNum?`<text x="${cx}" y="${base+25}" fill="${C.mute}" text-anchor="middle" font-size="8">${e.at}</text>`:'')+`</g>`;
+  }
+ }
+ svg.innerHTML=o;
+ let l=null;for(let i=V.steps.length-1;i>=0;i--)if(V.steps[i].k==='x'){l=V.steps[i];break;}
+ if(l)$('last').innerHTML=`last  prefill <span class="hi">${l.pf}</span> · FT <span class="hi">${l.ft}</span>${l.a?` (<span class="hi">${l.a}</span> ${esc(codes[l.a]||'')})`:''} · decode <span class="hi">${l.dc}</span> · <span class="hi">${fmt(l.ms,1)}</span> ms${l.g==null?'':l.g?' · graph':' · eager'}`;
+ $('codes').innerHTML=Object.entries(codes).filter(([k])=>k).map(([k,v])=>`<span class="hi">${k}</span> ${esc(v.split(/[ :(]/)[0])}`).join(' · ');
+}
+
+function lineChart(id,keys,scale,slo,unit,k){
+ const svg=$(id),W=svg.clientWidth||800,H=76,L=34,top=6,now=V.latest.now||Date.now()/1000,t0=now-range;
+ const rows=V.series.filter(r=>r.t>=t0);
+ let mx=slo?slo*1.15:0;rows.forEach(r=>keys.forEach(kk=>{if(r[kk]!=null)mx=Math.max(mx,r[kk]*scale)}));mx=mx||1;
+ const X=t=>L+(t-t0)/range*(W-L-6),Y=v=>top+H-Math.min(v,mx)/mx*H;
+ let o='';[0,.5,1].forEach(f=>{const v=mx*f;o+=`<line x1="${L}" x2="${W}" y1="${Y(v)}" y2="${Y(v)}" stroke="${C.grid}"/><text x="${L-4}" y="${Y(v)+3}" fill="${C.mute}" text-anchor="end">${fmt(v,v<1?2:0)}</text>`;});
+ for(let s=0;s<=4;s++){const t=t0+range*s/4;o+=`<text x="${X(t)}" y="${H+top+14}" fill="${C.mute}" text-anchor="${s===0?'start':s===4?'end':'middle'}">${s===4?(follow&&!REPLAY?'now':new Date(t*1000).toLocaleTimeString()):'-'+dur(range*(1-s/4))}</text>`;}
+ if(slo)o+=`<line x1="${L}" x2="${W}" y1="${Y(slo)}" y2="${Y(slo)}" stroke="${C.mute}" stroke-dasharray="5 4"/><text x="${W-4}" y="${Y(slo)-4}" fill="${C.mute}" text-anchor="end">SLO ${fmt(slo,slo<1?2:0)}${unit}</text>`;
+ keys.forEach((kk,i)=>{const col=i?C.p99:C.inf;const pts=rows.filter(r=>r[kk]!=null);
+  if(pts.length>1)o+=`<polyline fill="none" stroke="${col}" stroke-width="1.6" stroke-linejoin="round" points="${pts.map(r=>X(r.t)+','+Y(r[kk]*scale)).join(' ')}"/>`;
+  if(pts.length<=1||range<=300)pts.forEach(r=>o+=`<circle cx="${X(r.t)}" cy="${Y(r[kk]*scale)}" r="${pts.length>200?1:1.8}" fill="${col}" data-tip="${esc(new Date(r.t*1000).toLocaleTimeString()+'  '+kk+' '+fmt(r[kk]*scale,k)+unit+'  ('+(kk.startsWith('ttft')?r.nt+' first tokens':r.nf+' finished')+')')}"/>`);});
+ if(!rows.some(r=>r[keys[0]]!=null))o+=`<text x="${(L+W)/2}" y="${top+H/2}" fill="${C.mute}" text-anchor="middle">no ${id==='ttft'?'first tokens':'finished requests'} in this range</text>`;
+ svg.innerHTML=o;
+}
+
+function charts(){
+ const w=(V.latest.window||{}).inference||{},m=V.latest.meta||{};
+ const rows=V.series.filter(r=>r.t>=(V.latest.now||0)-range);
+ const nt=rows.reduce((a,r)=>a+r.nt,0),nf=rows.reduce((a,r)=>a+r.nf,0);
+ $('ttft_hdr').textContent='';
+ $('tpot_hdr').textContent=`${nf} finished`;
+ lineChart('ttft',['ttft50','ttft99'],1,w.ttft_slo,' s',3);
+ lineChart('tpot',['tpot50','tpot99'],1000,w.max_tbt_slo?w.max_tbt_slo*1000:null,' ms',1);
+}
+
+function bar(f,n=18,col=C.ft){f=Math.max(0,Math.min(1,f||0));const k=Math.round(f*n);return `<span style="color:${col}">${'█'.repeat(k)}</span><span style="color:#2f2f2c">${'█'.repeat(n-k)}</span>`;}
+
+function ft(){
+ const f=V.latest.finetuning||{},w=V.latest.window||{},fw=w.finetune||{},now=V.latest.now||0;
+ const last10=V.series.filter(r=>r.t>now-10),tr=last10.reduce((a,r)=>a+r.tr,0)/10;
+ const ep=f.total_epochs?((f.store_epoch??f.epoch??0)+1):null,frac=f.corpus_samples?(f.samples_trained_this_epoch||0)/f.corpus_samples:0;
+ const tokEpoch=f.corpus_tokens_per_epoch||0,remain=tokEpoch*(1-frac),etaE=tr>0&&tokEpoch?remain/tr:null,etaAll=etaE!=null&&f.total_epochs?etaE+tokEpoch*Math.max(0,f.total_epochs-ep)/tr:null;
+ $('ft').innerHTML=`<div>epoch <span class="hi">${ep??'–'}</span> / ${f.total_epochs??'–'} ${bar(frac,16)} <span class="hi">${fmt(frac*100,0)}%</span></div>`+
+  `<div class="mu">samples <span class="hi">${f.samples_trained_this_epoch??'–'}</span> / ${f.corpus_samples??'–'} this epoch</div>`+
+  `<div class="mu">trained <span class="hi">${big(f.tokens_trained)}</span> tok · <span class="hi">${fmt(tr,0)}</span> tok/s</div>`+
+  `<div class="mu">ETA epoch <span class="hi">${etaE!=null?dur(etaE):'–'}</span> · all epochs <span class="hi">${etaAll!=null?dur(etaAll):'–'}</span></div>`;
+ $('loss').textContent=fmt(f.mean_loss_last_20,3);
+ const pts=V.series.filter(r=>r.loss!=null&&r.t>=now-1800),svg=$('lossc'),W=svg.clientWidth||300,H=50;
+ if(pts.length>1){let mx=-1e9,mn=1e9;pts.forEach(r=>{mx=Math.max(mx,r.loss);mn=Math.min(mn,r.loss)});const span=mx-mn||1,t0=pts[0].t,t1=pts[pts.length-1].t||t0+1;
+  svg.innerHTML=`<text x="0" y="10" fill="${C.mute}">${fmt(mx,2)}</text><text x="0" y="${H}" fill="${C.mute}">${fmt(mn,2)}</text><text x="${W}" y="${H+12}" fill="${C.mute}" text-anchor="end">last ${dur(t1-t0)}</text>`+
+   `<polyline fill="none" stroke="${C.ft}" stroke-width="1.6" points="${pts.map(r=>(34+(r.t-t0)/(t1-t0||1)*(W-36))+','+(4+(mx-r.loss)/span*(H-6))).join(' ')}"/>`;}
+ else svg.innerHTML=`<text x="0" y="30" fill="${C.mute}">waiting for backward cycles…</text>`;
+ const g=fw.backward_gpu_ms_mean,wl=fw.backward_wall_ms_mean,cap=f.buffer_capacity||1;
+ const state=f.disabled_reason?`<span class="bad">disabled</span>`:f.backward_in_flight?'<span class="ok">▶ backward running</span>':'<span class="mu">◦ filling buffer</span>';
+ $('ft2').innerHTML=`<div class="mu">backward GPU <span class="hi">${fmt(g ?? f.last_backward_gpu_ms,0)}</span> ms · wall <span class="hi">${fmt(wl,0)}</span> ms${g&&wl?` · paused <span class="hi">${fmt(Math.max(0,1-g/wl)*100,0)}%</span>`:''}</div>`+
+  `<div class="mu">cycles <span class="hi">${(f.backwards_done??0).toLocaleString()}</span></div>`+
+  `<div>buffer ${bar((f.buffer_fill||0)/cap,16)} <span class="hi">${f.buffer_fill??'–'}</span> / ${f.buffer_capacity??'–'} tok</div>`+
+  `<div class="mu">state ${state} · admission <span class="${f.admission_open?'ok':'warn'}">${f.admission_open?'open':'closed'}</span>${f.estimator_fitted?' · SLO-gated':' · estimator cold'}</div>`+
+  (f.disabled_reason?`<div class="bad">${esc(f.disabled_reason)}</div>`:'');
+}
+
+function gpu(){
+ const now=V.latest.now||0,r=V.series.filter(x=>x.t>now-10),n=Math.max(1,r.length);
+ const fi=r.reduce((a,x)=>a+x.fi,0)/n,ff=r.reduce((a,x)=>a+x.ff,0)/n,bw=r.reduce((a,x)=>a+x.bw,0)/n;
+ const cell=(l,v,c)=>`<span style="white-space:nowrap">${l} ${bar(v,12,c)} <span class="hi" style="display:inline-block;width:4ch;text-align:right">${fmt(v*100,0)}%</span></span>`;
+ $('gpu').innerHTML=`<div class="row one" style="flex-wrap:nowrap" data-tip="GPU busy over the last 10 s: rank 0 kernel time ÷ wall.\nForward and backward share the GPU, so they can add up to more than 100 %.\nRequest times are measured in the engine (≈1 ms below what a client sees)."><span class="mu">GPU busy 10 s</span>`+cell('inference fwd',fi,C.inf)+cell('FT fwd',ff,C.ft)+cell('backward',bw,'#1baf7a')+`</div>`;
+ const out=r.reduce((a,x)=>a+x.out,0)/n,inp=r.reduce((a,x)=>a+x.inp,0)/n,tr=r.reduce((a,x)=>a+x.tr,0)/n,ftf=r.reduce((a,x)=>a+x.ftf,0)/n;
+ $('thr').innerHTML=`<div class="mu">tokens/s (10 s): inference out <span class="hi">${big(out)}</span> · prompt <span class="hi">${big(inp)}</span></div><div class="mu" style="padding-left:16ch">FT forwarded <span class="hi">${big(ftf)}</span> · trained <span class="hi">${big(tr)}</span></div>`;
+}
+
+function mem(){
+ const M=(V.latest.window||{}).memory||{},ranks=Object.keys(M).filter(k=>k.startsWith('rank')).sort();
+ if(!ranks.length)return;
+ const pick=(g,pre)=>{const e=Object.entries(g).find(([k])=>k.startsWith(pre));return e?e[1]:0;};
+ const CAT=[['weights','#3987e5',g=>g.model_weights||0],['KV cache','#d95926',g=>g.kv_cache||0],
+  ['LoRA','#5fb6c9',g=>g.lora_slots||0],['FT buffers','#199e70',g=>g.ft_activation_buffers||0],
+  ['other','#c98500',g=>pick(g,'other_allocated')],['cached / graphs','#9085e9',g=>pick(g,'torch_reserved')],
+  ['bwd child + others','#d55181',g=>Math.max(0,(g.device_used_all_processes||0)-(g.inference_process_reserved||0))]];
+ const barW=Math.max(200,($('mem').clientWidth||1000)-240);
+ let o=`<div class="mu" style="margin-bottom:4px">${CAT.map(([l,c])=>`<span class="sw" style="background:${c}"></span>${l}`).join(' &nbsp;')} &nbsp;<span class="sw" style="background:var(--free)"></span>free</div>`;
+ for(const r of ranks){const g=M[r].gib||{},tot=g.device_total||1,used=g.device_used_all_processes||0;
+  o+=`<div class="row" style="align-items:center;flex-wrap:nowrap;margin-top:5px"><span class="hi" style="width:52px">GPU${r.slice(4)}</span><div class="bar" style="height:18px">`+
+   CAT.map(([l,c,f])=>{const v=f(g);if(v<=0)return '';const pct=v/tot*100;
+    return `<div data-tip="${esc(l+': '+fmt(v,2)+' GiB')}" style="width:${pct}%;background:${c};color:#0b0b0b;font-size:10px;line-height:18px;text-align:center;overflow:hidden;white-space:nowrap">${pct*barW/100>=(fmt(v,v<1?2:1).length*6+6)?fmt(v,v<1?2:1):''}</div>`;}).join('')+
+   `<div style="flex:1;background:var(--free);font-size:10px;line-height:18px;text-align:center;color:var(--ink2)" data-tip="free ${fmt(tot-used,2)} GiB">${(tot-used)/tot>.06?fmt(tot-used,1)+' free':''}</div></div>`+
+   `<span style="width:170px;text-align:right"><span class="hi">${fmt(used,1)}</span> / ${fmt(tot,1)} GiB · ${fmt(used/tot*100,0)}%</span></div>`;}
+ const lo=M[ranks[0]].lora;
+ if(lo&&lo.slots)o+=`<div class="mu" style="margin-top:4px" data-tip="vLLM preallocates max_loras slots per GPU, sized for max_lora_rank and every LoRA-capable module.\nWhich adapter is in which slot: ADAPTERS.">LoRA: <span class="hi">${lo.slots}</span> GPU slots × <span class="hi">${fmt(lo.slot_gib*1024,0)}</span> MiB per GPU, preallocated (occupants: ADAPTERS)</div>`;
+ const ch=M.backward_child_rank0_gib;
+ if(ch)o+=`<div class="mu" style="margin-top:2px">backward child, rank 0: allocated <span class="hi">${fmt(ch.alloc,2)}</span> · peak <span class="hi">${fmt(ch.peak,2)}</span> · reserved <span class="hi">${fmt(ch.reserved,2)}</span> GiB · LoRA masters + grads + Adam <span class="hi">${fmt(ch.lora_train_state*1024,0)}</span> MiB</div>`;
+ $('mem').innerHTML=o;
+}
+function adapters(){
+ const L=V.latest,M=(L.window||{}).memory||{},ranks=Object.keys(M).filter(k=>k.startsWith('rank')).sort();
+ if(!ranks.length)return;
+ const lo=M[ranks[0]].lora||{},ads=lo.adapters||[],served=(L.models||[]).filter(m=>m.parent);
+ const ago=M[ranks[0]].unix_time&&L.now?Math.max(0,L.now-M[ranks[0]].unix_time):null;
+ let o=`<div>served by the API <span class="hi">${served.length}</span>${served.length?': '+served.map(m=>`<span class="hi">${esc(m.id)}</span>`).join(', '):''}</div>`;
+ o+=`<div style="margin-top:6px">host (CPU cache) <span class="hi">${lo.cpu_cached??0}</span> / ${lo.max_cpu_loras??'–'} · <span class="hi">${fmt((lo.cpu_cached_gib||0)*1024,0)}</span> MiB</div>`;
+ o+=`<table class="adt" style="width:100%;border-collapse:collapse;margin-top:2px">`+ads.map(a=>`<tr data-tip="${esc(`id ${a.id}
+${a.path||''}
+rank ${a.rank} · ${a.cpu_mib} MiB in host RAM${a.pinned?'\npinned (never evicted)':''}`)}">`+
+   `<td class="hi" style="padding:1px 0">${esc(a.name)}</td><td>${a.role==='finetune'?'<span style="color:var(--ft)">FT</span>':'<span style="color:#5fb6c9">inference</span>'}</td><td>r${a.rank??'?'}</td><td style="text-align:right">${fmt(a.cpu_mib,1)} MiB</td>`+
+   `<td style="text-align:right">${a.slot==null?'<span class="mu">host only</span>':'<span class="ok">slot '+a.slot+'</span>'}${a.pinned?' <span class="mu">pinned</span>':''}</td></tr>`).join('')+`</table>`;
+ o+=`<div style="margin-top:6px">GPU slots (<span class="hi">${lo.slots??'–'}</span> × <span class="hi">${fmt((lo.slot_gib||0)*1024,0)}</span> MiB, preallocated)</div>`;
+ for(const r of ranks){const l=M[r].lora||{},ins=l.in_slots||[],used=new Map(ins.map(x=>[x.slot,x]));
+  let cells='';for(let i=0;i<(l.slots||0);i++){const x=used.get(i);
+   cells+=x?`<span style="border:1px solid ${x.role!=='inference'?'var(--ft)':'#5fb6c9'};border-radius:3px;padding:0 5px;margin-right:4px" class="hi">${i}: ${esc(x.name||'id '+x.id)}</span>`
+           :`<span style="border:1px dashed var(--line);border-radius:3px;padding:0 5px;margin-right:4px">${i}: free</span>`;}
+  o+=`<div style="margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><span class="hi" style="display:inline-block;width:44px">GPU${r.slice(4)}</span>${cells}</div>`;}
+ if(ago!=null)o+=`<div class="mu" style="margin-top:6px">as of ${dur(ago)} ago · loaded on demand (LRU)</div>`;
+ $('ad').innerHTML=o;
+}
+let lastTbt=null;
+function kpi(){
+ const L=V.latest,now=L.now||0,w=(L.window||{}).inference||{},t=(L.window||{}).totals||{},f=L.finetuning||{};
+ const slo=w.ttft_slo,mslo=w.max_tbt_slo;
+ const tv=V.series.filter(r=>r.t>now-60).flatMap(r=>r.tv||[]).sort((a,b)=>a-b);
+ const p99=tv.length?tv[Math.min(tv.length-1,Math.ceil(.99*tv.length)-1)]:null;
+ const met=t.first_tokens?t.ttft_slo_met/t.first_tokens:null;
+ if(w.tbt_slo_attainment!=null)lastTbt=w.tbt_slo_attainment;else if(!follow)lastTbt=null;
+ const r10=V.series.filter(r=>r.t>now-10),n=Math.max(1,r10.length);
+ const out=r10.reduce((a,r)=>a+r.out,0)/n,tr=r10.reduce((a,r)=>a+r.tr,0)/n;
+ const col=(v,good)=>v==null?'':good?'ok':'bad';
+ const tile=(lab,val,cls,sub)=>`<div class="k"><div class="l"><span class="mu">${lab}</span><small class="one">${sub}</small></div><b class="${cls}">${val}</b></div>`;
+ $('kpi').innerHTML=
+  tile('TTFT p99',p99==null?'–':fmt(p99,2)+' s',col(p99,slo==null||p99<=slo),`1 min · ${tv.length} req`)+
+  tile('TTFT SLO met',met==null?'–':fmt(met*100,1)+'%',col(met,met>=.99),`since start`)+
+  tile('TBT SLO met',lastTbt==null?'–':fmt(lastTbt*100,1)+'%',col(lastTbt,lastTbt>=.99),`window · ≤${mslo?fmt(mslo*1000,0)+' ms':'–'}`)+
+  tile('inference out',big(out)+'/s','','tok · 10 s')+
+  tile('FT trained',big(tr)+'/s','','tok · 10 s')+
+  tile('loss',fmt(f.mean_loss_last_20,3),'','mean of last 20');
+}
+// Fill the window: lay the page out at a design width between 1300 px (the
+// narrowest it fits on one line per row) and 1500 px, then scale it (CSS zoom)
+// to fill the window's width and as much of its height as fits, so it never
+// scrolls: up to 2.4× on big screens, down to 0.75× on short ones. Phone-sized
+// windows keep the natural (stacked) layout.
+function fit(){
+ const w=document.querySelector('.wrap'),sc=document.querySelector('.scrub .in'),prev=Z,H=innerHeight-8;
+ const set=(z,lw)=>{w.style.zoom=sc.style.zoom=z;w.style.maxWidth=sc.style.maxWidth=lw?'none':'';w.style.width=sc.style.width=lw?lw+'px':'';};
+ let z=1,lw=0;
+ if(innerWidth>=1000){
+  lw=Math.min(1500,Math.max(1300,innerWidth));
+  for(let i=0;i<3;i++){  // the height depends a little on the width; settle it in a few passes
+   set(1,lw);
+   const tot=w.offsetHeight-52+sc.offsetHeight+1;  // 52 = the bottom padding kept free for the scrubber
+   z=Math.max(.75,Math.floor(Math.min(H/tot,innerWidth/1300,2.4)*50)/50);
+   const nl=Math.floor(innerWidth/z);if(nl===lw)break;lw=nl;
+  }
+ }
+ set(z,lw);Z=z;tip.style.fontSize=(12*z)+'px';tip.style.maxWidth=(420*z)+'px';
+ if(z!==prev)mkKey='';
+}
+function render(){try{fit();view();header();wave();charts();ft();gpu();kpi();mem();adapters();scrub();}catch(e){console.error(e);}}
+addEventListener('resize',()=>{mkKey='';render();});
+async function boot(){
+ const emb=document.getElementById('ds-embedded');
+ if(emb){  // an exported file: replay its history, no server
+  try{
+   const bin=Uint8Array.from(atob(emb.textContent.trim()),c=>c.charCodeAt(0));
+   const txt=await new Response(new Blob([bin]).stream().pipeThrough(new DecompressionStream('gzip'))).text();
+   const d=JSON.parse(txt);REPLAY=d;
+   absorb({...d,now:null,history_s:null,connected:false});
+   S.latest={meta:d.meta,t_start:d.t_start,dir:d.dir,top:d.top,connected:false};S.ok=true;
+   $('dl').style.display='none';$('stop').style.display='none';document.title='dserve-top · replay';
+  }catch(e){$('conn').textContent='could not read the embedded data: '+e;console.error(e);}
+  render();return;
+ }
+ poll();setInterval(poll,300);
+}
+document.readyState==='loading'?addEventListener('DOMContentLoaded',boot):boot();
+</script>
+</body>
+</html>

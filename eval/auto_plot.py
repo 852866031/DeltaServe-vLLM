@@ -49,7 +49,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 OUTPUT_DIR = os.path.join(_HERE, "output")
 PLOTS_DIR = os.path.join(_HERE, "plots")
-CONFIG_YAML = os.path.join(_ROOT, "configs", "serving_config_finetuning_llama3.yaml")
+CONFIG_YAML = os.path.join(_ROOT, "configs", "preset", "serving_config_finetuning_llama3.yaml")
 DEFAULT_SLO_FALLBACK = 1.0
 
 ALL_MODES = ("loose", "tight", "production")

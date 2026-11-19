@@ -3,7 +3,7 @@
 prediction misses the measured step time.
 
 Reads the per-step trace the server writes when launched with
-``finetune.step_trace_path`` (``auto_benchmark_tp.py --step-trace``) and joins
+``telemetry.step_trace_path`` (``auto_benchmark_tp.py --step-trace``) and joins
 it with the same run's request results, backward log and server log:
 
     step_trace<suffix>.csv          one row per timed step (+ rollbacks)

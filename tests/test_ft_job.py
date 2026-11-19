@@ -25,7 +25,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 _REPO = Path(__file__).resolve().parent.parent
-_CONFIG = _REPO / "configs" / "serving_config_finetuning_qwen3_0.6b.yaml"
+_CONFIG = _REPO / "configs" / "preset" / "serving_config_finetuning_qwen3_0.6b.yaml"
 
 _passed = 0
 _failed = 0
@@ -487,8 +487,8 @@ def test_yaml_section():
     check("preset still loads; FinetuneConfig.ft_job is None", ftc.ft_job is None)
 
     body = yaml.safe_load(_CONFIG.read_text())
-    flat = {k: body["finetune"].pop(k) for k in ("data_path", "num_epochs")}
-    lora = body["finetune"].pop("finetuning_lora_path")
+    flat = {k: body["finetune_param"].pop(k) for k in ("data_path", "num_epochs")}
+    lora = body["finetune_param"].pop("finetuning_lora_path")
     with tempfile.TemporaryDirectory() as d:
         p = Path(d) / "cfg.yaml"
 

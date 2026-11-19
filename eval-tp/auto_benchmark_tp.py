@@ -137,7 +137,7 @@ async def main() -> int:
     ap.add_argument("--step-trace", action="store_true",
                     help="(co only) write the per-step predicted-vs-actual "
                          "estimator trace to output/step_trace<suffix>.csv "
-                         "(finetune.step_trace_path; near-zero cost, see "
+                         "(telemetry.step_trace_path; near-zero cost, see "
                          "analyze_step_trace.py)")
     ap.add_argument("--request-model", default=None,
                     help="The `model` every request names (default: the inference "

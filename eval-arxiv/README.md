@@ -9,7 +9,7 @@ The median arxiv article is ~8k tokens.
 Model: **Qwen3-14B-Base, TP=2** on the two RTX 5090s (32k native context).
 Llama-3-8B cannot take these prompts (8192 max positions); Llama-3.1-8B would serve
 them but its `llama3` RoPE scaling is not implemented in the backward remat.
-YAML: `configs/serving_config_finetuning_qwen3_14b_tp2_arxiv.yaml`
+YAML: `configs/preset/serving_config_finetuning_qwen3_14b_tp2_arxiv.yaml`
 (`max_model_len 16384`, `ttft_slo 3.0`; everything else as the TP=2 YAML).
 
 ## Files

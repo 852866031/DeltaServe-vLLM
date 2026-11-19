@@ -62,6 +62,9 @@ class DeltaServeWorker(RouteEncodeMixin, Worker):
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights=load_dummy_weights)
+        # [telemetry] remember each adapter's name / path by its id (the GPU
+        # side only sees ids) for the dashboard's adapter panel.
+        self._track_lora_names()
         # Base weights are on the GPU now: share them (frozen, zero-copy) plus
         # the fp32 FT-adapter master weights with the backward child.
         self._maybe_share_finetuning_weights()
@@ -72,6 +75,45 @@ class DeltaServeWorker(RouteEncodeMixin, Worker):
         # LoRA buffers, so the trainer publishes straight into what inference
         # reads (no worker-side refresh).
         self._maybe_share_ft_served_lora()
+
+    def compile_or_warm_up_model(self):
+        out = super().compile_or_warm_up_model()
+        # [telemetry] KV cache, CUDA graphs and the FT buffers all exist now.
+        mdir = getattr(self.vllm_config.finetune_config, "metrics_dir", None)
+        if mdir:
+            from deltaserve import dprint
+            from deltaserve.metrics import write_memory_snapshot
+            try:
+                snap = write_memory_snapshot(
+                    mdir, self.rank, self.model_runner,
+                    getattr(self.model_runner, "_finetune_accumulator", None))
+                dprint(f"[telemetry] rank {self.rank} memory (GiB): {snap['gib']}")
+            except Exception as e:  # noqa: BLE001 — never block serving
+                dprint(f"[telemetry] memory snapshot failed: {e}")
+        return out
+
+    def _track_lora_names(self) -> None:
+        """Wrap this worker's LoRA manager ``add_adapter`` (instance level):
+        every adapter — the pinned FT adapter, the ones loaded on demand by a
+        request or by /v1/load_lora_adapter — passes through it with its
+        LoRARequest; record id → (name, path) on the model runner."""
+        lm = getattr(self.model_runner, "lora_manager", None)
+        if lm is None or getattr(lm, "_ds_tracked", False):
+            return
+        names: dict = {}
+        self.model_runner._ds_lora_names = names
+        orig = lm.add_adapter
+
+        def add_adapter(req, *a, **kw):
+            try:
+                names[int(req.lora_int_id)] = {
+                    "name": getattr(req, "lora_name", None),
+                    "path": getattr(req, "lora_path", None)}
+            except Exception:  # noqa: BLE001 — never block a load
+                pass
+            return orig(req, *a, **kw)
+        lm.add_adapter = add_adapter
+        lm._ds_tracked = True
 
     def _maybe_share_finetuning_weights(self) -> None:
         """Share base + FT-adapter weights with the backward process (Step 3)."""
@@ -124,6 +166,19 @@ class DeltaServeWorker(RouteEncodeMixin, Worker):
                     f"FT adapter safetensors not found at {safetensors_path}; "
                     f"sharing base weights only"
                 )
+        # A trainer with no FT adapter weights cannot train, and the same adapter
+        # would later fail to load as a LoRA inside the launch profiling pass —
+        # after EngineCore reported ready, which leaves the client waiting on a
+        # utility call forever. Fail here, at worker init, where vLLM's startup
+        # handshake reports the error and exits.
+        from deltaserve.bwd_services.registry import get_family
+
+        if not ft_state and get_family(self.model_config.hf_config.architectures[0]):
+            raise RuntimeError(
+                f"[deltaserve] finetuning is enabled but the FT adapter at "
+                f"{path!r} has no weights (adapter_model.safetensors missing or "
+                f"empty): set finetune_param.finetuning_lora_path to a LoRA adapter "
+                f"directory (see scripts/init_adapters_*.py)")
 
         # Resolve the LM-head weight + trim/scale info the backward process needs
         # to reconstruct logits. Models that tie word embeddings (Qwen3-0.6B) have
@@ -189,6 +244,10 @@ class DeltaServeWorker(RouteEncodeMixin, Worker):
         )
         summary = backward_process.share_weights(
             base_state, ft_state, print_hash=ft_cfg.print_weight_hash, meta=meta)
+        if summary.get("error"):
+            raise RuntimeError(
+                f"[deltaserve] the backward child (rank {tp_rank}) could not "
+                f"build its training state: {summary['error']}")
 
         # Optionally hash the first/last FFN weight (base) + first/last q_proj
         # LoRA-A (adapter) on the PARENT side and compare to the child's hashes.
@@ -304,7 +363,7 @@ class DeltaServeWorker(RouteEncodeMixin, Worker):
         coordinator.relay_mode = tp_size > 1
         # NOTE (known issue): under TP this worker-side coordinator keeps the
         # default ft_started=True and the scheduler mirrors it on the first
-        # step, so finetune.start_on_launch=false does not hold admission
+        # step, so finetune_param.start_on_launch=false does not hold admission
         # closed. Initialising the flag from start_on_launch here is not
         # enough: POST /start_finetuning only reaches the workers, and an idle
         # engine produces no ModelRunnerOutput to relay the flag back, so
@@ -526,8 +585,23 @@ class DeltaServeWorker(RouteEncodeMixin, Worker):
         coord = get_coordinator()
         if coord is None:
             return False
-        coord.start_finetuning()
-        return True
+        return coord.start_finetuning()
+
+    def deltaserve_save_adapter(self, path: str, save_id: str) -> bool:
+        """[DeltaServe] POST /save_adapter, via collective_rpc: every rank
+        asks its backward child to save (under TP the children gather their
+        shards to rank 0, which writes ``path``). Returns whether the request
+        reached the child; the save itself completes asynchronously."""
+        bp = getattr(self, "backward_process", None)
+        return bool(bp is not None and bp.request_save_adapter(path, save_id))
+
+    def deltaserve_memory_snapshot(self, root: str) -> dict:
+        """[telemetry] Write this rank's memory_rank<r>.json into ``root`` now
+        (POST /telemetry/start and dserve-top's periodic refresh)."""
+        from deltaserve.metrics import write_memory_snapshot
+        return write_memory_snapshot(
+            root, self.rank, self.model_runner,
+            getattr(self.model_runner, "_finetune_accumulator", None))["gib"]
 
     def deltaserve_stop_finetuning(self) -> bool:
         """[DeltaServe] Close FT admission. Invoked via collective_rpc from the

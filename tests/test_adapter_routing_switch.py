@@ -27,7 +27,7 @@ from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
 _PKG = _REPO / "deltaserve-plugin" / "deltaserve"
-_CONFIG = _REPO / "configs" / "serving_config_finetuning_qwen3_0.6b.yaml"
+_CONFIG = _REPO / "configs" / "preset" / "serving_config_finetuning_qwen3_0.6b.yaml"
 
 _passed = 0
 _failed = 0

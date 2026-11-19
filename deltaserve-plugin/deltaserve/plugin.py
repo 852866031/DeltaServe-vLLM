@@ -31,7 +31,8 @@ around upstream methods, never replacing their bodies:
 - ``EngineCore`` / ``EngineCoreProc``: the ``EngineHooks`` (arrival signal
   before the executor, profiling pass before the busy loop, estimator save at
   shutdown, the input thread's ADD signal) and the
-  ``deltaserve_save_estimator_state`` utility.
+  ``deltaserve_save_estimator_state`` / ``deltaserve_finetuning_status``
+  utilities.
 - ``register_vllm_serve_api_routers``: the /start_finetuning, /stop_finetuning
   and /save_estimator_state routes.
 """
@@ -211,7 +212,10 @@ def _patch_engine_core() -> None:
     from deltaserve.engine_core import (
         FtInputQueue,
         attach_engine_hooks,
+        finetuning_status,
+        metrics_summary,
         save_estimator_state,
+        telemetry,
     )
 
     EngineCore, EngineCoreProc = core_mod.EngineCore, core_mod.EngineCoreProc
@@ -423,7 +427,7 @@ def _patch_engine_core() -> None:
             ds = getattr(self, "_ds", None)
             if (ds is not None and self.shutdown_state
                     == core_mod.EngineShutdownState.REQUESTED):
-                ds.save_estimator_state()   # before the process is gone
+                ds.on_shutdown_requested()  # estimator + metrics, before the process is gone
             return orig(self, *args, **kwargs)
         return wrapper
 
@@ -500,6 +504,28 @@ def _patch_engine_core() -> None:
                 if jobs is None else jobs.status()
 
         EngineCore.deltaserve_ft_jobs = deltaserve_ft_jobs
+
+
+    if not hasattr(EngineCore, "deltaserve_finetuning_status"):
+        def deltaserve_finetuning_status(self) -> dict:
+            """Utility behind GET /finetuning_status."""
+            return finetuning_status(self)
+
+        EngineCore.deltaserve_finetuning_status = deltaserve_finetuning_status
+
+    if not hasattr(EngineCore, "deltaserve_telemetry"):
+        def deltaserve_telemetry(self, op, arg=None) -> dict:
+            """Utility behind /telemetry/{data,start,stop}."""
+            return telemetry(self, op, arg)
+
+        EngineCore.deltaserve_telemetry = deltaserve_telemetry
+
+    if not hasattr(EngineCore, "deltaserve_metrics_summary"):
+        def deltaserve_metrics_summary(self) -> dict:
+            """Utility behind GET /system_metrics."""
+            return metrics_summary(self)
+
+        EngineCore.deltaserve_metrics_summary = deltaserve_metrics_summary
 
 
 def _route_in_scheduler(scheduler, router) -> None:

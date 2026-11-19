@@ -178,7 +178,7 @@ def ref_head_loss(final_in, lm_w, norm_w, eps, ids, seq_lens, b_start, vocab):
 
 def build_synthetic_service(service_cls, *, hidden, n_layers, Hq, Hkv, Hd, inter,
                             vocab, r, lr, theta=10000.0, eps=1e-5, scaling=2.0,
-                            tied_lm_head=False, seed=0):
+                            tied_lm_head=False, seed=0, rope_scaling=None):
     """A ``LoraSftTrainerService`` subclass built on tiny random weights in the
     exact HF/PEFT naming the worker shares, with ``_build_state`` run. Returns
     ``(svc, embed_w)``. ``tied_lm_head=True`` omits ``lm_head.weight`` and
@@ -227,6 +227,7 @@ def build_synthetic_service(service_cls, *, hidden, n_layers, Hq, Hkv, Hd, inter
     meta = dict(hidden_size=hidden, num_hidden_layers=n_layers,
                 num_attention_heads=Hq, num_key_value_heads=Hkv, head_dim=Hd,
                 intermediate_size=inter, rope_theta=theta, rms_norm_eps=eps,
+                rope_scaling=rope_scaling,
                 lora_scaling=scaling, vocab_size=vocab, learning_rate=lr,
                 weight_decay=0.0, gamma=1.0, backward_fp32=True,
                 lm_head_key=lm_head_key, norm_weight_key="model.norm.weight",

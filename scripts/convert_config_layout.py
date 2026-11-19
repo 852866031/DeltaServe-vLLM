@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 """Rewrite a DeltaServe serving YAML into the sectioned finetune layout
-(finetune / throttles / slo / debug), keeping every comment next to its key.
+(finetune_param / finetune_features / throttles / slo / debug / telemetry),
+keeping every comment next to its key. Old layouts (one flat section, or the
+single ``finetune`` section) are split.
 
     python scripts/convert_config_layout.py configs/old.yaml            # print
     python scripts/convert_config_layout.py configs/old.yaml -o new.yaml
@@ -30,15 +32,26 @@ def _sections_table():
     tables = {}
     for node in ast.parse(src).body:
         if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) \
-                and node.target.id in ("FINETUNE_SECTIONS", "RETIRED_KEYS"):
+                and node.target.id in ("FINETUNE_SECTIONS", "RETIRED_KEYS",
+                                       "LEGACY_SECTIONS"):
             tables[node.target.id] = ast.literal_eval(node.value)
-    return tables["FINETUNE_SECTIONS"], tables["RETIRED_KEYS"]
+    return (tables["FINETUNE_SECTIONS"], tables["RETIRED_KEYS"],
+            tables["LEGACY_SECTIONS"])
 
 
-FINETUNE_SECTIONS, RETIRED_KEYS = _sections_table()
+FINETUNE_SECTIONS, RETIRED_KEYS, LEGACY_SECTIONS = _sections_table()
+# Sections the parser treats as finetune input (old ones are split on output).
+_FT_IN = (*FINETUNE_SECTIONS, *LEGACY_SECTIONS)
+# Where a key with no home in the table goes when it sits in an old section,
+# and where an old section's trailing comments go.
+_LEGACY_HOME = "finetune_param"
 SECTION_OF = {k: s for s, keys in FINETUNE_SECTIONS.items() for k in keys}
 _SECTION_RE = re.compile(r"^([A-Za-z_][\w-]*):\s*(#.*)?$")
 _KEY_RE = re.compile(r"^\s+([A-Za-z_][\w-]*):")
+
+
+def _home(section: str) -> str:
+    return _LEGACY_HOME if section in LEGACY_SECTIONS else section
 
 
 def convert(text: str) -> str:
@@ -54,8 +67,8 @@ def convert(text: str) -> str:
     for line in lines:
         m = _SECTION_RE.match(line)
         if m:
-            if cur in FINETUNE_SECTIONS:
-                tails[cur] += pending
+            if cur in _FT_IN:
+                tails[_home(cur)] += pending
             pending = []
             cur = m.group(1)
             order.append(cur)
@@ -65,7 +78,7 @@ def convert(text: str) -> str:
         if cur is None:
             preamble.append(line)
             continue
-        if cur not in FINETUNE_SECTIONS:
+        if cur not in _FT_IN:
             body[cur].append(line)
             continue
         if not line.strip():
@@ -80,14 +93,14 @@ def convert(text: str) -> str:
         pending = []
         if key in RETIRED_KEYS:
             continue
-        items[SECTION_OF.get(key, cur)].append(block)
-    if cur in FINETUNE_SECTIONS:
-        tails[cur] += pending
+        items[SECTION_OF.get(key, _home(cur))].append(block)
+    if cur in _FT_IN:
+        tails[_home(cur)] += pending
 
     out = list(preamble)
     emitted_ft = False
     for name in order:
-        if name in FINETUNE_SECTIONS:
+        if name in _FT_IN:
             if emitted_ft:
                 continue
             emitted_ft = True
@@ -115,14 +128,14 @@ def _check(old: str, new: str) -> None:
 
     def ft(cfg):
         out = {}
-        for sec in FINETUNE_SECTIONS:
+        for sec in _FT_IN:
             for k, v in (cfg.get(sec) or {}).items():
                 if k not in RETIRED_KEYS:
                     out[k] = v
         return out
 
     assert ft(a) == ft(b), "finetune settings changed"
-    rest = lambda c: {k: v for k, v in c.items() if k not in FINETUNE_SECTIONS}  # noqa: E731
+    rest = lambda c: {k: v for k, v in c.items() if k not in _FT_IN}  # noqa: E731
     assert rest(a) == rest(b), "non-finetune sections changed"
     for sec in FINETUNE_SECTIONS:
         for k in (b.get(sec) or {}):

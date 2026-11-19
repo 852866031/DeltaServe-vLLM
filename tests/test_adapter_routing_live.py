@@ -42,7 +42,7 @@ _FAMILIES = {
     "qwen3-14b": "serving_config_finetuning_qwen3_14b_tp2_adapter_routing.yaml",
 }
 _BASE = "qwen3-0.6b"
-_PRESET = _REPO / "configs" / _FAMILIES[_BASE]
+_PRESET = _REPO / "configs" / "preset" / _FAMILIES[_BASE]
 
 _passed = 0
 _failed = 0
@@ -127,7 +127,7 @@ def write_config(out: Path, args) -> Path:
     import yaml
 
     cfg = yaml.safe_load(_PRESET.read_text())
-    ft = cfg["finetune"]
+    ft = cfg["finetune_param"]
     src_adapter = (_PRESET.parent / ft.pop("finetuning_lora_path")).resolve()
     ft.pop("data_path")
     ft.pop("num_epochs")
@@ -198,9 +198,9 @@ def external_main(args, out: Path) -> None:
 
     cfg = yaml.safe_load(_PRESET.read_text())
     toy = (_PRESET.parent / cfg["adapters"]["lora_path_0"]).resolve()
-    toy_ft = (_PRESET.parent / cfg["finetune"]["finetuning_lora_path"]).resolve()
-    cfg["finetune"] = {"enable_finetuning": False}
-    for sec in ("throttles", "slo", "debug"):
+    toy_ft = (_PRESET.parent / cfg["finetune_param"]["finetuning_lora_path"]).resolve()
+    cfg["finetune_param"] = {"enable_finetuning": False}
+    for sec in ("finetune_features", "throttles", "slo", "debug", "telemetry"):
         cfg.pop(sec, None)
     data = {}
     for name, lines in TOPICS.items():
@@ -766,7 +766,7 @@ def main() -> None:
                     help="finetuning off: index and route existing adapters")
     args = ap.parse_args()
     global _BASE, _PRESET
-    _BASE, _PRESET = args.family, _REPO / "configs" / _FAMILIES[args.family]
+    _BASE, _PRESET = args.family, _REPO / "configs" / "preset" / _FAMILIES[args.family]
     if not os.environ.get("CUDA_VISIBLE_DEVICES"):
         raise SystemExit("set CUDA_VISIBLE_DEVICES to the GPU this may use")
 

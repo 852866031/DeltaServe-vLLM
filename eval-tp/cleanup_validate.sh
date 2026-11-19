@@ -4,14 +4,14 @@
 #   eval-tp/cleanup_validate.sh <tag> [mode ...]          (default modes: tight-half loose-half)
 #   BASE=00_base eval-tp/cleanup_validate.sh 05_worker production-600-800
 #   CO=0 eval-tp/cleanup_validate.sh 00_base_inf tight-half loose-half   (inference-only)
-#   CONFIG=configs/<variant>.yaml eval-tp/cleanup_validate.sh <tag>      (A/B a YAML variant)
+#   CONFIG=configs/preset/<variant>.yaml eval-tp/cleanup_validate.sh <tag>      (A/B a YAML variant)
 #
 # Runs the Qwen3-14B TP=2 co-serving timeline replay for each mode, sequentially,
 # into eval-tp/output/cleanup/<tag>/, then prints compare_runs.py against
 # eval-tp/output/cleanup/$BASE (default 00_base) when that run exists.
 set -u
 R=$(cd "$(dirname "$0")/.." && pwd)
-PY=${PY:-/mnt/storage/conda/envs/deltaserve-plugin/bin/python}
+PY=${PY:-/mnt/storage/conda/envs/deltaserve-v033/bin/python}
 TAG=${1:?usage: cleanup_validate.sh <tag> [mode ...]}; shift
 MODES=("$@"); [ ${#MODES[@]} -eq 0 ] && MODES=(tight-half loose-half)
 BASE=${BASE:-00_base}

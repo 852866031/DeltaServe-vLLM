@@ -141,7 +141,7 @@ class FinetuningStore:
                 f"(input_len > max_saved_finetuning_tokens={cap}); "
                 f"{sum(dropped_lens)} tokens skipped. "
                 f"Lengths: {sorted(dropped_lens)}. "
-                f"Raise ``finetune.max_saved_finetuning_tokens`` to include "
+                f"Raise ``finetune_param.max_saved_finetuning_tokens`` to include "
                 f"them, or accept the loss."
             )
         return loaded

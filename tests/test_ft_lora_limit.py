@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
-_CONFIG = _REPO / "configs" / "serving_config_finetuning_qwen3_0.6b.yaml"
+_CONFIG = _REPO / "configs" / "preset" / "serving_config_finetuning_qwen3_0.6b.yaml"
 _PAIRS = 16
 # Pair k: a request on adapter 0 at k*_PERIOD, one on adapter 1 _STAGGER later —
 # its prefill is scheduled while the first is decoding (both adapters in the

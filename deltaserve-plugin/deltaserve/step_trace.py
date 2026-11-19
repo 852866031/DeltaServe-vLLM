@@ -6,7 +6,7 @@
 One CSV row per timed engine step (plus one per rolled-back FT-only step),
 written by a daemon thread so the scheduler's hot path only pays for a
 string format and a queue put (a few µs against ≥5 ms steps). Enabled by
-``finetune.step_trace_path``; ``eval-tp/analyze_step_trace.py`` reads it.
+``telemetry.step_trace_path``; ``eval-tp/analyze_step_trace.py`` reads it.
 
 Column reference (all times in seconds, wall clocks are ``time.time()``):
 

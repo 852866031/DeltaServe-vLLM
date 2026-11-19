@@ -50,11 +50,24 @@ _HF_HOME_DEFAULT = "/mnt/storage/huggingface"
 # the inference adapter (``adapters.lora_path_0``); the preset name doubles as
 # the served model name and the output-file tag.
 PRESETS: dict[str, Path] = {
-    "llama3": _ROOT / "configs" / "serving_config_finetuning_llama3_tp2.yaml",
-    "qwen3-14b": _ROOT / "configs" / "serving_config_finetuning_qwen3_14b_tp2.yaml",
-    "qwen3-0.6b": _ROOT / "configs" / "serving_config_finetuning_qwen3_0.6b.yaml",
+    "llama3": _ROOT / "configs" / "preset" / "serving_config_finetuning_llama3_tp2.yaml",
+    "qwen3-14b": _ROOT / "configs" / "preset" / "serving_config_finetuning_qwen3_14b_tp2.yaml",
+    "qwen3-0.6b": _ROOT / "configs" / "preset" / "serving_config_finetuning_qwen3_0.6b.yaml",
 }
 DEFAULT_FAMILY = "llama3"
+
+
+def family_of_model(model: str | None) -> str | None:
+    """The preset family a base model belongs to (for the served name and the
+    output-file tag), or None if it matches none."""
+    m = (model or "").lower().replace("_", "-")
+    if "qwen3-14b" in m:
+        return "qwen3-14b"
+    if "qwen3-0.6b" in m:
+        return "qwen3-0.6b"
+    if "llama-3" in m or "llama3" in m:
+        return "llama3"
+    return None
 
 
 @dataclass
@@ -110,7 +123,7 @@ def build_server_cmd(config_path: str, port: int, base_model: str | None = None,
     slo sections are NOT passed, so ``enable_finetuning`` stays at its default
     (False) and no backward child is spawned. ``bwd_log_path`` (co only) is the
     backward-throughput CSV the server appends to; ``step_trace_path`` (co only)
-    the per-step predicted-vs-actual trace (``finetune.step_trace_path``, see
+    the per-step predicted-vs-actual trace (``telemetry.step_trace_path``, see
     eval-tp/analyze_step_trace.py). ``api_server_count``
     overrides the YAML's ``server.api_server_count``."""
     _strip_repo_from_syspath()
@@ -136,6 +149,12 @@ def build_server_cmd(config_path: str, port: int, base_model: str | None = None,
         raise SystemExit(f"[launch-tp] {config_path} has no adapters.lora_path_0 "
                          "(the inference adapter to serve)")
     infer_lora_name = Path(infer_lora_dir).name
+    # A YAML for another model than the family's (``--config`` with the
+    # default ``--family``): name the server after the YAML's model, not the
+    # default family (a Qwen3-0.6B template was served as "llama3").
+    inferred = family_of_model(base_model)
+    if inferred and inferred != family and not served_name:
+        family = inferred
     served_name = served_name or family
 
     vllm_bin = str(Path(sys.executable).parent / "vllm")

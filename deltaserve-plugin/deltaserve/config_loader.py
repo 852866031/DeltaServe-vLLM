@@ -7,17 +7,21 @@ It reads a DeltaServe-style sectioned YAML and maps it onto vLLM's existing
 ``EngineArgs`` + our ``FinetuneConfig``. It does NOT modify any upstream vLLM
 behaviour; it just produces the objects vLLM already consumes.
 
-YAML shape (see configs/serving_config_finetuning_qwen3_14b_tp2.yaml)::
+YAML shape (see configs/template_qwen3_14b_tp2.yaml)::
 
-    finetune:     # training workload + co-serving behaviour switches
+    finetune_param:     # the training job: adapter, data, epochs, lr, buffer, saves
       enable_finetuning: true
+      learning_rate: 5.0e-6
+    finetune_features:  # how co-serving runs it: graphs, saves, interrupts, pauses
       graph_ft_batches: true
-    throttles:    # how much FT is admitted next to inference
+    throttles:          # how much FT is admitted next to inference
       ft_tokens_admission_constrain_factor: -1
-    slo:          # SLO targets + the execution-time estimator
+    slo:                # SLO targets + the execution-time estimator
       ttft_slo: 0.4
-    debug:        # prints + trace / log paths
+    debug:              # log prints
       print_scheduler_add: true
+    telemetry:          # what is recorded to disk (traces, logs)
+      bwd_log_path: out/bwd_log.csv
 
     server:       # → returned separately (host/port/rank for serving)
       port: 8000
@@ -34,10 +38,10 @@ YAML shape (see configs/serving_config_finetuning_qwen3_14b_tp2.yaml)::
     engine:       # │ EngineArgs.
       gpu_memory_utilization: 0.80
 
-The four finetune sections all fold into ONE flat ``FinetuneConfig``; the
+The six finetune sections all fold into ONE flat ``FinetuneConfig``; the
 section a key belongs to is ``FINETUNE_SECTIONS``. A key found in another of the
-four sections (the pre-2026-10 layout kept the throttles under ``finetune`` /
-``slo``) still loads, with a one-line warning naming its section. Unknown
+six sections still loads, with a one-line warning naming its section; the old
+single ``finetune`` section (``LEGACY_SECTIONS``) loads with one note per file. Unknown
 finetune keys are rejected by ``FinetuneConfig`` (extra=forbid); unknown
 EngineArgs keys raise a clear ``TypeError`` from ``EngineArgs``.
 """
@@ -54,17 +58,24 @@ from vllm.engine.arg_utils import EngineArgs
 
 # Section → the FinetuneConfig fields that belong to it.
 FINETUNE_SECTIONS: dict[str, tuple[str, ...]] = {
-    "finetune": (
+    # The training job: what is trained, on what, with which hyperparameters,
+    # and where the trained adapter goes.
+    "finetune_param": (
         "enable_finetuning", "start_on_launch", "finetuning_lora_path",
         "data_path", "max_prepare", "num_epochs", "learning_rate",
         "weight_decay", "gamma", "max_saved_finetuning_tokens",
+        "adapter_save_path", "adapter_save_every_backwards",
+        "adapter_save_every_epoch", "adapter_save_keep_last",
+    ),
+    # How co-serving runs it: backward precision / graphs, activation saves,
+    # mixed-batch forward graphs, interrupts and pauses.
+    "finetune_features": (
         "backward_mps_percentage", "backward_fp32", "backward_cuda_graph",
         "backward_cuda_graph_attn_bn_max", "backward_cuda_graph_attn_l_max",
-        "backward_run_ahead_boundaries", "pause_on_arrival", "save_activations",
-        "save_attn_qkv",
+        "backward_run_ahead_boundaries", "save_activations", "save_attn_qkv",
         "save_attn_ctx", "save_resid_mid", "graph_ft_batches",
         "graph_ft_max_tokens", "graph_ft_only_batches", "forward_interruptible",
-        "ft_only_admission_grace_ms", "pause_prefill_always",
+        "ft_only_admission_grace_ms", "pause_on_arrival", "pause_prefill_always",
         "pause_until_prefill_done",
     ),
     "throttles": (
@@ -75,18 +86,30 @@ FINETUNE_SECTIONS: dict[str, tuple[str, ...]] = {
         "rps_throttle_close_time",
     ),
     "slo": (
-        "ttft_slo", "avg_tbt_slo", "avg_tbt_window_s", "max_tbt_slo", "decode_only_ft_safety_margin",
+        "ttft_slo", "avg_tbt_slo", "avg_tbt_window_s", "max_tbt_slo",
+        "decode_only_ft_safety_margin", "admission_margin", "admission_margin_k",
         "profile_on_launch", "profile_num_repeats", "validate_estimator",
         "estimator_validation_path", "estimator_state_save_path",
         "estimator_state_load_path",
     ),
+    # Log prints (stdout only).
     "debug": (
         "print_weight_hash", "print_activation_hash", "print_step_mode",
         "print_scheduler_add", "print_engine_batch_exec",
-        "print_engine_batch_done", "print_engine_req_recv", "step_trace_path",
-        "bwd_log_path", "batch_prediction_stats_path",
+        "print_engine_batch_done", "print_engine_req_recv",
+    ),
+    # Everything recorded to disk for analysis: per-step trace, per-backward
+    # log, admission statistics.
+    "telemetry": (
+        "metrics_dir", "metrics_interval_s", "steps_log_max_mb",
+        "step_trace_path", "bwd_log_path", "batch_prediction_stats_path",
     ),
 }
+# Pre-2026-11 layout: one ``finetune`` section held both finetune_param and
+# finetune_features. Still loaded (one warning per file);
+# scripts/convert_config_layout.py rewrites it.
+LEGACY_SECTIONS: tuple[str, ...] = ("finetune",)
+ALL_FINETUNE_SECTIONS: tuple[str, ...] = (*FINETUNE_SECTIONS, *LEGACY_SECTIONS)
 SECTION_OF: dict[str, str] = {k: s for s, keys in FINETUNE_SECTIONS.items()
                               for k in keys}
 # Keys old YAMLs may still carry that no longer do anything: dropped with a warning.
@@ -104,14 +127,14 @@ ADAPTER_ROUTING_SECTION = "adapter_routing"
 # (``JOB_FLAT_KEYS``), the rest is kept as ``FinetuneConfig.ft_job`` metadata.
 FT_JOB_SECTION = "ft_job"
 ADAPTER_ROUTING_KEY = "deltaserve_adapter_routing"
-_SPECIAL_SECTIONS = (*FINETUNE_SECTIONS, *_PASSTHROUGH_SECTIONS,
+_SPECIAL_SECTIONS = (*ALL_FINETUNE_SECTIONS, *_PASSTHROUGH_SECTIONS,
                      ADAPTER_ROUTING_SECTION, FT_JOB_SECTION)
 
 
 def load_yaml_config(path: str | Path, verbose: bool = True) -> dict[str, Any]:
     """Read the YAML file into a dict of sections. Validates top-level shape.
 
-    Relative path values (any key containing ``path``, e.g. ``finetuning_lora_path``,
+    Relative path values (any key containing ``path`` or ending ``_dir``, e.g. ``finetuning_lora_path``,
     ``bwd_log_path`` or ``lora_path_0``) inside the finetune sections and
     ``adapters`` are resolved to absolute against the YAML file's directory, so
     they work regardless of CWD (the worker process may run elsewhere). Mirrors
@@ -134,12 +157,12 @@ def load_yaml_config(path: str | Path, verbose: bool = True) -> dict[str, Any]:
             )
 
     base_dir = path.resolve().parent
-    for section in (*FINETUNE_SECTIONS, "adapters", ADAPTER_ROUTING_SECTION,
+    for section in (*ALL_FINETUNE_SECTIONS, "adapters", ADAPTER_ROUTING_SECTION,
                     FT_JOB_SECTION):
         body = raw.get(section) or {}
         for key, val in body.items():
-            if "path" in key.lower() and isinstance(val, str) \
-                    and not Path(val).is_absolute():
+            if ("path" in key.lower() or key.lower().endswith("_dir")) \
+                    and isinstance(val, str) and not Path(val).is_absolute():
                 body[key] = str((base_dir / val).resolve())
     # ... and the paths of the adapters listed for routing.
     for entry in (raw.get(ADAPTER_ROUTING_SECTION) or {}).get("adapters") or []:
@@ -165,20 +188,26 @@ def print_loaded_config(config: dict[str, Any], source: str | None = None) -> No
 
 
 def finetune_kwargs(config: dict[str, Any]) -> dict[str, Any]:
-    """The four finetune sections merged into flat ``FinetuneConfig`` kwargs.
+    """The finetune sections merged into flat ``FinetuneConfig`` kwargs.
 
     A key outside its own section still counts (with a warning naming the
     section it belongs in); a retired key is dropped with a warning; a key that
     appears twice is an error."""
     out: dict[str, Any] = {}
-    for section in FINETUNE_SECTIONS:
+    for section in LEGACY_SECTIONS:
+        if config.get(section):
+            dprint(f"[config] note: section '{section}' is the old layout "
+                   f"(now finetune_param + finetune_features); loaded as is — "
+                   f"scripts/convert_config_layout.py --in-place <yaml> splits it")
+    for section in ALL_FINETUNE_SECTIONS:
         for key, value in (config.get(section) or {}).items():
             if key in RETIRED_KEYS:
                 dprint(f"[config] WARNING: '{section}.{key}' is ignored "
                        f"({RETIRED_KEYS[key]}); remove it")
                 continue
             home = SECTION_OF.get(key)
-            if home is not None and home != section:
+            if (home is not None and home != section
+                    and section not in LEGACY_SECTIONS):
                 dprint(f"[config] WARNING: '{section}.{key}' belongs in "
                        f"section '{home}' (loaded anyway)")
             if key in out:
@@ -208,7 +237,7 @@ def finetune_kwargs(config: dict[str, Any]) -> dict[str, Any]:
 
 def finetune_value(config: dict[str, Any], key: str, default: Any = None) -> Any:
     """One finetune setting from a loaded config, whichever section holds it."""
-    for section in FINETUNE_SECTIONS:
+    for section in ALL_FINETUNE_SECTIONS:
         body = config.get(section) or {}
         if key in body:
             return body[key]
@@ -229,9 +258,12 @@ def adapter_routing_config(config: dict[str, Any]) -> AdapterRoutingConfig:
 
 def additional_config(config: dict[str, Any], **overrides: Any) -> dict:
     """vLLM ``additional_config`` carrying the finetune sections (+ overrides,
-    e.g. per-run log paths); None values are dropped. An ``adapter_routing``
-    section rides along as its own entry; without one the result is unchanged."""
-    kw = {**finetune_kwargs(config), **overrides}
+    e.g. per-run log paths). A None override means "not overridden": it keeps
+    the YAML's value (the launchers pass bwd_log_path=None etc. by default). An
+    ``adapter_routing`` section rides along as its own entry; without one the
+    result is unchanged."""
+    kw = {**finetune_kwargs(config),
+          **{k: v for k, v in overrides.items() if v is not None}}
     out = {"deltaserve": {k: v for k, v in kw.items() if v is not None}}
     routing = {k: v for k, v in adapter_routing_kwargs(config).items()
                if v is not None}

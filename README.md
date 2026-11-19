@@ -19,49 +19,150 @@ not have:
 - **Backward process:** one per GPU, with a hand-written LoRA backward and CUDA graphs.
 - **SLO-aware admission scheduler:** with a step-time estimator.
 - **Pre-emption and pause machinery:** keeps inference latency protected.
+- **Training outputs:** the trained adapter is saved on request or periodically as a
+  standard PEFT LoRA (merged across TP ranks), `GET /finetuning_status` reports
+  progress, and system metrics (TTFT / TBT, inference and FT throughput, GPU time
+  split, per-step LoRA time, memory per GPU) are recorded on launch. Failures stop the launch or switch finetuning off with a
+  reason; they never hang the server or train silently wrong.
 
 All of it ships as a **vLLM general plugin** (`deltaserve`, in `deltaserve-plugin/`).
 **vLLM itself is unmodified:** `vllm-upstream/` is a git submodule pinned at
-[`117afeea4`](https://github.com/vllm-project/vllm/commit/117afeea4)
-(`0.21.1rc1.dev123`), with no patches. Co-serving is enabled per launch through
+the
+[`v0.33.0`](https://github.com/vllm-project/vllm/releases/tag/v0.33.0) release
+(`4ba787ec9`), with no patches. Co-serving is enabled per launch through
 vLLM's own `--additional-config`. Without it, the server is plain vLLM.
-
-> **Looking for the original code?** The pre-plugin version (a patched vLLM fork,
-> `dserve-vllm/`), the original DeltaServe framework (`DeltaServe/`) and all the
-> phase-by-phase design notes (`INTEGRATION_PROGRESS.md`, `VLLM_FORK_CHANGES.md`, …)
-> are on the [`legacy`](https://github.com/852866031/DeltaServe-vLLM/tree/legacy)
-> branch.
 
 ---
 
 ## Contents
 
-1. [How it works](#how-it-works)
-2. [Supported models](#supported-models)
-3. [Features](#features)
+1. [Get started](#get-started)
+2. [How it works](#how-it-works)
+3. [Supported models](#supported-models)
+4. [Telemetry and live monitoring (`dserve-top`)](#telemetry-and-live-monitoring-dserve-top)
+   - [system metrics](#recorded-system-metrics) · [overhead](#overhead) · [quick start](#dserve-top-quick-start) · [over SSH](#opening-the-page-over-ssh) · [reading the page](#reading-the-page) · [going back in time](#going-back-in-time) · [exporting a run](#exporting-a-run)
+5. [Features](#features)
    - [Forward pass](#forward-pass)
    - [Backward pass](#backward-pass)
    - [CUDA graphs at a glance](#cuda-graphs-at-a-glance)
    - [Interrupts and pauses](#interrupts-and-pauses-protecting-inference-latency)
    - [Throttles and admission control](#throttles-and-admission-control)
    - [Optimizations](#optimizations)
-4. [Finetuning jobs and adapter routing](#finetuning-jobs-and-adapter-routing)
-5. [Results](#results)
-6. [Repository layout](#repository-layout)
-7. [Installation](#installation)
-8. [Launching a server](#launching-a-server)
-9. [Running experiments](#running-experiments)
-10. [Tests](#tests)
+6. [Finetuning jobs and adapter routing](#finetuning-jobs-and-adapter-routing)
+7. [Results](#results)
+8. [Repository layout](#repository-layout)
+9. [Installation](#installation)
+10. [Launching a server](#launching-a-server)
+    - [HTTP endpoints](#http-endpoints)
+    - [Saving the trained adapter](#saving-the-trained-adapter)
+    - [When something fails](#when-something-fails)
+11. [Running experiments](#running-experiments)
+12. [Tests](#tests)
+
+---
+
+## Get started
+
+The shortest path from a fresh clone to a co-serving server on one GPU
+(Qwen3-0.6B). Every step links to its full section below.
+
+**1. Clone** with the pinned vLLM submodule:
+
+```bash
+git clone --recurse-submodules https://github.com/852866031/DeltaServe-vLLM.git
+cd DeltaServe-vLLM
+```
+
+**2. Install** vLLM v0.33.0 (precompiled kernels, no CUDA build) and the plugin into
+a fresh env. On an RTX 5090, use the [RTX 5090 steps](#rtx-5090-blackwell-sm_120)
+instead (it needs CUDA 13 inside the env first).
+
+```bash
+conda create -n deltaserve python=3.12 -y && conda activate deltaserve
+pip install uv
+cd vllm-upstream
+VLLM_VERSION_OVERRIDE=0.33.0 \
+    VLLM_PRECOMPILED_WHEEL_COMMIT=4ba787ec9959e566d3b587a796dff07673324da5 \
+    VLLM_USE_PRECOMPILED=1 \
+    uv pip install --editable . --torch-backend=auto
+cd ..
+uv pip install --editable deltaserve-plugin --no-deps
+pip install peft datasets pandas matplotlib
+uv pip uninstall torchaudio     # vLLM 0.33 pins a torchaudio built for an older torch
+```
+
+**3. Download the model.** The launchers run with `HF_HUB_OFFLINE=1`, so fetch the
+weights once:
+
+```bash
+export HF_HOME=$HOME/hf-cache
+huggingface-cli download Qwen/Qwen3-0.6B-Base
+```
+
+**4. Build the LoRA adapters.** The repo ships only their configs; the weights
+(an inference adapter and the `-ft` copy the backward trains) are built locally in a
+few minutes:
+
+```bash
+python scripts/init_adapters_qwen3.py --size 0.6b
+```
+
+**5. Check the install** (CPU only, a few seconds), then **launch** a co-serving
+server from the Qwen3-0.6B template ([`configs/template_qwen3_0.6b.yaml`](configs/template_qwen3_0.6b.yaml),
+every setting commented). Finetuning starts as soon as the server is up:
+
+```bash
+python tests/test_phase1_step1.py
+python eval-tp/launch_deltaserve.py --config configs/template_qwen3_0.6b.yaml --hf-home $HF_HOME
+```
+
+**6. Send a request** from another shell. The server log prints one
+`[backward] … loss=…` line per training cycle while it serves:
+
+```bash
+curl -s localhost:8000/v1/completions -H 'content-type: application/json' \
+     -d '{"model": "qwen3-0.6b-toy-lora", "prompt": "The capital of France is", "max_tokens": 16}'
+```
+
+**7. Watch training and save the result.** The adapter being trained lives in GPU
+memory until you save it:
+
+```bash
+curl -s localhost:8000/finetuning_status          # backwards done, tokens, loss, epoch
+curl -s -X POST localhost:8000/save_adapter       # → checkpoints/qwen3-0.6b/manual-<time>/
+```
+
+The template also saves on its own (every 500 backward cycles and after each epoch,
+under `checkpoints/qwen3-0.6b/`) and logs every backward cycle to
+`logs/qwen3-0.6b/bwd_log.csv`. A saved directory is an ordinary LoRA adapter: serve it
+with `vllm serve Qwen/Qwen3-0.6B-Base --enable-lora --lora-modules sft=<dir>`, load it
+with PEFT, or set it as `finetune_param.finetuning_lora_path` to keep training
+([details](#saving-the-trained-adapter)).
+
+**Next:** the Qwen3-14B TP=2 template (`configs/template_qwen3_14b_tp2.yaml`, two
+GPUs), the [timeline benchmarks](#running-experiments) and the [tests](#tests).
 
 ---
 
 ## How it works
 
+![DeltaServe in one picture](docs/figures/overview.png)
+
+Inference requests and finetuning samples go through **one** scheduler, which
+packs FT samples into inference batches only while the latency SLOs allow it. The
+forward pass serves both. For FT samples it also saves their activations, from
+which a separate backward process trains the LoRA adapter, yielding the GPU
+whenever inference needs it. The trained adapter is published back into the
+server.
+
+**In detail** — what the plugin adds to each vLLM process:
+
 ![DeltaServe on stock vLLM](docs/figures/architecture.png)
 
-<sub>Editable source: [`docs/figures/architecture.drawio`](docs/figures/architecture.drawio)
+<sub>Editable sources: [`docs/figures/overview.drawio`](docs/figures/overview.drawio),
+[`docs/figures/architecture.drawio`](docs/figures/architecture.drawio)
 (open in draw.io / diagrams.net). Regenerate the PNG/SVG with
-`python docs/figures/make_architecture.py`.</sub>
+`python docs/figures/make_overview.py` / `make_architecture.py`.</sub>
 
 vLLM runs three kinds of processes. DeltaServe adds a fourth, the backward child.
 The plugin's entry point, `deltaserve.plugin:register`, is declared under
@@ -73,7 +174,7 @@ config fields.
 
 | Process | Stock vLLM | What DeltaServe adds | Seam (how it plugs in, no vLLM edit) |
 |---|---|---|---|
-| **API server** | OpenAI server, `AsyncLLM` | `/start_finetuning`, `/stop_finetuning`, `/save_estimator_state` | wrapper on `register_vllm_serve_api_routers` |
+| **API server** | OpenAI server, `AsyncLLM` | `/start_finetuning`, `/stop_finetuning`, `/finetuning_status`, `/system_metrics`, `/save_adapter`, `/save_estimator_state` | wrapper on `register_vllm_serve_api_routers` |
 | **EngineCore** | `EngineCoreProc`, `Scheduler` | `FinetuneScheduler`: FT injection, SLO admission, throttles, interrupt tiers A/B. `EngineHooks`: arrival counter, launch profiling pass, estimator save | `scheduler_cls`; wrappers on `EngineCore` / `EngineCoreProc` methods; input-queue class swap |
 | **Worker** (per TP rank) | `Worker`, `GPUModelRunner`, model, CUDA graphs | `DeltaServeWorker` spawns the backward child and exports weights and buffers over CUDA IPC. `DeltaServeModelRunner` builds the FT mask, keeps the timing ring, handles tier-C abort and relays results to the scheduler. `FtCudagraphDispatcher` adds the `has_ft` graph set. Accumulator hooks save FT activations | `worker_cls`; the worker adopts the runner by class swap; a dispatcher subclass with its own batch-descriptor class; wrapper on `CUDAGraphWrapper.__call__`; a custom op traced by Dynamo |
 | **Backward child** (per TP rank) | — | LoRA SFT trainer (`bwd_services/`): manual per-layer backward, CUDA graphs, fused AdamW, publish to the served LoRA slot | spawned by the worker (daemon check lifted around `start()`) |
@@ -110,7 +211,7 @@ hook is inert.
 | Family | HF architecture | Backward service | Tested on | Notes |
 |---|---|---|---|---|
 | **Qwen3** | `Qwen3ForCausalLM` | `bwd_services/qwen3.py` | **Qwen3-14B-Base, TP=2** (2× RTX 5090): primary target, full stack. Qwen3-0.6B-Base, TP=1 (smoke). Qwen3-14B / 32B at TP=4 on A100 (configs in `configs/*_A100*.yaml`) | Per-head `q_norm` / `k_norm` handled in the backward. Mixed-batch forward CUDA graphs supported. Tied `lm_head` (0.6B) resolved through the LoRA-wrapped embedding |
-| **Llama-3** | `LlamaForCausalLM` | `bwd_services/llama3.py` | Meta-Llama-3-8B, TP=1 and TP=2 | Full backward stack. Mixed-batch forward graphs not wired (FT batches run eager) |
+| **Llama-3 / 3.1 / 3.2 / 3.3** | `LlamaForCausalLM` | `bwd_services/llama3.py` | Meta-Llama-3-8B, TP=1 and TP=2; Llama-3.2-1B, TP=1 (end-to-end test) | Full backward stack. The 3.1+ RoPE rescale (`rope_type: llama3`) is reproduced exactly in the backward. Mixed-batch forward graphs not wired (FT batches run eager) |
 
 **Adding a family.** Write `bwd_services/<family>.py` (its layer forward and
 backward plus a `Family` record; everything shared lives in `bwd_services/common/`),
@@ -118,10 +219,330 @@ register it in `bwd_services/registry.py`, and add a YAML. vLLM needs no change
 unless the architecture breaks a generic assumption: module names, SwiGLU or
 RMSNorm.
 
+**RoPE:** plain, `linear` and `llama3` scaling. Any other variant (`yarn`,
+`dynamic`, `longrope`, partial rotary, multimodal) makes the worker refuse to start
+rather than train with positions that differ from the served forward.
+
 **LoRA targets:** `q_proj`, `k_proj`, `v_proj`, `o_proj` (rank 16 in the shipped
 toy adapters). **Parallelism:** tensor parallel. Each rank trains its own weight
 shard in its own child, joined by a dedicated NCCL group. Pipeline parallelism
 has not been tested.
+
+---
+
+## Telemetry and live monitoring (`dserve-top`)
+
+Two layers. The server records **system metrics**: per-request latency, per-cycle
+backward stats, 10-second summaries, GPU memory and a per-step log. Turn it on with
+`telemetry.metrics_dir`, or at runtime from `dserve-top`. On top of that feed,
+**`dserve-top`** is a live web dashboard. It shows what the engine is doing step by
+step, inference latency against the SLO, finetuning progress, throughput, adapters
+and GPU memory. You can scrub back through the run, download it as one HTML file
+that replays offline, and stop the server from it.
+
+![dserve-top on Qwen3-14B TP=2 under load](docs/figures/dserve_top_qwen3_14b_tp2.png)
+
+The same run as an exported file: [`docs/dserve-top-example.html`](docs/dserve-top-example.html)
+(53 KB, 72 s of Qwen3-14B TP=2 at about 3 req/s with finetuning running). Download it and
+open it in a browser; it replays with no server: scrub the timeline, press `▶`, hover anything.
+
+### Recorded system metrics
+
+Set `telemetry.metrics_dir` (the templates do: `logs/<model>/metrics`) and the server
+records, from the moment it starts:
+
+| File | One row per | Holds |
+|---|---|---|
+| `requests.csv` | finished inference request | TTFT, mean / max time between tokens, end-to-end latency, prompt / output tokens |
+| `backward.csv` | LoRA backward cycle | GPU time, wall time (incl. pauses while inference has the GPU), tokens, samples, loss, the backward child's GPU memory |
+| `summary.jsonl` | `metrics_interval_s` window (10 s) | TTFT / TBT p50 / p90 / p99 / max and SLO attainment; inference and FT token throughput; forward GPU time by step kind (inference-only / mixed / FT-only) and its inference vs FT share; backward GPU time; memory; run totals |
+| `memory_rank<r>.json` | GPU (written after warm-up) | model weights, KV cache, FT activation buffers, other allocations, CUDA-graph / cached memory, device total and used |
+
+`GET /system_metrics` returns the last window and the one in progress, and
+
+```bash
+python scripts/metrics_report.py logs/qwen3-14b/metrics --png report.png
+```
+
+prints a run report (latency, throughput, LoRA step time, GPU time split, memory per
+GPU) and draws TTFT per request, throughput, GPU busy time and memory.
+
+How it is measured: request times are taken in the EngineCore (arrival = the
+frontend's stamp, a token = the step that produced it), so they exclude HTTP and
+detokenization — measured against a client, about 1 ms lower. A request's TTFT
+counts in the window where its first token came out (live in `GET /system_metrics`
+at once), not when the request finishes; `requests.csv` gets the full row at the
+finish. Step GPU times are the
+runner's CUDA-event samples (the ones the SLO estimator fits on); in a mixed step the
+time is split between inference and FT by token count. The backward child shares the
+GPU (time-sliced), so forward and backward GPU seconds can overlap: each share is of
+that side's own busy time. Inter-token gaps go into 2 %-wide buckets, so their
+percentiles are within 2 % (mean, max and SLO attainment are exact). The cost is
+about 75 µs per 256-request step, writes happen on a background thread, and the window
+in progress is written when the server is asked to stop.
+
+### Overhead
+
+Recording costs **0.05 % of the engine thread on Qwen3-14B TP=2** and about 0.6 % on the
+host-bound Qwen3-0.6B. It has no measurable effect on throughput, decode latency or
+finetuning; the one visible change is **+1.6–1.8 ms on the median TTFT on 0.6B** (none
+measurable on 14B). A `dserve-top` attached and polling adds nothing measurable on top.
+
+Measured with `eval-tp/bench_metrics_overhead.py --order ABTTBA --num-prompts 2400` on
+Qwen3-0.6B (one RTX 5090, CUDA graphs): six interleaved runs, two each of recording off
+(B), recording on (A), and recording on with `dserve-top` polling the server (T), under
+the same closed-loop load (`vllm bench serve`, 32 concurrent, 512 tokens in / 128 out,
+~56 req/s, 2400 requests) with finetuning running. The 0.6B engine is host-bound
+(~2.3 ms steps), so engine-thread overhead shows most here: a worst case for larger
+models.
+
+| Δ vs recording off (mean of 2 runs) | recording on | + `dserve-top` |
+|---|---|---|
+| throughput (req/s, output tok/s) | +0.3 % | +0.5 % |
+| TPOT p50 / p99 | −0.2 % / −9 % | −0.2 % / −10 % |
+| ITL p50 / p99 | −0.1 % / −1.3 % | −0.0 % / −1.0 % |
+| FT tokens/s | −1.8 % | −0.4 % |
+| TTFT p50 | +3.2 % (56.3 → 58.1 ms) | +2.8 % (→ 57.9 ms) |
+| TTFT p99 | noise: 80–136 ms across all six runs, no consistent sign (off 112 / 122, on 136 / 129, with `dserve-top` 106 / 80) | |
+| recorder CPU on the engine thread | 0.57 %, 17 µs per step | 0.58–0.59 %, 15–16 µs per step |
+
+Where the time goes (every recorder call timed in the EngineCore): per step ~5 µs for
+token / request bookkeeping and ~9 µs for the step record and the live feed; each
+`dserve-top` poll (~4/s) is answered in ~80 µs, and its memory / adapter snapshot every
+10 s in ~90 µs; the slowest single call 0.3 ms. Files are written on a background thread.
+
+Disk: at this load (56 req/s) the recording grows ~17 MB per hour, mostly `requests.csv`
+(one row per request); the step log is ~0.7 MB per hour (plain decode steps fold into one
+entry) and is capped by `telemetry.steps_log_max_mb` (256 MB, rolling). `dserve-top` keeps
+its history in RAM up to `--history-hours` (12 h); an export is ~0.65 MB per hour of run
+(Qwen3-14B TP=2 at 3 req/s).
+
+On **Qwen3-14B TP=2** (2× RTX 5090; same six-run protocol, 16 concurrent, 512 / 128
+tokens, 1200 requests per run, finetuning running; the server is saturated, so TTFT is
+mostly queueing) the engine is GPU-bound and the cost all but disappears:
+
+| Δ vs recording off (mean of 2 runs) | recording on | + `dserve-top` |
+|---|---|---|
+| throughput | −0.15 % | −0.11 % |
+| TTFT p50 / p99 | +0.24 % / +0.73 % | +0.01 % / +0.49 % |
+| TPOT p50 / p99 | +0.13 % / +0.16 % | +0.12 % / −2.9 % |
+| ITL p50 / p99 | +0.02 % / +0.32 % | +0.07 % / +0.06 % |
+| FT tokens/s | −1.5 % | +0.1 % (noise: the off runs differ by 2.6 %) |
+| recorder CPU on the engine thread | 0.05 %, 14 µs per step | 0.10 %, 25 µs per step (the polls) |
+
+### `dserve-top`: quick start
+
+`dserve-top` is installed with the plugin (`pip install --editable deltaserve-plugin`
+puts it on the `PATH` of that env; `python -m deltaserve.top` is the same thing). It
+is standard library only: it does not import vLLM and starts instantly.
+
+**1. On the GPU machine**, in the env that has the plugin, next to the server:
+
+```bash
+dserve-top                                     # server at 127.0.0.1:8000, page on :8090
+dserve-top --server http://127.0.0.1:8001     # another port
+```
+
+The order does not matter: start it before the server and it waits; restart the
+server and it reconnects.
+
+**2. On your laptop**, open the SSH tunnel that `dserve-top` printed. It is filled
+in from your SSH session (user, address, port):
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes -L 8090:localhost:8090 -p 2222 you@gpu-box
+```
+
+**3. In your laptop's browser**, open <http://localhost:8090>.
+
+When it works, `dserve-top` prints `a browser opened the dashboard (via …)`.
+`Ctrl-C` quits; it stops the recording if it started one.
+
+### Opening the page over SSH
+
+The page is served on `127.0.0.1` of the GPU machine only (nothing is exposed on the
+network), so you reach it through an SSH tunnel. The first thing `dserve-top` prints
+is a step-by-step guide built from `$SSH_CONNECTION` (the address and port you
+logged in through):
+
+```
+  1. On your LAPTOP (a new local terminal, not this SSH session), run:
+       ssh -N -o ExitOnForwardFailure=yes -L 8090:localhost:8090 -p 2222 you@100.102.161.15
+  2. In your laptop's browser open:   http://localhost:8090
+     Check from the laptop without a browser:  curl -s http://localhost:8090/healthz
+```
+
+- **The tunnel command prints nothing.** That is normal: `-N` means "tunnel only,
+  no shell". Leave it running. `ExitOnForwardFailure=yes` makes it exit with an
+  error if the local port is taken, instead of staying up without a tunnel. Add
+  `-v` to watch it connect.
+- **Check the tunnel without a browser:** `curl -s http://localhost:8090/healthz`
+  answers `dserve-top OK · server connected` (or why it is not connected).
+- **Local port 8090 is taken on the laptop:** forward another local port, e.g.
+  `-L 18090:localhost:8090`, and open `http://localhost:18090`.
+- **Through a jump host:** add `-J <jump-host>`, or use your `~/.ssh/config`
+  alias: `ssh -N -L 8090:localhost:8090 <alias>`.
+- **VS Code Remote-SSH:** Ports panel → Forward a Port → `8090` → open the local
+  address.
+- **On the GPU machine's own desktop:** open <http://127.0.0.1:8090> directly.
+- **Port 8090 busy on the GPU machine:** `dserve-top` takes the next free port and
+  the guide uses it; `--port` picks one.
+
+Any number of browser tabs can be open: `dserve-top` polls the server once, about
+four times a second, and every tab reads from its buffers.
+
+### What `dserve-top` does to the server
+
+The dashboard needs the server's telemetry recording. `dserve-top` handles that:
+
+| The server… | dserve-top |
+|---|---|
+| is not up yet | serves the page ("waiting for the DeltaServe server …") and keeps trying every 2 s; `--no-wait` exits instead |
+| records telemetry already (`telemetry.metrics_dir` in its config) | attaches to it and leaves it running on exit |
+| does not record | starts a recording at runtime (`POST /telemetry/start`) into `--dir` (default `./dserve-top/<time>`, on the GPU machine), and stops it on exit unless `--keep-recording` |
+| goes away | keeps the history (you can still scrub and export), says "lost the server", and waits |
+| comes back (restart) | starts recording again; the page starts a fresh history for the new run |
+| has finetuning off, or an old plugin | says it has no `/telemetry` routes |
+
+The recording is the [system metrics](#recorded-system-metrics) set (`requests.csv`,
+`backward.csv`, `summary.jsonl`, `memory_rank<r>.json`) plus the rolling step log
+`steps.*.jsonl.gz`. It costs well under 1 % of the engine thread (measured in
+[System metrics](#recorded-system-metrics)). Every 10 s `dserve-top` also asks for a fresh
+per-GPU memory and adapter snapshot (`POST /telemetry/memory`) and reads
+`/v1/models`, so adapters loaded on demand show up.
+
+### `dserve-top` options
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--server URL` | `http://127.0.0.1:8000` | the DeltaServe server |
+| `--port N` | `8090` (next free) | dashboard port on the GPU machine |
+| `--bind ADDR` | `127.0.0.1` | address to serve on; keep it local and use the SSH tunnel |
+| `--dir PATH` | `./dserve-top/<time>` | where the server records, if `dserve-top` starts the recording |
+| `--interval S` | `10` | summary window (`summary.jsonl`) of a recording started here |
+| `--keep-recording` | off | leave a recording `dserve-top` started running after it quits |
+| `--poll S` | `0.25` | seconds between polls of the server |
+| `--history-hours H` | `12` | how far back the page can scrub, kept in `dserve-top`'s memory |
+| `--no-wait` | off | exit with an error if the server is not reachable now |
+
+### Reading the page
+
+The page refreshes about three times a second and scales itself to the window
+(0.75× to 2.4×): it fills the width and fits the height, so it never scrolls and
+nothing is cut short; a window under 1000 px wide gets the plain stacked layout. The only button that changes
+the server is `■ STOP`.
+
+| Panel | Shows |
+|---|---|
+| Header | model, TP size, how long it has been recording, FT state (running · backward / filling, stopped, disabled: hover for why), connection, recording dir (hover for the full path) |
+| At a glance (top row) | TTFT p99 over the last minute (green / red against the SLO), TTFT SLO met since start, TBT SLO met this window, inference and FT tokens/s (last 10 s), loss |
+| Engine | every engine step as a bar, newest on the right: FT (bottom), inference prefill, decode tokens, on a √ scale. Runs of plain decode steps fold into one growing `d×N` block. Under each bar: the FT admission decision (table below) and the FT tokens admitted. `✗` = an FT-only step pre-empted for an arriving request. Hover a bar for its GPU ms, CUDA graph / eager, backward running / paused. Below: the last step, and GPU busy over the last 10 s for inference forward, FT forward and LoRA backward (hover for how it is measured) |
+| TTFT, TPOT | side by side: p50 / p99 per second against the SLO line (TTFT counted when the first token comes out; TPOT per finished request); range 1 (default) / 5 / 30 / 60 min |
+| Finetuning progress | epoch and progress through it, samples, tokens trained and tokens/s, ETA for the epoch and all epochs, loss curve, backward GPU / wall ms and paused share, cycles, buffer fill, admission open / closed, estimator fitted; tokens/s over the last 10 s: inference output and prompt, FT forwarded and trained |
+| Adapters | adapters served by the API; the host (CPU) adapter cache with each adapter's role (FT / inference), rank, size and whether it sits in a GPU slot or host only (pinned = the FT adapter); each GPU's LoRA slots and what is in them |
+| Memory | one bar per GPU: weights, KV cache, LoRA adapter slots, FT buffers, other, cached / CUDA graphs, backward child + other processes, free. Below: the LoRA slot size and the backward child's memory (allocated / peak / reserved, LoRA masters + grads + Adam) |
+
+FT admission codes under the engine bars (`ADMIT_CODES` in `ft_scheduler.py`):
+
+| Code | Meaning |
+|---|---|
+| `A` | admitted |
+| `S` | SLO: no latency headroom, or cut short |
+| `F` | buffer: admitted what fit, or full |
+| `C` | step token budget: admitted what fit, or none left |
+| `B` | backward running (the buffer is being trained) |
+| `T` | admission closed (throttle, or epoch flush) |
+| `X` | finetuning not started or disabled |
+| `E` | corpus finished |
+| `D` | decode-only step (admission phase `prefill`) |
+| `K` | waiting for prefill credit (`match_prefill_workload_factor`) |
+
+Request times are measured in the engine, about 1 ms below what a client sees.
+Forward and backward share the GPU, so their busy fractions can add up to more
+than 100 %.
+
+### Going back in time
+
+The bar at the bottom of the page covers the whole history `dserve-top` holds (the
+last `--history-hours`). Behind the slider is a strip of inference load (blue) and FT
+load (orange), with red ticks on the seconds where the TTFT p99 broke the SLO, so
+the bad moments are easy to find.
+
+| Do | To |
+|---|---|
+| drag the slider, or click on it | show that moment in every panel: the batches up to it, the charts ending at it, FT status, memory and adapters as they were |
+| `←` / `→` (`Shift`: 1 min) | step 5 s back / forward |
+| `Home` | jump to the start of the history |
+| `▶` (`Space`), speed 1× / 10× / 60× | play from the cursor; from live it starts 5 min back |
+| `⏭ LIVE` (`End`) | jump back to the newest data and follow it again (`● LIVE`) |
+| `■ STOP` | stop the server, as `Ctrl-C` on the launcher would (asks first). In-flight requests are dropped; the estimator state and telemetry are saved; `dserve-top` keeps running with the history. Works only when `dserve-top` runs on the server's machine |
+
+While you look at the past, data keeps arriving in the background. The label shows
+the cursor's time and how far behind live it is (`−mm:ss`).
+
+When the server stops, the history stays: scrub and export as long as `dserve-top`
+runs (reloading the page reloads the history). It is reset only when a new server
+run connects, so export first if you restart the server.
+
+### Exporting a run
+
+**`⤓ HTML`** downloads the history as one self-contained HTML file: the page with
+the data gzip'd and embedded. Open it anywhere, offline, with no server and no
+`dserve-top`. It replays with the same scrubber and says `replay · exported <time>`
+in the header. Attach it to an issue, mail it, or keep it next to the results.
+
+The file is capped at **50 MB**. Above that, the oldest part is dropped and the
+newest kept. The button shows the current size estimate.
+
+| Load | Per second of run | 12 h (default history) | 50 MB holds |
+|---|---|---|---|
+| Qwen3-14B TP=2, 3 req/s, FT running (measured) | ≈ 0.18 KiB | ≈ 8 MB | ≈ 75 h |
+| busier: ~6× the non-decode steps | ≈ 0.6 KiB | ≈ 26 MB | ≈ 20–30 h |
+
+Most of it is the step stream (65 B/s gzip'd at the measured load), then the
+per-second rows (51 B/s) and status snapshots every 2 s (23 B/s); base64 adds a
+third. Plain decode steps fold into one entry, so a quiet server costs almost
+nothing. With the default 12 h history the cap rarely matters; it applies with a
+long `--history-hours` on a busy server.
+
+From the command line, the same file:
+
+```bash
+curl -o run.html http://localhost:8090/api/export            # ≤ 50 MB
+curl -o run.html "http://localhost:8090/api/export?max_mb=10"
+```
+
+### `dserve-top` troubleshooting
+
+| You see | Means / do |
+|---|---|
+| the tunnel command prints nothing | normal (`-N`); test it with `curl -s http://localhost:8090/healthz` on the laptop |
+| `bind [127.0.0.1]:8090: Address already in use` (tunnel exits) | the laptop's port 8090 is taken: `-L 18090:localhost:8090`, open `:18090` |
+| browser: connection refused | the tunnel is not running, or `dserve-top` is not; `/healthz` tells which |
+| header: waiting for the DeltaServe server | the server is not up (yet) at `--server`; `dserve-top` connects when it is |
+| `… has no /telemetry routes` | the server runs with finetuning off (`finetune_param.enable_finetuning`) or an old plugin |
+| `could not start recording` | the server could not create `--dir` (permissions, disk); pass another `--dir` |
+| `dserve-top: command not found` | not in the plugin's env: activate it, or `python -m deltaserve.top` |
+| memory / adapters panels say waiting | the first per-GPU snapshot comes within ~10 s of connecting |
+
+### Under the hood: the feed and the endpoints
+
+| Endpoint | Of | Returns |
+|---|---|---|
+| `/` | dserve-top | the page (`deltaserve/top_page.html`) |
+| `/api/state?steps_since&series_since&snaps_since&mems_since&models_since` | dserve-top | what is new since the page's last poll; the first poll gets the whole history (gzip'd) |
+| `/api/export?max_mb=50` | dserve-top | the single-HTML export |
+| `POST /api/stop` | dserve-top | the `■ STOP` button: forwards to the server's `POST /shutdown` (needs the header `X-DServe-Stop: 1`) |
+| `/healthz` | dserve-top | `dserve-top OK · server connected` / not connected (why) |
+| `GET /telemetry/data?steps_since&series_since` | server | the live feed: steps since a sequence number, per-second rows since a time, current window, FT status |
+| `POST /telemetry/start` / `stop` / `memory` | server | start / stop a recording at runtime; refresh the per-GPU memory and adapter snapshot |
+| `POST /shutdown` | server | SIGINT to the API server, so vLLM shuts down as on `Ctrl-C`; loopback clients only (403 otherwise) |
+
+On the server, `live.LiveFeed` inside the telemetry recorder builds the step stream
+(plain decode steps folded into `d×N` runs; FT admission codes stamped by
+`admit_ft_to_step`) and the per-second rows. While it records, the step stream is
+also written to `steps.*.jsonl.gz` in the recording dir, rolling under
+`telemetry.steps_log_max_mb` (256 MB).
 
 ---
 
@@ -136,7 +557,7 @@ Every step is one vLLM batch. What runs depends on what the batch contains:
 | **Inference-only** | prefill and/or decode | stock vLLM | ✅ stock: piecewise, plus FULL for uniform decode | — |
 | **Mixed** | inference + FT samples | compiled forward | ✅ **`has_ft` piecewise set** (`graph_ft_batches`, Qwen3), up to `graph_ft_max_tokens` (512) padded tokens; larger batches run compiled without a graph. Never FULL | `torch.ops.vllm.dserve_save_rows`, a capturable op fed by persistent index tensors |
 | **Mixed** (graphs off / Llama-3) | inference + FT | eager | ❌ | Python forward hooks (slice fast path) |
-| **FT-only** | only FT samples (idle GPU) | compiled + graphs with `graph_ft_only_batches`, else eager | ✅ same `has_ft` set (opt-in) / ❌ | same as above |
+| **FT-only** | only FT samples (idle GPU) | compiled + graphs with `graph_ft_only_batches`, else eager | ✅ with `graph_ft_only_batches`: replays the mixed batches' `has_ft` graphs; ❌ otherwise (default) | same as above |
 
 - FT samples are **prefill-only**. They run once, hold no KV past the step, emit no
   tokens, and are invisible to clients.
@@ -152,6 +573,21 @@ Every step is one vLLM batch. What runs depends on what the batch contains:
 The trainer is a hand-written LoRA SFT backward (no autograd), gradchecked against
 autograd to ~1e-7. It rematerializes each layer from the saved activations,
 backpropagates, and steps an fp32 master copy of the LoRA weights.
+
+**This is the template every supported family follows.** The loop, the LM head,
+the optimizer, the TP collectives, the three CUDA graphs and the publish are shared
+(`bwd_services/common/trainer.py`, `graph.py`). A family file (`llama3.py`,
+`qwen3.py`) supplies only its per-layer math through a `Family` record: the layer
+forward recompute, the layer backward and its graphed variant, and its weight names.
+What differs per family:
+
+| Family | Layer forward recompute / backward adds |
+|---|---|
+| Llama-3 / 3.1 / 3.2 / 3.3 | RoPE with the model's scaling (`llama3` for 3.1+); saved q/k are post-RoPE |
+| Qwen3 | per-head `q_norm` / `k_norm` RMSNorm before RoPE, and their backward; saved q/k are taken at the norm inputs |
+
+A new family follows the same table by providing those functions
+([Adding a family](#supported-models)).
 
 | Stage | What it does | CUDA graph? | Precision |
 |---|---|---|---|
@@ -186,7 +622,7 @@ failure, with identical gradients.
 Two directions of contention, two sets of mechanisms:
 
 **1. An inference request arrives while an FT-only forward is about to run or is
-running. That forward is pre-empted.** Enabled by `finetune.forward_interruptible`.
+running. That forward is pre-empted.** Enabled by `finetune_features.forward_interruptible`.
 
 | Tier | When | What happens | TP |
 |---|---|---|---|
@@ -224,12 +660,49 @@ applies. The throttles shape admission further:
 | **Step-time estimator** (`slo.profile_on_launch`, `profile_num_repeats`) | 6-parameter model `T ≈ α·S + β·T_in + γ·T_ft + δ·B_d + ε·K + c`, with separate coefficients for 5 regimes (inference prefill, FT-only, decode-only, decode with backward running, FT-mixed). Seeded by a profiling pass at launch, refit online every 256 steps | profiling on |
 | `slo.coserving_admission_phase` | `prefill`: FT rides only steps that carry inference prefill (or idle steps). `both`: FT may also ride decode-only / mixed steps (`BothPhaseFinetuneScheduler`) | `prefill` |
 | `slo.decode_only_ft_safety_margin` | with `both`: scale `max_tbt_slo` on decode-only steps | `0.7` |
+| `slo.admission_margin` / `admission_margin_k` | how much the step-time prediction is inflated before the SLO gate: `legacy` = ×(1 + 1.5·RMSE in seconds), ≈ 0.2 % in practice; `relative` = ×(1 + k·relative RMSE of the regime); `absolute` = + k·RMSE. See [The admission margin](#the-admission-margin) | `relative` / `1.5` (presets pin `legacy`) |
 | `throttles.ft_tokens_admission_constrain_factor` | cap FT tokens at `factor × inference-prefill tokens` per step (`-1` = off) | `-1` |
 | `throttles.match_prefill_workload_factor` | leaky bucket: admit one FT sample once accumulated prefill × factor covers its length (`0` = off) | `0` |
 | `throttles.fwd_token_throttle_enable` / `fwd_token_throttle` | pause the backward when the batch's total tokens ≥ threshold | off / 1024 |
 | `throttles.rps_throttle_*` | close FT admission above `close_rps`, reopen below `open_rps` (hysteresis, sliding window, minimum close time) | off |
-| `finetune.start_on_launch` | open admission at launch, or wait for `POST /start_finetuning` | `true` (`false` in the shipped YAMLs) |
+| `finetune_param.start_on_launch` | open admission at launch, or wait for `POST /start_finetuning` | `true` (`false` in the shipped YAMLs) |
 | Buffer accounting | FT budget ≤ free activation-buffer space; flush when the next-smallest sample won't fit | always |
+
+#### The admission margin
+
+On a step with running decodes, admission adds FT samples until the predicted step time
+reaches `max_tbt_slo`, so whatever the estimator under-predicts lands as a step over the
+limit. The original margin multiplies the prediction by 1 + 1.5·RMSE with the RMSE in
+**seconds**: with RMSEs of 1–3 ms that is ×1.002–1.005, effectively none. `relative`
+uses the regime's relative error instead (3.3 % for mixed steps on Qwen3-14B TP=2, so
+k = 1.5 adds 5 %).
+
+Measured with `eval-tp/margin_ab.py` on Qwen3-14B TP=2 (2× RTX 5090, production preset,
+`max_tbt_slo` 50 ms, TTFT SLO 0.4 s), replaying `timeline_margin_stress.csv`
+(`scripts/timelines/margin_stress_gen.py`: 275 requests in 120 s, Poisson at 1.5 / 3 req/s
+alternating every 15 s, prompts 16–160 tokens log-uniform, outputs 64–256: decodes are
+always running and prefill shapes vary, the case where FT is packed up to the TBT
+limit). Two interleaved runs per arm:
+
+| `admission_margin` | FT steps over 50 ms | by how much | actual ÷ admitted prediction, p50 · p95 | TTFT met | FT tokens/s |
+|---|---|---|---|---|---|
+| `legacy` (presets) | **21 / 205 (10.2 %)** | 0.5–3.5 ms | 0.98 · 1.06 | 100 % | 57 |
+| `relative`, k = 1.0 | 7 / 207 (3.4 %) | 0.1–1.5 ms | 0.96 · 1.03 | 100 % | 56 |
+| `relative`, k = 1.5 (default) | **4 / 205 (2.0 %)** | 0.0–2.2 ms | 0.94 · 1.02 | 100 % | **56** |
+| `absolute`, k = 1.5 | 3 / 194 (1.5 %) | 0.2–1.4 ms | 0.93 · 1.01 | 100 % | 54 |
+
+`relative` with k = 1.5 cuts the steps that break the TBT limit by 5× for −1 % FT
+throughput (within run-to-run noise: the two legacy runs gave 56 and 58): it trims the
+last FT sample on steps already at the limit, while most FT tokens ride steps with room
+or FT-only steps. At a fixed 50 ms limit `absolute` is about the same thing (1.5 × a
+1.6 ms RMSE ≈ 5 % of 48 ms); the two differ when the step at the limit is much longer
+or shorter than the steps the RMSE was measured on (another `max_tbt_slo`, model or
+GPU), where an error in seconds no longer matches the step and a relative one does.
+`relative` with k = 1.5 is the default; the presets under `configs/preset/` pin `legacy` so
+they reproduce the published runs. Tested with admission phase `prefill`; with `both` the
+margin also inflates decode-only predictions (≈ 4.7 % relative error there), untested.
+Steps without FT are not affected; inference-only prefill steps exceeded 50 ms on their
+own in 72–80 % of the cases in every arm, which no admission setting can change.
 
 ### Optimizations
 
@@ -356,7 +829,7 @@ Otherwise it runs in a CPU process in the lowest scheduling class, with
 Its state is a checkpointed running sum, so moving between the two costs
 nothing.
 
-**What it needs on the GPU** (`configs/serving_config_finetuning_qwen3_14b_tp2_adapter_routing.yaml`
+**What it needs on the GPU** (`configs/preset/serving_config_finetuning_qwen3_14b_tp2_adapter_routing.yaml`
 is the worked example for two 32 GB cards):
 
 - **The encoder lives in a vLLM worker** — the last tensor-parallel rank by
@@ -432,7 +905,7 @@ it. `docs/adapter_routing_scheduling.md` walks through the whole design.
 ## Results
 
 Qwen3-14B-Base, TP=2 on 2× RTX 5090, co-serving the shipped preset
-(`configs/serving_config_finetuning_qwen3_14b_tp2.yaml`), TTFT SLO 0.4 s. Three
+(`configs/preset/serving_config_finetuning_qwen3_14b_tp2.yaml`), TTFT SLO 0.4 s. Three
 inference workloads replayed from recorded traces:
 
 | Workload | Requests | Span | Rate |
@@ -455,6 +928,19 @@ this plugin on stock vLLM. Each figure is the mean of two runs.
 
 Reproduce with `eval-tp/cleanup_validate.sh` (see [Running experiments](#running-experiments)).
 
+**vLLM v0.33.0 (current pin) vs the previous pin (117afeea4)**, same plugin and preset:
+
+| Workload | TTFT p50 | TTFT p99 | FT throughput | TTFT SLO satisfaction |
+|---|---|---|---|---|
+| tight-half | 110.5 → **102.9 ms** | 138 → 143 ms | 295 → **360 tok/s (+22 %)** | 100 % → 100 % |
+| loose-half | 104.2 → **87.8 ms** | 134 → 135 ms | 579 → **626 tok/s (+8 %)** | 100 % → 100 % |
+| production-600-800 | 76.1 → **68.9 ms** | 99.8 → **89.3 ms** | 401 → **460 tok/s (+15 %)** | 100 % → 100 % |
+
+vLLM itself got faster (decode step 18.3 → 14.9 ms, prefill 40 → 36 ms) and its CUDA
+graphs use 6.8 → 4.0 GiB, leaving ~15 % more KV cache. One regression, upstream and not
+FT-specific: the host dispatch of piecewise prefill steps grew 2 → ~20 ms (inference-only
+prefills too); async scheduling hides it.
+
 ---
 
 ## Repository layout
@@ -468,7 +954,7 @@ DeltaServe-vLLM/
 │       ├── config.py                  FinetuneConfig: every flag, documented
 │       ├── config_loader.py           YAML → vLLM CLI args (+ --additional-config)
 │       ├── engine_config.py           worker_cls / scheduler_cls / async defaults
-│       ├── engine_core.py             EngineHooks: arrival signal, profiling, input queue
+│       ├── engine_core.py             EngineHooks: arrival signal, profiling (failure → FT off), input queue, status
 │       ├── ft_scheduler.py            FinetuneScheduler: injection, SLO admission, tiers A/B
 │       ├── ft_scheduler_both.py       BothPhaseFinetuneScheduler (admission phase "both")
 │       ├── estimator.py               step-time estimator + tracker
@@ -482,15 +968,20 @@ DeltaServe-vLLM/
 │       ├── accumulate.py              per-layer activation-save hooks
 │       ├── ft_save_op.py              torch.ops.vllm.dserve_save_rows
 │       ├── backward_process.py        child process launch / IPC
+│       ├── adapter_io.py              trained-adapter checkpoints: PEFT writer, TP shard merge, save results
+│       ├── metrics.py                 system metrics recorder (telemetry.metrics_dir) + per-GPU memory snapshot
+│       ├── live.py                    live feed for the dashboard: step stream, per-second series, rolling step log
+│       ├── top.py, top_page.html      dserve-top: starts recording, serves the dashboard, prints the SSH guide
 │       ├── bwd_services/              backward trainers
 │       │   ├── base.py                recv loop, _maybe_pause
 │       │   ├── registry.py            HF arch → service
-│       │   ├── common/                ops, attention, ffn, head, tp, trainer, graph
-│       │   ├── llama3.py              Llama-3 family
+│       │   ├── common/                ops (RoPE incl. llama3 scaling), attention, ffn, head, tp, trainer (+ adapter saves), graph
+│       │   ├── llama3.py              Llama-3 / 3.1 / 3.2 / 3.3 family
 │       │   └── qwen3.py               Qwen3 family
-│       └── api.py                     HTTP routes
-├── vllm-upstream/                     stock vLLM @ 117afeea4 (git submodule, no patches)
-├── configs/                           serving YAMLs (5090 + A100 presets)
+│       └── api.py                     HTTP routes: start/stop, finetuning_status, save_adapter, save_estimator_state
+├── vllm-upstream/                     stock vLLM v0.33.0 (git submodule, no patches)
+├── configs/                           template_*.yaml (commented starting points, one per model)
+│   └── preset/                        the configs behind experiments + tests (5090 + A100)
 ├── adapters/                          toy LoRA adapters (inference + "-ft" training target)
 ├── data/                              datasets: FT corpora (alpaca_1000.txt, test_dataset.txt),
 │                                      request traces (timelines/5090, timelines/A100)
@@ -499,7 +990,9 @@ DeltaServe-vLLM/
 ├── eval-arxiv/                        long-context probe (16k, arxiv summarization)
 ├── scripts/                           adapter builders, config converter, timeline generators (timelines/)
 ├── tests/                             standalone test scripts (+ run_all.sh)
-└── docs/figures/                      architecture figure (+ generator), result plots
+└── docs/
+    ├── figures/                       overview + architecture figures (+ generators), result plots
+    └── dserve-top-example.html        an exported dserve-top run (opens offline)
 ```
 
 ---
@@ -528,14 +1021,18 @@ pip install uv            # for --torch-backend=auto
 # 3. Stock vLLM, editable, with its precompiled kernels (no CUDA build).
 #    VLLM_PRECOMPILED_WHEEL_COMMIT pins the .so files to the submodule commit.
 cd vllm-upstream
-VLLM_VERSION_OVERRIDE=0.21.1rc1.dev123+g117afeea4.precompiled \
-    VLLM_PRECOMPILED_WHEEL_COMMIT=117afeea4665367a3066c1df58d4082d07fcc946 \
+VLLM_VERSION_OVERRIDE=0.33.0 \
+    VLLM_PRECOMPILED_WHEEL_COMMIT=4ba787ec9959e566d3b587a796dff07673324da5 \
     VLLM_USE_PRECOMPILED=1 \
     uv pip install --editable . --torch-backend=auto
 cd ..
 
 # 4. The plugin (pure Python; vLLM discovers it through its entry point)
 uv pip install --editable deltaserve-plugin --no-deps
+
+# vLLM 0.33 pins torchaudio 2.11 next to torch 2.14; transformers imports it and
+# its CUDA-version check fails. Text-only serving does not need it:
+uv pip uninstall torchaudio
 
 # 5. Eval / adapter-building extras
 pip install peft datasets pandas matplotlib
@@ -585,17 +1082,18 @@ which nvcc && nvcc --version     # MUST be $CONDA_PREFIX/bin/nvcc, release 13.0
 # vLLM (precompiled, pulls torch cu130) + the plugin
 pip install uv
 cd vllm-upstream
-VLLM_VERSION_OVERRIDE=0.21.1rc1.dev123+g117afeea4.precompiled \
-    VLLM_PRECOMPILED_WHEEL_COMMIT=117afeea4665367a3066c1df58d4082d07fcc946 \
+VLLM_VERSION_OVERRIDE=0.33.0 \
+    VLLM_PRECOMPILED_WHEEL_COMMIT=4ba787ec9959e566d3b587a796dff07673324da5 \
     VLLM_USE_PRECOMPILED=1 \
     uv pip install --editable . --torch-backend=auto
 cd ..
 uv pip install --editable deltaserve-plugin --no-deps
 pip install peft datasets pandas matplotlib
+uv pip uninstall torchaudio     # vLLM 0.33 pins torchaudio 2.11 next to torch 2.14
 
 # Check, then trigger the one-time FlashInfer JIT
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_capability())"
-# expect: 2.11.0+cu130 13.0 (12, 0)
+# expect: 2.14.0+cu132 13.2 (12, 0)
 python -c "from vllm import LLM; print(LLM('facebook/opt-125m').generate('Hello'))"
 ```
 
@@ -614,10 +1112,16 @@ the TP floor on that hardware. No MPS daemon is assumed
 
 ### Models and adapters
 
-Set `HF_HOME` to your weight cache (`HF_HUB_OFFLINE=1` once downloaded). Every
-serving YAML needs two adapter directories: an **inference** adapter, served by
-name, and an **`-ft`** copy that the backward trains. The toy adapters are
-committed under `adapters/`. To rebuild them:
+Set `HF_HOME` to your weight cache. The launchers set `HF_HUB_OFFLINE=1` unless you
+set it yourself, so download each base model once first
+(`huggingface-cli download Qwen/Qwen3-14B-Base`), and pass `--hf-home` (the
+launcher's built-in default is this project's own machine).
+
+Every serving YAML needs two adapter directories: an **inference** adapter, served
+by name, and an **`-ft`** copy that the backward trains. `adapters/` holds only
+their configs; the weights (`adapter_model.safetensors`) are not in the repo, so
+build them once (a few minutes; the 14B one uses both GPUs). A launch whose FT
+adapter has no weights stops at startup with an error saying so.
 
 ```bash
 python scripts/init_adapters_qwen3.py              # adapters/qwen3-14b-toy-lora{,-ft}  (Qwen/Qwen3-14B-Base)
@@ -631,23 +1135,39 @@ python scripts/init_adapters_llama3.py             # adapters/llama3-toy-lora{,-
 
 ### The serving YAML
 
-Launchers turn one YAML (`configs/`) into a `vllm serve` command. The co-serving
-sections go into `--additional-config`. The rest become ordinary vLLM flags.
+Launchers turn one YAML into a `vllm serve` command. The co-serving sections go
+into `--additional-config`. The rest become ordinary vLLM flags.
 
 | Section | Holds |
 |---|---|
-| `finetune` | the FT job (corpus `data_path`, FT adapter, epochs, lr, buffer size `max_saved_finetuning_tokens`), forward/backward graph flags, activation saves, interrupts, pauses |
+| `finetune_param` | the training job: switch, FT adapter, corpus `data_path`, epochs, lr, weight decay, buffer size `max_saved_finetuning_tokens`, adapter checkpoints (`adapter_save_*`) |
+| `finetune_features` | how co-serving runs it: backward precision and CUDA graphs, activation saves, mixed-batch forward graphs, interrupts, pauses |
 | `throttles` | admission shapers ([table above](#throttles-and-admission-control)) |
-| `slo` | `ttft_slo`, `avg_tbt_slo`, `max_tbt_slo`, estimator profiling, admission phase |
-| `debug` | log switches (`print_scheduler_add`, `print_engine_batch_exec`, …) and trace paths |
+| `slo` | `ttft_slo`, `avg_tbt_slo`, `max_tbt_slo`, estimator profiling |
+| `debug` | log prints (`print_scheduler_add`, `print_engine_batch_exec`, …) |
+| `telemetry` | what is recorded to disk: system metrics `metrics_dir` ([below](#recorded-system-metrics)), per-backward log `bwd_log_path`, per-step trace `step_trace_path`, admission stats |
 | `model`, `engine`, `parallel`, `lora`, `adapters`, `server` | plain vLLM settings: base model, memory, TP size, LoRA limits, inference adapter, port |
 
-`finetune.*` fields are documented one by one in
+Every finetune key is documented in
 [`deltaserve-plugin/deltaserve/config.py`](deltaserve-plugin/deltaserve/config.py).
-Relative paths resolve against the YAML's directory. Old flat-layout YAMLs still
-load (with a warning); `scripts/convert_config_layout.py` rewrites them.
+Relative paths resolve against the YAML's directory. Older layouts (a single
+`finetune` section, or no sections) still load, with a note;
+`scripts/convert_config_layout.py --in-place <yaml>` rewrites them, keeping comments.
 
-**Presets:**
+**Templates** (`configs/`): start here. Each is the validated preset for its model
+with every setting commented, finetuning opened at launch, the per-batch prints off,
+and adapter checkpoints (`checkpoints/<model>/`) plus the backward log
+(`logs/<model>/`) on.
+
+| YAML | Model | GPUs |
+|---|---|---|
+| `template_qwen3_14b_tp2.yaml` | Qwen3-14B-Base | 2 GPUs, TP=2 (e.g. 2× 5090) |
+| `template_qwen3_0.6b.yaml` | Qwen3-0.6B-Base | 1 GPU |
+| `template_llama3_8b.yaml` | Meta-Llama-3-8B (3.1 / 3.2 / 3.3: change `model`) | 1 GPU |
+
+**Presets** (`configs/preset/`): the exact configs behind the experiments, tests and
+the launchers' `--family` names. Change these only together with the runs they
+reproduce.
 
 | YAML | Model | GPUs |
 |---|---|---|
@@ -663,6 +1183,7 @@ load (with a warning); `scripts/convert_config_layout.py` rewrites them.
 ```bash
 export HF_HOME=/path/to/hf-cache HF_HUB_OFFLINE=1
 
+python eval-tp/launch_deltaserve.py --config configs/template_qwen3_14b_tp2.yaml   # a template
 python eval-tp/launch_deltaserve.py --family qwen3-14b                     # Qwen3-14B TP=2 preset
 python eval-tp/launch_deltaserve.py --family qwen3-14b --start-finetuning  # …and open FT admission once healthy
 python eval-tp/launch_deltaserve.py --family qwen3-0.6b                    # single-GPU smoke
@@ -693,10 +1214,53 @@ curl -X POST localhost:8000/start_finetuning        # open FT admission (start_o
 curl -X POST localhost:8000/stop_finetuning         # close it
 curl -X POST localhost:8000/save_estimator_state -H 'content-type: application/json' \
      -d '{"path": "estimator.json"}'                # dump the fitted estimator
+curl localhost:8000/finetuning_status               # progress: backwards, tokens, loss, epoch, admission
+curl localhost:8000/system_metrics                 # system metrics (telemetry.metrics_dir): TTFT/TBT, throughput, GPU time, memory
+dserve-top                                          # live web dashboard (see Monitoring with dserve-top)
+curl -X POST localhost:8000/save_adapter -H 'content-type: application/json' \
+     -d '{"path": "out/my-adapter"}'                # write the trained adapter now (PEFT format)
 ```
 
-Per-cycle training progress goes to the server log (`[backward] <ms>ms (graph)
-loss=… n=… epoch=…`) and, if `bwd_log_path` is set, to a CSV.
+`GET /finetuning_status` returns whether finetuning is running (or why it was
+switched off), backward cycles done, tokens trained, last loss and the mean of the
+last 20, epoch, buffer fill and corpus progress. Under TP it is the EngineCore's
+view, fed by every rank's relayed acks. Per-cycle progress also goes to the server
+log (`[backward] <ms>ms (graph) loss=… n=… epoch=…`) and, if
+`telemetry.bwd_log_path` is set, to a CSV.
+
+### Saving the trained adapter
+
+The adapter being trained lives in GPU memory. Save it with `POST /save_adapter`
+or periodically:
+
+| `finetune_param.*` | Writes | Default |
+|---|---|---|
+| `adapter_save_path` | root directory for the saves below; `POST /save_adapter` without a `path` writes `<root>/manual-<time>` | unset |
+| `adapter_save_every_backwards: N` | `<root>/backward-<N>` after every N-th backward cycle | `0` (off) |
+| `adapter_save_every_epoch` | `<root>/epoch-<E>`: the adapter after the last backward of epoch E | `false` |
+| `adapter_save_keep_last: K` | keep only the newest K `backward-*` saves (epoch and manual saves are kept) | `0` (all) |
+
+Each save is a standard PEFT LoRA directory: `adapter_model.safetensors` (the fp32
+masters, under TP merged from every rank's shard), the source adapter's
+`adapter_config.json`, and `trainer_state.json` (cycles, tokens, last loss, epoch,
+lr). It loads with `vllm serve --lora-modules name=<dir>`, with PEFT, or as
+`finetune_param.finetuning_lora_path` to keep training from it (the optimizer state starts
+fresh). The backward child writes it between cycles, so the snapshot is consistent
+and FT admission is not held for it. `POST /save_adapter` waits until it is on disk
+(`{"wait": false}` returns at once; `timeout_s`, default 300).
+
+### When something fails
+
+| Failure | Behaviour |
+|---|---|
+| FT adapter missing or empty | the worker refuses to start, with the path in the error |
+| the backward child cannot build its training state (missing weight, bad TP geometry, …) | the child's error comes back in its first reply; the launch aborts with it |
+| unsupported RoPE variant | the launch aborts (see [Supported models](#supported-models)) |
+| the launch profiling pass raises | finetuning is switched off with the reason; the server serves inference |
+| the backward child dies or stops answering | finetuning is switched off for the run (also under TP); inference continues |
+
+The reason shows in `GET /finetuning_status` as `disabled_reason`, and
+`POST /start_finetuning` cannot reopen a disabled run.
 
 ---
 
@@ -742,7 +1306,7 @@ Plot one run with
 ```bash
 eval-tp/cleanup_validate.sh 00_base tight-half loose-half production-600-800              # reference run
 eval-tp/cleanup_validate.sh my_change tight-half loose-half                             # candidate, compared to 00_base
-BASE=00_base CONFIG=configs/my_variant.yaml eval-tp/cleanup_validate.sh my_variant      # A/B a YAML variant
+BASE=00_base CONFIG=configs/preset/my_variant.yaml eval-tp/cleanup_validate.sh my_variant      # A/B a YAML variant
 CO=0 eval-tp/cleanup_validate.sh inf_only tight-half                                    # inference-only
 
 python eval-tp/compare_runs.py --suffix _qwen3-14b_tp2_co_factor_off_phase_prefill_tight-half \
@@ -781,6 +1345,16 @@ tests/run_all.sh /tmp/ds-tests 'test_qwen3_*'  # a subset
 | Group | Scripts | Needs |
 |---|---|---|
 | Plugin wiring, config, store, estimator, child spawn | `test_phase1_step1`, `test_phase1_step2`, `test_config_loader`, `test_finetuning_store`, `test_merged_estimator`, `test_profiling_shapes`, `test_step_trace` | CPU |
+| RoPE scaling == vLLM's served RoPE (llama3 / linear / default), unsupported variants refused, trainer gradients with llama3 RoPE (+ negative control) | `test_rope_scaling` | CPU |
+| Adapter checkpoints: TP merge, periodic / epoch / manual saves, PEFT-loadable with matching logits, error reporting, TP=2 gather | `test_adapter_save` | CPU (gloo) |
+| Fail-safes and status: build errors reach the worker, sticky disable (incl. the TP mirror), profiling failure degrades, status bookkeeping, HTTP routes | `test_ft_failsafe` | CPU |
+| Configs: every template + preset loads in the current layout, templates fully commented, old `finetune` layout + converter | `test_config_loader` | CPU |
+| System metrics: TTFT / TBT / token counts on a simulated clock, step kinds and the mixed-step split, backward rows, windows, idle ticker, final flush, histogram accuracy, hot-path cost, the child's ack fields, the route | `test_metrics` | CPU |
+| **System metrics end to end**: real server + streaming clients; server TTFT vs client TTFT, tokens vs usage, backward rows vs status, memory vs checkpoint size and vLLM's KV log, the report script | `test_metrics_e2e` (`--tp2` for Qwen3-14B on 2 GPUs) | 1 / 2 GPUs + weights |
+| `dserve-top` + its feed: decode folding, per-second rows, the rolling step log; against a fake server: starts / stops the recording, SSH guide, page served, feed merged, headless-Chrome render; history kept after the server goes, incremental snapshots, gzip; export (whole history, 50 MB cap drops the oldest), offline replay, scrubbing back / End to live in Chrome | `test_dserve_top` | CPU |
+| **`dserve-top` end to end**: a real server with telemetry off; dserve-top switches recording on, the feed carries real admission codes, per-GPU memory, the step log; HTML export replays offline; stops on exit | `test_dserve_top_e2e` (`--tp2`) | 1 / 2 GPUs + weights |
+| **Every template launches as shipped** (serves, trains, saves the adapter, writes the backward log) | `test_templates_launch` | GPUs of each template + weights |
+| **Checkpoints / status / fail-safes end to end**: real server, saved adapter == the served trained slot (vLLM and HF PEFT), profiling failure, resume, Llama-3.2-1B remat == served forward | `test_adapter_save_e2e` (`--tp 2` for the HTTP phase on 2 GPUs) | 1 / 2 GPUs + weights |
 | Activation hooks | `test_accumulate_hooks` | CPU |
 | Graph-capturable save op, CUDA-IPC weight sharing | `test_ft_save_op`, `test_phase1_step3` | 1 GPU |
 | Backward math (gradcheck vs autograd), graph == eager | `test_{llama3,qwen3}_backward`, `test_{llama3,qwen3}_backward_graph`, `test_{llama3,qwen3}_train_overfit` | 1 GPU |
@@ -798,3 +1372,11 @@ tests/run_all.sh /tmp/ds-tests 'test_qwen3_*'  # a subset
 with its SHA, and run `tests/run_all.sh`. The plugin depends only on the vLLM APIs
 it imports and the methods `deltaserve/plugin.py` wraps (listed in that file's
 docstring).
+
+---
+
+> **Looking for the original code?** The pre-plugin version (a patched vLLM fork,
+> `dserve-vllm/`), the original DeltaServe framework (`DeltaServe/`) and all the
+> phase-by-phase design notes (`INTEGRATION_PROGRESS.md`, `VLLM_FORK_CHANGES.md`, …)
+> are on the [`legacy`](https://github.com/852866031/DeltaServe-vLLM/tree/legacy)
+> branch.

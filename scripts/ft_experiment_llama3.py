@@ -36,7 +36,7 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 _ROOT = _HERE.parent  # repo root (this script lives in scripts/)
-_DEFAULT_CONFIG = _ROOT / "configs" / "serving_config_finetuning_llama3.yaml"
+_DEFAULT_CONFIG = _ROOT / "configs" / "preset" / "serving_config_finetuning_llama3.yaml"
 _SERVED_NAME = "llama3"
 
 

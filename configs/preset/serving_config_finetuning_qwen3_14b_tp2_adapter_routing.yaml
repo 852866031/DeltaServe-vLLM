@@ -1,0 +1,124 @@
+# DeltaServe-on-vLLM serving config — Qwen3-14B TP=2 co-serving WITH adapter routing.
+#
+# serving_config_finetuning_qwen3_14b_tp2.yaml (see its header for the finetune
+# flags) plus what adapter routing needs on two 32 GB cards:
+#
+#   - adapter_routing            : on. Requests with `model: "auto"` are routed to
+#                                 a pool adapter; adapters join the pool through
+#                                 POST /adapters or a finetuning job.
+#   - max_loras: 5               : a batch holds at most max_loras DISTINCT adapters,
+#                                 the FT adapter included. With 2, routed requests
+#                                 of different adapters queue behind each other
+#                                 (production trace: TTFT p95 89 ms → 1.5 s).
+#   - sparse CUDA-graph sizes    : the router's encoder lives on the last GPU
+#                                 (router_device: auto) and needs ~2 GB there. The
+#                                 default capture list (51 sizes × 3 piecewise sets
+#                                 + 35 × 2 full) costs 6.8 GiB per card; the sparse
+#                                 list below is much smaller. A batch is padded to
+#                                 the next size.
+#   - gpu_memory_utilization 0.75: the room for the encoder. The utilization is
+#                                 vLLM's WHOLE budget (weights + graphs + KV), so
+#                                 smaller graphs alone only turn into more KV cache;
+#                                 lowering it is what leaves the card memory free.
+#                                 With the sparse list the KV cache still ends up
+#                                 larger than in the plain preset.
+#
+finetune_param:
+  enable_finetuning: true
+  start_on_launch: false             # hold FT admission closed (M1: launch-only)
+  finetuning_lora_path: ../../adapters/qwen3-14b-toy-lora-ft
+  data_path: ../../data/alpaca_1000.txt
+  max_saved_finetuning_tokens: 256
+  num_epochs: 20
+  learning_rate: 0.000005
+  weight_decay: 0.01
+  gamma: 0.9
+
+finetune_features:
+  backward_mps_percentage: 0         # no MPS daemon on this box; the pause contract protects prefill
+  graph_ft_batches: true             # [mixed-fwd-cuda-graph] mixed batches (inference + FT) replay has_ft CUDA graphs (FT-only too with graph_ft_only_batches)
+  graph_ft_max_tokens: 512           # capture the has_ft set up to this padded size
+  graph_ft_only_batches: true       # FT-only steps replay the has_ft graphs too (tier-C abort polled between segments); production FT +5 %
+  backward_run_ahead_boundaries: 2   # child CPU ≤2 _maybe_pause boundaries ahead of its GPU → a pause lands within ~3-6 ms (0 = unbounded)
+  pause_on_arrival: true            # yield the GPU when a request arrives during a cycle (production TTFT p99 270 → 99 ms, FT −1.5 %)
+  backward_fp32: false
+  forward_interruptible: true        # tiers A/B (scheduler) + tier C rank-symmetric under TP
+  ft_only_admission_grace_ms: 2.0
+  backward_cuda_graph: true         # TP-safe since M5 (2-GPU gated; live A/B pending)
+  save_attn_qkv: true                # pre-norm q/k + v saved: skips the Q/K/V GEMM (exact for Qwen3)
+  save_attn_ctx: true                # attention context saved: skips the attention forward
+  save_resid_mid: true               # save post-attn residual: drops the forward-remat o all-reduce (7 → 6 collectives/layer) + the O-proj GEMM; +100 MB
+
+throttles:
+  fwd_token_throttle_enable: false
+  fwd_token_throttle: 200
+  ft_tokens_admission_constrain_factor: -1
+  match_prefill_workload_factor: 0
+
+# A routed request's first token also pays for its encode step (4-17 ms) and,
+# when its adapter is not in a GPU slot, the adapter load (4 ms from host
+# memory, about 18 ms from disk); an encode step also sits between two decode
+# steps of the requests already running. The plain preset's SLOs (0.4 s /
+# 20 ms / 50 ms) are widened, so the finetuning admission is not squeezed out
+# by work that routing itself adds; the average TBT is enforced here (it is
+# not in the plain preset, where only the per-step maximum is checked).
+slo:
+  admission_margin: legacy           # pinned: reproduces the published runs (the default is now relative)
+  ttft_slo: 0.5
+  avg_tbt_slo: 0.035
+  avg_tbt_window_s: 1.0               # enforce it: every decode token of the last second, averaged
+  max_tbt_slo: 0.07
+  # M4.2: the runner's per-step timing samples and the profiling pass's
+  # record gate now ride the TP relay (ModelRunnerOutput.finetune_timing /
+  # SchedulerOutput.finetune_record_timing), so the launch-time profiling
+  # pass fits a real, TP-calibrated estimator and FT admission is SLO-gated
+  # under TP exactly as on a single GPU. Set false to fall back to the
+  # cold-start fixed buffer-cap budget (no SLO gate).
+  profile_on_launch: true
+  profile_num_repeats: 2
+  decode_only_ft_safety_margin: 0.7
+
+debug:
+  print_weight_hash: false
+  print_activation_hash: false
+  print_scheduler_add: true
+  print_engine_batch_exec: true
+  print_engine_batch_done: false
+  print_engine_req_recv: false
+
+adapter_routing:
+  enable_adapter_routing: true
+  # router_device: auto              # the encoder goes on the last GPU the engine sees
+  max_active_adapters: 32
+
+adapters:
+  lora_path_0: ../../adapters/qwen3-14b-toy-lora
+
+lora:
+  enable_lora: true
+  max_loras: 5                       # distinct adapters per batch, FT adapter included
+  max_lora_rank: 16
+
+server:
+  host: 127.0.0.1
+  port: 8000
+  rank_id: 0
+  # Single frontend for TP bring-up (fewer moving parts in the launch prints).
+  api_server_count: 1
+
+model:
+  model: Qwen/Qwen3-14B-Base
+  tokenizer_mode: auto
+  trust_remote_code: false
+  dtype: auto
+  max_model_len: 2048
+
+engine:
+  gpu_memory_utilization: 0.75          # leaves ~2 GB for the router's encoder (see header)
+  enforce_eager: false
+  disable_log_stats: true
+  # 19 sizes instead of 51 (same 512-token coverage)
+  compilation_config: '{"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 160, 192, 224, 256, 320, 384, 448, 512], "max_cudagraph_capture_size": 512}'
+
+parallel:
+  tensor_parallel_size: 2            # <<< TP=2
