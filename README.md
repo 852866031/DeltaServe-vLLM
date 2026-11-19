@@ -19,6 +19,9 @@ not have:
 - **Backward process:** one per GPU, with a hand-written LoRA backward and CUDA graphs.
 - **SLO-aware admission scheduler:** with a step-time estimator.
 - **Pre-emption and pause machinery:** keeps inference latency protected.
+- **Adapter routing** (optional, off by default): a request may leave the choice of
+  adapter to the server, and a finished finetuning job publishes its adapter into the
+  pool that choice is made from ([in brief](#adapter-routing-in-brief)).
 - **Training outputs:** the trained adapter is saved on request or periodically as a
   standard PEFT LoRA (merged across TP ranks), `GET /finetuning_status` reports
   progress, and system metrics (TTFT / TBT, inference and FT throughput, GPU time
@@ -38,26 +41,27 @@ vLLM's own `--additional-config`. Without it, the server is plain vLLM.
 
 1. [Get started](#get-started)
 2. [How it works](#how-it-works)
-3. [Supported models](#supported-models)
-4. [Telemetry and live monitoring (`dserve-top`)](#telemetry-and-live-monitoring-dserve-top)
+3. [Adapter routing in brief](#adapter-routing-in-brief)
+4. [Supported models](#supported-models)
+5. [Telemetry and live monitoring (`dserve-top`)](#telemetry-and-live-monitoring-dserve-top)
    - [system metrics](#recorded-system-metrics) · [overhead](#overhead) · [quick start](#dserve-top-quick-start) · [over SSH](#opening-the-page-over-ssh) · [reading the page](#reading-the-page) · [going back in time](#going-back-in-time) · [exporting a run](#exporting-a-run)
-5. [Features](#features)
+6. [Features](#features)
    - [Forward pass](#forward-pass)
    - [Backward pass](#backward-pass)
    - [CUDA graphs at a glance](#cuda-graphs-at-a-glance)
    - [Interrupts and pauses](#interrupts-and-pauses-protecting-inference-latency)
    - [Throttles and admission control](#throttles-and-admission-control)
    - [Optimizations](#optimizations)
-6. [Finetuning jobs and adapter routing](#finetuning-jobs-and-adapter-routing)
-7. [Results](#results)
-8. [Repository layout](#repository-layout)
-9. [Installation](#installation)
-10. [Launching a server](#launching-a-server)
+7. [Finetuning jobs and adapter routing](#finetuning-jobs-and-adapter-routing)
+8. [Results](#results)
+9. [Repository layout](#repository-layout)
+10. [Installation](#installation)
+11. [Launching a server](#launching-a-server)
     - [HTTP endpoints](#http-endpoints)
     - [Saving the trained adapter](#saving-the-trained-adapter)
     - [When something fails](#when-something-fails)
-11. [Running experiments](#running-experiments)
-12. [Tests](#tests)
+12. [Running experiments](#running-experiments)
+13. [Tests](#tests)
 
 ---
 
@@ -203,6 +207,41 @@ config fields.
 
 Without `--additional-config`, the backward child is never spawned and every
 hook is inert.
+
+---
+
+## Adapter routing in brief
+
+Optional, and off unless the serving YAML has an `adapter_routing` section. With it
+on, a request does not have to name its adapter: `"model": "auto"` lets the server
+pick one from a pool of adapters, and falls back to the base model when none fits.
+
+![A named request and a routed request](docs/figures/scheduling/01-request-path.png)
+
+A routed request does two things a named one does not, both inside the engine and
+before its prefill: its prompt is **encoded** by a small encoder on the GPU
+(e5-large-v2, 4–17 ms), and the embedding is compared with the **indexed adapter
+pool** to pick the adapter. The rest of the path is the same; the adapter that was
+chosen is reported in the response headers.
+
+![Everything the scheduler places with adapter routing on](docs/figures/scheduling/04-scheduling-overview.png)
+
+The pool is fed by the server itself. A finetuning job trains an adapter, its
+dataset is **indexed** into a routing entry while it trains, and when the job ends
+the **adapter handover** saves the adapter and publishes it to the pool, from where
+requests are routed to it. The scheduler places all of this next to the forward and
+backward batches, and inference comes first for each: an encode step pauses the
+backward like a prefill does, indexing uses the GPU only while no request is
+present, and the handover runs off the engine loop.
+
+On Qwen3-14B TP=2 with finetuning co-serving, choosing the adapter costs a routed
+request about 15 ms of TTFT at the median and 4–5 % of the finetuning throughput;
+with adapter routing off, performance and GPU memory are unchanged.
+
+- Design walkthrough, one figure per part:
+  [`docs/adapter_routing_scheduling.md`](docs/adapter_routing_scheduling.md)
+- How to configure and use it, and the measurements:
+  [Finetuning jobs and adapter routing](#finetuning-jobs-and-adapter-routing)
 
 ---
 
