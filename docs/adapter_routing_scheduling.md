@@ -4,7 +4,7 @@ How DeltaServe serves a request whose LoRA adapter is chosen by the system
 ("adapter routing"), and how every piece of extra work this needs is decided by the
 SLO-aware scheduler at step granularity.
 
-This is a walkthrough of the design as implemented on the `adapter-routing` branch.
+This is a walkthrough of the design as implemented (merged from the `adapter-routing` branch).
 Timings marked *measured* come from Qwen3-14B TP=2 on 2× RTX 5090. What is not done
 yet is listed in section 10. Figure sources (`.drawio`) are in
 [`figures/scheduling/`](figures/scheduling/).
