@@ -65,14 +65,84 @@ indexing, and the adapter handover.
 The same picture with the loop added. Inputs are on the left (inference requests,
 the adapter pool, finetuning jobs), responses on the right, and everything in between
 is work the scheduler decides. Orange marks what is new compared with section 2:
-the adapter pool, encoding, indexing and the adapter handover.
+the adapter pool, encoding, indexing and the adapter handover. The figures that
+follow keep this colour for the four of them.
 
 The principle: **anything that occupies the GPU or the engine loop is decided by the
 scheduler.** Nothing takes GPU time on its own initiative.
 
+### 4.1 Encoding
+
+![Encoding](figures/scheduling/05-encoding.png)
+
+Encoding turns a routed request into an adapter choice.
+
+- **Input** — the request's prompt, already tokenized for the encoder by the API
+  server (up to 512 tokens).
+- **Encoder** — e5-large-v2, about 1.3 GiB of weights, loaded once inside the worker
+  of one GPU.
+- **Cost** — 4–17 ms on the GPU (*measured*: ≈ 3.5 ms + 0.014 ms × total tokens). On
+  the CPU the same encode takes 50–130 ms, all of which lands on TTFT, so requests
+  are always encoded on the GPU.
+- **Output** — one embedding per request.
+- **Choosing the adapter** — the embedding is compared with every routing entry in
+  the pool. The confidence combines how close the best entry is with how far ahead
+  of the second-best it is; above the pool's threshold the request gets that
+  adapter, below it the base model.
+
+### 4.2 Indexing
+
+![Indexing](figures/scheduling/06-indexing.png)
+
+Indexing makes an adapter routable by computing its routing entry.
+
+- **Input** — a new adapter and its finetuning dataset (up to 2500 samples).
+- **What it does** — encodes the samples in small chunks with the same encoder and
+  keeps a running sum of the embeddings; the routing entry is their centroid.
+- **Where it runs** — the scheduler decides. While no inference request has been
+  present for 3 s it runs on the GPU, in a process of its own that shares the
+  encoder's weights with the worker (no second copy). Otherwise it runs on the CPU
+  at the lowest priority, with 2–8 threads.
+- **Switching** — when a request arrives, the GPU process stops at its next encoder
+  layer, under a millisecond away, and the same chunk is redone on the CPU. The
+  running sum is checkpointed after every chunk and is the job's whole state, so
+  moving in either direction costs nothing but the interrupted chunk.
+- **Output** — the routing entry, added to the adapter pool.
+
+### 4.3 Adapter pool
+
+![Adapter pool](figures/scheduling/07-adapter-pool.png)
+
+The pool holds the adapters, one routing entry per active adapter, and where each
+adapter currently is. Only active adapters are candidates for routed requests; a
+retired one is still served when named. Load cost by location (*measured*):
+
+| Location | Cost | How it is scheduled |
+|---|---|---|
+| GPU slot | 0 ms | — |
+| host memory | ≈ 4 ms | loaded at step start |
+| disk, other work pending | ≈ 12 ms read in the background, then ≈ 6 ms | request held one step |
+| disk, nothing else to do | ≈ 18 ms | loaded in-step |
+
+GPU slots follow vLLM's own LRU; the pool mirrors it and pins the adapters the
+current batch needs rather than choosing victims itself. Adapters in use stay in host
+memory, so the disk path is taken only on a cold start.
+
+### 4.4 Adapter handover
+
+![Adapter handover](figures/scheduling/08-adapter-handover.png)
+
+When a finetuning job finishes, its adapter has to be saved and the backward has to
+move on to the next job. The scheduler closes FT admission and starts the handover;
+the backward process copies the trained weights to host memory, and an engine
+background thread merges, saves and publishes them into the adapter pool, where
+indexing picks the new adapter up. Once the weights are copied the backward switches
+to the next job's adapter and FT admission reopens. Saving is not time-critical, so
+none of it runs on the engine loop or keeps the GPU from inference.
+
 ## 5. Schedulable objects
 
-![Schedulable objects](figures/scheduling/05-schedulable-objects.png)
+![Schedulable objects](figures/scheduling/09-schedulable-objects.png)
 
 Reading the work off the overview gives five schedulable objects:
 
@@ -86,18 +156,18 @@ Reading the work off the overview gives five schedulable objects:
 
 ## 6. Where everything runs
 
-![GPU layout](figures/scheduling/06-gpu-layout.png)
+![GPU layout](figures/scheduling/10-gpu-layout.png)
 
 With *n* GPUs under tensor parallelism, each GPU holds one worker and its backward
 child. The encoder lives in the worker of **one** rank, so an encode is an ordinary
 worker call and can never overlap a model step. Indexing is a separate process that
 shares the encoder's weights with that worker when it runs on the GPU, and has a
 CPU process to fall back to. Adapters sit in one of three places — GPU slot, host
-memory, disk — which is what the load cost in section 1 depends on.
+memory, disk — which is what the load cost in section 4.3 depends on.
 
 ## 7. One scheduling step
 
-![One scheduling step](figures/scheduling/07-one-scheduling-step.png)
+![One scheduling step](figures/scheduling/11-one-scheduling-step.png)
 
 A step, in order: encode the routed requests that are waiting, pick their adapters,
 load what the batch needs, run the forward batch, then let the backward use what is
@@ -112,7 +182,7 @@ the engine loop.
 
 ## 8. Scheduler decisions
 
-![Scheduler decisions](figures/scheduling/08-scheduler-decisions.png)
+![Scheduler decisions](figures/scheduling/12-scheduler-decisions.png)
 
 The decisions in the order the scheduler takes them, with the batch contents shown
 alongside as they grow:
@@ -134,7 +204,7 @@ alongside as they grow:
 
 ## 9. Inference first
 
-![Inference first](figures/scheduling/09-inference-first.png)
+![Inference first](figures/scheduling/13-inference-first.png)
 
 Every object other than the forward batch yields to inference. The backward yields
 at each of its boundaries, indexing yields between encoder layers and moves to the
@@ -143,21 +213,3 @@ backward child and everything else on the CPU. The estimator is told what adapte
 routing cost: the encode time is already inside TTFT because the arrival is stamped
 before it, it is added explicitly to TBT, and the predicted adapter load time is
 added to the step time.
-
-## 10. Adapter pool
-
-![Adapter pool](figures/scheduling/10-adapter-pool.png)
-
-The pool tracks each adapter's routing entry and where the adapter currently is.
-Load cost by location (*measured*):
-
-| Location | Cost | How it is scheduled |
-|---|---|---|
-| GPU slot | 0 ms | — |
-| host memory | ≈ 4 ms | loaded at step start |
-| disk, other work pending | ≈ 12 ms read in the background, then ≈ 6 ms | request held one step |
-| disk, nothing else to do | ≈ 18 ms | loaded in-step |
-
-GPU slots follow vLLM's own LRU; the pool mirrors it and pins the adapters the
-current batch needs rather than choosing victims itself. Adapters in use stay in host
-memory, so the disk path is taken only on a cold start.
