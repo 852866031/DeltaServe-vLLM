@@ -151,7 +151,7 @@ Co-serving is switched on per launch with `--additional-config '{"deltaserve": {
 Plugin on stock vLLM validated against the original fork on Qwen3-14B TP=2 (2× RTX
 5090), tight-half / loose-half / production-600-800 at TTFT SLO 0.4 s: 100 % TTFT
 satisfaction everywhere, TTFT p99 201→137 / 204→134 / 295→~100 ms, FT throughput
-equal or higher (numbers + plots in README "Results"). Llama-3-8B (TP=1/2) and
+equal or higher (numbers + plots in `docs/results.md`). Llama-3-8B (TP=1/2) and
 Qwen3-0.6B are supported (Llama-3.1/3.2/3.3 too: their `llama3` RoPE scaling is
 reproduced); A100 TP=4 presets exist for Qwen3-14B/32B.
 
