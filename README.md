@@ -21,7 +21,7 @@ not have:
 - **Pre-emption and pause machinery:** keeps inference latency protected.
 - **Adapter routing** (optional, off by default): a request may leave the choice of
   adapter to the server, and a finished finetuning job publishes its adapter into the
-  pool that choice is made from ([in brief](#adapter-routing-in-brief)).
+  pool that choice is made from ([more](#adapter-routing)).
 - **Training outputs:** the trained adapter is saved on request or periodically as a
   standard PEFT LoRA (merged across TP ranks), `GET /finetuning_status` reports
   progress, and system metrics (TTFT / TBT, inference and FT throughput, GPU time
@@ -41,27 +41,28 @@ vLLM's own `--additional-config`. Without it, the server is plain vLLM.
 
 1. [Get started](#get-started)
 2. [How it works](#how-it-works)
-3. [Adapter routing in brief](#adapter-routing-in-brief)
-4. [Supported models](#supported-models)
-5. [Telemetry and live monitoring (`dserve-top`)](#telemetry-and-live-monitoring-dserve-top)
-   - [system metrics](#recorded-system-metrics) · [overhead](#overhead) · [quick start](#dserve-top-quick-start) · [over SSH](#opening-the-page-over-ssh) · [reading the page](#reading-the-page) · [going back in time](#going-back-in-time) · [exporting a run](#exporting-a-run)
-6. [Features](#features)
+3. [Supported models](#supported-models)
+4. [Features](#features)
+   - [Telemetry and live monitoring (`dserve-top`)](#telemetry-and-live-monitoring-dserve-top)
+     [system metrics](#recorded-system-metrics) · [overhead](#overhead) · [quick start](#dserve-top-quick-start) · [over SSH](#opening-the-page-over-ssh) · [reading the page](#reading-the-page) · [going back in time](#going-back-in-time) · [exporting a run](#exporting-a-run)
+   - [Adapter routing](#adapter-routing)
+5. [Implementation](#implementation)
    - [Forward pass](#forward-pass)
    - [Backward pass](#backward-pass)
    - [CUDA graphs at a glance](#cuda-graphs-at-a-glance)
    - [Interrupts and pauses](#interrupts-and-pauses-protecting-inference-latency)
    - [Throttles and admission control](#throttles-and-admission-control)
    - [Optimizations](#optimizations)
-7. [Finetuning jobs and adapter routing](#finetuning-jobs-and-adapter-routing)
-8. [Results](#results)
-9. [Repository layout](#repository-layout)
-10. [Installation](#installation)
-11. [Launching a server](#launching-a-server)
+6. [Finetuning jobs and adapter routing](#finetuning-jobs-and-adapter-routing)
+7. [Results](#results)
+8. [Repository layout](#repository-layout)
+9. [Installation](#installation)
+10. [Launching a server](#launching-a-server)
     - [HTTP endpoints](#http-endpoints)
     - [Saving the trained adapter](#saving-the-trained-adapter)
     - [When something fails](#when-something-fails)
-12. [Running experiments](#running-experiments)
-13. [Tests](#tests)
+11. [Running experiments](#running-experiments)
+12. [Tests](#tests)
 
 ---
 
@@ -210,41 +211,6 @@ hook is inert.
 
 ---
 
-## Adapter routing in brief
-
-Optional, and off unless the serving YAML has an `adapter_routing` section. With it
-on, a request does not have to name its adapter: `"model": "auto"` lets the server
-pick one from a pool of adapters, and falls back to the base model when none fits.
-
-![A named request and a routed request](docs/figures/scheduling/01-request-path.png)
-
-A routed request does two things a named one does not, both inside the engine and
-before its prefill: its prompt is **encoded** by a small encoder on the GPU
-(e5-large-v2, 4–17 ms), and the embedding is compared with the **indexed adapter
-pool** to pick the adapter. The rest of the path is the same; the adapter that was
-chosen is reported in the response headers.
-
-![Everything the scheduler places with adapter routing on](docs/figures/scheduling/04-scheduling-overview.png)
-
-The pool is fed by the server itself. A finetuning job trains an adapter, its
-dataset is **indexed** into a routing entry while it trains, and when the job ends
-the **adapter handover** saves the adapter and publishes it to the pool, from where
-requests are routed to it. The scheduler places all of this next to the forward and
-backward batches, and inference comes first for each: an encode step pauses the
-backward like a prefill does, indexing uses the GPU only while no request is
-present, and the handover runs off the engine loop.
-
-On Qwen3-14B TP=2 with finetuning co-serving, choosing the adapter costs a routed
-request about 15 ms of TTFT at the median and 4–5 % of the finetuning throughput;
-with adapter routing off, performance and GPU memory are unchanged.
-
-- Design walkthrough, one figure per part:
-  [`docs/adapter_routing_scheduling.md`](docs/adapter_routing_scheduling.md)
-- How to configure and use it, and the measurements:
-  [Finetuning jobs and adapter routing](#finetuning-jobs-and-adapter-routing)
-
----
-
 ## Supported models
 
 | Family | HF architecture | Backward service | Tested on | Notes |
@@ -269,7 +235,12 @@ has not been tested.
 
 ---
 
-## Telemetry and live monitoring (`dserve-top`)
+## Features
+
+What the server offers on top of co-serving itself. How the co-serving path is
+built is in [Implementation](#implementation).
+
+### Telemetry and live monitoring (`dserve-top`)
 
 Two layers. The server records **system metrics**: per-request latency, per-cycle
 backward stats, 10-second summaries, GPU memory and a per-step log. Turn it on with
@@ -285,7 +256,7 @@ The same run as an exported file: [`docs/dserve-top-example.html`](docs/dserve-t
 (53 KB, 72 s of Qwen3-14B TP=2 at about 3 req/s with finetuning running). Download it and
 open it in a browser; it replays with no server: scrub the timeline, press `▶`, hover anything.
 
-### Recorded system metrics
+#### Recorded system metrics
 
 Set `telemetry.metrics_dir` (the templates do: `logs/<model>/metrics`) and the server
 records, from the moment it starts:
@@ -320,7 +291,7 @@ percentiles are within 2 % (mean, max and SLO attainment are exact). The cost is
 about 75 µs per 256-request step, writes happen on a background thread, and the window
 in progress is written when the server is asked to stop.
 
-### Overhead
+#### Overhead
 
 Recording costs **0.05 % of the engine thread on Qwen3-14B TP=2** and about 0.6 % on the
 host-bound Qwen3-0.6B. It has no measurable effect on throughput, decode latency or
@@ -369,7 +340,7 @@ mostly queueing) the engine is GPU-bound and the cost all but disappears:
 | FT tokens/s | −1.5 % | +0.1 % (noise: the off runs differ by 2.6 %) |
 | recorder CPU on the engine thread | 0.05 %, 14 µs per step | 0.10 %, 25 µs per step (the polls) |
 
-### `dserve-top`: quick start
+#### `dserve-top`: quick start
 
 `dserve-top` is installed with the plugin (`pip install --editable deltaserve-plugin`
 puts it on the `PATH` of that env; `python -m deltaserve.top` is the same thing). It
@@ -397,7 +368,7 @@ ssh -N -o ExitOnForwardFailure=yes -L 8090:localhost:8090 -p 2222 you@gpu-box
 When it works, `dserve-top` prints `a browser opened the dashboard (via …)`.
 `Ctrl-C` quits; it stops the recording if it started one.
 
-### Opening the page over SSH
+#### Opening the page over SSH
 
 The page is served on `127.0.0.1` of the GPU machine only (nothing is exposed on the
 network), so you reach it through an SSH tunnel. The first thing `dserve-top` prints
@@ -430,7 +401,7 @@ logged in through):
 Any number of browser tabs can be open: `dserve-top` polls the server once, about
 four times a second, and every tab reads from its buffers.
 
-### What `dserve-top` does to the server
+#### What `dserve-top` does to the server
 
 The dashboard needs the server's telemetry recording. `dserve-top` handles that:
 
@@ -450,7 +421,7 @@ The recording is the [system metrics](#recorded-system-metrics) set (`requests.c
 per-GPU memory and adapter snapshot (`POST /telemetry/memory`) and reads
 `/v1/models`, so adapters loaded on demand show up.
 
-### `dserve-top` options
+#### `dserve-top` options
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -464,7 +435,7 @@ per-GPU memory and adapter snapshot (`POST /telemetry/memory`) and reads
 | `--history-hours H` | `12` | how far back the page can scrub, kept in `dserve-top`'s memory |
 | `--no-wait` | off | exit with an error if the server is not reachable now |
 
-### Reading the page
+#### Reading the page
 
 The page refreshes about three times a second and scales itself to the window
 (0.75× to 2.4×): it fills the width and fits the height, so it never scrolls and
@@ -500,7 +471,7 @@ Request times are measured in the engine, about 1 ms below what a client sees.
 Forward and backward share the GPU, so their busy fractions can add up to more
 than 100 %.
 
-### Going back in time
+#### Going back in time
 
 The bar at the bottom of the page covers the whole history `dserve-top` holds (the
 last `--history-hours`). Behind the slider is a strip of inference load (blue) and FT
@@ -523,7 +494,7 @@ When the server stops, the history stays: scrub and export as long as `dserve-to
 runs (reloading the page reloads the history). It is reset only when a new server
 run connects, so export first if you restart the server.
 
-### Exporting a run
+#### Exporting a run
 
 **`⤓ HTML`** downloads the history as one self-contained HTML file: the page with
 the data gzip'd and embedded. Open it anywhere, offline, with no server and no
@@ -551,7 +522,7 @@ curl -o run.html http://localhost:8090/api/export            # ≤ 50 MB
 curl -o run.html "http://localhost:8090/api/export?max_mb=10"
 ```
 
-### `dserve-top` troubleshooting
+#### `dserve-top` troubleshooting
 
 | You see | Means / do |
 |---|---|
@@ -564,7 +535,7 @@ curl -o run.html "http://localhost:8090/api/export?max_mb=10"
 | `dserve-top: command not found` | not in the plugin's env: activate it, or `python -m deltaserve.top` |
 | memory / adapters panels say waiting | the first per-GPU snapshot comes within ~10 s of connecting |
 
-### Under the hood: the feed and the endpoints
+#### Under the hood: the feed and the endpoints
 
 | Endpoint | Of | Returns |
 |---|---|---|
@@ -583,9 +554,62 @@ On the server, `live.LiveFeed` inside the telemetry recorder builds the step str
 also written to `steps.*.jsonl.gz` in the recording dir, rolling under
 `telemetry.steps_log_max_mb` (256 MB).
 
+### Adapter routing
+
+Optional, and off unless the serving YAML has an `adapter_routing` section. With it
+on, a request does not have to name its adapter: `"model": "auto"` lets the server
+pick one from a pool of adapters, and falls back to the base model when none fits.
+
+**The routing method is ARIADNE, not ours.** It was proposed by Cassano et al.,
+[*Semantic Adapter Routing with Fine-Tuning Task Embeddings*](https://arxiv.org/abs/2606.19079)
+(arXiv:2606.19079, 2026): training-free semantic routing in which every adapter is
+represented by a task embedding built from its finetuning data, and a query is
+sent to the adapter whose embedding is nearest in a frozen encoder's space. No
+adapter weights are read and nothing is trained. DeltaServe uses it as the way an
+adapter is picked (here with e5-large-v2 and one centroid per adapter).
+
+What DeltaServe adds is the serving system around it:
+
+- **Integration, end to end.** The whole path runs inside one server: a routed
+  request is encoded, its adapter is picked and loaded, it is prefilled and answered,
+  and the adapter that was chosen is reported in the response headers. A finetuning
+  job's adapter becomes routable without an operator in between: it is trained,
+  saved and published to the pool by the server itself.
+- **SLO awareness.** Picking the adapter is work on the GPU, so it is scheduled like
+  everything else: the encode is a step the scheduler issues, its time counts
+  against the request's TTFT and the running requests' TBT, the backward pauses for
+  it as for a prefill, and finetuning admission is reduced by what it takes.
+- **Indexing as a schedulable component.** Building an adapter's routing entry from
+  its dataset is automatic and placed by the scheduler: it runs while the job
+  trains, on the GPU only while no inference request is present, on the CPU
+  otherwise.
+
+![A named request and a routed request](docs/figures/scheduling/01-request-path.png)
+
+A routed request does two things a named one does not, both inside the engine and
+before its prefill: its prompt is **encoded** by the encoder on the GPU (4–17 ms),
+and the embedding is compared with the **indexed adapter pool** to pick the
+adapter. The rest of the path is the same.
+
+![Everything the scheduler places with adapter routing on](docs/figures/scheduling/04-scheduling-overview.png)
+
+The scheduler places five kinds of work: the encode step, the forward batch, the
+backward batch, indexing, and the **adapter handover** at a job's end (save the
+adapter, publish it to the pool, start the next job; off the engine loop).
+Inference comes first for each of them.
+
+On Qwen3-14B TP=2 with finetuning co-serving, choosing the adapter costs a routed
+request about 15 ms of TTFT at the median and 4–5 % of the finetuning throughput;
+with adapter routing off, performance and GPU memory are unchanged.
+
+- Design walkthrough, one figure per part:
+  [`docs/adapter_routing_scheduling.md`](docs/adapter_routing_scheduling.md)
+- How to configure and use it, and the measurements:
+  [Finetuning jobs and adapter routing](#finetuning-jobs-and-adapter-routing)
+
 ---
 
-## Features
+## Implementation
 
 ### Forward pass
 
@@ -797,7 +821,7 @@ Without a name a job is called `dserve-<random>` (`dserve-routing-<random>` when
 it is auto-routable). A new stage is a `Stage` subclass registered with
 `deltaserve.ft_job.register_stage`.
 
-### Adapter routing
+### Using adapter routing
 
 With `adapter_routing.enable_adapter_routing: true`, a request whose `model` is
 `"auto"` is sent to the pool adapter that fits it best, or to the base model
@@ -805,7 +829,7 @@ when none fits. A request naming an adapter or the base model is never touched.
 With the feature off nothing of it is loaded, and `model: "auto"` is answered by
 the base model with a message saying routing is not enabled.
 
-**How an adapter is chosen** (ARIADNE): each adapter has a *centroid*, the mean
+**How an adapter is chosen** ([ARIADNE](https://arxiv.org/abs/2606.19079), Cassano et al., 2026): each adapter has a *centroid*, the mean
 sentence embedding (e5-large-v2) of its training inputs. The request is embedded
 and compared with every centroid. The decision uses scores centred on the pool's
 mean and a confidence built from the best score and its margin over the second;
