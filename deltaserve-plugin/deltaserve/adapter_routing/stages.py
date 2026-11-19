@@ -237,3 +237,8 @@ class AdmissionStage(Stage):
 
     def start(self, job, ctx) -> None:
         ctx.admit_job(job)
+
+    def poll(self, job, ctx) -> bool:
+        # A job that trained: its save + admission run off the engine loop.
+        done = getattr(ctx, "job_handover_done", None)
+        return True if done is None else done(job)

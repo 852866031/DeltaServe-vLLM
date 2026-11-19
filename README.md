@@ -385,9 +385,19 @@ has not been run on this trace yet):
 There the extra ~25 ms was the route call: an encode takes 4–14 ms on an idle
 card (by input length, up to the 512-token cap) but about 25 ms when it shares
 the card with the model's processes, and a decode step that collided with one
-took ~8 ms longer — the reason the encode became a step of its own. Saving a
-trained adapter blocks the engine loop for 200–290 ms on this model (once per
-job).
+took ~8 ms longer — the reason the encode became a step of its own.
+
+**When a job ends** (*adapter handover*) the engine loop only triggers the
+work. Saving: every rank's backward child snapshots its trained weights to
+host memory and writes its shard itself; an engine thread merges the ranks,
+writes the adapter and publishes it to the pool. Switching to the next job:
+its adapter file was read in the background when the job was queued, and the
+check and the switch share one copy of it on the GPU. On Qwen3-14B TP=2 the
+engine loop is held about 25 ms for the save (it was 200–290 ms) and about
+35 ms for the switch (it was 60 ms), once per job; the save itself finishes
+about 140 ms later. A new adapter is not registered with vLLM up front: it is
+read in the background with the next step and loaded when a request first
+uses it.
 
 ---
 

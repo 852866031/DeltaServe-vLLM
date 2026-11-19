@@ -136,19 +136,31 @@ plugins disabled or not. Qwen3 defaults to v2 when finetuning is off, so FT-off 
 
 **Adapter routing + finetuning jobs** (branch `adapter-routing`, off unless
 configured; README "Finetuning jobs and adapter routing"): `deltaserve/ft_job.py`
-(jobs, stage registry), `adapter_save.py`, `route_middleware.py`,
-`adapter_routing/` (index, decision, pool, engine_router, index_process, resolver, engine), `route_worker.py`.
-Always say "adapter routing" / `adapter_routing`, never bare "routing". Validated
-live on Qwen3-0.6B and Qwen3-14B TP=2 (routing preset
-`serving_config_finetuning_qwen3_14b_tp2_adapter_routing.yaml`): production trace
-534/534, TTFT p99 140 ms; both inference gates pass with routing on. Constraints
-that bite: the encoder needs ~2 GB on its GPU (`gpu_memory_utilization` is vLLM's
-whole budget — lower it, and use sparse CUDA-graph sizes to keep the KV cache);
-`max_loras` ≥ adapters in use at once + 1. Not done: `validation` stage; async
-adapter save (blocks the engine loop 200–290 ms on 14B); recovery when phase 2 of
-an adapter switch fails; the route time is invisible to the SLO estimator
-(`arrival_time` is stamped after the middleware); threshold calibration on a real
-adapter pool.
+(jobs, stage registry), `adapter_save.py`, `route_middleware.py`, `route_worker.py`,
+`adapter_routing/` (index, decision, router, pool, engine_router, index_process,
+resolver, engine). Always say "adapter routing" / `adapter_routing`, never bare
+"routing". **The scheduler places five kinds of work**: the encode step (a routed
+request's adapter is chosen INSIDE the engine, by a step issued at the start of
+`schedule()`; the e5 encoder lives in a worker), the forward batch, the backward
+batch, indexing (GPU process sharing the encoder's weights while no inference
+request is present, else CPU), and the adapter handover at a job's end (save /
+publish / switch, triggered on the engine loop, done off it). Invariants:
+- **Attaching an adapter to a request recomputes its prefix-cache block hashes**
+  (`engine_router.attach_adapter`) — vLLM hashed it before the adapter was known;
+  without it a routed request reuses the BASE model's KV. `tests/test_engine_router.py`.
+- **A held request (awaiting its encode step, or its cold adapter) is not in the
+  scheduler**: it counts in `has_requests`, and aborts must reach `EngineRouter`.
+- **The encode step clears the backward grant and does not restore it**; the next
+  model step keeps the pause (inference prefill) or releases it
+  (`model_runner._ds_route_hold`).
+- **Never `EngineCore.add_lora` from the pool** (blocks the loop on every rank):
+  vLLM loads lazily, the scheduler arranges a background read (cold start).
+Validated on Qwen3-0.6B and Qwen3-14B TP=2 (live test 29/29, both inference
+gates with routing on). `max_loras` ≥ adapters in use at once + 1. Not done:
+`validation` stage; production-trace numbers for the in-scheduler path; adapter
+load cost from profiling (config constants now); the "tight" indexing level;
+recovery when phase 2 of an adapter switch fails; threshold calibration on a real
+adapter pool; the pool's own tier bookkeeping vs `LoraCacheMirror`.
 
 Open: the live backward-graph vs eager A/B under TP on the real models; a relative
 (not seconds-based) admission margin for the estimator; mixed-batch forward graphs

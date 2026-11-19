@@ -307,7 +307,9 @@ def test_online_jobs():
         store0 = FinetuningStore(launch_data, tokenize=lambda t: t.split(),
                                  total_epochs=1, max_saved_finetuning_tokens=16)
         store0.load()
-        rpc = []
+        rpc = []           # the switch calls
+        prepared = []      # [adapter handover] the background pre-read of a
+        #                    queued job's adapter file (not a switch)
 
         class Sched:
             """What the job code needs of a FinetuneScheduler."""
@@ -328,7 +330,9 @@ def test_online_jobs():
                 self._job_switch = None
                 self._ft_exhausted_logged = True
                 self._ds_engine = SimpleNamespace(model_executor=SimpleNamespace(
-                    collective_rpc=lambda m, args=(), **k: rpc.append((m, args))))
+                    collective_rpc=lambda m, args=(), **k: (
+                        prepared if m == "deltaserve_prepare_ft_adapter"
+                        else rpc).append((m, args))))
                 self._launch_job = self._ft_jobs.submit(FinetuneJobSpec(
                     name="launch", adapter_path="/a", data_path=launch_data)).name
 
@@ -387,6 +391,10 @@ def test_online_jobs():
               and s._ft_injector.store is store0)
         s._coord.pending_backward = False
         mgr.tick(s)
+        check("the job's adapter file was pre-read in the background when it "
+              "was prepared (one call, its path), so the switch does not wait "
+              "for the disk",
+              [c[1] for c in prepared] == [(a2,)])
         check("then every rank first CHECKS the adapter, then takes it, with the "
               "job's hyper-parameters",
               len(rpc) == 2 and rpc[0][0] == rpc[1][0] == "deltaserve_switch_ft_adapter"
@@ -428,6 +436,8 @@ def test_online_jobs():
         calls = []
 
         def refuse(m, args=(), **k):       # rank 0 accepts, rank 1 refuses
+            if m == "deltaserve_prepare_ft_adapter":
+                return [True, True]
             calls.append(args[1].get("dry_run"))
             return [{"tensors": 8, "dry_run": True},
                     {"error": "ValueError: rank differs"}]

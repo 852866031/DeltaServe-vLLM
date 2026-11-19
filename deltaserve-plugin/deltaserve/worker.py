@@ -426,13 +426,60 @@ class DeltaServeWorker(RouteEncodeMixin, Worker):
             backward_process = getattr(self, "backward_process", None)
             if backward_process is None:
                 raise RuntimeError("no backward child on this worker")
-            weights = os.path.join(path, "adapter_model.safetensors")
-            raw = load_file(weights, device=str(self.device))
-            ft_state = {k: v.float() for k, v in raw.items()}
+            # The check and the switch are two calls for the same adapter:
+            # it is put on the GPU once. The file itself was read in the
+            # background when the job was prepared
+            # (``deltaserve_prepare_ft_adapter``), so neither call waits for
+            # the disk.
+            cached = getattr(self, "_ft_switch_state", None)
+            if cached is not None and cached[0] == path:
+                ft_state = cached[1]
+            else:
+                job = getattr(self, "_ft_adapter_reads", {}).pop(path, None)
+                raw = None
+                if job is not None:
+                    job[0].join()
+                    raw = job[1].get("state")
+                if raw is None:
+                    raw = load_file(os.path.join(path, "adapter_model.safetensors"))
+                ft_state = {k: v.to(self.device).float() for k, v in raw.items()}
+            self._ft_switch_state = (path, ft_state) if hparams.get("dry_run") \
+                else None
             return backward_process.switch_adapter(
                 ft_state, {**hparams, "lora_scaling": read_lora_scaling(path)})
         except Exception as e:  # noqa: BLE001 — reported to the engine
+            self._ft_switch_state = None
             return {"error": f"{type(e).__name__}: {e}"}
+
+    def deltaserve_prepare_ft_adapter(self, path: str) -> bool:
+        """[adapter handover] A job was queued: read its adapter file into host
+        memory on a thread, so the switch to it (which holds the engine loop)
+        does not wait for the disk. Returns at once; a failed read is simply
+        repeated by the switch."""
+        import os
+        import threading
+
+        from safetensors.torch import load_file
+
+        reads = getattr(self, "_ft_adapter_reads", None)
+        if reads is None:
+            reads = self._ft_adapter_reads = {}
+        if path in reads:
+            return True
+        box = {}
+
+        def run():
+            try:
+                box["state"] = load_file(
+                    os.path.join(path, "adapter_model.safetensors"))
+            except Exception:  # noqa: BLE001 — the switch reads it itself
+                box["state"] = None
+
+        thread = threading.Thread(target=run, daemon=True,
+                                  name="deltaserve-ft-adapter-read")
+        reads[path] = (thread, box)
+        thread.start()
+        return True
 
     def deltaserve_export_ft_adapter(self):
         """[ft-job] ``(tp_rank, {PEFT key: CPU tensor})``: this rank's shard of
@@ -446,6 +493,27 @@ class DeltaServeWorker(RouteEncodeMixin, Worker):
         try:        # errors are returned, never raised (see the switch RPC)
             return (int(get_tensor_model_parallel_rank()),
                     backward_process.export_lora())
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"{type(e).__name__}: {e}"}
+
+    def deltaserve_save_ft_adapter(self, directory: str):
+        """[adapter handover] ``(tp_rank, shard path)``: this rank's backward
+        child snapshots the trained FT adapter and writes its shard to
+        ``directory`` in the background; None without a backward child.
+        Returns after the snapshot (a few ms), not after the write — the
+        engine loop only triggers the save."""
+        backward_process = getattr(self, "backward_process", None)
+        if backward_process is None:
+            return None
+        import os
+
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        try:        # errors are returned, never raised (see the switch RPC)
+            rank = int(get_tensor_model_parallel_rank())
+            path = os.path.join(directory, f"shard-rank{rank}.safetensors")
+            backward_process.save_lora(path)
+            return (rank, path)
         except Exception as e:  # noqa: BLE001
             return {"error": f"{type(e).__name__}: {e}"}
 

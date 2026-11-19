@@ -208,6 +208,7 @@ class FinetuneScheduler(AsyncScheduler):
         # waits for jobs submitted over HTTP (POST /ft_jobs).
         self._launch_job = None
         self._job_switch: dict | None = None    # the next job being prepared
+        self._job_saves: dict = {}              # job name → JobSave in progress
         self._job_wait = False
         if ft_cfg.enable_finetuning and ft_cfg.data_path:
             self._launch_job = self._ft_jobs.submit(
@@ -237,10 +238,25 @@ class FinetuneScheduler(AsyncScheduler):
         """[ft-job] 'ready': save the trained adapter (and publish it to the
         adapter pool). ``_ds_engine`` / ``_adapter_routing`` are set by the
         plugin once the engine is built."""
-        from deltaserve.adapter_save import save_job_adapter
+        from deltaserve.adapter_save import start_job_save
 
-        save_job_adapter(job, getattr(self, "_ds_engine", None),
-                         getattr(self, "_adapter_routing", None))
+        # [adapter handover] Only triggered here: the snapshot is taken now,
+        # merging / writing / publishing run off the engine loop;
+        # ``job_handover_done`` is what the stage polls.
+        self._job_saves[job.name] = start_job_save(
+            job, getattr(self, "_ds_engine", None),
+            getattr(self, "_adapter_routing", None))
+
+    def job_handover_done(self, job) -> bool:
+        """[adapter handover] The save (and publish) ``on_job_ready`` /
+        ``admit_job`` started has finished; raises its failure."""
+        save = self._job_saves.get(job.name)
+        if save is None:
+            return True
+        if not save.done():
+            return False
+        self._job_saves.pop(job.name, None)
+        return True
 
     # ---- [ft-job] jobs submitted while serving, run one after another -----
     def submit_ft_job(self, spec: dict) -> dict:
@@ -311,6 +327,15 @@ class FinetuneScheduler(AsyncScheduler):
                                            name="deltaserve-ft-job-prepare")
         state["thread"].start()
         self._job_switch = state
+        # [adapter handover] ... and every rank reads the job's adapter file in
+        # the background, so the switch does not wait for the disk.
+        engine = getattr(self, "_ds_engine", None)
+        if engine is not None:
+            try:
+                engine.model_executor.collective_rpc(
+                    "deltaserve_prepare_ft_adapter", args=(job.spec.adapter_path,))
+            except Exception as e:  # noqa: BLE001 — the switch reads it itself
+                dprint(f"[ft-job] {job.name}: adapter not pre-read ({e})")
 
     def job_ready_to_train(self, job) -> bool:
         """'init' is done when the job's dataset is ready AND the finetuning
@@ -351,9 +376,15 @@ class FinetuneScheduler(AsyncScheduler):
 
         # Two phases, so the ranks cannot end up training different adapters:
         # every rank checks the adapter first; only then does any rank take it.
+        t_switch = time.monotonic()
         all_ranks({**hparams, "dry_run": True}, "the adapter was refused")
+        t_checked = time.monotonic()
         all_ranks(hparams, "the adapter switch failed AFTER the check passed "
                            "(ranks may disagree; restart the server)")
+        # Runs on the engine loop: no step is scheduled meanwhile.
+        dprint(f"[ft-job] {job.name}: adapter switch held the engine loop "
+               f"{(time.monotonic() - t_switch) * 1e3:.0f} ms (check "
+               f"{(t_checked - t_switch) * 1e3:.0f} ms)")
         # Every rank trains the new adapter now: the scheduler follows.
         self._ft_injector.store = store
         coord.current_epoch = 0

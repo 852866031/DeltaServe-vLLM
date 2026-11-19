@@ -324,6 +324,21 @@ class BackwardProcess:
                                f"{reply.get('event')!r}")
         return reply["state"]
 
+    def save_lora(self, path: str, timeout: float = 30.0) -> dict:
+        """[adapter handover] Have the child snapshot its trained LoRA masters
+        and write them to ``path`` in the background. Returns once the
+        snapshot is taken (a few ms) — not when the file is written.
+        Synchronous for that snapshot: call only while no backward is
+        pending."""
+        self._conn.send({"cmd": "save_lora", "path": path})
+        if not self._conn.poll(timeout):
+            raise TimeoutError("[deltaserve] save_lora timed out")
+        reply = self._conn.recv()
+        if reply.get("event") != "lora_save_started":
+            raise RuntimeError(f"backward child could not snapshot the adapter: "
+                               f"{reply.get('msg', reply.get('event'))}")
+        return reply
+
     def checksum(self, which: str = "ft", timeout: float = 30.0) -> float:
         """Ask the child to re-checksum its mapped view (zero-copy proof)."""
         self._conn.send({"cmd": "checksum", "which": which})

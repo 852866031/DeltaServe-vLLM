@@ -177,6 +177,11 @@ class ReadyStage(Stage):
         if hook is not None:
             hook(job)
 
+    def poll(self, job, ctx) -> bool:
+        # The hook may only have STARTED the save (off the engine loop).
+        done = getattr(ctx, "job_handover_done", None)
+        return True if done is None else done(job)
+
 
 # ------------------------------------------------------------------- spec
 @dataclass

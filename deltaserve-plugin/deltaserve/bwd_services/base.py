@@ -65,6 +65,32 @@ def service_main(conn, mps_percentage: int, device_index: int,
         dprint("[backward] child interrupted by shutdown; exiting")
 
 
+
+def _write_shard_async(state: dict, path: str) -> None:
+    """Write ``state`` to ``path`` (safetensors) on a daemon thread; the file
+    appears under its name only when complete, ``path + ".error"`` holds the
+    reason if it could not be written."""
+    import threading
+
+    def run():
+        tmp = path + ".tmp"
+        try:
+            from safetensors.torch import save_file
+
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            save_file({k: v.detach().float().cpu().contiguous()
+                       for k, v in state.items()}, tmp)
+            os.replace(tmp, path)
+        except Exception as e:  # noqa: BLE001 — the engine reads the reason
+            try:
+                with open(path + ".error", "w") as f:
+                    f.write(f"{type(e).__name__}: {e}")
+            except OSError:
+                pass
+
+    threading.Thread(target=run, daemon=True,
+                     name="deltaserve-shard-writer").start()
+
 class BackwardService:
     """Base class: the model-agnostic backward recv/dispatch loop."""
 
@@ -342,6 +368,22 @@ class BackwardService:
                     except Exception as e:  # noqa: BLE001 — the job fails, not the child
                         conn.send({"event": "error",
                                    "msg": f"{type(e).__name__}: {e}"})
+                elif cmd == "save_lora":
+                    # [adapter handover] Snapshot the trained masters to host
+                    # memory NOW (they are consistent: no backward is running,
+                    # and the next job may overwrite them right after this
+                    # ack), then write this rank's shard on a thread: the
+                    # worker — and with it the engine loop — does not wait
+                    # for the file.
+                    try:
+                        state = self.export_lora_state()
+                    except Exception as e:  # noqa: BLE001
+                        conn.send({"event": "lora_save_failed",
+                                   "msg": f"{type(e).__name__}: {e}"})
+                        continue
+                    _write_shard_async(state, msg["path"])
+                    conn.send({"event": "lora_save_started",
+                               "tensors": len(state)})
                 elif cmd == "export_lora":
                     # [ft-job] the trained adapter, for saving at 'ready'
                     conn.send({"event": "lora_state",

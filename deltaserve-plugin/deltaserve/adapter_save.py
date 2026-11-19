@@ -152,6 +152,121 @@ def save_job_adapter(job, engine, routing=None) -> str | None:
     return job.saved_path
 
 
+class JobSave:
+    """A job's adapter being saved (and published) off the engine loop.
+
+    ``start`` runs on the engine loop and only triggers: one worker call in
+    which every rank's backward child snapshots its trained masters to host
+    memory (a few ms) and starts writing its shard file. Everything else —
+    waiting for the shards, merging the ranks, checking the replicated
+    factors, writing the adapter directory, publishing it to the adapter
+    pool — runs on a thread. ``done()`` is polled by the job's stage; it
+    raises the failure, if any."""
+
+    SHARD_WAIT_S = 120.0
+
+    def __init__(self, job, engine, routing, dst: str) -> None:
+        self.job, self.engine, self.routing, self.dst = job, engine, routing, dst
+        self.error: str | None = None
+        self.finished = False
+        self.trigger_ms = self.total_ms = None
+        self._thread = None
+
+    def start(self) -> "JobSave":
+        import tempfile
+        import threading
+        import time
+
+        t0 = time.monotonic()
+        os.makedirs(os.path.dirname(os.path.abspath(self.dst)), exist_ok=True)
+        self.shard_dir = tempfile.mkdtemp(
+            prefix=".shards-", dir=os.path.dirname(os.path.abspath(self.dst)))
+        replies = self.engine.model_executor.collective_rpc(
+            "deltaserve_save_ft_adapter", args=(self.shard_dir,))
+        replies = [r for r in replies if r is not None]
+        errors = [r["error"] for r in replies if isinstance(r, dict)]
+        if errors:
+            raise RuntimeError(f"adapter save failed on a worker: {errors[0]}")
+        if not replies:
+            raise RuntimeError("no worker has a trained adapter to save")
+        replies.sort(key=lambda r: r[0])
+        ranks = [r[0] for r in replies]
+        if ranks != list(range(len(ranks))):
+            raise RuntimeError(f"adapter save is missing a rank: got {ranks}")
+        self.shards = [r[1] for r in replies]
+        self.trigger_ms = (time.monotonic() - t0) * 1e3
+        self._t0 = t0
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="deltaserve-adapter-save")
+        self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        import time
+
+        from safetensors.torch import load_file
+
+        from deltaserve import dprint
+
+        job = self.job
+        try:
+            deadline = time.monotonic() + self.SHARD_WAIT_S
+            while not all(os.path.exists(p) for p in self.shards):
+                failed = [p for p in self.shards if os.path.exists(p + ".error")]
+                if failed:
+                    with open(failed[0] + ".error") as f:
+                        raise RuntimeError(f"a rank could not write its shard: "
+                                           f"{f.read()}")
+                if time.monotonic() > deadline:
+                    raise TimeoutError("the ranks' adapter shards did not appear")
+                time.sleep(0.01)
+            per_rank = [load_file(p) for p in self.shards]
+            job.saved_path = write_adapter(
+                job.spec.adapter_path, self.dst, merge_rank_shards(per_rank),
+                overwrite=True)
+            self.total_ms = (time.monotonic() - self._t0) * 1e3
+            dprint(f"[ft-job] {job.name} trained adapter saved to {job.saved_path} "
+                   f"in {self.total_ms:.0f} ms, off the engine loop (the loop "
+                   f"was held {self.trigger_ms:.0f} ms to trigger it)")
+            if self.routing is not None and job.spec.auto_routing \
+                    and job.admission is None:
+                self.routing.publish(job)
+        except Exception as e:  # noqa: BLE001 — raised by done()
+            self.error = f"{type(e).__name__}: {e}"
+        finally:
+            shutil.rmtree(self.shard_dir, ignore_errors=True)
+            self.finished = True
+
+    def done(self) -> bool:
+        if not self.finished:
+            return False
+        if self.error:
+            raise RuntimeError(self.error)
+        return True
+
+
+def start_job_save(job, engine, routing=None):
+    """Begin what 'ready' / 'admission' does for a job that trained: save its
+    adapter and, when auto-routable, publish it to the pool — without holding
+    the engine loop. Returns a ``JobSave`` to poll, or None when everything
+    was done at once (nothing to save, or already saved)."""
+    from deltaserve import dprint
+
+    spec = job.spec
+    dst = spec.save_path or (routing.adapter_dir(job.name) if routing else None)
+    if dst is None and job.saved_path is None:
+        dprint(f"[ft-job] {job.name} is ready but NOT saved: set ft_job.save_path "
+               f"(or enable adapter routing)")
+        return None
+    if job.saved_path is not None:
+        if routing is not None and spec.auto_routing and job.admission is None:
+            routing.publish(job)
+        return None
+    if engine is None or not spec.adapter_path:
+        raise RuntimeError(f"{job.name}: no engine / source adapter to export from")
+    return JobSave(job, engine, routing, dst).start()
+
+
 def export_trained_adapter(engine, src_dir: str, dst_dir: str,
                            overwrite: bool = False) -> str:
     """Collect the trained LoRA shards from every rank's worker, merge them and
