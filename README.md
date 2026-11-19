@@ -45,21 +45,17 @@ vLLM's own `--additional-config`. Without it, the server is plain vLLM.
 4. [Features](#features)
    - [Telemetry and live monitoring (`dserve-top`)](#telemetry-and-live-monitoring-dserve-top)
      - [system metrics](#recorded-system-metrics)
-     - [overhead](#overhead)
-     - [quick start](#dserve-top-quick-start)
-     - [over SSH](#opening-the-page-over-ssh)
+     - [`dserve-top` quick start](#dserve-top-quick-start)
      - [reading the page](#reading-the-page)
-     - [going back in time](#going-back-in-time)
-     - [exporting a run](#exporting-a-run)
    - [Adapter routing](#adapter-routing)
-5. [Implementation](#implementation)
+5. [Finetuning jobs and adapter routing](#finetuning-jobs-and-adapter-routing)
+6. [Implementation](#implementation)
    - [Forward pass](#forward-pass)
    - [Backward pass](#backward-pass)
    - [CUDA graphs at a glance](#cuda-graphs-at-a-glance)
    - [Interrupts and pauses](#interrupts-and-pauses-protecting-inference-latency)
    - [Throttles and admission control](#throttles-and-admission-control)
    - [Optimizations](#optimizations)
-6. [Finetuning jobs and adapter routing](#finetuning-jobs-and-adapter-routing)
 7. [Results](#results)
 8. [Repository layout](#repository-layout)
 9. [Installation](#installation)
@@ -615,185 +611,6 @@ with adapter routing off, performance and GPU memory are unchanged.
 
 ---
 
-## Implementation
-
-### Forward pass
-
-Every step is one vLLM batch. What runs depends on what the batch contains:
-
-| Batch type | Contains | How it runs | CUDA graph | Activation save |
-|---|---|---|---|---|
-| **Inference-only** | prefill and/or decode | stock vLLM | ✅ stock: piecewise, plus FULL for uniform decode | — |
-| **Mixed** | inference + FT samples | compiled forward | ✅ **`has_ft` piecewise set** (`graph_ft_batches`, Qwen3), up to `graph_ft_max_tokens` (512) padded tokens; larger batches run compiled without a graph. Never FULL | `torch.ops.vllm.dserve_save_rows`, a capturable op fed by persistent index tensors |
-| **Mixed** (graphs off / Llama-3) | inference + FT | eager | ❌ | Python forward hooks (slice fast path) |
-| **FT-only** | only FT samples (idle GPU) | compiled + graphs with `graph_ft_only_batches`, else eager | ✅ with `graph_ft_only_batches`: replays the mixed batches' `has_ft` graphs; ❌ otherwise (default) | same as above |
-
-- FT samples are **prefill-only**. They run once, hold no KV past the step, emit no
-  tokens, and are invisible to clients.
-- Only hidden states are saved (no logits). The backward child computes the
-  LM head itself.
-- The `has_ft` graphs are their own capture set (keyed by `FtBatchDescriptor`), so
-  inference-only steps keep replaying vLLM's unmodified graphs. The graph-affecting
-  FT flags feed vLLM's compile-cache hash, so toggling one recompiles instead of
-  loading a stale graph.
-
-### Backward pass
-
-The trainer is a hand-written LoRA SFT backward (no autograd), gradchecked against
-autograd to ~1e-7. It rematerializes each layer from the saved activations,
-backpropagates, and steps an fp32 master copy of the LoRA weights.
-
-**This is the template every supported family follows.** The loop, the LM head,
-the optimizer, the TP collectives, the three CUDA graphs and the publish are shared
-(`bwd_services/common/trainer.py`, `graph.py`). A family file (`llama3.py`,
-`qwen3.py`) supplies only its per-layer math through a `Family` record: the layer
-forward recompute, the layer backward and its graphed variant, and its weight names.
-What differs per family:
-
-| Family | Layer forward recompute / backward adds |
-|---|---|
-| Llama-3 / 3.1 / 3.2 / 3.3 | RoPE with the model's scaling (`llama3` for 3.1+); saved q/k are post-RoPE |
-| Qwen3 | per-head `q_norm` / `k_norm` RMSNorm before RoPE, and their backward; saved q/k are taken at the norm inputs |
-
-A new family follows the same table by providing those functions
-([Adding a family](#supported-models)).
-
-| Stage | What it does | CUDA graph? | Precision |
-|---|---|---|---|
-| **LM head backward** | final RMSNorm + vocab projection + cross-entropy, batched over all predicting rows | ❌ eager: chunked over the vocab, each chunk is a pause boundary | **fp32** (logits, softmax, norm) |
-| **Layer forward recompute** | RMSNorm → (Q/K/V proj + RoPE) → attention → O proj → residual, skipping whatever was saved | ✅ **Graph 1**, one per layer | bf16 GEMMs, fp32 scores/softmax |
-| **FFN backward** | SwiGLU MLP backward (frozen), post-attention RMSNorm backward | ✅ **Graph 2**, one per layer | bf16 GEMMs, fp32 norm |
-| **Attention backward** | padded multi-sample GQA attention backward + Q/K/V/O LoRA grads | ✅ **Graph 3**, one shared graph reused by every layer | **fp32 scores** |
-| **TP collectives** | 2 residual all-reduces per layer; LoRA factor grads bucketed every 8 layers on a comm stream; 1 tiny `[L]` reduce for the clip | ❌ always eager, between replays | — |
-| **Optimizer** | per-layer grad clip (rank-symmetric under TP), **fused AdamW** (one kernel for all LoRA tensors), StepLR | ❌ eager | fp32 masters |
-| **Publish** | write the trained adapter into vLLM's served LoRA slot, with `α/r` baked into B | ❌ | bf16 |
-
-`_maybe_pause` is called **between** the graphs of every layer and inside the LM
-head's chunk loop. It cannot sit inside a captured region, which is why the
-backward is three graphs per layer rather than one graph per step.
-
-### CUDA graphs at a glance
-
-| Graph | Where | Type | Captures | Not captured | Flag (default) |
-|---|---|---|---|---|---|
-| Inference graphs | worker | vLLM piecewise + FULL | the whole forward, split at attention | — | stock vLLM |
-| **`has_ft` forward set** | worker | **piecewise** (one segment per layer), captured at startup next to vLLM's | mixed (and opt-in FT-only) forward + the FT row saves | attention (piecewise split); the tier-C abort poll runs **between** segments | `graph_ft_batches` (off; on in Qwen3 YAMLs), `graph_ft_only_batches` (off; on in the Qwen3-14B TP=2 preset), `graph_ft_max_tokens: 512` |
-| **Backward Graph 1**: forward recompute | backward child | full-region graph, **per layer** | in-norm, (Q/K/V + RoPE), padded attention fwd, O proj, residual: only the parts not saved | the O-proj all-reduce under TP (graph split at `static_o`) | `backward_cuda_graph` (off; on in TP YAMLs) |
-| **Backward Graph 2**: FFN bwd | backward child | full-region graph, **per layer** | SwiGLU + RMSNorm backward | residual all-reduce | same |
-| **Backward Graph 3**: attention bwd | backward child | full-region graph, **one, shared** across layers (no per-layer weights in the core) | padded GQA attention backward | residual all-reduce | same; fits ≤ `backward_cuda_graph_attn_bn_max` (8) samples × ≤ `…_l_max` (64) tokens, otherwise eager for that cycle |
-| — | backward child | — | — | LM head, AdamW, all collectives, `_maybe_pause` | — |
-
-Every backward graph falls back to eager per layer on a capture or shape-fit
-failure, with identical gradients.
-
-### Interrupts and pauses (protecting inference latency)
-
-Two directions of contention, two sets of mechanisms:
-
-**1. An inference request arrives while an FT-only forward is about to run or is
-running. That forward is pre-empted.** Enabled by `finetune_features.forward_interruptible`.
-
-| Tier | When | What happens | TP |
-|---|---|---|---|
-| **A**: grace poll | before `schedule()` would produce an FT-only step | engine blocks up to `ft_only_admission_grace_ms` (2 ms) on the input queue; an arrival schedules inference instead | n/a (scheduler) |
-| **B**: rollback | arrival lands between `schedule()` and `execute_model()` | FT scheduling rolled back (KV, claimed samples, buffer reservation released) and the step re-scheduled once | n/a |
-| **C**: mid-forward abort | arrival lands **during** the FT-only forward | eager: per-layer hook raises `FTAborted`; graphed: the poll between piecewise segments aborts. Partial writes zeroed, samples released, step treated as empty | **rank-symmetric**: shm arrival counter + gloo MAX vote per layer, so all ranks leave at the same layer |
-
-A co-serving batch that carries inference tokens is **never** aborted.
-
-**2. The backward child is running while inference needs the GPU. The child pauses.**
-The child checks a grant (`mp.Event`) at every boundary, about half a layer apart.
-
-| Mechanism | Pauses the child when… | Resumes when… | Flag (default) |
-|---|---|---|---|
-| Prefill pause | a step carries inference prefill | that step finishes | always on |
-| `pause_until_prefill_done` | (refines the above) | the prefill has **completed on the GPU** (CUDA event), not merely been enqueued | `true` |
-| `pause_on_arrival` | a request **arrives** (shm counter), before its prefill is even scheduled | that request's prefill pause ends, or after 100 ms | `false` (on in Qwen3-14B TP=2 preset) |
-| `pause_prefill_always` | every prefill step, even with no backward outstanding (closes the TP trigger race) | step done | `false` |
-| `fwd_token_throttle` | the batch's total tokens ≥ threshold | it drops below | `throttles.fwd_token_throttle_enable` (`false`) |
-| Run-ahead bound | — | — | `backward_run_ahead_boundaries: 2`: the child's CPU stays ≤ 2 boundaries ahead of its GPU, so a pause takes effect within ~3–6 ms |
-| TP agreement | — | — | all children vote over gloo at each boundary and pause at the **same** one (otherwise a peer's in-flight NCCL kernel would spin on the GPU) |
-
-A race fix is always on: if a backward trigger arrives while a prefill is in flight,
-the child starts in the paused state.
-
-### Throttles and admission control
-
-FT admission is decided per step in `FinetuneScheduler`. The **SLO gate** always
-applies. The throttles shape admission further:
-
-| Knob (YAML section) | What it controls | Default |
-|---|---|---|
-| **SLO gate** (`slo.ttft_slo`, `max_tbt_slo`, `avg_tbt_slo`) | admit FT tokens only while the estimator predicts the step stays within 0.9 × TTFT SLO for the oldest waiting request and within `max_tbt_slo` | always on |
-| `slo.avg_tbt_window_s` | enforce `avg_tbt_slo`: FT joins a step with decode requests only while the average time between tokens over the last N seconds (every decode token of the window, that step included) stays within it. `0` = only the per-step maximum is checked | `0` |
-| **Step-time estimator** (`slo.profile_on_launch`, `profile_num_repeats`) | 6-parameter model `T ≈ α·S + β·T_in + γ·T_ft + δ·B_d + ε·K + c`, with separate coefficients for 5 regimes (inference prefill, FT-only, decode-only, decode with backward running, FT-mixed). Seeded by a profiling pass at launch, refit online every 256 steps | profiling on |
-| `slo.coserving_admission_phase` | `prefill`: FT rides only steps that carry inference prefill (or idle steps). `both`: FT may also ride decode-only / mixed steps (`BothPhaseFinetuneScheduler`) | `prefill` |
-| `slo.decode_only_ft_safety_margin` | with `both`: scale `max_tbt_slo` on decode-only steps | `0.7` |
-| `slo.admission_margin` / `admission_margin_k` | how much the step-time prediction is inflated before the SLO gate: `legacy` = ×(1 + 1.5·RMSE in seconds), ≈ 0.2 % in practice; `relative` = ×(1 + k·relative RMSE of the regime); `absolute` = + k·RMSE. See [The admission margin](#the-admission-margin) | `relative` / `1.5` (presets pin `legacy`) |
-| `throttles.ft_tokens_admission_constrain_factor` | cap FT tokens at `factor × inference-prefill tokens` per step (`-1` = off) | `-1` |
-| `throttles.match_prefill_workload_factor` | leaky bucket: admit one FT sample once accumulated prefill × factor covers its length (`0` = off) | `0` |
-| `throttles.fwd_token_throttle_enable` / `fwd_token_throttle` | pause the backward when the batch's total tokens ≥ threshold | off / 1024 |
-| `throttles.rps_throttle_*` | close FT admission above `close_rps`, reopen below `open_rps` (hysteresis, sliding window, minimum close time) | off |
-| `finetune_param.start_on_launch` | open admission at launch, or wait for `POST /start_finetuning` | `true` (`false` in the shipped YAMLs) |
-| Buffer accounting | FT budget ≤ free activation-buffer space; flush when the next-smallest sample won't fit | always |
-
-#### The admission margin
-
-On a step with running decodes, admission adds FT samples until the predicted step time
-reaches `max_tbt_slo`, so whatever the estimator under-predicts lands as a step over the
-limit. The original margin multiplies the prediction by 1 + 1.5·RMSE with the RMSE in
-**seconds**: with RMSEs of 1–3 ms that is ×1.002–1.005, effectively none. `relative`
-uses the regime's relative error instead (3.3 % for mixed steps on Qwen3-14B TP=2, so
-k = 1.5 adds 5 %).
-
-Measured with `eval-tp/margin_ab.py` on Qwen3-14B TP=2 (2× RTX 5090, production preset,
-`max_tbt_slo` 50 ms, TTFT SLO 0.4 s), replaying `timeline_margin_stress.csv`
-(`scripts/timelines/margin_stress_gen.py`: 275 requests in 120 s, Poisson at 1.5 / 3 req/s
-alternating every 15 s, prompts 16–160 tokens log-uniform, outputs 64–256: decodes are
-always running and prefill shapes vary, the case where FT is packed up to the TBT
-limit). Two interleaved runs per arm:
-
-| `admission_margin` | FT steps over 50 ms | by how much | actual ÷ admitted prediction, p50 · p95 | TTFT met | FT tokens/s |
-|---|---|---|---|---|---|
-| `legacy` (presets) | **21 / 205 (10.2 %)** | 0.5–3.5 ms | 0.98 · 1.06 | 100 % | 57 |
-| `relative`, k = 1.0 | 7 / 207 (3.4 %) | 0.1–1.5 ms | 0.96 · 1.03 | 100 % | 56 |
-| `relative`, k = 1.5 (default) | **4 / 205 (2.0 %)** | 0.0–2.2 ms | 0.94 · 1.02 | 100 % | **56** |
-| `absolute`, k = 1.5 | 3 / 194 (1.5 %) | 0.2–1.4 ms | 0.93 · 1.01 | 100 % | 54 |
-
-`relative` with k = 1.5 cuts the steps that break the TBT limit by 5× for −1 % FT
-throughput (within run-to-run noise: the two legacy runs gave 56 and 58): it trims the
-last FT sample on steps already at the limit, while most FT tokens ride steps with room
-or FT-only steps. At a fixed 50 ms limit `absolute` is about the same thing (1.5 × a
-1.6 ms RMSE ≈ 5 % of 48 ms); the two differ when the step at the limit is much longer
-or shorter than the steps the RMSE was measured on (another `max_tbt_slo`, model or
-GPU), where an error in seconds no longer matches the step and a relative one does.
-`relative` with k = 1.5 is the default; the presets under `configs/preset/` pin `legacy` so
-they reproduce the published runs. Tested with admission phase `prefill`; with `both` the
-margin also inflates decode-only predictions (≈ 4.7 % relative error there), untested.
-Steps without FT are not affected; inference-only prefill steps exceeded 50 ms on their
-own in 72–80 % of the cases in every arm, which no admission setting can change.
-
-### Optimizations
-
-| Optimization | Effect | Flag |
-|---|---|---|
-| Mixed-batch forward CUDA graphs | mixed-step FT cost 14 → 4–8 ms; FT +8–39 % at the same TTFT | `graph_ft_batches` |
-| FT-only forward CUDA graphs (abortable) | removes ~63 ms of host dispatch per FT-only step on Qwen3-14B TP=2; production FT +5 % | `graph_ft_only_batches` |
-| Backward CUDA graphs (3 per layer) | ~5 ms less dispatch per cycle | `backward_cuda_graph` |
-| Save MLP gate/up pre-activation | skips the gate_up GEMM recompute | `save_activations` (on) |
-| Save q/k/v | skips Q/K/V projection (+ RoPE on Llama-3), ~400–500 GFLOPs per backward on Llama-3-8B | `save_attn_qkv` |
-| Save attention context | skips the attention forward recompute | `save_attn_ctx` |
-| Save post-attention residual | skips the O-proj GEMM; **under TP removes the forward recompute's only all-reduce** (7 → 6 per layer) | `save_resid_mid` |
-| *(all three saves on)* | per-layer forward recompute = one RMSNorm | — |
-| Batched fp32 LM head | one GEMM over all rows, one bf16→fp32 conversion per chunk: cycle 168 → 127 ms (Qwen3-14B) | always |
-| Bucketed TP gradient reduce + comm stream | 240 → 86 collectives per cycle, overlapped with compute | always under TP |
-| Fused AdamW + persistent grad buffers | one optimizer kernel; no per-cycle zero-fills | always |
-| Slice-based activation save | `val[start:start+n]` view instead of `index_select` when FT rows are contiguous | always (falls back to a mask gather) |
-| `disable_log_stats` auto-on | removes a frontend stall (per-step stats saturating the API asyncio loop) that looked like GPU contention | automatic with finetuning |
-| Precision contract | fp32 attention scores/softmax, RMSNorm, LM head, LoRA masters; bf16 bulk GEMMs | `backward_fp32: false` (true = all-fp32 GEMMs) |
-
----
-
 ## Finetuning jobs and adapter routing
 
 Both are off unless configured; with them off the server behaves exactly as
@@ -973,6 +790,185 @@ with the engine loop held 0 ms for both (200–290 ms and 60 ms when the engine
 did them itself). A new adapter is not registered with vLLM up front: it is
 read in the background with the next step and loaded when a request first uses
 it. `docs/adapter_routing_scheduling.md` walks through the whole design.
+
+---
+
+## Implementation
+
+### Forward pass
+
+Every step is one vLLM batch. What runs depends on what the batch contains:
+
+| Batch type | Contains | How it runs | CUDA graph | Activation save |
+|---|---|---|---|---|
+| **Inference-only** | prefill and/or decode | stock vLLM | ✅ stock: piecewise, plus FULL for uniform decode | — |
+| **Mixed** | inference + FT samples | compiled forward | ✅ **`has_ft` piecewise set** (`graph_ft_batches`, Qwen3), up to `graph_ft_max_tokens` (512) padded tokens; larger batches run compiled without a graph. Never FULL | `torch.ops.vllm.dserve_save_rows`, a capturable op fed by persistent index tensors |
+| **Mixed** (graphs off / Llama-3) | inference + FT | eager | ❌ | Python forward hooks (slice fast path) |
+| **FT-only** | only FT samples (idle GPU) | compiled + graphs with `graph_ft_only_batches`, else eager | ✅ with `graph_ft_only_batches`: replays the mixed batches' `has_ft` graphs; ❌ otherwise (default) | same as above |
+
+- FT samples are **prefill-only**. They run once, hold no KV past the step, emit no
+  tokens, and are invisible to clients.
+- Only hidden states are saved (no logits). The backward child computes the
+  LM head itself.
+- The `has_ft` graphs are their own capture set (keyed by `FtBatchDescriptor`), so
+  inference-only steps keep replaying vLLM's unmodified graphs. The graph-affecting
+  FT flags feed vLLM's compile-cache hash, so toggling one recompiles instead of
+  loading a stale graph.
+
+### Backward pass
+
+The trainer is a hand-written LoRA SFT backward (no autograd), gradchecked against
+autograd to ~1e-7. It rematerializes each layer from the saved activations,
+backpropagates, and steps an fp32 master copy of the LoRA weights.
+
+**This is the template every supported family follows.** The loop, the LM head,
+the optimizer, the TP collectives, the three CUDA graphs and the publish are shared
+(`bwd_services/common/trainer.py`, `graph.py`). A family file (`llama3.py`,
+`qwen3.py`) supplies only its per-layer math through a `Family` record: the layer
+forward recompute, the layer backward and its graphed variant, and its weight names.
+What differs per family:
+
+| Family | Layer forward recompute / backward adds |
+|---|---|
+| Llama-3 / 3.1 / 3.2 / 3.3 | RoPE with the model's scaling (`llama3` for 3.1+); saved q/k are post-RoPE |
+| Qwen3 | per-head `q_norm` / `k_norm` RMSNorm before RoPE, and their backward; saved q/k are taken at the norm inputs |
+
+A new family follows the same table by providing those functions
+([Adding a family](#supported-models)).
+
+| Stage | What it does | CUDA graph? | Precision |
+|---|---|---|---|
+| **LM head backward** | final RMSNorm + vocab projection + cross-entropy, batched over all predicting rows | ❌ eager: chunked over the vocab, each chunk is a pause boundary | **fp32** (logits, softmax, norm) |
+| **Layer forward recompute** | RMSNorm → (Q/K/V proj + RoPE) → attention → O proj → residual, skipping whatever was saved | ✅ **Graph 1**, one per layer | bf16 GEMMs, fp32 scores/softmax |
+| **FFN backward** | SwiGLU MLP backward (frozen), post-attention RMSNorm backward | ✅ **Graph 2**, one per layer | bf16 GEMMs, fp32 norm |
+| **Attention backward** | padded multi-sample GQA attention backward + Q/K/V/O LoRA grads | ✅ **Graph 3**, one shared graph reused by every layer | **fp32 scores** |
+| **TP collectives** | 2 residual all-reduces per layer; LoRA factor grads bucketed every 8 layers on a comm stream; 1 tiny `[L]` reduce for the clip | ❌ always eager, between replays | — |
+| **Optimizer** | per-layer grad clip (rank-symmetric under TP), **fused AdamW** (one kernel for all LoRA tensors), StepLR | ❌ eager | fp32 masters |
+| **Publish** | write the trained adapter into vLLM's served LoRA slot, with `α/r` baked into B | ❌ | bf16 |
+
+`_maybe_pause` is called **between** the graphs of every layer and inside the LM
+head's chunk loop. It cannot sit inside a captured region, which is why the
+backward is three graphs per layer rather than one graph per step.
+
+### CUDA graphs at a glance
+
+| Graph | Where | Type | Captures | Not captured | Flag (default) |
+|---|---|---|---|---|---|
+| Inference graphs | worker | vLLM piecewise + FULL | the whole forward, split at attention | — | stock vLLM |
+| **`has_ft` forward set** | worker | **piecewise** (one segment per layer), captured at startup next to vLLM's | mixed (and opt-in FT-only) forward + the FT row saves | attention (piecewise split); the tier-C abort poll runs **between** segments | `graph_ft_batches` (off; on in Qwen3 YAMLs), `graph_ft_only_batches` (off; on in the Qwen3-14B TP=2 preset), `graph_ft_max_tokens: 512` |
+| **Backward Graph 1**: forward recompute | backward child | full-region graph, **per layer** | in-norm, (Q/K/V + RoPE), padded attention fwd, O proj, residual: only the parts not saved | the O-proj all-reduce under TP (graph split at `static_o`) | `backward_cuda_graph` (off; on in TP YAMLs) |
+| **Backward Graph 2**: FFN bwd | backward child | full-region graph, **per layer** | SwiGLU + RMSNorm backward | residual all-reduce | same |
+| **Backward Graph 3**: attention bwd | backward child | full-region graph, **one, shared** across layers (no per-layer weights in the core) | padded GQA attention backward | residual all-reduce | same; fits ≤ `backward_cuda_graph_attn_bn_max` (8) samples × ≤ `…_l_max` (64) tokens, otherwise eager for that cycle |
+| — | backward child | — | — | LM head, AdamW, all collectives, `_maybe_pause` | — |
+
+Every backward graph falls back to eager per layer on a capture or shape-fit
+failure, with identical gradients.
+
+### Interrupts and pauses (protecting inference latency)
+
+Two directions of contention, two sets of mechanisms:
+
+**1. An inference request arrives while an FT-only forward is about to run or is
+running. That forward is pre-empted.** Enabled by `finetune_features.forward_interruptible`.
+
+| Tier | When | What happens | TP |
+|---|---|---|---|
+| **A**: grace poll | before `schedule()` would produce an FT-only step | engine blocks up to `ft_only_admission_grace_ms` (2 ms) on the input queue; an arrival schedules inference instead | n/a (scheduler) |
+| **B**: rollback | arrival lands between `schedule()` and `execute_model()` | FT scheduling rolled back (KV, claimed samples, buffer reservation released) and the step re-scheduled once | n/a |
+| **C**: mid-forward abort | arrival lands **during** the FT-only forward | eager: per-layer hook raises `FTAborted`; graphed: the poll between piecewise segments aborts. Partial writes zeroed, samples released, step treated as empty | **rank-symmetric**: shm arrival counter + gloo MAX vote per layer, so all ranks leave at the same layer |
+
+A co-serving batch that carries inference tokens is **never** aborted.
+
+**2. The backward child is running while inference needs the GPU. The child pauses.**
+The child checks a grant (`mp.Event`) at every boundary, about half a layer apart.
+
+| Mechanism | Pauses the child when… | Resumes when… | Flag (default) |
+|---|---|---|---|
+| Prefill pause | a step carries inference prefill | that step finishes | always on |
+| `pause_until_prefill_done` | (refines the above) | the prefill has **completed on the GPU** (CUDA event), not merely been enqueued | `true` |
+| `pause_on_arrival` | a request **arrives** (shm counter), before its prefill is even scheduled | that request's prefill pause ends, or after 100 ms | `false` (on in Qwen3-14B TP=2 preset) |
+| `pause_prefill_always` | every prefill step, even with no backward outstanding (closes the TP trigger race) | step done | `false` |
+| `fwd_token_throttle` | the batch's total tokens ≥ threshold | it drops below | `throttles.fwd_token_throttle_enable` (`false`) |
+| Run-ahead bound | — | — | `backward_run_ahead_boundaries: 2`: the child's CPU stays ≤ 2 boundaries ahead of its GPU, so a pause takes effect within ~3–6 ms |
+| TP agreement | — | — | all children vote over gloo at each boundary and pause at the **same** one (otherwise a peer's in-flight NCCL kernel would spin on the GPU) |
+
+A race fix is always on: if a backward trigger arrives while a prefill is in flight,
+the child starts in the paused state.
+
+### Throttles and admission control
+
+FT admission is decided per step in `FinetuneScheduler`. The **SLO gate** always
+applies. The throttles shape admission further:
+
+| Knob (YAML section) | What it controls | Default |
+|---|---|---|
+| **SLO gate** (`slo.ttft_slo`, `max_tbt_slo`, `avg_tbt_slo`) | admit FT tokens only while the estimator predicts the step stays within 0.9 × TTFT SLO for the oldest waiting request and within `max_tbt_slo` | always on |
+| `slo.avg_tbt_window_s` | enforce `avg_tbt_slo`: FT joins a step with decode requests only while the average time between tokens over the last N seconds (every decode token of the window, that step included) stays within it. `0` = only the per-step maximum is checked | `0` |
+| **Step-time estimator** (`slo.profile_on_launch`, `profile_num_repeats`) | 6-parameter model `T ≈ α·S + β·T_in + γ·T_ft + δ·B_d + ε·K + c`, with separate coefficients for 5 regimes (inference prefill, FT-only, decode-only, decode with backward running, FT-mixed). Seeded by a profiling pass at launch, refit online every 256 steps | profiling on |
+| `slo.coserving_admission_phase` | `prefill`: FT rides only steps that carry inference prefill (or idle steps). `both`: FT may also ride decode-only / mixed steps (`BothPhaseFinetuneScheduler`) | `prefill` |
+| `slo.decode_only_ft_safety_margin` | with `both`: scale `max_tbt_slo` on decode-only steps | `0.7` |
+| `slo.admission_margin` / `admission_margin_k` | how much the step-time prediction is inflated before the SLO gate: `legacy` = ×(1 + 1.5·RMSE in seconds), ≈ 0.2 % in practice; `relative` = ×(1 + k·relative RMSE of the regime); `absolute` = + k·RMSE. See [The admission margin](#the-admission-margin) | `relative` / `1.5` (presets pin `legacy`) |
+| `throttles.ft_tokens_admission_constrain_factor` | cap FT tokens at `factor × inference-prefill tokens` per step (`-1` = off) | `-1` |
+| `throttles.match_prefill_workload_factor` | leaky bucket: admit one FT sample once accumulated prefill × factor covers its length (`0` = off) | `0` |
+| `throttles.fwd_token_throttle_enable` / `fwd_token_throttle` | pause the backward when the batch's total tokens ≥ threshold | off / 1024 |
+| `throttles.rps_throttle_*` | close FT admission above `close_rps`, reopen below `open_rps` (hysteresis, sliding window, minimum close time) | off |
+| `finetune_param.start_on_launch` | open admission at launch, or wait for `POST /start_finetuning` | `true` (`false` in the shipped YAMLs) |
+| Buffer accounting | FT budget ≤ free activation-buffer space; flush when the next-smallest sample won't fit | always |
+
+#### The admission margin
+
+On a step with running decodes, admission adds FT samples until the predicted step time
+reaches `max_tbt_slo`, so whatever the estimator under-predicts lands as a step over the
+limit. The original margin multiplies the prediction by 1 + 1.5·RMSE with the RMSE in
+**seconds**: with RMSEs of 1–3 ms that is ×1.002–1.005, effectively none. `relative`
+uses the regime's relative error instead (3.3 % for mixed steps on Qwen3-14B TP=2, so
+k = 1.5 adds 5 %).
+
+Measured with `eval-tp/margin_ab.py` on Qwen3-14B TP=2 (2× RTX 5090, production preset,
+`max_tbt_slo` 50 ms, TTFT SLO 0.4 s), replaying `timeline_margin_stress.csv`
+(`scripts/timelines/margin_stress_gen.py`: 275 requests in 120 s, Poisson at 1.5 / 3 req/s
+alternating every 15 s, prompts 16–160 tokens log-uniform, outputs 64–256: decodes are
+always running and prefill shapes vary, the case where FT is packed up to the TBT
+limit). Two interleaved runs per arm:
+
+| `admission_margin` | FT steps over 50 ms | by how much | actual ÷ admitted prediction, p50 · p95 | TTFT met | FT tokens/s |
+|---|---|---|---|---|---|
+| `legacy` (presets) | **21 / 205 (10.2 %)** | 0.5–3.5 ms | 0.98 · 1.06 | 100 % | 57 |
+| `relative`, k = 1.0 | 7 / 207 (3.4 %) | 0.1–1.5 ms | 0.96 · 1.03 | 100 % | 56 |
+| `relative`, k = 1.5 (default) | **4 / 205 (2.0 %)** | 0.0–2.2 ms | 0.94 · 1.02 | 100 % | **56** |
+| `absolute`, k = 1.5 | 3 / 194 (1.5 %) | 0.2–1.4 ms | 0.93 · 1.01 | 100 % | 54 |
+
+`relative` with k = 1.5 cuts the steps that break the TBT limit by 5× for −1 % FT
+throughput (within run-to-run noise: the two legacy runs gave 56 and 58): it trims the
+last FT sample on steps already at the limit, while most FT tokens ride steps with room
+or FT-only steps. At a fixed 50 ms limit `absolute` is about the same thing (1.5 × a
+1.6 ms RMSE ≈ 5 % of 48 ms); the two differ when the step at the limit is much longer
+or shorter than the steps the RMSE was measured on (another `max_tbt_slo`, model or
+GPU), where an error in seconds no longer matches the step and a relative one does.
+`relative` with k = 1.5 is the default; the presets under `configs/preset/` pin `legacy` so
+they reproduce the published runs. Tested with admission phase `prefill`; with `both` the
+margin also inflates decode-only predictions (≈ 4.7 % relative error there), untested.
+Steps without FT are not affected; inference-only prefill steps exceeded 50 ms on their
+own in 72–80 % of the cases in every arm, which no admission setting can change.
+
+### Optimizations
+
+| Optimization | Effect | Flag |
+|---|---|---|
+| Mixed-batch forward CUDA graphs | mixed-step FT cost 14 → 4–8 ms; FT +8–39 % at the same TTFT | `graph_ft_batches` |
+| FT-only forward CUDA graphs (abortable) | removes ~63 ms of host dispatch per FT-only step on Qwen3-14B TP=2; production FT +5 % | `graph_ft_only_batches` |
+| Backward CUDA graphs (3 per layer) | ~5 ms less dispatch per cycle | `backward_cuda_graph` |
+| Save MLP gate/up pre-activation | skips the gate_up GEMM recompute | `save_activations` (on) |
+| Save q/k/v | skips Q/K/V projection (+ RoPE on Llama-3), ~400–500 GFLOPs per backward on Llama-3-8B | `save_attn_qkv` |
+| Save attention context | skips the attention forward recompute | `save_attn_ctx` |
+| Save post-attention residual | skips the O-proj GEMM; **under TP removes the forward recompute's only all-reduce** (7 → 6 per layer) | `save_resid_mid` |
+| *(all three saves on)* | per-layer forward recompute = one RMSNorm | — |
+| Batched fp32 LM head | one GEMM over all rows, one bf16→fp32 conversion per chunk: cycle 168 → 127 ms (Qwen3-14B) | always |
+| Bucketed TP gradient reduce + comm stream | 240 → 86 collectives per cycle, overlapped with compute | always under TP |
+| Fused AdamW + persistent grad buffers | one optimizer kernel; no per-cycle zero-fills | always |
+| Slice-based activation save | `val[start:start+n]` view instead of `index_select` when FT rows are contiguous | always (falls back to a mask gather) |
+| `disable_log_stats` auto-on | removes a frontend stall (per-step stats saturating the API asyncio loop) that looked like GPU contention | automatic with finetuning |
+| Precision contract | fp32 attention scores/softmax, RMSNorm, LM head, LoRA masters; bf16 bulk GEMMs | `backward_fp32: false` (true = all-fp32 GEMMs) |
 
 ---
 
