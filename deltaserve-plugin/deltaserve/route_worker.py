@@ -54,6 +54,29 @@ class RouteEncodeMixin:
     _route_device = None
     _route_pad = 0
 
+    def _route_stats(self) -> dict:
+        """This worker's counters (kept on the model runner, which takes part
+        in the backward hand-over)."""
+        runner = self.model_runner
+        stats = getattr(runner, "_ds_route_stats", None)
+        if stats is None:
+            stats = runner._ds_route_stats = {
+                "encode_steps": 0, "encoded_requests": 0, "encode_ms": 0.0, "encode_wait_ms": 0.0,
+                # the backward child was paused for an encode step ...
+                "backward_paused_for_encode": 0,
+                # ... and the model step after it had an inference prefill
+                # (the pause went on until that prefill was done) / had none
+                # (the child got the GPU back at once)
+                "pause_kept_for_prefill": 0, "pause_released_no_prefill": 0,
+                "preloads_started": 0, "preloads_used": 0}
+        return stats
+
+    def deltaserve_route_stats(self):
+        try:
+            return {"rank": self._route_tp_rank(), **self._route_stats()}
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"{type(e).__name__}: {e}"}
+
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
         # Before vLLM measures what is left for the KV cache.
@@ -158,6 +181,8 @@ class RouteEncodeMixin:
             jobs = mgr._ds_preloads = {}
             read = mgr._load_adapter
 
+            stats = self._route_stats()
+
             def load_adapter(lora_request):
                 job = jobs.pop(lora_request.lora_int_id, None)
                 if job is not None:
@@ -165,6 +190,7 @@ class RouteEncodeMixin:
                     thread.join()
                     if box.get("lora") is not None \
                             and box["path"] == lora_request.lora_path:
+                        stats["preloads_used"] += 1
                         return box["lora"]
                 return read(lora_request)
 
@@ -188,12 +214,13 @@ class RouteEncodeMixin:
             thread = threading.Thread(target=run, daemon=True,
                                       name="deltaserve-adapter-preload")
             jobs[req.lora_int_id] = (thread, box)
+            self._route_stats()["preloads_started"] += 1
             thread.start()
 
     def deltaserve_route_encode(self, batch: list):
         """The encode step. ``batch``: e5 token-id lists (prefix included,
-        truncated by the API server). Returns [n, dim] float32 from the rank
-        that holds the encoder, None from the others, ``{"error": ...}`` on a
+        truncated by the API server). Returns ``([n, dim] float32, seconds the
+        encode took on the GPU)`` from the rank that holds the encoder, None from the others, ``{"error": ...}`` on a
         failure — never raises (see ``deltaserve_switch_ft_adapter``)."""
         try:
             runner = self.model_runner
@@ -205,9 +232,30 @@ class RouteEncodeMixin:
                 if coord.pending_backward or cfg.pause_prefill_always:
                     coord.gpu_pause_backward()
                     runner._ds_route_hold = True
+                    self._route_stats()["backward_paused_for_encode"] += 1
             if self._route_encoder is None or not batch:
                 return None
-            return self._route_forward(batch)
+            import time
+
+            import torch
+
+            # The step issued before this one may still be on the GPU (async
+            # scheduling): wait for it first, so that what is timed — and
+            # reported to the scheduler's TBT check — is the encode alone.
+            # The wait is paid by the next model step with or without an
+            # encode; counting it as encode time charged it twice.
+            t_wait = time.perf_counter()
+            if torch.device(self._route_device).type == "cuda":
+                torch.cuda.synchronize(self._route_device)
+            t0 = time.perf_counter()
+            out = self._route_forward(batch)
+            seconds = time.perf_counter() - t0
+            stats = self._route_stats()
+            stats["encode_steps"] += 1
+            stats["encoded_requests"] += len(batch)
+            stats["encode_ms"] += seconds * 1e3
+            stats["encode_wait_ms"] += (t0 - t_wait) * 1e3
+            return out, seconds
         except Exception as e:  # noqa: BLE001 — reported to the engine
             return {"error": f"{type(e).__name__}: {e}"}
 

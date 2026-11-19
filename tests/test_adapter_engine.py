@@ -863,11 +863,12 @@ def test_real_encoder():
             texts = ["Translate to English: Guten Morgen",
                      "Translate to English: Wo ist der Bahnhof?"]
             ref = enc.encode(texts)
-            got = rank.deltaserve_route_encode([tok(t) for t in texts])
+            got, spent = rank.deltaserve_route_encode([tok(t) for t in texts])
             check("tokenizer + worker encode step give the embeddings the index "
                   "was built with (SentenceEncoder), padding included "
                   f"(max diff {np.abs(ref - got).max():.1e})",
-                  got.shape == ref.shape and np.allclose(ref, got, atol=1e-4))
+                  got.shape == ref.shape and np.allclose(ref, got, atol=1e-4)
+                  and 0 < spent < 5)
             model, headers, request = asyncio.run(auto_request(
                 mw, routing, reg, "translate this"))
             check("empty pool → base model, reason 'no-adapters'",

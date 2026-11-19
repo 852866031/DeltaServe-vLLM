@@ -57,11 +57,13 @@ throttles:
 # when its adapter is not in a GPU slot, the adapter load (4 ms from host
 # memory, about 18 ms from disk); an encode step also sits between two decode
 # steps of the requests already running. The plain preset's SLOs (0.4 s /
-# 20 ms / 50 ms) are widened by that much, so the finetuning admission is not
-# squeezed out by work that routing itself adds.
+# 20 ms / 50 ms) are widened, so the finetuning admission is not squeezed out
+# by work that routing itself adds; the average TBT is enforced here (it is
+# not in the plain preset, where only the per-step maximum is checked).
 slo:
   ttft_slo: 0.5
-  avg_tbt_slo: 0.025
+  avg_tbt_slo: 0.035
+  avg_tbt_window_s: 1.0               # enforce it: every decode token of the last second, averaged
   max_tbt_slo: 0.07
   # M4.2: the runner's per-step timing samples and the profiling pass's
   # record gate now ride the TP relay (ModelRunnerOutput.finetune_timing /

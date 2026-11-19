@@ -193,7 +193,7 @@ class AdapterRoutingEngine:
                     raise RuntimeError(r.get("error", "encode failed"))
             for r in replies:
                 if r is not None:
-                    return r
+                    return r      # (embeddings, seconds on the GPU)
             raise RuntimeError("no worker holds the route encoder")
 
         from deltaserve.adapter_routing.engine_router import LoraCacheMirror
@@ -368,7 +368,21 @@ class AdapterRoutingEngine:
             jobs = self.jobs.status()
         self.pool.sync_tiers()
         return {**self.pool.status(), "jobs": jobs,
-                "router": self.router.status(), "index_dir": self.dir}
+                "router": self.router.status(),
+                "indexing": {"level": self.placement.level,
+                             "level_changes": self.placement.changes,
+                             "gpu_granted": bool(self.grant is not None
+                                                 and self.grant.is_set())},
+                "index_dir": self.dir}
+
+    def worker_stats(self) -> list:
+        """Every rank's route counters. One worker call — for GET /adapters,
+        not part of ``status()``."""
+        try:
+            return [r for r in self.engine.model_executor.collective_rpc(
+                "deltaserve_route_stats") if r is not None]
+        except Exception:  # noqa: BLE001 — a stock worker, a test engine
+            return []
 
     def shutdown(self) -> None:
         self._stop.set()

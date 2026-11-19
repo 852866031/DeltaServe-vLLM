@@ -220,6 +220,7 @@ applies. The throttles shape admission further:
 | Knob (YAML section) | What it controls | Default |
 |---|---|---|
 | **SLO gate** (`slo.ttft_slo`, `max_tbt_slo`, `avg_tbt_slo`) | admit FT tokens only while the estimator predicts the step stays within 0.9 × TTFT SLO for the oldest waiting request and within `max_tbt_slo` | always on |
+| `slo.avg_tbt_window_s` | enforce `avg_tbt_slo`: FT joins a step with decode requests only while the average time between tokens over the last N seconds (every decode token of the window, that step included) stays within it. `0` = only the per-step maximum is checked | `0` |
 | **Step-time estimator** (`slo.profile_on_launch`, `profile_num_repeats`) | 6-parameter model `T ≈ α·S + β·T_in + γ·T_ft + δ·B_d + ε·K + c`, with separate coefficients for 5 regimes (inference prefill, FT-only, decode-only, decode with backward running, FT-mixed). Seeded by a profiling pass at launch, refit online every 256 steps | profiling on |
 | `slo.coserving_admission_phase` | `prefill`: FT rides only steps that carry inference prefill (or idle steps). `both`: FT may also ride decode-only / mixed steps (`BothPhaseFinetuneScheduler`) | `prefill` |
 | `slo.decode_only_ft_safety_margin` | with `both`: scale `max_tbt_slo` on decode-only steps | `0.7` |
@@ -338,6 +339,7 @@ adapters on demand through its LoRA resolver.
 
 ```bash
 curl localhost:8000/adapters                                          # pool + jobs + router status
+curl localhost:8000/adapters/available                                # what a request can use now (answered by the API server, not the engine)
 curl -X POST localhost:8000/adapters -H 'content-type: application/json' \
      -d '{"name": "sql", "path": "/adapters/sql", "data_path": "/data/sql.txt"}'
 curl -X POST localhost:8000/adapters/sql/retire                       # or reactivate / pin / unpin
@@ -390,6 +392,29 @@ less is left for FT. The routing preset widens the SLOs by what an encode takes
 and gets half of that back. The four pool adapters share one set of weights and
 their routing entries were built from the trace's prompts: this measures the
 path, not the quality of the choice.
+
+After that table was measured, two things changed. The encode time handed to the
+TBT check is now the encode alone (the worker reports it); before, it also held
+the wait for the step still on the GPU, which the next model step pays anyway —
+about 18 ms counted twice per encode, which worked as an unplanned margin. And
+the routing preset now enforces the average TBT (`slo.avg_tbt_window_s: 1.0`,
+target 35 ms). Same trace, one run: 534/534, TTFT 94 / 110 / 116 ms, average TBT
+p50 28.9 ms (95 % of requests within 35 ms), 110,396 FT tokens in 397 backward
+cycles — more finetuning than with named adapters, for 10 ms of TTFT.
+
+Things happening during the trace (one run each, routed, FT co-serving):
+
+- **Two adapters that need indexing** (400 samples each) added at 35 s and 116 s:
+  534/534, TTFT 84 / 99 / 111 ms. While the first was being indexed (mostly on
+  the CPU, 41 s) the average TBT was 20.5 ms against 20.2–20.4 ms in three runs
+  without indexing; the second fell in a gap without requests and took 7 s on
+  the GPU.
+- **A finetuning job indexed from the start that ends mid-trace** (53k tokens):
+  it finished 61 s into the 184 s trace, was saved in 129 ms off the engine loop
+  (loop held 0 ms), admitted to the pool (self-recall 1.0) and listed by
+  `GET /adapters/available`; a client polling that route switched to it, and its
+  first requests on the new adapter had TTFT 40–65 ms (no cold start: the save
+  leaves it in host memory).
 
 **When a job ends** (*adapter handover*) nothing runs on the engine loop. The
 engine has a direct line to every rank's backward child; a background thread

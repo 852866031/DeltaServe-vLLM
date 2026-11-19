@@ -166,6 +166,12 @@ routed vs 77/90/104 named (README). `max_loras` ≥ adapters in use at once + 1.
   command pipe; only while no backward is in flight.
 - **Adapter tiers are vLLM's, read through `LoraCacheMirror`** (`pool.sync_tiers`):
   act on a tier only after syncing (a stale one made removal skip `remove_lora`).
+`GET /adapters/available` (API server, reads the pool registry) tells a client
+what it can use. The encode time given to the TBT check is the worker's own
+(the engine's wall time also holds the wait for the step in flight).
+**`slo.avg_tbt_window_s`** (0 = off; 1.0 in the adapter routing preset, target
+35 ms) enforces `avg_tbt_slo` over a sliding window (`deltaserve/tbt_window.py`);
+without it only `max_tbt_slo` is checked and `avg_tbt_slo` is not enforced.
 Not done: `validation` stage; adapter load cost from profiling (config constants
 now); the "tight" indexing level; recovery when phase 2 of an adapter switch
 fails; giving up on a dead indexing process; threshold calibration on a real

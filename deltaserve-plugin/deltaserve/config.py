@@ -170,6 +170,14 @@ class FinetuneConfig:
     avg_tbt_slo: float = 0.1
     """Average time-between-tokens SLO (seconds) for running decode requests."""
 
+    avg_tbt_window_s: float = 0.0
+    """Enforce ``avg_tbt_slo``: FT is admitted to a step with decode requests
+    only while the average time between tokens over the last
+    ``avg_tbt_window_s`` seconds, that step included, stays within
+    ``avg_tbt_slo`` (``deltaserve/tbt_window.py``: every decode token of the
+    window, averaged). 0 (default) = off: only the per-step ``max_tbt_slo``
+    check runs and ``avg_tbt_slo`` is not enforced, as before."""
+
     max_tbt_slo: float = 0.2
     """Max time-between-tokens SLO (seconds): a single step's predicted time must
     not exceed this while FT tokens are admitted."""

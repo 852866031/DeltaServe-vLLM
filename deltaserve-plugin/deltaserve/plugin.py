@@ -451,8 +451,9 @@ def _patch_engine_core() -> None:
         def deltaserve_adapters(self) -> dict:
             """Utility behind GET /adapters: the adapter pool and its jobs."""
             routing = getattr(self, "_ds_routing", None)
-            return {"error": "adapter routing is off"} if routing is None \
-                else routing.status()
+            if routing is None:
+                return {"error": "adapter routing is off"}
+            return {**routing.status(), "workers": routing.worker_stats()}
 
         def deltaserve_add_adapter(self, spec: dict) -> dict:
             """Utility behind POST /adapters: add an existing adapter."""

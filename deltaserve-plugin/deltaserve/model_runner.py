@@ -143,6 +143,9 @@ class DeltaServeModelRunner(GPUModelRunner):
             feats = getattr(scheduler_output, "_ft_step_features", None)
             if feats is None or int(feats.t_in) - int(feats.t_ft) <= 0:
                 self._ds_route_hold = False
+                stats = getattr(self, "_ds_route_stats", None)
+                if stats is not None:
+                    stats["pause_released_no_prefill"] += 1
                 if not self._throttle_held:
                     coord.gpu_resume_backward()
         if self._throttle_held:
@@ -403,6 +406,9 @@ class DeltaServeModelRunner(GPUModelRunner):
             # step owns it now, whatever ``pending_backward`` says by now.
             self._ds_route_hold = False
             pause_bwd = True
+            stats = getattr(self, "_ds_route_stats", None)
+            if stats is not None:
+                stats["pause_kept_for_prefill"] += 1
         if self._throttle_held and not pause_throttle:
             coord.gpu_resume_backward()
             self._throttle_held = False

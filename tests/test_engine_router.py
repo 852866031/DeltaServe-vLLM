@@ -162,6 +162,38 @@ def test_hold_and_route():
           and st["held"] == 0)
 
 
+def test_encode_time():
+    print("Encode time handed to the TBT check")
+    import time
+
+    import numpy as np
+
+    def slow(spent):
+        def encode(batch):
+            time.sleep(0.03)          # the wait for the step in flight
+            embs = np.zeros((len(batch), 4), dtype=np.float32)
+            return embs if spent is None else (embs, spent)
+        return encode
+
+    r, log = make_router(encode=slow(0.004))
+    r.hold(fake_request("a", [1, 2]))
+    n = r.route_pending()
+    check("the worker's own encode time is used, not the engine's wall time "
+          f"({r.encode_s * 1e3:.1f} ms of {r.encode_wall_s * 1e3:.0f} ms)",
+          n == 1 and abs(r.encode_s - 0.004) < 1e-9
+          and r.encode_wall_s >= 0.03
+          and r.status()["encode_wall_ms"] >= 30)
+    r, log = make_router(encode=slow(None))
+    r.hold(fake_request("b", [1, 2]))
+    r.route_pending()
+    check("a worker that reports no time: the wall time is used",
+          r.encode_s >= 0.03 and r.encode_s == r.encode_wall_s)
+    r, log = make_router(encode=slow(9.0))
+    r.hold(fake_request("c", [1, 2]))
+    r.route_pending()
+    check("never more than the wall time", r.encode_s == r.encode_wall_s < 1)
+
+
 def test_token_cap():
     print("An encode step's token cap")
     from deltaserve.adapter_routing.engine_router import _Held, take_batch
@@ -761,6 +793,7 @@ def test_worker_mixin():
 def main():
     test_wire_format()
     test_hold_and_route()
+    test_encode_time()
     test_token_cap()
     test_never_stuck()
     test_abort()

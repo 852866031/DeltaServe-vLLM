@@ -173,6 +173,15 @@ class FinetuneScheduler(AsyncScheduler):
         self._ttft_slo = float(ft_cfg.ttft_slo)
         self._max_tbt_slo = float(ft_cfg.max_tbt_slo)
         self._avg_tbt_slo = float(ft_cfg.avg_tbt_slo)
+        # [avg_tbt_window_s] The average-TBT check: off (None) = only the
+        # per-step ``max_tbt_slo`` check, as before.
+        self._tbt_window = None
+        if float(getattr(ft_cfg, "avg_tbt_window_s", 0.0) or 0.0) > 0:
+            from deltaserve.tbt_window import TbtWindow
+
+            self._tbt_window = TbtWindow(float(ft_cfg.avg_tbt_window_s))
+            dprint(f"[ft-sched] average TBT kept within {self._avg_tbt_slo}s "
+                   f"over a {ft_cfg.avg_tbt_window_s}s window")
         # [async] Under pipelined (async) scheduling, schedule(N+1) runs while
         # forward(N) is still on the GPU, so a request admitted now isn't
         # prefilled until the in-flight step(s) finish. We add that queue wait to
@@ -641,6 +650,11 @@ class FinetuneScheduler(AsyncScheduler):
             effective_tbt = self._max_tbt_slo * decode_only_margin
             if t_baseline + t_encode >= effective_tbt:
                 return 0, []
+            # [avg_tbt_window_s] Already over the average without FT.
+            if self._tbt_window is not None and self._tbt_window.average_with(
+                    time.monotonic(), feats.b_d,
+                    t_baseline + t_encode) >= self._avg_tbt_slo:
+                return 0, []
         if ttft_deadline is not None and self._estimator.is_ready:
             if (ttft_deadline - now - queue_wait - t_baseline) <= 0:
                 return 0, []
@@ -745,6 +759,13 @@ class FinetuneScheduler(AsyncScheduler):
                 if feats.b_d > 0:
                     effective_tbt = self._max_tbt_slo * decode_only_margin
                     if t_with_ft + t_encode > effective_tbt:
+                        break
+                    # [avg_tbt_window_s] The average over the last window,
+                    # this step included, stays within ``avg_tbt_slo``.
+                    if (self._tbt_window is not None
+                            and self._tbt_window.average_with(
+                                time.monotonic(), feats.b_d,
+                                t_with_ft + t_encode) > self._avg_tbt_slo):
                         break
                 if ttft_deadline is not None:
                     if (ttft_deadline - now - queue_wait - t_with_ft) <= 0:
@@ -1223,7 +1244,7 @@ class FinetuneScheduler(AsyncScheduler):
         so it rides the step being built."""
         routing = getattr(self, "_adapter_routing", None)
         if routing is not None:
-            routing.router.route_pending()
+            routing.router.route_pending("arrival")
 
     def _schedule_step(self) -> SchedulerOutput:
         # [Phase 4] Drain step durations the runner finished timing (deferred
@@ -1557,6 +1578,14 @@ class FinetuneScheduler(AsyncScheduler):
         model_runner_output: ModelRunnerOutput,
     ) -> dict:
         self._maybe_log_batch_done(scheduler_output)
+        if self._tbt_window is not None:
+            feats = getattr(scheduler_output, "_ft_step_features", None)
+            aborted = getattr(model_runner_output, "finetune_aborted", False)
+            self._tbt_window.step_done(
+                time.monotonic(),
+                0 if (feats is None or aborted) else int(feats.b_d),
+                any(not getattr(r, "is_finetuning", False)
+                    for r in self.running))
         if getattr(model_runner_output, "finetune_aborted", False):
             # [forward_interruptible / tier C] The runner abandoned this FT-only
             # forward: undo its FT scheduling (the output carries no per-request

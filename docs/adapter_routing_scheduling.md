@@ -243,7 +243,9 @@ at each of its boundaries, indexing yields between encoder layers and moves to t
 CPU, and the handover does its GPU part (copying weights to host memory) in the
 backward child and everything else on the CPU. The estimator is told what adapter
 routing cost: the encode time is already inside TTFT because the arrival is stamped
-before it, it is added explicitly to TBT, and the predicted adapter load time is
+before it, it is added explicitly to TBT (the worker's own time for the encode —
+not the engine's wall time, which also holds the wait for the step still on the
+GPU), and the predicted adapter load time is
 added to the step time (and taken off the measured step time before the model is
 refitted, so loads do not skew it).
 
@@ -269,6 +271,21 @@ the scheduler counts the encode against the SLOs; widening them by what an encod
 takes gets half of it back. The four pool adapters share one set of weights and
 their routing entries were built from the trace's own prompts, so this measures the
 path, not the quality of the choice.
+
+Later changes, same trace, one run each: with the encode time counted once (see
+section 9) and the average TBT enforced over a 1 s window at 35 ms
+(`slo.avg_tbt_window_s`), the routed run gives TTFT 94 / 110 / 116 ms, average TBT
+p50 28.9 ms (95 % of requests within 35 ms) and 110,396 FT tokens. Two indexing
+jobs added mid-trace changed the average TBT by 0.1–0.3 ms while they ran. A
+finetuning job that ended 61 s into the trace was saved in 129 ms off the engine
+loop, admitted, listed by `GET /adapters/available` and used by the client from
+its next request, without a cold start.
+
+Seen in these runs: 614 encode steps of one request each, the backward paused for
+an encode 110 times and every time kept for the prefill that followed, 3 cold-start
+holds (all preloads used). Never seen live, covered by unit tests only: an encode
+batch split by the token cap, a pause released because no prefill followed, GPU
+indexing preempted by a request.
 
 **Not done:**
 

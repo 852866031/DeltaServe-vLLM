@@ -202,6 +202,14 @@ class EngineRouter:
         # (the scheduler's hook resets it): the gap they add between two
         # decode steps, for the TBT check.
         self.encode_s = 0.0
+        self.encode_wall_s = 0.0      # cumulative, engine side (status only)
+        # What happened, for GET /adapters: encode steps by what led to them
+        # ("schedule": the start of a schedule() call; "arrival": a request
+        # that landed during the FT-only grace wait or after a rollback), how
+        # many requests they carried, and how often the token cap split a
+        # batch over two steps.
+        self.encode_by = {"schedule": 0, "arrival": 0}
+        self.encoded_requests = self.split_batches = 0
 
     # ----------------------------------------------------------------- hold
     @staticmethod
@@ -287,22 +295,33 @@ class EngineRouter:
         return preload, copies, reads
 
     # ---------------------------------------------------------------- route
-    def route_pending(self) -> int:
+    def route_pending(self, why: str = "schedule") -> int:
         """Encode, decide and release held requests (one encode step's worth).
         Returns how many entered the scheduler."""
         if not self.held:
             return 0
         n = take_batch(self.held, self.max_tokens)
         batch, self.held = self.held[:n], self.held[n:]
-        embs = None
+        self.encode_by[why] = self.encode_by.get(why, 0) + 1
+        self.encoded_requests += n
+        if self.held:
+            self.split_batches += 1
+        embs = spent = None
         t0 = time.perf_counter()
         try:
             embs = self._encode([h.ids for h in batch])
+            if isinstance(embs, tuple):
+                # The worker's own time for the encode: the engine's wall
+                # time also holds the wait for the step still in flight,
+                # which the next model step pays with or without an encode.
+                embs, spent = embs
             self.encode_steps += 1
         except Exception as e:  # noqa: BLE001 — a request is never stuck
             dprint(f"[adapter-routing] encode step failed ({type(e).__name__}: "
                    f"{e}); {len(batch)} request(s) served by the base model")
-        self.encode_s += time.perf_counter() - t0
+        wall = time.perf_counter() - t0
+        self.encode_wall_s += wall
+        self.encode_s += wall if spent is None else min(float(spent), wall)
         if embs is None or len(embs) != len(batch):
             decisions = [RouteDecision(None, None, UNAVAILABLE) for _ in batch]
         else:
@@ -349,7 +368,10 @@ class EngineRouter:
         out = {"held": len(self.held), "encode_steps": self.encode_steps,
                "routed": self.routed, "fallbacks": self.fallbacks,
                "dropped": self.dropped, "cold_held": len(self.cold),
-               "cold_holds": self.cold_holds}
+               "cold_holds": self.cold_holds, "encode_by": dict(self.encode_by),
+               "encoded_requests": self.encoded_requests,
+               "split_batches": self.split_batches,
+               "encode_wall_ms": round(self.encode_wall_s * 1e3, 1)}
         if self.mirror is not None:
             out["adapters"] = self.mirror.status()
         return out

@@ -142,6 +142,41 @@ async def adapters(raw_request: Request):
                         content=result)
 
 
+def available_adapters(directory: str, route_model: str = "auto") -> dict:
+    """What a client can ask for right now, from the pool's registry file."""
+    from deltaserve.adapter_routing.pool import read_registry
+
+    reg = read_registry(directory) or {"adapters": [], "version": 0}
+    return {
+        "route_model": route_model, "version": reg.get("version", 0),
+        "adapters": [{"name": a["name"], "level": a.get("level"),
+                      # a candidate for model=<route_model>; every listed
+                      # adapter can be asked for by name
+                      "routable": a.get("level") == "active"
+                      and bool(a.get("enabled"))}
+                     for a in reg["adapters"]]}
+
+
+@routing_router.get("/adapters/available")
+async def adapters_available(raw_request: Request):
+    """The adapters a client can use now: by name (``"model": "<name>"``), and
+    — those marked routable — through ``"model": "<route_model>"``. An adapter
+    appears here the moment its finetuning job has saved it and the pool has
+    admitted it. Answered by the API server from the pool's registry file, no
+    engine call: cheap enough to poll."""
+    cfg = getattr(raw_request.app.state, "deltaserve_adapter_routing", None)
+    if cfg is None:
+        return JSONResponse(status_code=409,
+                            content={"error": "adapter routing is off"})
+    from deltaserve.adapter_routing.stages import index_dir
+
+    try:
+        return JSONResponse(status_code=200, content=available_adapters(
+            index_dir(cfg), cfg.route_model_name))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @routing_router.post("/adapters")
 async def add_adapter(raw_request: Request):
     """Add an existing adapter to the pool without training. JSON body:
@@ -212,6 +247,7 @@ def attach_router(app: FastAPI):
         # Route middleware + the pool's LoRA resolver (pool adapters become
         # servable by name) + cache invalidation.
         install(app, cfg)
+        app.state.deltaserve_adapter_routing = cfg
         app.include_router(routing_router)
         logger.info("Adapter routing on: requests with model=%r are routed.",
                     routing.get("route_model_name", "auto"))

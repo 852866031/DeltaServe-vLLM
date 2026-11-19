@@ -660,6 +660,36 @@ def test_routing_off():
               and kw["route_model_name"] == "auto")
 
 
+def test_available():
+    print("GET /adapters/available (what a client can use now)")
+    import json
+    import tempfile
+
+    from deltaserve.api import available_adapters
+
+    with tempfile.TemporaryDirectory() as d:
+        got = available_adapters(d, "auto")
+        check("no registry yet: an empty list, not an error",
+              got == {"route_model": "auto", "version": 0, "adapters": []})
+        with open(os.path.join(d, "pool.json"), "w") as f:
+            json.dump({"version": 7, "adapters": [
+                {"name": "a", "level": "active", "enabled": True},
+                {"name": "b", "level": "active", "enabled": False},
+                {"name": "c", "level": "retired", "enabled": True}]}, f)
+        got = available_adapters(d, "auto")
+        by = {a["name"]: a for a in got["adapters"]}
+        check("every pool adapter is listed, with the registry version",
+              got["version"] == 7 and list(by) == ["a", "b", "c"])
+        check("routable = active and with a routing entry; the others can "
+              "still be named",
+              by["a"]["routable"] and not by["b"]["routable"]
+              and not by["c"]["routable"] and by["c"]["level"] == "retired")
+        with open(os.path.join(d, "pool.json"), "w") as f:
+            f.write("{half")
+        check("a registry being rewritten reads as empty",
+              available_adapters(d)["adapters"] == [])
+
+
 def test_end_to_end():
     green("middleware → route payload → engine router → decision → headers:")
     from deltaserve.adapter_routing.middleware import AdapterRouteMiddleware
@@ -815,6 +845,7 @@ def main():
     test_router()
     test_middleware()
     test_routing_off()
+    test_available()
     test_end_to_end()
     test_real_encoder()
     print()
