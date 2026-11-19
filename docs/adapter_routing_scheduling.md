@@ -51,9 +51,11 @@ when the backward may run.
 
 Adapter routing closes a loop. A finetuning job's samples go through the forward
 batch (1), their activations are saved (2), and the backward trains the adapter (3).
-When the job finishes, the **adapter handover** saves and publishes it (4);
-**indexing** computes its routing entry (5) and adds it to the adapter pool. From
-then on it is a candidate for routed requests (6), which are served with it (7).
+**In parallel**, indexing reads the same dataset and builds the adapter's routing
+entry while the job trains. When the job finishes, the **adapter handover** saves and
+publishes the adapter into the pool (4), where its routing entry is already waiting
+or arrives shortly after. From then on it is a candidate for routed requests (5),
+which are served with it (6).
 
 The loop introduces three kinds of work that did not exist in section 2: encoding,
 indexing, and the adapter handover.
@@ -96,7 +98,8 @@ Encoding turns a routed request into an adapter choice.
 
 Indexing makes an adapter routable by computing its routing entry.
 
-- **Input** — a new adapter and its finetuning dataset (up to 2500 samples).
+- **Input** — an adapter's finetuning dataset (up to 2500 samples). It starts with
+  the finetuning job and runs alongside training; it does not wait for the adapter.
 - **What it does** — encodes the samples in small chunks with the same encoder and
   keeps a running sum of the embeddings; the routing entry is their centroid.
 - **Where it runs** — the scheduler decides. While no inference request has been
@@ -135,8 +138,8 @@ memory, so the disk path is taken only on a cold start.
 When a finetuning job finishes, its adapter has to be saved and the backward has to
 move on to the next job. The scheduler closes FT admission and starts the handover;
 the backward process copies the trained weights to host memory, and an engine
-background thread merges, saves and publishes them into the adapter pool, where
-indexing picks the new adapter up. Once the weights are copied the backward switches
+background thread merges, saves and publishes them into the adapter pool, next to
+the routing entry that indexing built while the job trained. Once the weights are copied the backward switches
 to the next job's adapter and FT admission reopens. Saving is not time-critical, so
 none of it runs on the engine loop or keeps the GPU from inference.
 
