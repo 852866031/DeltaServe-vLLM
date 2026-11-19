@@ -207,16 +207,18 @@ def _index_process_main(pipe, hf_config, encoder_name, prefix, max_tokens,
     pipe.send({"ready": True, "pid": os.getpid(),
                "grant": grant is not None})
     stats = {"chunks": 0, "preempted": 0, "errors": 0}
+    import signal
+
+    # The worker stops this process with SIGTERM: leave quietly (the listener
+    # removes its own socket file).
+    signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
     try:
         while True:
             conn = listener.accept()
             threading.Thread(target=_serve, daemon=True, args=(
                 conn, model, tok, grant, prefix, max_tokens, device, stats)).start()
-    finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+    except (OSError, KeyboardInterrupt):
+        pass
 
 
 class IndexEncoderProcess:

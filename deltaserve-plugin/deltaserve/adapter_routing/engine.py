@@ -115,6 +115,12 @@ class AdapterRoutingEngine:
         if hasattr(self.pool.backend, "mirror"):
             self.pool.backend.mirror = self.router.mirror
             self.pool.backend.preload = self.router.request_preload
+            # Where an adapter is, is what vLLM did with it: the pool reads
+            # its tiers from the mirror instead of keeping its own.
+            self.pool.mirror = self.router.mirror
+        # Among close candidates the decision prefers an adapter that is in a
+        # GPU slot right now (no load), then the most used one.
+        self.decider._prefer = self._prefer
 
         # Indexing runs on its own (IndexingRunner thread); the scheduler only
         # tells it where it may run, when that changes: on the GPU — the
@@ -214,6 +220,13 @@ class AdapterRoutingEngine:
             return None
         return LoRARequest(lora_name=e.name, lora_int_id=int(e.lora_int_id),
                            lora_path=e.path)
+
+    def _prefer(self, name: str):
+        e = self.pool.entries.get(name)
+        mirror = self.router.mirror
+        in_slot = bool(e is not None and mirror is not None
+                       and mirror.in_slot(e.lora_int_id))
+        return (in_slot, 0 if e is None else e.hits)
 
     def _on_routed(self, request, decision) -> None:
         if decision.adapter:
@@ -353,6 +366,7 @@ class AdapterRoutingEngine:
     def status(self) -> dict:
         with self._jobs_lock:
             jobs = self.jobs.status()
+        self.pool.sync_tiers()
         return {**self.pool.status(), "jobs": jobs,
                 "router": self.router.status(), "index_dir": self.dir}
 

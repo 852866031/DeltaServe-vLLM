@@ -19,7 +19,14 @@ Checks
   * ``start_job_save``: nothing to save / already saved are handled at once;
   * the job stages: 'ready' and 'admission' stay running until the handover
     is done and fail with its error;
-  * the worker's switch: the adapter file is read once in the background
+  * the engine's DIRECT LINE to the backward children
+    (deltaserve.handover_channel): each child listens on its own socket; save
+    and the two-phase switch are answered on a handover thread; one rank's
+    error raises without leaving a reply on a line; ``JobSave`` over the line
+    makes no worker call at all and falls back to the worker call when the
+    children are not listening; the scheduler's switch thread checks every
+    rank before any rank takes the adapter;
+  * the worker's switch (the fallback path): the adapter file is read once in the background
     (``deltaserve_prepare_ft_adapter``), the check and the switch share one
     copy of it, and a job that was never pre-read still switches.
 """
@@ -375,7 +382,198 @@ def test_worker_switch():
             st.load_file = real
 
 
+class FakeService:
+    """A backward service as the handover line sees it."""
+
+    def __init__(self, rank, shard, refuse=None):
+        self.device_index, self.shard, self.refuse = rank, shard, refuse
+        self.switched, self.thread = [], None
+
+    def export_lora_state(self):
+        self.thread = threading.current_thread().name
+        return self.shard
+
+    def switch_adapter(self, ft, hparams):
+        if self.refuse:
+            raise ValueError(self.refuse)
+        self.switched.append((ft, dict(hparams)))
+        return {"tensors": len(ft), "dry_run": bool(hparams.get("dry_run"))}
+
+
+def test_direct_line():
+    print("The engine's direct line to the backward children")
+    from safetensors.torch import load_file
+
+    from deltaserve import handover_channel as hc
+    from deltaserve.adapter_save import JobSave, start_job_save
+
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "src")
+        trained = {k: v + 2.0 for k, v in make_adapter(src).items()}
+        with open(os.path.join(src, "adapter_config.json"), "w") as f:
+            f.write('{"r": 4, "lora_alpha": 8}')
+        shards = rank_shards(trained)
+        line_dir = hc.make_directory()
+        old = os.environ.get(hc.ENV)
+        try:
+            check("no directory offered by the engine: the child does not listen",
+                  os.environ.pop(hc.ENV, None) is None or True)
+            check("... and reports no line",
+                  hc.start_listener(FakeService(0, shards[0])) is None)
+            os.environ[hc.ENV] = line_dir
+            client = hc.HandoverClient(line_dir, 2, timeout_s=5.0)
+            check("not available before every rank listens", not client.available())
+            svcs = [FakeService(r, shards[r]) for r in range(2)]
+            paths = [hc.start_listener(s) for s in svcs]
+            check("each rank's child listens on its own socket",
+                  paths == [hc.socket_path(line_dir, 0), hc.socket_path(line_dir, 1)]
+                  and client.available())
+            check("ping reaches both", [r["pid"] for r in client.call_all(
+                lambda r: ("ping",))] == [os.getpid()] * 2)
+
+            out = [os.path.join(d, "sh", f"r{r}.safetensors") for r in range(2)]
+            replies = client.call_all(lambda r: ("save", out[r]))
+            check("save: each rank writes ITS shard, answered when the file is "
+                  "complete, on the handover thread (not the child's command loop)",
+                  [r["tensors"] for r in replies] == [len(trained)] * 2
+                  and all(os.path.exists(p) for p in out)
+                  and all(torch.equal(load_file(out[r])[k], shards[r][k])
+                          for r in range(2) for k in trained)
+                  and svcs[0].thread == "deltaserve-handover")
+
+            hp = {"learning_rate": 3e-4}
+            r1 = client.call_all(lambda r: ("switch", src, {**hp, "dry_run": True}))
+            r2 = client.call_all(lambda r: ("switch", src, hp))
+            check("switch: check then take; the child reads the adapter file "
+                  "itself (the FULL adapter, fp32) and adds its scaling",
+                  [x["dry_run"] for x in r1] == [True, True]
+                  and [x["dry_run"] for x in r2] == [False, False]
+                  and len(svcs[1].switched) == 2
+                  and set(svcs[1].switched[1][0]) == set(trained)
+                  and svcs[1].switched[1][0][key(0, "q", "A")].dtype == torch.float32
+                  and svcs[1].switched[1][1]["learning_rate"] == 3e-4
+                  and svcs[1].switched[1][1]["lora_scaling"] == 2.0)
+
+            svcs[1].refuse = "the adapter has 320 LoRA tensors, the launch adapter 224"
+            try:
+                client.call_all(lambda r: ("switch", src, {"dry_run": True}))
+                msg = ""
+            except RuntimeError as e:
+                msg = str(e)
+            check("one rank refusing raises with its reason",
+                  "ValueError" in msg and "320 LoRA tensors" in msg)
+            check("... and no reply is left on a line: the next call is answered "
+                  "correctly", client.call_all(lambda r: ("ping",))[0]["pid"]
+                  == os.getpid())
+            svcs[1].refuse = None
+            try:
+                client.call_all(lambda r: ("switch", os.path.join(d, "missing"), {}))
+                msg = ""
+            except RuntimeError as e:
+                msg = str(e)
+            check("a missing adapter file is an error reply, not a dead child",
+                  msg != "" and client.call_all(lambda r: ("ping",)))
+            check("an unknown request is refused",
+                  hc.handle(svcs[0], ("format-disk",))[0] == "error")
+
+            # the save, end to end, with NO worker call at all
+            class NoWorkers:
+                def collective_rpc(self, *a, **k):
+                    raise AssertionError("the save went through the workers")
+
+            j = job(src, name="direct", save_path=os.path.join(d, "saved"))
+            t0 = time.monotonic()
+            save = start_job_save(j, SimpleNamespace(model_executor=NoWorkers()),
+                                  None, handover=client)
+            held = (time.monotonic() - t0) * 1e3
+            check(f"JobSave over the direct line: start() does nothing on the "
+                  f"engine loop but start a thread ({held:.1f} ms, no worker call)",
+                  isinstance(save, JobSave) and held < 50)
+            err = wait(save)
+            saved = load_file(os.path.join(d, "saved", "adapter_model.safetensors")) \
+                if err is None else {}
+            check("and the adapter saved is the merged ranks' trained weights",
+                  err is None and all(torch.equal(saved[k], trained[k])
+                                      for k in trained))
+
+            gone = hc.HandoverClient(os.path.join(d, "nowhere"), 2)
+            j2 = job(src, name="fallback", save_path=os.path.join(d, "saved2"))
+            save = start_job_save(j2, SimpleNamespace(
+                model_executor=FakeExecutor(shards)), None, handover=gone)
+            check("children not listening: the save falls back to the worker call",
+                  wait(save) is None and j2.saved_path == os.path.join(d, "saved2"))
+            client.close()
+        finally:
+            if old is None:
+                os.environ.pop(hc.ENV, None)
+            else:
+                os.environ[hc.ENV] = old
+            # The listeners remove their own socket files when the process
+            # exits; the (then empty) directory is removed after them.
+            import atexit
+            import multiprocessing.util as mpu
+
+            mpu.Finalize(None, lambda: os.path.isdir(line_dir)
+                         and not os.listdir(line_dir) and os.rmdir(line_dir),
+                         exitpriority=-100)
+            del atexit
+
+
+def test_scheduler_switch():
+    print("Scheduler: the switch runs on a thread, the engine loop only watches")
+    from deltaserve.ft_scheduler import FinetuneScheduler
+
+    calls = []
+
+    class Line:
+        ranks = 2
+
+        def __init__(self, fail_at=None):
+            self.fail_at = fail_at
+
+        def available(self):
+            return True
+
+        def call_all(self, make_msg):
+            msg = make_msg(0)
+            calls.append((msg[0], msg[1], bool(msg[2].get("dry_run"))))
+            time.sleep(0.05)
+            if self.fail_at == len(calls):
+                raise RuntimeError("ValueError: wrong shape")
+            return [{}, {}]
+
+    j = SimpleNamespace(name="next", spec=SimpleNamespace(adapter_path="/a/next"))
+    sw = FinetuneScheduler._start_switch(None, j, Line(), {"learning_rate": 1e-4})
+    check("starting it returns at once", sw["done"] is False)
+    t0 = time.monotonic()
+    while not sw["done"] and time.monotonic() - t0 < 5:
+        time.sleep(0.01)
+    check("every rank is asked to CHECK the adapter first, then to take it",
+          sw["error"] is None and calls == [("switch", "/a/next", True),
+                                            ("switch", "/a/next", False)]
+          and sw["ms"] >= 90)
+    calls.clear()
+    sw = FinetuneScheduler._start_switch(None, j, Line(fail_at=1), {})
+    while not sw["done"]:
+        time.sleep(0.01)
+    check("a refused adapter stops after the check: nothing was taken",
+          "the adapter was refused" in sw["error"] and "wrong shape" in sw["error"]
+          and len(calls) == 1)
+    calls.clear()
+    sw = FinetuneScheduler._start_switch(None, j, Line(fail_at=2), {})
+    while not sw["done"]:
+        time.sleep(0.01)
+    check("a failure after the check says the ranks may disagree",
+          "AFTER the check passed" in sw["error"] and len(calls) == 2)
+    line = SimpleNamespace(available=lambda: False)
+    check("no usable line → the scheduler uses the worker path",
+          FinetuneScheduler._handover_line(SimpleNamespace(_ds_handover=line))
+          is None and FinetuneScheduler._handover_line(SimpleNamespace()) is None)
+
+
 def main():
+    test_direct_line()
+    test_scheduler_switch()
     test_shard_writer()
     test_job_save()
     test_stages()

@@ -550,11 +550,22 @@ def test_external_adapters():
                   len(set(ids.values())) == 4)
             routing.note_request(SimpleNamespace(
                 lora_request=SimpleNamespace(lora_name="translate-adapter")))
-            check("the first request for it gives it a GPU slot in the pool's "
-                  "view; the engine is not asked to load it (vLLM does, in the "
-                  "step that uses it)",
+            routing.pool.sync_tiers()
+            check("a request for it does not move it by itself, and the engine "
+                  "is not asked to load it: where an adapter is, is what vLLM "
+                  "did with it",
                   engine.added == []
-                  and routing.pool.entries["translate-adapter"].tier == "gpu")
+                  and routing.pool.entries["translate-adapter"].tier == "disk")
+            routing.router.step_issued([ids["translate-adapter"]])
+            tiers = {a["name"]: a["tier"] for a in routing.status()["adapters"]}
+            check("once a step uses it, vLLM has it in a GPU slot — and the "
+                  "pool's view (GET /adapters) says so, read from the mirror",
+                  routing.pool.entries["translate-adapter"].tier == "gpu"
+                  and tiers.get("translate-adapter") == "gpu")
+            check("among close candidates the decision prefers the adapter "
+                  "that is in a GPU slot now",
+                  routing._prefer("translate-adapter")[0] is True
+                  and routing._prefer(j2["name"])[0] is False)
 
             n = CountingExec.made[0].samples
             vc2 = vllm_config(d, finetuning=False)

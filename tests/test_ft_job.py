@@ -316,6 +316,11 @@ def test_online_jobs():
             submit_ft_job = FS.submit_ft_job
             begin_job = FS.begin_job
             job_ready_to_train = FS.job_ready_to_train
+            # This engine has no direct line to the backward children, so the
+            # switch goes through the workers (tests/test_adapter_handover.py
+            # covers the direct line).
+            _handover_line = staticmethod(FS._handover_line)
+            _adopt_job = FS._adopt_job
 
             def __init__(self):
                 self.vllm_config = SimpleNamespace(finetune_config=SimpleNamespace(

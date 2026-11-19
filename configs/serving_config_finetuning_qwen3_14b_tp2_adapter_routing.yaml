@@ -53,10 +53,16 @@ throttles:
   ft_tokens_admission_constrain_factor: -1
   match_prefill_workload_factor: 0
 
+# A routed request's first token also pays for its encode step (4-17 ms) and,
+# when its adapter is not in a GPU slot, the adapter load (4 ms from host
+# memory, about 18 ms from disk); an encode step also sits between two decode
+# steps of the requests already running. The plain preset's SLOs (0.4 s /
+# 20 ms / 50 ms) are widened by that much, so the finetuning admission is not
+# squeezed out by work that routing itself adds.
 slo:
-  ttft_slo: 0.4
-  avg_tbt_slo: 0.02
-  max_tbt_slo: 0.05
+  ttft_slo: 0.5
+  avg_tbt_slo: 0.025
+  max_tbt_slo: 0.07
   # M4.2: the runner's per-step timing samples and the profiling pass's
   # record gate now ride the TP relay (ModelRunnerOutput.finetune_timing /
   # SchedulerOutput.finetune_record_timing), so the launch-time profiling

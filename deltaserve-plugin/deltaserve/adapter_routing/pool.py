@@ -113,6 +113,10 @@ class AdapterPool:
                  min_pool: int = 4, min_self_recall: float = 0.0,
                  max_stolen: float = 1.0) -> None:
         self.backend = backend
+        # The engine's replay of vLLM's adapter caches. With it the tiers are
+        # facts read from there (``sync_tiers``); without it (tests, no
+        # engine) they are the pool's own LRU-by-frequency bookkeeping.
+        self.mirror = None
         self.index = index if index is not None else CentroidIndex()
         # ``capacity`` bounds the ACTIVE adapters only (a quality knob: the more
         # adapters compete, the more often routing picks a neighbour).
@@ -234,6 +238,8 @@ class AdapterPool:
             e.tier = GPU
 
     def _to_disk(self, e: PoolEntry) -> None:
+        # Where it really is decides whether vLLM has to drop it.
+        self.sync_tiers()
         if e.tier == GPU:
             self.backend.deactivate(e)
             e.tier = CPU
@@ -296,8 +302,21 @@ class AdapterPool:
         e.hits += 1
         if e.tier == DISK:
             self.cold_loads += 1
-        self.ensure_gpu(name, in_use=in_use)
+        if self.mirror is None:
+            self.ensure_gpu(name, in_use=in_use)
         return e
+
+    @_locked
+    def sync_tiers(self, mirror=None) -> None:
+        """Set every adapter's tier from where vLLM really has it (the engine's
+        ``LoraCacheMirror``): the pool does not move adapters between tiers
+        itself when one is attached."""
+        mirror = mirror if mirror is not None else self.mirror
+        if mirror is None:
+            return
+        for e in self.entries.values():
+            i = e.lora_int_id
+            e.tier = GPU if mirror.in_slot(i) else CPU if mirror.in_memory(i) else DISK
 
     def route(self, embedding, threshold: float = -1.0) -> tuple[str | None, float]:
         """ARIADNE top-1 over the enabled, indexed adapters; (None, score) is

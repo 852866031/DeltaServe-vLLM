@@ -346,24 +346,27 @@ def test_middleware():
                   "no adapter matched")
               and "x-deltaserve-adapter" not in h)
 
-        # A stream's response starts before its first token: the start is held
-        # until the engine's decision is back.
+        # A stream's response starts before its first token — and before
+        # vLLM has submitted the request to the engine (the body generator
+        # does that). The start is therefore never WAITED on: the app's
+        # send(start) returns at once, and the client gets the start with the
+        # first body message, the decision in its headers.
         state = {}
 
         async def early_app(scope, receive, send):
             await receive()
             payload = ROUTE_PAYLOAD.get()
-            start = asyncio.ensure_future(send(
-                {"type": "http.response.start", "status": 200, "headers": []}))
-            await asyncio.sleep(0.03)
-            state["held"] = not start.done()
-            eng.take(payload)
-            await start
+            await asyncio.wait_for(send(
+                {"type": "http.response.start", "status": 200, "headers": []}), 1.0)
+            state["returned"] = True
+            eng.take(payload)             # only now does the engine see it
             await send({"type": "http.response.body", "body": b"tok"})
 
         seen, out = run(call(mw, body, app=early_app))
-        check("the response start waits for the engine's decision and carries it",
-              state["held"] and out["status"] == 200
+        check("a streamed response is not held hostage: send(start) returns "
+              "before the engine has the request, and the start reaches the "
+              "client with the first token, carrying the decision",
+              state.get("returned") and out["status"] == 200
               and out["headers"].get("x-deltaserve-adapter")
               == "dserve-routing-translate" and out["body"] == b"tok")
 

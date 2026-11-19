@@ -311,6 +311,14 @@ class BackwardService:
             "mps_percentage": inherited_mps,
             "max_connections": inherited_max_conn,
         })
+        # [adapter handover] A direct line from the engine (see
+        # ``deltaserve.handover_channel``): saving the trained adapter and
+        # switching to the next job's do not go through the worker.
+        from deltaserve.handover_channel import start_listener
+
+        line = start_listener(self)
+        if line:
+            dprint(f"[backward] pid={pid} handover line {line}")
         try:
             while True:
                 try:

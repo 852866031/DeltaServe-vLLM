@@ -243,9 +243,10 @@ class FinetuneScheduler(AsyncScheduler):
         # [adapter handover] Only triggered here: the snapshot is taken now,
         # merging / writing / publishing run off the engine loop;
         # ``job_handover_done`` is what the stage polls.
+        engine = getattr(self, "_ds_engine", None)
         self._job_saves[job.name] = start_job_save(
-            job, getattr(self, "_ds_engine", None),
-            getattr(self, "_adapter_routing", None))
+            job, engine, getattr(self, "_adapter_routing", None),
+            handover=getattr(engine, "_ds_handover", None))
 
     def job_handover_done(self, job) -> bool:
         """[adapter handover] The save (and publish) ``on_job_ready`` /
@@ -327,10 +328,12 @@ class FinetuneScheduler(AsyncScheduler):
                                            name="deltaserve-ft-job-prepare")
         state["thread"].start()
         self._job_switch = state
-        # [adapter handover] ... and every rank reads the job's adapter file in
-        # the background, so the switch does not wait for the disk.
+        # [adapter handover] Without the direct line to the backward children
+        # the switch goes through the workers: have every rank read the job's
+        # adapter file in the background, so that call does not wait for the
+        # disk.
         engine = getattr(self, "_ds_engine", None)
-        if engine is not None:
+        if engine is not None and not self._handover_line(engine):
             try:
                 engine.model_executor.collective_rpc(
                     "deltaserve_prepare_ft_adapter", args=(job.spec.adapter_path,))
@@ -366,6 +369,24 @@ class FinetuneScheduler(AsyncScheduler):
         hparams = {"learning_rate": job.spec.learning_rate,
                    "weight_decay": job.spec.weight_decay, "gamma": job.spec.gamma,
                    "total_tokens_per_epoch": int(store.total_tokens_in_memory)}
+        line = self._handover_line(engine)
+        if line is not None:
+            # [adapter handover] Off the engine loop: a thread asks every
+            # rank's backward child directly — first to check the adapter,
+            # then to take it. This call only starts it and, a few steps
+            # later, sees that it is done.
+            switch = state.get("switch")
+            if switch is None:
+                state["switch"] = self._start_switch(job, line, hparams)
+                return False
+            if not switch["done"]:
+                return False
+            if switch["error"]:
+                raise RuntimeError(switch["error"])
+            dprint(f"[ft-job] {job.name}: adapter switched in "
+                   f"{switch['ms']:.0f} ms, off the engine loop")
+            return self._adopt_job(job, store)
+
         def all_ranks(hp, what):
             replies = engine.model_executor.collective_rpc(
                 "deltaserve_switch_ft_adapter", args=(job.spec.adapter_path, hp))
@@ -385,7 +406,51 @@ class FinetuneScheduler(AsyncScheduler):
         dprint(f"[ft-job] {job.name}: adapter switch held the engine loop "
                f"{(time.monotonic() - t_switch) * 1e3:.0f} ms (check "
                f"{(t_checked - t_switch) * 1e3:.0f} ms)")
-        # Every rank trains the new adapter now: the scheduler follows.
+        return self._adopt_job(job, store)
+
+    @staticmethod
+    def _handover_line(engine):
+        """The engine's direct line to the backward children, when every rank
+        is listening on it."""
+        line = getattr(engine, "_ds_handover", None)
+        return line if line is not None and line.available() else None
+
+    def _start_switch(self, job, line, hparams) -> dict:
+        import threading
+
+        switch = {"done": False, "error": None, "ms": None}
+        path = job.spec.adapter_path
+
+        def run():
+            t0 = time.monotonic()
+            try:
+                # Two phases, so the ranks cannot end up training different
+                # adapters: every rank checks first; only then does any take it.
+                try:
+                    line.call_all(lambda r: ("switch", path,
+                                             {**hparams, "dry_run": True}))
+                except Exception as e:  # noqa: BLE001
+                    raise RuntimeError(f"the adapter was refused: {e}") from e
+                try:
+                    line.call_all(lambda r: ("switch", path, hparams))
+                except Exception as e:  # noqa: BLE001
+                    raise RuntimeError(
+                        "the adapter switch failed AFTER the check passed "
+                        f"(ranks may disagree; restart the server): {e}") from e
+            except Exception as e:  # noqa: BLE001 — raised by the init stage
+                switch["error"] = str(e)
+            finally:
+                switch["ms"] = (time.monotonic() - t0) * 1e3
+                switch["done"] = True
+
+        threading.Thread(target=run, daemon=True,
+                         name="deltaserve-adapter-switch").start()
+        return switch
+
+    def _adopt_job(self, job, store) -> bool:
+        """Every rank trains the job's adapter now: the scheduler follows with
+        its dataset and counters."""
+        coord = self._coord
         self._ft_injector.store = store
         coord.current_epoch = 0
         coord.corpus_total_tokens = int(store.total_tokens_in_memory)

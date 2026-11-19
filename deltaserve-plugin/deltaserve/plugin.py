@@ -220,6 +220,28 @@ def _patch_engine_core() -> None:
         def __init__(self, vllm_config, *args, **kwargs):
             # Before the executor spawns the workers (arrival signal).
             self._ds = attach_engine_hooks(self, vllm_config)
+            self._ds_handover = None
+            if vllm_config.finetune_config.enable_finetuning:
+                # [adapter handover] Where every rank's backward child listens
+                # for the engine; the name travels in the workers' environment.
+                import os
+
+                from deltaserve.handover_channel import (
+                    ENV,
+                    HandoverClient,
+                    make_directory,
+                )
+
+                try:
+                    directory = make_directory()
+                    os.environ[ENV] = directory
+                    self._ds_handover = HandoverClient(
+                        directory,
+                        vllm_config.parallel_config.tensor_parallel_size)
+                except Exception as e:  # noqa: BLE001 — handover via the workers
+                    from deltaserve import dprint
+
+                    dprint(f"[ft-job] no direct handover line ({e})")
             self._ds_index_grant = None
             if vllm_config.adapter_routing_config.enable_adapter_routing:
                 # [indexing] May indexing use the GPU? The engine writes it,
@@ -273,6 +295,13 @@ def _patch_engine_core() -> None:
             routing = getattr(self, "_ds_routing", None)
             if routing is not None:
                 routing.shutdown()
+            handover = getattr(self, "_ds_handover", None)
+            if handover is not None:
+                import shutil
+
+                handover.close()
+                shutil.rmtree(handover.directory, ignore_errors=True)
+                self._ds_handover = None
             grant = getattr(self, "_ds_index_grant", None)
             if grant is not None:
                 grant.set(False)

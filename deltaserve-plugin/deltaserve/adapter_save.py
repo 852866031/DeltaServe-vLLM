@@ -165,8 +165,13 @@ class JobSave:
 
     SHARD_WAIT_S = 120.0
 
-    def __init__(self, job, engine, routing, dst: str) -> None:
+    def __init__(self, job, engine, routing, dst: str, handover=None) -> None:
         self.job, self.engine, self.routing, self.dst = job, engine, routing, dst
+        # The engine's direct line to the backward children: with it nothing
+        # at all happens on the engine loop (the thread asks every rank to
+        # write its shard and waits there).
+        self.handover = handover if (handover is not None
+                                     and handover.available()) else None
         self.error: str | None = None
         self.finished = False
         self.trigger_ms = self.total_ms = None
@@ -181,6 +186,15 @@ class JobSave:
         os.makedirs(os.path.dirname(os.path.abspath(self.dst)), exist_ok=True)
         self.shard_dir = tempfile.mkdtemp(
             prefix=".shards-", dir=os.path.dirname(os.path.abspath(self.dst)))
+        if self.handover is not None:
+            self.shards = [os.path.join(self.shard_dir, f"shard-rank{r}.safetensors")
+                           for r in range(self.handover.ranks)]
+            self.trigger_ms = (time.monotonic() - t0) * 1e3
+            self._t0 = t0
+            self._thread = threading.Thread(target=self._run, daemon=True,
+                                            name="deltaserve-adapter-save")
+            self._thread.start()
+            return self
         replies = self.engine.model_executor.collective_rpc(
             "deltaserve_save_ft_adapter", args=(self.shard_dir,))
         replies = [r for r in replies if r is not None]
@@ -210,6 +224,10 @@ class JobSave:
 
         job = self.job
         try:
+            if self.handover is not None:
+                # every rank snapshots and writes its shard; answered when
+                # the file is complete
+                self.handover.call_all(lambda rank: ("save", self.shards[rank]))
             deadline = time.monotonic() + self.SHARD_WAIT_S
             while not all(os.path.exists(p) for p in self.shards):
                 failed = [p for p in self.shards if os.path.exists(p + ".error")]
@@ -245,7 +263,7 @@ class JobSave:
         return True
 
 
-def start_job_save(job, engine, routing=None):
+def start_job_save(job, engine, routing=None, handover=None):
     """Begin what 'ready' / 'admission' does for a job that trained: save its
     adapter and, when auto-routable, publish it to the pool — without holding
     the engine loop. Returns a ``JobSave`` to poll, or None when everything
@@ -262,9 +280,9 @@ def start_job_save(job, engine, routing=None):
         if routing is not None and spec.auto_routing and job.admission is None:
             routing.publish(job)
         return None
-    if engine is None or not spec.adapter_path:
+    if (engine is None and handover is None) or not spec.adapter_path:
         raise RuntimeError(f"{job.name}: no engine / source adapter to export from")
-    return JobSave(job, engine, routing, dst).start()
+    return JobSave(job, engine, routing, dst, handover=handover).start()
 
 
 def export_trained_adapter(engine, src_dir: str, dst_dir: str,

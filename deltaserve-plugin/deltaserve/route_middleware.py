@@ -33,8 +33,10 @@ request and reports the outcome:
     x-deltaserve-routing-reason: <why>            (fallback only)
     x-deltaserve-routing-message: <the same, as a sentence>   (fallback only)
 
-   They reach the client with the first token, streaming or not: the response
-   start is held until the decision is known. The response body's ``model``
+   They reach the client with the first token, streaming or not: a streamed
+   response's start is kept back and sent with its first body message (it
+   cannot WAIT for the decision — vLLM submits a streamed request to the
+   engine only after the start was sent). The response body's ``model``
    field is the base model's name — the adapter is reported in the headers
    only.
 
@@ -200,10 +202,10 @@ def _resolve(fut, decision) -> None:
 
 DECISIONS = DecisionRegistry()
 
-# A streamed response starts when its first token exists; its headers wait
-# for the decision, which the engine makes before the prefill. This only
-# bounds a request whose engine never answers at all.
-DECISION_WAIT_S = 120.0
+# How long the first body message of a response waits for the decision when
+# it somehow precedes it (it should not: the decision rides on the request's
+# first engine output). Bounds the delay; the response then says "timeout".
+DECISION_WAIT_S = 5.0
 
 
 def decision_headers(decision: RouteDecision) -> list:
@@ -321,29 +323,56 @@ class AdapterRouteMiddleware:
 
         fut = self.registry.expect(key) if key is not None else None
 
+        # A streamed response sends its start BEFORE vLLM submits the request
+        # to the engine (the body generator does that on its first step), so
+        # the start cannot wait for the engine's decision: nothing would ever
+        # be submitted. It is kept back instead and sent with the first body
+        # message — the first token, which the decision precedes.
+        held_start = None
+
+        async def flush_start():
+            nonlocal decision, held_start
+            message, held_start = held_start, None
+            if decision is None and fut is not None:
+                if not fut.done():
+                    # the request is in the engine by now: its decision is
+                    # at most a step away
+                    try:
+                        await asyncio.wait_for(asyncio.shield(fut), DECISION_WAIT_S)
+                    except asyncio.TimeoutError:
+                        pass
+                decision = fut.result() if fut.done() \
+                    else RouteDecision(None, None, TIMEOUT)
+            if decision is not None:
+                message = {**message, "headers": [
+                    *message.get("headers", []), *decision_headers(decision)]}
+            await send(message)
+
         async def send_with_headers(message):
-            nonlocal decision
+            nonlocal decision, held_start
             if message["type"] == "http.response.start":
-                if decision is None and fut is not None:
-                    if fut.done():
-                        decision = fut.result()
-                    elif int(message.get("status", 200)) < 400:
-                        # A stream starts before its first token: wait for
-                        # the engine's decision (it precedes the prefill).
-                        try:
-                            decision = await asyncio.wait_for(
-                                asyncio.shield(fut), DECISION_WAIT_S)
-                        except asyncio.TimeoutError:
-                            decision = RouteDecision(None, None, TIMEOUT)
-                    # an error response that never reached the engine's
-                    # router carries no routing headers
-                if decision is not None:
-                    message = {**message, "headers": [
-                        *message.get("headers", []), *decision_headers(decision)]}
+                if decision is None and fut is not None and fut.done():
+                    decision = fut.result()
+                held_start = message
+                if decision is not None or fut is None \
+                        or int(message.get("status", 200)) >= 400:
+                    # known already (a complete response, or decided without
+                    # the engine), or an error that never reached the router:
+                    # nothing to wait for
+                    if decision is None and int(message.get("status", 200)) >= 400:
+                        message, held_start = held_start, None
+                        await send(message)
+                    else:
+                        await flush_start()
+                return
+            if held_start is not None:
+                await flush_start()
             await send(message)
 
         try:
-            return await self.app(scope, replay, send_with_headers)
+            await self.app(scope, replay, send_with_headers)
+            if held_start is not None:      # a response without a body message
+                await flush_start()
         finally:
             if key is not None:
                 self.registry.forget(key)

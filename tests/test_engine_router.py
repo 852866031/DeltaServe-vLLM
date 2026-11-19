@@ -639,6 +639,76 @@ def test_middleware():
                                            for k in out["headers"])
           and not reg.waiting)
 
+    # How vLLM really streams: the request is submitted to the engine by the
+    # body generator, i.e. only AFTER the app's send(start) has returned. A
+    # middleware that made the start wait for the decision would wait forever
+    # (found on the production trace: every streamed routed request took the
+    # full timeout).
+    async def lazy_stream():
+        events, got = [], {}
+
+        async def app(scope, receive, send):
+            await receive()
+            key, _ = decode_route(ROUTE_PAYLOAD.get())
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            events.append("start returned")
+            # only now is the request "submitted": the engine decides
+            reg.note_headers({DECISION_HEADER: encode_decision(
+                key, RouteDecision("ad-b", 0.7, "", None, ()))})
+            await asyncio.sleep(0)
+            await send({"type": "http.response.body", "body": b"tok1",
+                        "more_body": True})
+            await send({"type": "http.response.body", "body": b"tok2"})
+
+        mw.app = app
+        sent = False
+
+        async def receive():
+            nonlocal sent
+            if not sent:
+                sent = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            await asyncio.sleep(3600)
+
+        async def send(m):
+            events.append(m["type"] if m["type"].endswith("start")
+                          else m.get("body"))
+            if m["type"] == "http.response.start":
+                got.update({k.decode(): v.decode() for k, v in m["headers"]})
+
+        await asyncio.wait_for(mw({"type": "http", "method": "POST",
+                                   "path": "/v1/chat/completions", "headers": []},
+                                  receive, send), 3.0)
+        return events, got
+
+    try:
+        events, got = asyncio.run(lazy_stream())
+    except asyncio.TimeoutError:
+        events, got = ["DEADLOCK"], {}
+    check("a stream whose request is submitted only after send(start) returns "
+          "does not deadlock: the start is kept back, not waited on",
+          events[0] == "start returned")
+    check("the client gets the start with the first token, headers included, "
+          "then the tokens in order",
+          events[1:] == ["http.response.start", b"tok1", b"tok2"]
+          and got.get("x-deltaserve-adapter") == "ad-b" and not reg.waiting)
+
+    async def no_body_app(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+
+    import deltaserve.route_middleware as rm
+
+    old, rm.DECISION_WAIT_S = rm.DECISION_WAIT_S, 0.05
+    try:
+        _, out = asyncio.run(_asgi(mw, body, app=no_body_app))
+    finally:
+        rm.DECISION_WAIT_S = old
+    check("a response that ends without a body message still gets its start; "
+          "no decision ever came → the headers say router-timeout",
+          out["status"] == 200
+          and out["headers"].get("x-deltaserve-routing-reason") == "router-timeout")
+
     named = json.dumps({"model": "ad-a", "messages": []}).encode()
     seen, out = asyncio.run(_asgi(mw, named))
     check("a request naming an adapter passes byte-for-byte, no headers",

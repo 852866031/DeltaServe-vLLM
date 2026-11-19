@@ -465,6 +465,9 @@ def external_main(args, out: Path) -> None:
         byname = [http(port, "/v1/completions", {
             "model": "ext-poem", "prompt": "A poem:", "max_tokens": 2,
             "temperature": 0})[0] for _ in range(6)]
+        lifecycle(port, toy)
+        cancel_while_held(port)
+
         s7, _, r7 = http(port, "/adapters/ext-poem", None, method="DELETE")
         time.sleep(1.5)
         gone = [http(port, "/v1/completions", {
@@ -489,6 +492,169 @@ def external_main(args, out: Path) -> None:
         if not ok:
             print(f"\n--- last lines of {log_path} ---")
             print("\n".join(log_path.read_text(errors="replace").splitlines()[-60:]))
+
+
+def _router(port) -> dict:
+    return http(port, "/adapters")[2].get("router", {})
+
+
+def _tier(port, name):
+    for a in http(port, "/adapters")[2]["adapters"]:
+        if a["name"] == name:
+            return a["tier"]
+    return None
+
+
+def lifecycle(port, adapter_path) -> None:
+    """One adapter through every place it can be, seen from outside:
+
+        added (disk) → first request while others run: COLD START, held one
+        step, read in the background (host memory) → loaded into a GPU slot →
+        pushed out of its slot by other adapters (host memory again) → back
+        into a slot with a plain load (no disk read, not held) → retired
+        (not routed to, still served by name) → removed (gone from vLLM).
+
+    The tiers shown by GET /adapters are vLLM's caches as the engine replays
+    them (LoraCacheMirror), so this also checks that replay."""
+    print("  adapter life cycle:", flush=True)
+    name = "ext-life"
+    status, _, _ = http(port, "/adapters", {"name": name, "path": str(adapter_path)})
+    t0 = time.monotonic()
+    while _tier(port, name) is None and time.monotonic() - t0 < 60:
+        time.sleep(0.2)
+    check("added without a dataset: in the pool, on disk, nothing loaded",
+          status == 202 and _tier(port, name) == "disk")
+    before = _router(port)
+
+    # Other inference work in flight, so that a step runs with or without the
+    # cold request: only then is holding it worth a step.
+    stop, sent = threading.Event(), []
+
+    def load():
+        while not stop.is_set():
+            s, _, _ = http(port, "/v1/completions", {
+                "model": _BASE, "prompt": "Count slowly from one to two hundred:",
+                "max_tokens": 200, "temperature": 0})
+            sent.append(s)
+
+    threads = [threading.Thread(target=load, daemon=True) for _ in range(3)]
+    for t in threads:
+        t.start()
+    time.sleep(1.0)
+    s1, h1, b1 = http(port, "/v1/completions", {
+        "model": name, "prompt": "Hello", "max_tokens": 4, "temperature": 0})
+    mid = _router(port)
+    print(f"    first request: {s1}; cold holds {before.get('cold_holds')} → "
+          f"{mid.get('cold_holds')}, disk reads "
+          f"{before.get('adapters', {}).get('disk_reads')} → "
+          f"{mid.get('adapters', {}).get('disk_reads')}; tier {_tier(port, name)}")
+    check("COLD START: the first request for it, while other requests run, is "
+          "held one step (the adapter is read in the background) and answered",
+          s1 == 200 and b1.get("model") == name
+          and mid.get("cold_holds", 0) == before.get("cold_holds", 0) + 1
+          and mid.get("cold_held") == 0)
+    check("it is in a GPU slot now", _tier(port, name) == "gpu")
+    s2, _, _ = http(port, "/v1/completions", {
+        "model": name, "prompt": "Hello again", "max_tokens": 4, "temperature": 0})
+    after = _router(port)
+    check("the next request for it is not held and reads nothing from disk",
+          s2 == 200 and after.get("cold_holds") == mid.get("cold_holds")
+          and after.get("adapters", {}).get("disk_reads")
+          == mid.get("adapters", {}).get("disk_reads"))
+    stop.set()
+    for t in threads:
+        t.join(timeout=120)
+    check(f"the requests that were running meanwhile were all served "
+          f"({len(sent)})", sent and all(s == 200 for s in sent))
+
+    # Fill the GPU slots with other adapters: vLLM evicts the least recently
+    # used — ours.
+    others = [a["name"] for a in http(port, "/adapters")[2]["adapters"]
+              if a["name"] != name]
+    slots = http(port, "/adapters")[2]["gpu_slots"]
+    for _ in range(2):
+        for o in others[:slots]:
+            http(port, "/v1/completions", {"model": o, "prompt": "Hi",
+                                           "max_tokens": 2, "temperature": 0})
+    tier = _tier(port, name)
+    print(f"    after {min(len(others), slots)} other adapters used "
+          f"({slots} slots): tier {tier}")
+    if len(others) >= slots:
+        check("pushed out of its GPU slot by the others: back in host memory, "
+              "not on disk", tier == "cpu")
+        r0 = _router(port)
+        s3, _, _ = http(port, "/v1/completions", {
+            "model": name, "prompt": "Back", "max_tokens": 4, "temperature": 0})
+        r1 = _router(port)
+        check("used again: loaded into a slot from host memory — a slot copy, "
+              "no disk read, not held",
+              s3 == 200 and _tier(port, name) == "gpu"
+              and r1["adapters"]["slot_copies"] > r0["adapters"]["slot_copies"]
+              and r1["adapters"]["disk_reads"] == r0["adapters"]["disk_reads"]
+              and r1["cold_holds"] == r0["cold_holds"])
+    else:
+        print(f"    (only {len(others)} other adapters for {slots} slots: "
+              f"eviction not exercised)")
+
+    s4, _, _ = http(port, f"/adapters/{name}/retire", {})
+    s5, _, b5 = http(port, "/v1/completions", {
+        "model": name, "prompt": "Still here?", "max_tokens": 2, "temperature": 0})
+    check("retired: still served by name", s4 == 200 and s5 == 200
+          and b5.get("model") == name)
+    held_before = _router(port).get("adapters", {})
+    s6, _, _ = http(port, f"/adapters/{name}", None, method="DELETE")
+    gone = None
+    for _ in range(20):
+        gone, _, _ = http(port, "/v1/completions", {
+            "model": name, "prompt": "x", "max_tokens": 1})
+        if gone != 200:
+            break
+        time.sleep(0.3)
+    left = _router(port).get("adapters", {})
+    check("removed: no longer served, gone from the pool and from vLLM's caches "
+          "(one adapter fewer in host memory)",
+          s6 == 200 and gone != 200 and _tier(port, name) is None
+          and len(left.get("in_memory", [])) == len(held_before.get("in_memory", [])) - 1)
+    print(f"    vLLM caches after removal: in memory {left.get('in_memory')}, "
+          f"in slots {left.get('in_slots')}")
+
+
+def cancel_while_held(port) -> None:
+    """Routed requests whose client goes away at once: some are cancelled
+    while the engine still holds them outside the scheduler (waiting for their
+    encode step). Nothing may be left behind, and the server must go on."""
+    import socket
+
+    body = json.dumps({"model": "auto", "stream": True, "max_tokens": 64,
+                       "messages": [{"role": "user", "content":
+                                     "Translate to English: Es regnet heute."}]}
+                      ).encode()
+    head = (f"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n").encode()
+    before = _router(port)
+    for i in range(40):
+        try:
+            sk = socket.create_connection(("127.0.0.1", port), timeout=5)
+            sk.sendall(head + body)
+            if i % 2:
+                time.sleep(0.002)
+            sk.close()                       # gone before any answer
+        except OSError:
+            pass
+    time.sleep(2.0)
+    after = _router(port)
+    s, h, _ = http(port, "/v1/completions", {
+        "model": "auto", "prompt": "Translate to English: Guten Tag.",
+        "max_tokens": 4, "temperature": 0})
+    print(f"    40 abandoned routed requests: dropped while held "
+          f"{after.get('dropped', 0) - before.get('dropped', 0)}, encode steps "
+          f"{after.get('encode_steps', 0) - before.get('encode_steps', 0)}; "
+          f"held now {after.get('held')} / cold {after.get('cold_held')}")
+    check("clients that vanish mid-route leave nothing held in the engine",
+          after.get("held") == 0 and after.get("cold_held") == 0)
+    check("and the server keeps routing",
+          s == 200 and h.get("x-deltaserve-routing") == "routed")
 
 
 def second_job(args, out, port, first, first_saved, src_adapter) -> None:
@@ -746,6 +912,35 @@ def main() -> None:
               f"base={texts[2]!r}")
         check("a routed request is served with the adapter: same output as "
               "naming the adapter", texts[0] is not None and texts[0] == texts[1])
+        # Streaming: vLLM submits a streamed request to the engine only after
+        # the response start was sent, so the start must not wait for the
+        # routing decision (it did once: every streamed routed request took
+        # the full decision timeout).
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/chat/completions",
+            data=json.dumps({"model": "auto", "stream": True, "max_tokens": 8,
+                             "temperature": 0, "messages": [{
+                                 "role": "user", "content":
+                                 "Translate to English: Guten Morgen."}]}).encode(),
+            headers={"content-type": "application/json"})
+        t0 = time.monotonic()
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                sh = {k.lower(): v for k, v in r.headers.items()}
+                first = r.readline()
+                ttft = time.monotonic() - t0
+                rest = r.read()
+            stream_ok = (first.startswith(b"data:") and b"[DONE]" in rest)
+        except Exception as e:  # noqa: BLE001
+            sh, ttft, stream_ok = {}, time.monotonic() - t0, False
+            print(f"    streamed request failed: {e}")
+        print(f"    streamed routed request: first chunk after {ttft * 1e3:.0f} ms, "
+              f"adapter {sh.get('x-deltaserve-adapter')}")
+        check("a STREAMED routed request gets its first token promptly, with "
+              "the adapter in the response headers",
+              stream_ok and ttft < 5.0
+              and sh.get("x-deltaserve-routing") == "routed"
+              and sh.get("x-deltaserve-adapter") == name)
 
         status, headers, body = http(port, "/v1/completions", {
             "model": "auto", "prompt": "What is the capital of Australia?",
