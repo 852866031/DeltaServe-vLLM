@@ -372,32 +372,35 @@ is the worked example for two 32 GB cards):
   an empty pool or an adapter that left the pool means the base model, with
   the reason in the headers.
 
-Measured on Qwen3-14B TP=2, `production-600-800`, four pool adapters, every
-request `model: "auto"` — **with the previous design** (a router service chose
-the adapter before the request reached the engine; the in-scheduler path above
-has not been run on this trace yet):
+Measured on Qwen3-14B TP=2, `production-600-800` (534 streamed requests,
+finetuning co-serving throughout, four pool adapters; one run each):
 
-| | ok | TTFT p50 / p95 / p99 (ms) | within 400 ms | backward cycles |
-|---|---|---|---|---|
-| routing off (plain preset) | 534/534 | 77 / 89 / 96 | 100 % | 373 |
-| routing on (routing preset) | 534/534 | 103 / 134 / 140 | 100 % | 354 |
+| | SLOs (TTFT / avg TBT / max TBT) | ok | TTFT p50 / p95 / p99 (ms) | backward cycles | FT tokens trained |
+|---|---|---|---|---|---|
+| requests name their adapter | 0.4 s / 20 ms / 50 ms | 534/534 | 77 / 90 / 104 | 363 | 101,184 |
+| routed (`model: "auto"`) | 0.4 s / 20 ms / 50 ms | 534/534 | 75 / 91 / 104 | 295 | 82,067 |
+| routed, the routing preset's SLOs | 0.5 s / 25 ms / 70 ms | 534/534 | 83 / 97 / 105 | 330 | 92,005 |
 
-There the extra ~25 ms was the route call: an encode takes 4–14 ms on an idle
-card (by input length, up to the 512-token cap) but about 25 ms when it shares
-the card with the model's processes, and a decode step that collided with one
-took ~8 ms longer — the reason the encode became a step of its own.
+Routing does not add to TTFT. (With the adapter chosen before the engine — the
+previous design — the same trace gave 103 / 134 / 140 ms: an encode that shares
+the card with the model's processes takes about 25 ms instead of 4–14, and a
+decode step that collided with one took ~8 ms longer.) What routing costs is
+finetuning throughput: the scheduler counts the encode against the SLOs, so
+less is left for FT. The routing preset widens the SLOs by what an encode takes
+and gets half of that back. The four pool adapters share one set of weights and
+their routing entries were built from the trace's prompts: this measures the
+path, not the quality of the choice.
 
-**When a job ends** (*adapter handover*) the engine loop only triggers the
-work. Saving: every rank's backward child snapshots its trained weights to
-host memory and writes its shard itself; an engine thread merges the ranks,
-writes the adapter and publishes it to the pool. Switching to the next job:
-its adapter file was read in the background when the job was queued, and the
-check and the switch share one copy of it on the GPU. On Qwen3-14B TP=2 the
-engine loop is held about 25 ms for the save (it was 200–290 ms) and about
-35 ms for the switch (it was 60 ms), once per job; the save itself finishes
-about 140 ms later. A new adapter is not registered with vLLM up front: it is
-read in the background with the next step and loaded when a request first
-uses it.
+**When a job ends** (*adapter handover*) nothing runs on the engine loop. The
+engine has a direct line to every rank's backward child; a background thread
+asks each child to copy its trained weights to host memory and write its
+shard, merges the ranks, writes the adapter and publishes it to the pool, and
+then has every child check and take the next job's adapter. On Qwen3-14B TP=2
+the save is done about 125 ms after the job ends and the switch takes 49 ms,
+with the engine loop held 0 ms for both (200–290 ms and 60 ms when the engine
+did them itself). A new adapter is not registered with vLLM up front: it is
+read in the background with the next step and loaded when a request first uses
+it. `docs/adapter_routing_scheduling.md` walks through the whole design.
 
 ---
 

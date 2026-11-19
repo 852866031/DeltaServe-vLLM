@@ -156,11 +156,20 @@ publish / switch, triggered on the engine loop, done off it). Invariants:
 - **Never `EngineCore.add_lora` from the pool** (blocks the loop on every rank):
   vLLM loads lazily, the scheduler arranges a background read (cold start).
 Validated on Qwen3-0.6B and Qwen3-14B TP=2 (live test 29/29, both inference
-gates with routing on). `max_loras` ≥ adapters in use at once + 1. Not done:
-`validation` stage; production-trace numbers for the in-scheduler path; adapter
-load cost from profiling (config constants now); the "tight" indexing level;
-recovery when phase 2 of an adapter switch fails; threshold calibration on a real
-adapter pool; the pool's own tier bookkeeping vs `LoraCacheMirror`.
+gates with routing on); production trace 534/534, TTFT p50/p95/p99 75/91/104 ms
+routed vs 77/90/104 named (README). `max_loras` ≥ adapters in use at once + 1.
+- **A streamed response's start is never made to wait for the routing decision**
+  (vLLM submits a streamed request only after the start was sent): it is kept back
+  and sent with the first body message (`route_middleware`).
+- **The handover talks to the backward children directly** (`handover_channel.py`,
+  an engine background thread), never on the engine loop and never on the child's
+  command pipe; only while no backward is in flight.
+- **Adapter tiers are vLLM's, read through `LoraCacheMirror`** (`pool.sync_tiers`):
+  act on a tier only after syncing (a stale one made removal skip `remove_lora`).
+Not done: `validation` stage; adapter load cost from profiling (config constants
+now); the "tight" indexing level; recovery when phase 2 of an adapter switch
+fails; giving up on a dead indexing process; threshold calibration on a real
+adapter pool. `docs/adapter_routing_scheduling.md` is the design walkthrough.
 
 Open: the live backward-graph vs eager A/B under TP on the real models; a relative
 (not seconds-based) admission margin for the estimator; mixed-batch forward graphs

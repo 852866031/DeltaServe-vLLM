@@ -4,9 +4,9 @@ How DeltaServe serves a request whose LoRA adapter is chosen by the system
 ("adapter routing"), and how every piece of extra work this needs is decided by the
 SLO-aware scheduler at step granularity.
 
-This is a design walkthrough. Timings marked *measured* come from Qwen3-14B TP=2 on
-2× RTX 5090; the scheduling behaviour describes the target design, parts of which are
-still being implemented. Figure sources (`.drawio`) are in
+This is a walkthrough of the design as implemented on the `adapter-routing` branch.
+Timings marked *measured* come from Qwen3-14B TP=2 on 2× RTX 5090. What is not done
+yet is listed in section 10. Figure sources (`.drawio`) are in
 [`figures/scheduling/`](figures/scheduling/).
 
 ## 1. Request path: what adapter routing costs
@@ -25,8 +25,13 @@ prefill:
 
 Everything else is shared. The API server tokenizes (for a routed request it also
 runs the encoder's tokenizer) and forwards at once; the arrival time is stamped when
-the request enters the engine, so the time spent choosing the adapter counts against
-TTFT. The chosen adapter is reported in the response headers.
+the request reaches the API server, so the time spent choosing the adapter counts
+against TTFT. The encoder's tokens travel into the engine with the request, and the
+decision comes back with its first output — both in the request's `trace_headers`,
+no extra channel. The chosen adapter is reported in the response headers (the
+body's `model` field is the base model's name); for a streamed response the headers
+are sent with the first token, because vLLM submits a streamed request to the engine
+only after the response has started.
 
 **Load adapter** applies to both paths and depends on where the adapter is: a GPU
 slot (0 ms), host memory (≈ 4 ms, inside the step), or disk (the request is held one
@@ -85,7 +90,7 @@ Encoding turns a routed request into an adapter choice.
   of one GPU.
 - **Cost** — 4–17 ms on the GPU (*measured*: ≈ 3.5 ms + 0.014 ms × total tokens). On
   the CPU the same encode takes 50–130 ms, all of which lands on TTFT, so requests
-  are always encoded on the GPU.
+  are encoded on the GPU (`router_device: cpu` exists for experiments only).
 - **Output** — one embedding per request.
 - **Choosing the adapter** — the embedding is compared with every routing entry in
   the pool. The confidence combines how close the best entry is with how far ahead
@@ -127,21 +132,45 @@ retired one is still served when named. Load cost by location (*measured*):
 | disk, other work pending | ≈ 12 ms read in the background, then ≈ 6 ms | request held one step |
 | disk, nothing else to do | ≈ 18 ms | loaded in-step |
 
-GPU slots follow vLLM's own LRU; the pool mirrors it and pins the adapters the
-current batch needs rather than choosing victims itself. Adapters in use stay in host
-memory, so the disk path is taken only on a cold start.
+GPU slots follow vLLM's own LRU. The engine does not choose victims and pins
+nothing but the finetuning adapter: it replays vLLM's two caches (host memory, GPU
+slots) from the adapters of every step it issues, and that replay is where the pool,
+the scheduler and `GET /adapters` read an adapter's location from. Active adapters
+fit in host memory (`max_cpu_loras` is raised to hold them), so the disk path is
+taken only on a cold start. A new adapter is not registered with vLLM up front
+either: it is read in the background with the next step and loaded when a request
+first uses it.
+
+Attaching an adapter to a request after it entered the engine has one consequence
+that is easy to miss: vLLM keys its prefix-cache blocks by adapter and computed them
+when the request was built, without one. The block hashes are recomputed when the
+adapter is attached — otherwise a routed request would reuse the KV the *base* model
+computed for the same prompt.
 
 ### 4.4 Adapter handover
 
 ![Adapter handover](figures/scheduling/08-adapter-handover.png)
 
 When a finetuning job finishes, its adapter has to be saved and the backward has to
-move on to the next job. The scheduler closes FT admission and starts the handover;
-the backward process copies the trained weights to host memory, and an engine
-background thread merges, saves and publishes them into the adapter pool, next to
-the routing entry that indexing built while the job trained. Once the weights are copied the backward switches
-to the next job's adapter and FT admission reopens. Saving is not time-critical, so
-none of it runs on the engine loop or keeps the GPU from inference.
+move on to the next job. None of it runs on the engine loop: the engine has a direct
+line to every rank's backward child (a socket per child, next to its command pipe),
+and an engine background thread does the talking.
+
+- **Save and publish** — each backward child copies its rank's trained weights to
+  host memory and writes its shard; the background thread merges the ranks, writes
+  the adapter and publishes it into the adapter pool, next to the routing entry that
+  indexing built while the job trained. *Measured:* done about 125 ms after the
+  job ends, engine loop held 0 ms (200–290 ms when the engine did it itself).
+- **Switch** — only after the previous job is saved and published does the next
+  job start: the thread asks every rank's child to *check* the new adapter, and only
+  when all agree to *take* it (the child reads the file itself). *Measured:* 49 ms,
+  engine loop held 0 ms. The scheduler then takes the new dataset and reopens FT
+  admission.
+
+FT admission needs no explicit gate during the handover: the finished job has no
+samples left, and the next job's dataset is installed only when the switch is done.
+If the children are not listening, both steps fall back to worker calls (22–34 ms on
+the engine loop).
 
 ## 5. Schedulable objects
 
@@ -155,7 +184,7 @@ Reading the work off the overview gives five schedulable objects:
 | ② | Forward engine batch | decode + prefill + FT samples; adapter load at step start | every step |
 | ③ | Backward batch | one backward pass of the adapter being trained | any time except encode steps and steps with inference prefill |
 | ④ | Indexing | compute a new adapter's routing entry | on the GPU only when no inference request is present; otherwise on the CPU |
-| ⑤ | Adapter handover | save, publish, switch to the next job | off the engine loop; FT admission closes when it starts |
+| ⑤ | Adapter handover | save, publish, switch to the next job | off the engine loop; no FT runs between two jobs |
 
 ## 6. Where everything runs
 
@@ -199,11 +228,11 @@ alongside as they grow:
 3. **Backward pause / resume** — pause for an encode step or a prefill step, resume
    otherwise.
 4. **FT admission** — add FT samples only while the predicted TTFT / TBT stay within
-   the SLO; closed while an adapter handover is in progress.
+   the SLO; there is nothing to admit while an adapter handover is in progress.
 5. **Indexing** — allowed on the GPU only when no inference request is present; the
    scheduler notifies the indexing process only when this changes.
-6. **Adapter handover** — when a job finishes, close FT admission and start the
-   handover off the engine loop.
+6. **Adapter handover** — when a job finishes, start the handover off the engine
+   loop; the next job's samples are admitted once it has switched.
 
 ## 9. Inference first
 
@@ -215,4 +244,42 @@ CPU, and the handover does its GPU part (copying weights to host memory) in the
 backward child and everything else on the CPU. The estimator is told what adapter
 routing cost: the encode time is already inside TTFT because the arrival is stamped
 before it, it is added explicitly to TBT, and the predicted adapter load time is
-added to the step time.
+added to the step time (and taken off the measured step time before the model is
+refitted, so loads do not skew it).
+
+Requests the engine is holding — waiting for their encode step, or for a cold
+adapter — are outside vLLM's queues. They count as pending work, so the engine loop
+does not go idle on them, and a client that disconnects removes its request from
+there too.
+
+## 10. Measured, and not done
+
+**Production trace** (Qwen3-14B TP=2, `production-600-800`, 534 streamed requests,
+finetuning co-serving throughout, four pool adapters; one run each):
+
+| | SLOs (TTFT / avg TBT / max TBT) | TTFT p50 / p95 / p99 | FT tokens trained |
+|---|---|---|---|
+| requests name their adapter | 0.4 s / 20 ms / 50 ms | 77 / 90 / 104 ms | 101,184 |
+| routed | 0.4 s / 20 ms / 50 ms | 75 / 91 / 104 ms | 82,067 |
+| routed, SLOs widened for the encode | 0.5 s / 25 ms / 70 ms | 83 / 97 / 105 ms | 92,005 |
+
+Routing no longer adds to TTFT (with the adapter chosen before the engine, the same
+trace gave 103 / 134 / 140 ms). Its cost shows up as finetuning throughput, because
+the scheduler counts the encode against the SLOs; widening them by what an encode
+takes gets half of it back. The four pool adapters share one set of weights and
+their routing entries were built from the trace's own prompts, so this measures the
+path, not the quality of the choice.
+
+**Not done:**
+
+- the adapter load cost comes from configuration constants (4.5 ms / 13.5 ms,
+  measured once), not from the launch profiling pass;
+- indexing has two levels (no inference / inference present); a third one that
+  backs the CPU indexer off when the SLO margin is small does not exist, and the
+  effect of CPU indexing on serving has not been measured;
+- recovery when the second phase of an adapter switch fails on one rank (the job
+  fails and asks for a restart);
+- an indexing process that died is retried every 30 s instead of being given up on;
+- the `validation` stage; calibration of the routing threshold on a real pool of
+  distinct adapters.
+
