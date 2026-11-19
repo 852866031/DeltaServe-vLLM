@@ -256,44 +256,58 @@ there too.
 
 ## 10. Measured, and not done
 
-**Production trace** (Qwen3-14B TP=2, `production-600-800`, 534 streamed requests,
-finetuning co-serving throughout, four pool adapters; one run each):
+**Production trace** (Qwen3-14B TP=2, vLLM 0.33, `production-600-800`, 534 streamed
+requests, finetuning co-serving throughout; every run 534/534):
 
-| | SLOs (TTFT / avg TBT / max TBT) | TTFT p50 / p95 / p99 | FT tokens trained |
-|---|---|---|---|
-| requests name their adapter | 0.4 s / 20 ms / 50 ms | 77 / 90 / 104 ms | 101,184 |
-| routed | 0.4 s / 20 ms / 50 ms | 75 / 91 / 104 ms | 82,067 |
-| routed, SLOs widened for the encode | 0.5 s / 25 ms / 70 ms | 83 / 97 / 105 ms | 92,005 |
+| | preset | runs | TTFT p50 / p95 / p99 | avg TBT p50 | FT tokens trained |
+|---|---|---|---|---|---|
+| adapter routing off | plain (0.4 s / 50 ms) | 2 | 68 / 81–82 / 88–89 ms | 20.3–20.4 ms | 118.5–119.6k |
+| requests name their adapter | routing (0.5 s / 35 ms over 1 s / 70 ms) | 3 | 70–72 / 99–100 / 103–105 ms | 23.4–23.9 ms | 127.8–129.1k |
+| routed | routing | 3 | 85–86 / 104 / 107–109 ms | 24.8–25.7 ms | 122.4–122.9k |
 
-Routing no longer adds to TTFT (with the adapter chosen before the engine, the same
-trace gave 103 / 134 / 140 ms). Its cost shows up as finetuning throughput, because
-the scheduler counts the encode against the SLOs; widening them by what an encode
-takes gets half of it back. The four pool adapters share one set of weights and
-their routing entries were built from the trace's own prompts, so this measures the
-path, not the quality of the choice.
+Choosing the adapter costs a routed request about 15 ms of TTFT at the median (4 ms
+at p99), 1.5–2 ms of average TBT and 4–5 % of the finetuning throughput. With
+adapter routing off, performance and GPU memory are those of the code without this
+feature (same harness, two runs each). The four pool adapters share one set of
+weights and their routing entries were built from the trace's own prompts, so this
+measures the path, not the quality of the choice.
 
-Later changes, same trace, one run each: with the encode time counted once (see
-section 9) and the average TBT enforced over a 1 s window at 35 ms
-(`slo.avg_tbt_window_s`), the routed run gives TTFT 94 / 110 / 116 ms, average TBT
-p50 28.9 ms (95 % of requests within 35 ms) and 110,396 FT tokens. Two indexing
-jobs added mid-trace changed the average TBT by 0.1–0.3 ms while they ran. A
-finetuning job that ended 61 s into the trace was saved in 129 ms off the engine
-loop, admitted, listed by `GET /adapters/available` and used by the client from
-its next request, without a cold start.
+Two indexing jobs added mid-trace (400 samples each) left the routed numbers
+unchanged (TTFT 85 / 103 / 108 ms, 124.3k FT tokens); the first took 27 s, mostly
+while requests were present, the second 1.6 s on the GPU in a gap. A finetuning job
+indexed from the start (64k tokens) ended 75.8 s into the 184 s trace, was saved in
+152 ms off the engine loop, admitted, listed by `GET /adapters/available` 0.26 s
+after training ended and used by the client from its next request, without a cold
+start.
 
-Seen in these runs: 614 encode steps of one request each, the backward paused for
-an encode 110 times and every time kept for the prefill that followed, 3 cold-start
-holds (all preloads used). Never seen live, covered by unit tests only: an encode
-batch split by the token cap, a pause released because no prefill followed, GPU
-indexing preempted by a request.
+Seen in these runs: 614 encode steps of one request each (7 ms each on the GPU, plus
+14 ms of waiting for the step in flight), the backward paused for an encode 267
+times and every time kept for the prefill that followed, 2 cold-start holds (both
+preloads used). Never seen live, covered by unit tests only: an encode batch split
+by the token cap, a pause released because no prefill followed, GPU indexing
+preempted by a request.
+
+**Next to the rest of DeltaServe** (things this walkthrough does not schedule):
+
+- *Adapter checkpoints* (`POST /save_adapter`, periodic and per-epoch saves) are a
+  second way to write the adapter being trained: the backward children gather
+  their shards to rank 0 over their own process group and rank 0 writes the file.
+  The handover of section 4.4 does not use it (each rank writes its shard, the
+  engine merges them on the CPU). Both read the same masters and the same key
+  names. A per-epoch checkpoint and a job's handover falling on the same moment
+  has no test yet; no preset turns both on.
+- *Telemetry and `dserve-top`* do not know the encode step, indexing or the
+  handover: their GPU time split has no entry for them, and the ADAPTERS panel
+  shows vLLM's LoRA state in the workers, not the adapter pool.
+- *The admission margin* (`slo.admission_margin`) scales the predicted step time;
+  the adapter load and encode times are added outside it.
 
 **Not done:**
 
 - the adapter load cost comes from configuration constants (4.5 ms / 13.5 ms,
   measured once), not from the launch profiling pass;
 - indexing has two levels (no inference / inference present); a third one that
-  backs the CPU indexer off when the SLO margin is small does not exist, and the
-  effect of CPU indexing on serving has not been measured;
+  backs the CPU indexer off when the SLO margin is small does not exist;
 - recovery when the second phase of an adapter switch fails on one rank (the job
   fails and asks for a restart);
 - an indexing process that died is retried every 30 s instead of being given up on;

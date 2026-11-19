@@ -847,47 +847,52 @@ is the worked example for two 32 GB cards):
   an empty pool or an adapter that left the pool means the base model, with
   the reason in the headers.
 
-Measured on Qwen3-14B TP=2, `production-600-800` (534 streamed requests,
-finetuning co-serving throughout, four pool adapters; one run each):
+Measured on Qwen3-14B TP=2 (vLLM 0.33), `production-600-800` (534 streamed
+requests, finetuning co-serving throughout; every run 534/534, no errors):
 
-| | SLOs (TTFT / avg TBT / max TBT) | ok | TTFT p50 / p95 / p99 (ms) | backward cycles | FT tokens trained |
-|---|---|---|---|---|---|
-| requests name their adapter | 0.4 s / 20 ms / 50 ms | 534/534 | 77 / 90 / 104 | 363 | 101,184 |
-| routed (`model: "auto"`) | 0.4 s / 20 ms / 50 ms | 534/534 | 75 / 91 / 104 | 295 | 82,067 |
-| routed, the routing preset's SLOs | 0.5 s / 25 ms / 70 ms | 534/534 | 83 / 97 / 105 | 330 | 92,005 |
+| | preset (TTFT / avg TBT / max TBT) | runs | TTFT p50 / p95 / p99 (ms) | avg TBT p50 / p95 (ms) | backward cycles | FT tokens trained |
+|---|---|---|---|---|---|---|
+| adapter routing off | plain (0.4 s / — / 50 ms) | 2 | 68 / 81–82 / 88–89 | 20.3–20.4 / 25.6–25.8 | 429–432 | 118.5–119.6k |
+| routing on, requests name their adapter | routing (0.5 s / 35 ms over 1 s / 70 ms) | 3 | 70–72 / 99–100 / 103–105 | 23.4–23.9 / 29.0–29.3 | 464–466 | 127.8–129.1k |
+| routing on, routed (`model: "auto"`) | routing | 3 | 85–86 / 104 / 107–109 | 24.8–25.7 / 31.6–32.6 | 441–443 | 122.4–122.9k |
 
-Routing does not add to TTFT. (With the adapter chosen before the engine — the
-previous design — the same trace gave 103 / 134 / 140 ms: an encode that shares
-the card with the model's processes takes about 25 ms instead of 4–14, and a
-decode step that collided with one took ~8 ms longer.) What routing costs is
-finetuning throughput: the scheduler counts the encode against the SLOs, so
-less is left for FT. The routing preset widens the SLOs by what an encode takes
-and gets half of that back. The four pool adapters share one set of weights and
-their routing entries were built from the trace's prompts: this measures the
-path, not the quality of the choice.
+With adapter routing off the server is the one on `main` was before: same
+harness, same preset, two runs each, TTFT 68 / 80–81 / 89 ms and 119.0–119.4k FT
+tokens there, and the same GPU memory to the MiB (28,246 / 28,009 MiB peak, KV
+cache 40,096 tokens). Choosing the adapter costs a routed request about 15 ms of
+TTFT at the median (4 ms at p99), 1.5–2 ms of average TBT and 4–5 % of the
+finetuning throughput; 99 % of requests keep their average TBT within the 35 ms
+target either way. The routing preset uses less GPU memory than the plain one
+(24.8 / 26.4 GB peak): `gpu_memory_utilization` 0.75 and a sparser CUDA-graph
+size list leave the room the encoder needs. The four pool adapters share one set
+of weights and their routing entries were built from the trace's prompts: this
+measures the path, not the quality of the choice.
 
-After that table was measured, two things changed. The encode time handed to the
-TBT check is now the encode alone (the worker reports it); before, it also held
-the wait for the step still on the GPU, which the next model step pays anyway —
-about 18 ms counted twice per encode, which worked as an unplanned margin. And
-the routing preset now enforces the average TBT (`slo.avg_tbt_window_s: 1.0`,
-target 35 ms). Same trace, one run: 534/534, TTFT 94 / 110 / 116 ms, average TBT
-p50 28.9 ms (95 % of requests within 35 ms), 110,396 FT tokens in 397 backward
-cycles — more finetuning than with named adapters, for 10 ms of TTFT.
+The encode time handed to the TBT check is the encode alone (the worker reports
+it: 7 ms on average here); the engine's wall time for the step also holds the
+wait for the model step still on the GPU (14 ms), which the next model step
+pays with or without an encode.
 
-Things happening during the trace (one run each, routed, FT co-serving):
+Things happening during the trace (one run each, FT co-serving):
 
-- **Two adapters that need indexing** (400 samples each) added at 35 s and 116 s:
-  534/534, TTFT 84 / 99 / 111 ms. While the first was being indexed (mostly on
-  the CPU, 41 s) the average TBT was 20.5 ms against 20.2–20.4 ms in three runs
-  without indexing; the second fell in a gap without requests and took 7 s on
-  the GPU.
-- **A finetuning job indexed from the start that ends mid-trace** (53k tokens):
-  it finished 61 s into the 184 s trace, was saved in 129 ms off the engine loop
+- **Two adapters that need indexing** (400 samples each) added at 35 s and 116 s,
+  routed requests: 534/534, TTFT 85 / 103 / 108 ms, average TBT p50 24.8 ms,
+  124.3k FT tokens — the same as the routed runs without indexing. The first
+  took 27 s (13 chunks on the CPU, 24 on the GPU), the second fell in a gap
+  without requests and took 1.6 s on the GPU.
+- **A finetuning job indexed from the start that ends mid-trace** (64k tokens,
+  2,300 samples; indexing done after 35 s, 260 of 274 chunks on the GPU): it
+  finished 75.8 s into the 184 s trace, was saved in 152 ms off the engine loop
   (loop held 0 ms), admitted to the pool (self-recall 1.0) and listed by
-  `GET /adapters/available`; a client polling that route switched to it, and its
-  first requests on the new adapter had TTFT 40–65 ms (no cold start: the save
-  leaves it in host memory).
+  `GET /adapters/available` 0.26 s after training ended; a client polling that
+  route switched to it, and its first requests on the new adapter had TTFT
+  47–79 ms (no cold start: the save leaves it in host memory).
+
+Seen in these runs: 614 encode steps of one request each, the backward paused
+for an encode 267 times and every time kept for the prefill that followed, 2
+cold-start holds (both preloads used). Never seen live, covered by unit tests
+only: an encode batch split by the token cap, a pause released because no
+prefill followed, GPU indexing preempted by a request.
 
 **When a job ends** (*adapter handover*) nothing runs on the engine loop. The
 engine has a direct line to every rank's backward child; a background thread

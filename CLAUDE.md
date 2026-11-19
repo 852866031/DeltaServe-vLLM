@@ -215,9 +215,10 @@ publish / switch, triggered on the engine loop, done off it). Invariants:
   (`model_runner._ds_route_hold`).
 - **Never `EngineCore.add_lora` from the pool** (blocks the loop on every rank):
   vLLM loads lazily, the scheduler arranges a background read (cold start).
-Validated on Qwen3-0.6B and Qwen3-14B TP=2 (live test 29/29, both inference
-gates with routing on); production trace 534/534, TTFT p50/p95/p99 75/91/104 ms
-routed vs 77/90/104 named (README). `max_loras` ≥ adapters in use at once + 1.
+Validated on vLLM 0.33, Qwen3-0.6B and Qwen3-14B TP=2 (live test 30/30, both
+inference gates); with routing off, performance and GPU memory equal the
+pre-merge main. Production trace 534/534, TTFT p50/p95/p99 85/104/108 ms routed
+vs 71/99/104 named, FT −4 % (README). `max_loras` ≥ adapters in use at once + 1.
 - **A streamed response's start is never made to wait for the routing decision**
   (vLLM submits a streamed request only after the start was sent): it is kept back
   and sent with the first body message (`route_middleware`).
