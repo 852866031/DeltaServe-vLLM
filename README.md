@@ -299,7 +299,28 @@ mean and a confidence built from the best score and its margin over the second;
 the threshold comes from reference samples kept at indexing time
 (`route_keep_percent`). Low confidence → base model.
 
-Every routed response says what happened:
+**Where it is chosen: in the scheduler.** A routed request goes into the engine
+at once (its `arrival_time` is its real arrival); the API server only tokenizes
+its text for the encoder. The scheduler holds it out of the queue and starts
+its next `schedule()` with an **encode step** for all held requests — the
+encoder runs inside a vLLM worker, in the model's CUDA context, between two
+model steps (about 3.5 ms + 0.014 ms per padded token; a step carries at most
+`route_encode_max_tokens`). Then the request gets its adapter and its prefill
+is scheduled by the same call. Nothing else is on the GPU during the encode:
+the backward child yields for it as for a prefill, and stays off until that
+prefill is done. An encode next to a model step would only make that step
+longer without the scheduler knowing; as a step of its own it costs its own
+time, which the FT admission accounts for.
+
+**Loading the adapter** is the same for a routed and a named request. In a GPU
+slot: nothing. In host memory: the step copies it into a slot (about 4 ms,
+added to the step's predicted time). On disk (*cold start*): the request is
+held for one step while other requests run — that step's workers read the
+adapter on a background thread — and joins the next step; with nothing else to
+run it is scheduled at once and the step loads it itself.
+
+Every routed response says what happened, in its headers (the body's `model`
+field is the base model's name):
 
 | Header | Value |
 |---|---|
@@ -323,45 +344,50 @@ curl -X POST localhost:8000/adapters/sql/retire                       # or react
 curl -X DELETE localhost:8000/adapters/sql
 ```
 
-**Indexing** is a best-effort job. While inference is active it runs in a CPU
-process that yields to everything else (idle priority, free-memory and idle-core
-checks); when only finetuning is running it borrows the router's GPU encoder,
-and gives it back the moment a request arrives. Its state is a checkpointed
-running sum, so moving between the two costs nothing.
+**Indexing** is a best-effort job that runs on its own; the scheduler only
+tells it where, and only when that changes. While the engine has no inference
+request (and has had none for `indexing_gpu_after_quiet_s`) it uses the GPU: a
+process of its own that shares the route encoder's weights with the worker —
+no second copy — and stops at its next encoder layer when a request arrives.
+Otherwise it runs in a CPU process in the lowest scheduling class, with
+`indexing_cpu_busy_threads` threads (`indexing_cpu_max_threads` when idle).
+Its state is a checkpointed running sum, so moving between the two costs
+nothing.
 
 **What it needs on the GPU** (`configs/serving_config_finetuning_qwen3_14b_tp2_adapter_routing.yaml`
 is the worked example for two 32 GB cards):
 
-- **The encoder sits on a GPU** — by default the last one the engine sees
-  (`router_device: auto`; `router_gpu: N` picks a physical card). It needs about
-  2 GB there. `gpu_memory_utilization` is vLLM's whole budget (weights + CUDA
-  graphs + KV cache), so it has to be lowered to leave that room; a sparse
-  `cudagraph_capture_sizes` list gets the KV cache back (19 sizes instead of 51:
-  graph pool 6.8 → 2.6 GiB, KV cache 31,936 → 63,856 tokens at 0.75). A startup
-  self-test reports an encoder that cannot encode a full batch. On the CPU an
-  encode takes 50–130 ms and nearly every route request times out under load.
+- **The encoder lives in a vLLM worker** — the last tensor-parallel rank by
+  default (`router_gpu: N` picks the rank). Its weights (about 1.3 GiB, fp32)
+  are loaded before vLLM sizes the KV cache, so they come out of
+  `gpu_memory_utilization` automatically. The GPU indexing process adds one
+  CUDA context on that card, outside the budget. A sparse
+  `cudagraph_capture_sizes` list frees graph memory for the KV cache (19 sizes
+  instead of 51: graph pool 6.8 → 2.6 GiB).
 - **`lora.max_loras` ≥ adapters in use at once + 1.** A batch holds at most
   `max_loras` distinct adapters, the finetuning adapter included. With 2,
   requests routed to different adapters queue behind each other (TTFT p95
-  89 ms → 1.5 s on the production trace); with 5, see below.
-- A route request never fails the request it belongs to: a slow or dead router
-  means the base model. After three failures in a row the API server stops
-  asking for a while (2 s, doubling to 30 s) instead of waiting out the timeout
-  on every request.
+  89 ms → 1.5 s on the production trace).
+- A routed request is never stuck or failed by routing: a failed encode step,
+  an empty pool or an adapter that left the pool means the base model, with
+  the reason in the headers.
 
 Measured on Qwen3-14B TP=2, `production-600-800`, four pool adapters, every
-request `model: "auto"`:
+request `model: "auto"` — **with the previous design** (a router service chose
+the adapter before the request reached the engine; the in-scheduler path above
+has not been run on this trace yet):
 
 | | ok | TTFT p50 / p95 / p99 (ms) | within 400 ms | backward cycles |
 |---|---|---|---|---|
 | routing off (plain preset) | 534/534 | 77 / 89 / 96 | 100 % | 373 |
 | routing on (routing preset) | 534/534 | 103 / 134 / 140 | 100 % | 354 |
 
-The extra ~25 ms is the route call itself: an encode takes 4–14 ms on an idle
-card (by input length, up to the 512-token cap) and about 25 ms next to the
-model's processes. A decode step that collides with an encode takes ~8 ms
-longer. Saving a trained adapter blocks the engine loop for 200–290 ms on this
-model (once per job).
+There the extra ~25 ms was the route call: an encode takes 4–14 ms on an idle
+card (by input length, up to the 512-token cap) but about 25 ms when it shares
+the card with the model's processes, and a decode step that collided with one
+took ~8 ms longer — the reason the encode became a step of its own. Saving a
+trained adapter blocks the engine loop for 200–290 ms on this model (once per
+job).
 
 ---
 

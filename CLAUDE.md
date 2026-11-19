@@ -137,7 +137,7 @@ plugins disabled or not. Qwen3 defaults to v2 when finetuning is off, so FT-off 
 **Adapter routing + finetuning jobs** (branch `adapter-routing`, off unless
 configured; README "Finetuning jobs and adapter routing"): `deltaserve/ft_job.py`
 (jobs, stage registry), `adapter_save.py`, `route_middleware.py`,
-`adapter_routing/` (index, decision, pool, router service, resolver, engine).
+`adapter_routing/` (index, decision, pool, engine_router, index_process, resolver, engine), `route_worker.py`.
 Always say "adapter routing" / `adapter_routing`, never bare "routing". Validated
 live on Qwen3-0.6B and Qwen3-14B TP=2 (routing preset
 `serving_config_finetuning_qwen3_14b_tp2_adapter_routing.yaml`): production trace

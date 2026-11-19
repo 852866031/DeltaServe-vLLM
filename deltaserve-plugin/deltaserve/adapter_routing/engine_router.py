@@ -194,6 +194,7 @@ class EngineRouter:
         # step runs whether or not the cold request is in it.
         self.mirror = mirror
         self.busy = busy
+        self.on_busy = None           # inference work is present (indexing)
         self.cold: list[_Held] = []
         self._preload: dict = {}          # lora id → LoRARequest, for the next step
         self.cold_holds = 0

@@ -23,8 +23,13 @@ Checks
   * an adapter that is indexed but not ready is NOT routable;
   * hit counting, a restart restoring the same pool with the same LoRA ids,
     a job without auto_routing, GPU-slot count, LoRA serving required;
-  * no router service process: ``service`` is None, status reports the
-    engine's router instead.
+  * no router service process: status reports the engine's router;
+  * indexing on the GPU: with an ``IndexingGrant`` the shared indexer gets a
+    "gpu" ``SharedEncoderExecutor`` on the index directory's socket and the
+    placement holds the grant (cleared at start, with the configured idle /
+    busy thread counts); without a grant, with ``indexing_on_gpu: false`` or
+    with ``router_device: cpu`` indexing is CPU only; ``note_inference()`` —
+    the scheduler's ``on_busy`` — and every request clear the grant at once.
 """
 
 import asyncio
@@ -173,8 +178,7 @@ def vllm_config(d, finetuning=True, max_loras=4, lora=True):
 
     cfg = AdapterRoutingConfig(
         enable_adapter_routing=True, index_path=str(Path(d) / "index"),
-        fallback_score_threshold=0.5, indexing_chunk_samples=4,
-        indexing_cpu_reserve_cores=0, indexing_min_free_memory_gb=0.0)
+        fallback_score_threshold=0.5, indexing_chunk_samples=4)
     return SimpleNamespace(
         adapter_routing_config=cfg,
         finetune_config=SimpleNamespace(enable_finetuning=finetuning),
@@ -266,7 +270,7 @@ def test_closed_loop():
         read_registry,
     )
     from deltaserve.adapter_routing.resolver import PoolLoRAResolver
-    from deltaserve.adapter_routing.service import Router
+    from deltaserve.adapter_routing.router import Router
     from deltaserve.ft_job import FinetuneJobSpec, FtJobManager
     from deltaserve.route_middleware import AdapterRouteMiddleware, DecisionRegistry
 
@@ -280,7 +284,7 @@ def test_closed_loop():
             trained = lora_state(42)
             vc = vllm_config(d)
             engine = FakeEngineCore(trained)
-            routing = AdapterRoutingEngine(engine, vc, start_service=False)
+            routing = AdapterRoutingEngine(engine, vc)
             check("pool starts empty; 4 LoRA slots minus the FT slot → 3 for the pool",
                   len(routing.pool) == 0 and routing.pool.gpu_slots == 3)
             ctx = SchedulerCtx(vc, engine, routing, str(data))
@@ -386,7 +390,7 @@ def test_closed_loop():
                   and status["router"]["held"] == 0)
 
             engine2 = FakeEngineCore(trained)
-            routing2 = AdapterRoutingEngine(engine2, vc, start_service=False)
+            routing2 = AdapterRoutingEngine(engine2, vc)
             lora2 = routing2.lora_for(job.name)
             check("server restart: the pool comes back with the same adapter, id "
                   "and path; nothing is loaded until a request needs it",
@@ -463,7 +467,7 @@ def test_external_adapters():
     from deltaserve.adapter_routing.engine import AdapterRoutingEngine
     from deltaserve.adapter_routing.pool import ROUTABLE_FILE
     from deltaserve.adapter_routing.resolver import PoolLoRAResolver
-    from deltaserve.adapter_routing.service import Router
+    from deltaserve.adapter_routing.router import Router
     from deltaserve.adapter_routing.stages import SharedIndexer
 
     keep = st.IndexingStage.make_executors
@@ -483,7 +487,7 @@ def test_external_adapters():
             engine.model_executor.collective_rpc = (
                 lambda method, *a, **k: rpc_calls.append(method) or [])
             vc = vllm_config(d, finetuning=False)
-            routing = AdapterRoutingEngine(engine, vc, start_service=False,
+            routing = AdapterRoutingEngine(engine, vc,
                                            start_driver=False)
 
             j1 = routing.submit_adapter(src, name="translate-adapter",
@@ -561,7 +565,7 @@ def test_external_adapters():
                  "data_path": str(Path(d) / "tr.txt")},
                 {"path": src, "name": "late", "data_path": corpus("po", "poem", 6)}]
             routing2 = AdapterRoutingEngine(FakeEngineCore(lora_state(0)), vc2,
-                                            start_service=False, start_driver=False)
+                                            start_driver=False)
             check("restart with the adapters listed in the config",
                   run_jobs(routing2))
             fin2 = {j["name"]: j for j in routing2.status()["jobs"]["finished"]}
@@ -652,7 +656,7 @@ def test_engine_config():
     green("engine object:")
     from deltaserve.adapter_routing.engine import AdapterRoutingEngine, VllmLoRABackend
     from deltaserve.adapter_routing.engine_router import EngineRouter
-    from deltaserve.adapter_routing.service import Router
+    from deltaserve.adapter_routing.router import Router
 
     with tempfile.TemporaryDirectory() as d:
         eng = FakeEngineCore(lora_state(0))
@@ -663,15 +667,16 @@ def test_engine_config():
               isinstance(r.pool.backend, VllmLoRABackend))
         check("adapter routing without LoRA serving is refused",
               "enable_lora" in (error_of(lambda: AdapterRoutingEngine(
-                  eng, vllm_config(d, lora=False), start_service=False)) or ""))
+                  eng, vllm_config(d, lora=False))) or ""))
         t0 = r.placement._last_inference
         r.note_request(SimpleNamespace(lora_request=None))
         check("every request tells the indexing placement that inference is active",
               t0 is None and r.placement._last_inference is not None
               and r.placement.choose(True) == "cpu")
-        check("no router service process is started (the adapter is chosen "
-              "inside the engine)",
-              r.service is None and "router_service_alive" not in r.status())
+        check("no router service: the status reports the engine's router",
+              not hasattr(r, "service")
+              and "router_service_alive" not in r.status()
+              and "router" in r.status())
         check("the engine's router: an EngineRouter deciding from embeddings "
               "with the pool's routable index",
               isinstance(r.router, EngineRouter) and isinstance(r.decider, Router)
@@ -682,16 +687,12 @@ def test_engine_config():
               r.router.mirror is not None
               and r.pool.backend.mirror is r.router.mirror
               and (r.router.mirror.gpu_slots, r.router.mirror.pinned) == (4, set()))
-        check("no router service → indexing has no GPU executor",
-              "gpu" not in r.shared_indexer._factory())
-        vc_gpu = vllm_config(d, finetuning=False)
-        vc_gpu.adapter_routing_config.router_gpu = 0
-        rg = AdapterRoutingEngine(eng, vc_gpu, start_service=True)
-        check("start_service is ignored; the route encoder lives in a worker, "
-              "so indexing cannot borrow it (CPU executor only, even with "
-              "router_gpu set)",
-              rg.service is None and "gpu" not in rg.shared_indexer._factory())
-        rg.shutdown()
+        check("without a grant indexing has no GPU executor and the placement "
+              "holds none",
+              r.grant is None and r.placement.grant is None
+              and set(r.shared_indexer._factory()) == {"cpu"})
+        check("the scheduler's busy signal is the engine's note_inference",
+              r.router.on_busy == r.note_inference)
         ft = AdapterRoutingEngine(eng, vllm_config(d, finetuning=True, max_loras=4),
                                   start_driver=False)
         from deltaserve.ft_injector import FT_LORA_INT_ID
@@ -712,6 +713,105 @@ def test_engine_config():
               eng.removed == [e.lora_int_id]
               and not r.router.mirror.in_memory(e.lora_int_id))
         r.shutdown()
+
+
+def test_gpu_indexing_wiring():
+    green("indexing on the GPU: grant, executor, placement:")
+    from deltaserve.adapter_routing import stages as st
+    from deltaserve.adapter_routing.engine import (
+        AdapterRoutingEngine,
+        route_encoder_on_cpu,
+    )
+    from deltaserve.adapter_routing.index_process import (
+        IndexingGrant,
+        SharedEncoderExecutor,
+        socket_path,
+    )
+    from deltaserve.adapter_routing.runner import BUSY, IDLE
+
+    def engine_with(d, grant, **cfg_changes):
+        vc = vllm_config(d, finetuning=False)
+        for k, v in cfg_changes.items():
+            setattr(vc.adapter_routing_config, k, v)
+        return AdapterRoutingEngine(FakeEngineCore(lora_state(0)), vc,
+                                    start_driver=False, grant=grant)
+
+    keep = st.IndexingStage.make_executors
+    st.IndexingStage.make_executors = staticmethod(lambda cfg: {"cpu": FakeExec()})
+    grant = IndexingGrant.create()
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            grant.set(True)                 # a stale "granted" from before
+            r = engine_with(d, grant, indexing_cpu_max_threads=6,
+                            indexing_cpu_busy_threads=3,
+                            indexing_gpu_after_quiet_s=5.0)
+            ex = r.shared_indexer._factory()
+            check("with a grant: a 'gpu' SharedEncoderExecutor next to the CPU one",
+                  set(ex) == {"cpu", "gpu"}
+                  and isinstance(ex["gpu"], SharedEncoderExecutor))
+            check("it talks to the indexing process of this index directory, "
+                  "which is not up yet (not ready)",
+                  ex["gpu"].path == socket_path(r.dir) and not ex["gpu"].ready)
+            check("the placement holds that grant and starts with it cleared",
+                  r.grant is grant and r.placement.grant is grant
+                  and not grant.is_set())
+            check("the placement takes its quiet period and thread counts "
+                  "from the config",
+                  (r.placement.gpu_after_quiet_s, r.placement.idle_threads,
+                   r.placement.busy_threads) == (5.0, 6, 3))
+            check("the shared indexer's runners get the engine's placement",
+                  r.shared_indexer.placement is r.placement)
+            check("never saw inference → idle: GPU granted, idle thread count",
+                  r.placement.choose(True) == "gpu" and grant.is_set()
+                  and r.placement.level == IDLE
+                  and r.placement.cpu_threads() == 6)
+            check("the engine router's on_busy is note_inference",
+                  r.router.on_busy == r.note_inference)
+            r.router.on_busy()
+            check("note_inference() clears the grant at once; busy thread count",
+                  not grant.is_set() and r.placement.level == BUSY
+                  and r.placement.cpu_threads() == 3
+                  and r.placement.choose(True) == "cpu")
+            r.placement._last_inference -= 10.0          # quiet for 10 s
+            check("quiet period over → granted again",
+                  r.placement.refresh() == IDLE and grant.is_set())
+            r.note_request(SimpleNamespace(lora_request=None))
+            check("a request reaching the engine clears the grant too",
+                  not grant.is_set() and r.placement.level == BUSY)
+            ex["gpu"].stop()
+            r.shutdown()
+
+            off = engine_with(d, grant, indexing_on_gpu=False)
+            check("indexing_on_gpu: false → CPU only (the placement still "
+                  "switches the CPU thread count)",
+                  set(off.shared_indexer._factory()) == {"cpu"}
+                  and off.placement.cpu_threads()
+                  == off.cfg.indexing_cpu_max_threads)
+            off.shutdown()
+            cpu = engine_with(d, grant, router_device="cpu")
+            check("router_device: cpu → the encoder is on the CPU, nothing "
+                  "indexes on a GPU",
+                  route_encoder_on_cpu(cpu.cfg)
+                  and set(cpu.shared_indexer._factory()) == {"cpu"})
+            cpu.shutdown()
+            rank = engine_with(d, grant, router_device="cpu", router_gpu=0)
+            check("router_gpu (a rank) wins over router_device: cpu → GPU "
+                  "indexing is offered",
+                  not route_encoder_on_cpu(rank.cfg)
+                  and "gpu" in rank.shared_indexer._factory())
+            rank.shutdown()
+            none = engine_with(d, None)
+            check("no grant (no indexing process could be told to stop) → "
+                  "CPU only",
+                  set(none.shared_indexer._factory()) == {"cpu"}
+                  and none.placement.grant is None)
+            none.note_inference()
+            check("note_inference() without a grant still sets the level",
+                  none.placement.level == BUSY)
+            none.shutdown()
+    finally:
+        grant.close()
+        st.IndexingStage.make_executors = keep
 
 
 def test_real_encoder():
@@ -784,6 +884,7 @@ def main():
     test_external_adapters()
     test_adapters_config()
     test_engine_config()
+    test_gpu_indexing_wiring()
     test_real_encoder()
     print()
     if _failed:

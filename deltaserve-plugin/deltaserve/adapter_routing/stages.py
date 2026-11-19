@@ -13,7 +13,7 @@ import tempfile
 import threading
 
 from deltaserve import dprint
-from deltaserve.adapter_routing.governor import CpuGovernor, parse_cpu_list
+from deltaserve.adapter_routing.encoder import parse_cpu_list
 from deltaserve.adapter_routing.index import (
     CentroidIndex,
     Indexer,
@@ -175,15 +175,12 @@ class IndexingStage(Stage):
             share = dict(stop_executors=False, on_exit=self._shared.release)
         else:
             executors, share = self.make_executors(cfg), {}
-        governor = CpuGovernor(
-            max_threads=cfg.indexing_cpu_max_threads,
-            reserve_cores=cfg.indexing_cpu_reserve_cores,
-            min_free_memory_bytes=int(cfg.indexing_min_free_memory_gb * (1 << 30)),
-            cpus=parse_cpu_list(cfg.indexing_cpus))
         placement = getattr(self._shared, "placement", None) \
-            or IndexingPlacement(cfg.indexing_gpu_after_quiet_s)
+            or IndexingPlacement(cfg.indexing_gpu_after_quiet_s,
+                                 idle_threads=cfg.indexing_cpu_max_threads,
+                                 busy_threads=cfg.indexing_cpu_busy_threads)
         self.runner = IndexingRunner(
-            self._indexer, executors, governor=governor, placement=placement,
+            self._indexer, executors, placement=placement,
             chunk_samples={"cpu": cfg.indexing_chunk_samples,
                            "gpu": cfg.indexing_gpu_chunk_samples},
             name=job.name, **share)

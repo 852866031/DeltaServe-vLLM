@@ -3,11 +3,15 @@
 
 """Drives one indexing job across executors, chunk by chunk.
 
-``IndexingPlacement`` says where the next chunk goes:
+Indexing runs on its own: ``IndexingRunner`` is a thread that takes a chunk,
+has it encoded, stores the progress, takes the next. The scheduler does not
+issue its work — it only says where indexing may run, and only when that
+changes (``IndexingPlacement``):
 
-- **cpu** while inference work is present (or was, in the last
-  ``gpu_after_quiet_s`` seconds) — throttled by the ``CpuGovernor``;
-- **gpu** when only finetuning batches are running and a GPU executor exists.
+- **gpu** while the engine has no inference request (and has had none for a
+  quiet period) and a GPU executor exists — the indexing process that shares
+  the route encoder's weights (``index_process``);
+- **cpu** otherwise, with the thread count of the current level.
 
 ``IndexingRunner.step()`` does one thing per call: collect the chunk in flight,
 or hand the next one to the chosen executor. Moving between devices costs
@@ -15,107 +19,88 @@ nothing because the job's state is the indexer's checkpoint:
 
 - cpu → gpu: the CPU chunk in flight is allowed to finish, the next one goes to
   the GPU;
-- gpu → cpu: the GPU chunk in flight is cancelled at once (the quick kill when
-  inference arrives) and handed out again on the CPU.
+- gpu → cpu: the GPU chunk in flight is dropped (the indexing process stops at
+  its next encoder layer once the grant is cleared) and its samples are handed
+  out again on the CPU.
 
-``start()`` runs the steps on a daemon thread so indexing progresses whether or
-not the engine is stepping. An executor is anything with ``submit(texts,
-threads)``, ``poll(timeout)`` → embeddings | None, ``cancel()``, ``loaded``,
-``unload()`` and ``stop()``.
+An executor is anything with ``submit(texts, threads)``, ``poll(timeout)`` →
+embeddings | None, ``cancel()``, ``loaded``, ``unload()`` and ``stop()``.
 """
 
 import threading
 import time
 
 from deltaserve import dprint
+from deltaserve.adapter_routing.index_process import Preempted
+
+
+IDLE, BUSY = "idle", "busy"
 
 
 class IndexingPlacement:
-    def __init__(self, gpu_after_quiet_s: float = 3.0, clock=time.monotonic) -> None:
+    """What the scheduler tells indexing, and only when it changes:
+
+    - **busy** — an inference request is in the engine: indexing stays off the
+      GPU (the grant is cleared at once) and on the CPU uses at most
+      ``busy_threads`` threads;
+    - **idle** — none has been for ``gpu_after_quiet_s`` seconds: the GPU may
+      be used (grant set), the CPU with ``idle_threads``.
+
+    ``note_inference()`` is the scheduler's side: called when a request
+    arrives and by every ``schedule()`` that still has one. The quiet period
+    keeps the short gaps between requests of a steady load from flipping the
+    level (a GPU chunk started in such a gap would be dropped by the next
+    arrival). ``grant`` is the ``IndexingGrant`` the indexing process obeys."""
+
+    def __init__(self, gpu_after_quiet_s: float = 3.0, clock=time.monotonic,
+                 grant=None, idle_threads: int = 8, busy_threads: int = 2) -> None:
         self.gpu_after_quiet_s = float(gpu_after_quiet_s)
         self._clock = clock
         self._last_inference: float | None = None
+        self.grant = grant
+        self.idle_threads, self.busy_threads = int(idle_threads), int(busy_threads)
+        self.level = IDLE
+        self.changes = 0
+        if grant is not None:
+            grant.set(False)          # nothing is granted before the first look
+
+    def _set(self, level: str) -> None:
+        if level != self.level:
+            self.level = level
+            self.changes += 1
+        if self.grant is not None and self.grant.is_set() != (level == IDLE):
+            self.grant.set(level == IDLE)
 
     def note_inference(self) -> None:
-        """Call whenever inference work is seen (an arrival, a running request)."""
+        """Inference work is present (an arrival, a request still running)."""
         self._last_inference = self._clock()
+        self._set(BUSY)
+
+    def refresh(self) -> str:
+        """The level now (the quiet period may have run out)."""
+        last = self._last_inference
+        quiet = last is None or self._clock() - last >= self.gpu_after_quiet_s
+        self._set(IDLE if quiet else BUSY)
+        return self.level
+
+    def cpu_threads(self) -> int:
+        return self.idle_threads if self.refresh() == IDLE else self.busy_threads
 
     def choose(self, gpu_available: bool) -> str:
-        if not gpu_available:
-            return "cpu"
-        last = self._last_inference
-        if last is not None and self._clock() - last < self.gpu_after_quiet_s:
-            return "cpu"
-        return "gpu"
-
-
-class RouterEncodeExecutor:
-    """The GPU executor: indexing chunks are encoded by the router service's
-    resident encoder (indexing *borrows* it — nothing else is loaded on the
-    GPU). The service runs a chunk only when no route request is waiting.
-    ``cancel`` stops waiting for the chunk in flight: its result is dropped,
-    and the runner hands the same samples to the CPU."""
-
-    device, loaded = "gpu", True
-
-    def __init__(self, socket: str, timeout_s: float = 30.0) -> None:
-        from deltaserve.adapter_routing.service import RouterClient
-
-        self._client = RouterClient(socket, timeout_s=timeout_s)
-        self._socket = socket
-        self._timeout = timeout_s
-        self._seq = 0
-        self._job = None            # [seq, Event, embeddings, error]
-
-    @property
-    def ready(self) -> bool:
-        """The service is listening. It loads its encoder after the engine
-        starts, so a job submitted at launch must not count on it yet."""
-        import os
-
-        return os.path.exists(self._socket)
-
-    def submit(self, texts: list, threads: int = 0) -> None:
-        self._seq += 1
-        job = [self._seq, threading.Event(), None, None]
-        self._job = job
-
-        def run():
-            try:
-                job[2] = self._client.encode(texts, self._timeout)
-            except Exception as e:  # noqa: BLE001 — surfaced by poll()
-                job[3] = e
-            job[1].set()
-
-        threading.Thread(target=run, daemon=True, name="deltaserve-gpu-chunk").start()
-
-    def poll(self, timeout: float = 0.0):
-        job = self._job
-        if job is None or not job[1].wait(timeout):
-            return None
-        self._job = None
-        if job[3] is not None:
-            raise job[3]
-        return job[2]
-
-    def cancel(self) -> None:
-        self._job = None
-
-    def unload(self) -> None:
-        """Nothing to free: the encoder is the router service's."""
-
-    def stop(self) -> None:
-        self._job = None
-        self._client.close()
+        return "gpu" if self.refresh() == IDLE and gpu_available else "cpu"
 
 
 class IndexingRunner:
-    def __init__(self, indexer, executors: dict, governor=None, placement=None,
+    def __init__(self, indexer, executors: dict, cpu_threads=None, placement=None,
                  chunk_samples: int | dict = 16, recheck_s: float = 0.5,
                  poll_s: float = 0.05, name: str = "indexing",
                  stop_executors: bool = True, on_exit=None) -> None:
         self.indexer, self.executors = indexer, dict(executors)
-        self.governor, self.placement = governor, placement
+        # ``cpu_threads() -> int``: threads for the next CPU chunk (0 = wait).
+        # Default: the placement's level.
+        if cpu_threads is None and placement is not None:
+            cpu_threads = placement.cpu_threads
+        self.cpu_threads, self.placement = cpu_threads, placement
         self.chunk = (chunk_samples if isinstance(chunk_samples, dict)
                       else {d: int(chunk_samples) for d in self.executors})
         self.recheck_s, self.poll_s, self.name = recheck_s, poll_s, name
@@ -125,6 +110,7 @@ class IndexingRunner:
         self.pause_reason = ""
         self.chunks = {d: 0 for d in self.executors}
         self.discarded = 0
+        self.preempted = 0            # GPU chunks inference interrupted
         self.error: str | None = None
         self._gpu_off_until = 0.0     # after a GPU executor failure: CPU only
         # Shared executors (one encoder process for every job) are not ours to stop.
@@ -161,13 +147,18 @@ class IndexingRunner:
             except Exception as e:  # noqa: BLE001
                 if cur != "gpu" or "cpu" not in self.executors:
                     raise
-                # The router service could not encode it: redo it on the CPU
-                # and leave the GPU alone for a while.
+                self._inflight = None
+                self.discarded += 1
+                if isinstance(e, Preempted):
+                    # Inference took the GPU back mid-chunk: the scheduler's
+                    # level says where the samples go next.
+                    self.preempted += 1
+                    return 0.0
+                # The indexing process could not encode it: redo it on the
+                # CPU and leave the GPU alone for a while.
                 dprint(f"[indexing] {self.name}: GPU chunk failed ({e}); "
                        f"continuing on the CPU")
                 self._gpu_off_until = time.monotonic() + 30.0
-                self._inflight = None
-                self.discarded += 1
                 return 0.0
             if emb is None:
                 return 0.0
@@ -179,19 +170,14 @@ class IndexingRunner:
             return 0.0
 
         threads = 0
-        if dev == "cpu" and self.governor is not None:
-            ex = self.executors[dev]
-            d = self.governor.decide(loaded=bool(ex.loaded))
-            if not d.run:
-                now = time.monotonic()
-                if self.state != "paused" or d.reason != self.pause_reason:
-                    dprint(f"[indexing] {self.name} paused: {d.reason}")
-                    self._paused_since = now
-                self.state, self.pause_reason = "paused", d.reason
-                if ex.loaded and "memory" in d.reason:
-                    ex.unload()           # give the memory back while waiting
+        if dev == "cpu" and self.cpu_threads is not None:
+            threads = int(self.cpu_threads())
+            if threads < 1:
+                if self.state != "paused":
+                    dprint(f"[indexing] {self.name} paused by the scheduler")
+                    self._paused_since = time.monotonic()
+                self.state, self.pause_reason = "paused", "scheduler"
                 return self.recheck_s
-            threads = d.threads
         if self.state != dev:
             done, total = idx.progress
             dprint(f"[indexing] {self.name} running on {dev} ({done}/{total})")
@@ -240,4 +226,5 @@ class IndexingRunner:
         done, total = self.indexer.progress
         return {"state": self.state, "encoded": done, "total": total,
                 "chunks": dict(self.chunks), "discarded": self.discarded,
+                "preempted": self.preempted,
                 "pause_reason": self.pause_reason, "error": self.error}

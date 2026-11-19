@@ -17,7 +17,8 @@ Checks
   * three outcomes: a clear winner, several close (chosen by preference, the
     choice reported), low confidence → base;
   * small pools and pools without reference samples degrade as documented;
-  * the decision reaches the client: service protocol, log, and — the path a
+  * the decision reaches the client: ``Router`` decisions (confidence,
+    candidates, reasons), the decision log, and — the path a
     request takes — middleware → route payload → the engine's router (fake
     encode step + ``Router.route_embeddings``) → decision header → response
     headers (the body's ``model`` is the base model; the adapter is in the
@@ -28,7 +29,6 @@ import asyncio
 import json
 import sys
 import tempfile
-import threading
 from pathlib import Path
 
 import numpy as np
@@ -263,12 +263,7 @@ def test_degraded_modes():
 def test_reaches_the_client():
     green("the decision reaches the client:")
     from deltaserve.adapter_routing.pool import AdapterPool
-    from deltaserve.adapter_routing.service import (
-        Router,
-        RouterClient,
-        serve,
-        socket_path,
-    )
+    from deltaserve.adapter_routing.router import Router
     from types import SimpleNamespace
 
     from deltaserve.adapter_routing.engine_router import EngineRouter
@@ -312,112 +307,101 @@ def test_reaches_the_client():
         log = str(Path(d) / "decisions.jsonl")
         router = Router(Enc(), str(Path(d) / ROUTABLE_FILE), keep_percent=80,
                         reload_s=0.0, decision_log=log)
-        path = socket_path(d)
-        stop, ready = threading.Event(), threading.Event()
-        th = threading.Thread(target=serve, args=(router, path, stop, ready),
-                              daemon=True)
-        th.start()
-        ready.wait(5)
-        try:
-            client = RouterClient(path, timeout_s=5.0)
-            d5 = client.route("t:5")
-            check("routed decision over the socket carries confidence and candidates",
-                  d5.adapter == "a5" and d5.confidence is not None
-                  and d5.candidates and d5.candidates[0] == "a5")
-            lows = [client.route("u:") for _ in range(30)]
-            low = next(x for x in lows if x.adapter is None)
-            check("a low-confidence fallback has its own reason",
-                  low.reason == "low-confidence" and low.confidence is not None)
+        d5 = router.route("t:5")
+        check("a routed decision carries confidence and candidates",
+              d5.adapter == "a5" and d5.confidence is not None
+              and d5.candidates and d5.candidates[0] == "a5")
+        lows = [router.route("u:") for _ in range(30)]
+        low = next(x for x in lows if x.adapter is None)
+        check("a low-confidence fallback has its own reason",
+              low.reason == "low-confidence" and low.confidence is not None)
 
-            pool.note_hit("a1")                 # a1 now sits in a GPU slot
-            pool.save(d)
-            router.refresh(force=True)
-            twins = [client.route("t:0") for _ in range(60)]
-            both = [x for x in twins if x.adapter and "a1" in x.candidates
-                    and len(x.candidates) > 1]
-            check("close candidates: the router picks the one the pool has in a "
-                  f"GPU slot ({len(both)} such requests)",
-                  len(both) >= 20 and all(x.adapter == "a1" for x in both))
+        pool.note_hit("a1")                 # a1 now sits in a GPU slot
+        pool.save(d)
+        router.refresh(force=True)
+        twins = [router.route("t:0") for _ in range(60)]
+        both = [x for x in twins if x.adapter and "a1" in x.candidates
+                and len(x.candidates) > 1]
+        check("close candidates: the router picks the one the pool has in a "
+              f"GPU slot ({len(both)} such requests)",
+              len(both) >= 20 and all(x.adapter == "a1" for x in both))
 
-            # The path of a request: the API server tokenizes (here: the
-            # text's bytes), the engine's router encodes the held requests in
-            # one step, decides from the embeddings and attaches the adapter;
-            # the decision returns on the request's trace_headers.
-            reg = DecisionRegistry()
-            enc = Enc()
+        # The path of a request: the API server tokenizes (here: the
+        # text's bytes), the engine's router encodes the held requests in
+        # one step, decides from the embeddings and attaches the adapter;
+        # the decision returns on the request's trace_headers.
+        reg = DecisionRegistry()
+        enc = Enc()
 
-            def engine_router(added):
-                def add(request, *args, **kwargs):
-                    added.append(request)
-                    reg.note_headers(request.trace_headers)
+        def engine_router(added):
+            def add(request, *args, **kwargs):
+                added.append(request)
+                reg.note_headers(request.trace_headers)
 
-                return EngineRouter(
-                    lambda batch: enc.encode([bytes(ids).decode() for ids in batch]),
-                    router.route_embeddings,
-                    lambda name: SimpleNamespace(lora_name=name, lora_int_id=1,
-                                                 lora_path=f"/p/{name}"),
-                    add)
+            return EngineRouter(
+                lambda batch: enc.encode([bytes(ids).decode() for ids in batch]),
+                router.route_embeddings,
+                lambda name: SimpleNamespace(lora_name=name, lora_int_id=1,
+                                             lora_path=f"/p/{name}"),
+                add)
 
-            async def one(prompt):
-                seen, out, added = {}, {}, []
-                er = engine_router(added)
+        async def one(prompt):
+            seen, out, added = {}, {}, []
+            er = engine_router(added)
 
-                async def app(scope, receive, send):
-                    seen["body"] = (await receive())["body"]
-                    er.hold(SimpleNamespace(
-                        request_id="r", lora_request=None,
-                        trace_headers={ROUTE_HEADER: ROUTE_PAYLOAD.get()}))
-                    er.route_pending()
-                    await send({"type": "http.response.start", "status": 200,
-                                "headers": []})
-                    await send({"type": "http.response.body", "body": b""})
+            async def app(scope, receive, send):
+                seen["body"] = (await receive())["body"]
+                er.hold(SimpleNamespace(
+                    request_id="r", lora_request=None,
+                    trace_headers={ROUTE_HEADER: ROUTE_PAYLOAD.get()}))
+                er.route_pending()
+                await send({"type": "http.response.start", "status": 200,
+                            "headers": []})
+                await send({"type": "http.response.body", "body": b""})
 
-                mw = AdapterRouteMiddleware(app, lambda text: list(text.encode()),
-                                            "auto", "base", registry=reg)
-                msgs = [{"type": "http.request", "more_body": False,
-                         "body": json.dumps({"model": "auto",
-                                             "prompt": prompt}).encode()}]
+            mw = AdapterRouteMiddleware(app, lambda text: list(text.encode()),
+                                        "auto", "base", registry=reg)
+            msgs = [{"type": "http.request", "more_body": False,
+                     "body": json.dumps({"model": "auto",
+                                         "prompt": prompt}).encode()}]
 
-                async def receive():
-                    return msgs.pop(0) if msgs else {"type": "http.disconnect"}
+            async def receive():
+                return msgs.pop(0) if msgs else {"type": "http.disconnect"}
 
-                async def send(m):
-                    if m["type"] == "http.response.start":
-                        out.update({k.decode(): v.decode() for k, v in m["headers"]})
+            async def send(m):
+                if m["type"] == "http.response.start":
+                    out.update({k.decode(): v.decode() for k, v in m["headers"]})
 
-                await mw({"type": "http", "method": "POST",
-                          "path": "/v1/completions", "headers": []}, receive, send)
-                lora = added[0].lora_request
-                return (json.loads(seen["body"])["model"], out,
-                        lora.lora_name if lora is not None else None)
+            await mw({"type": "http", "method": "POST",
+                      "path": "/v1/completions", "headers": []}, receive, send)
+            lora = added[0].lora_request
+            return (json.loads(seen["body"])["model"], out,
+                    lora.lora_name if lora is not None else None)
 
-            for _ in range(40):
-                model, h, lora = asyncio.run(one("t:0"))
-                if "x-deltaserve-routing-candidates" in h \
-                        and h.get("x-deltaserve-routing") == "routed":
-                    break
-            check("response headers: confidence, and the candidates when several "
-                  "were close",
-                  "x-deltaserve-routing-confidence" in h
-                  and set(h["x-deltaserve-routing-candidates"].split(",")[:2])
-                  == {"a0", "a1"})
-            check("the request went on as a base-model request; the adapter is "
-                  "on the engine request and in the header",
-                  model == "base" and lora == h["x-deltaserve-adapter"]
-                  and lora in ("a0", "a1"))
-            for _ in range(40):
-                model, h, lora = asyncio.run(one("u:"))
-                if h.get("x-deltaserve-routing") == "fallback":
-                    break
-            check("response headers on a low-confidence fallback: base model, "
-                  "reason, message, confidence",
-                  model == "base" and lora is None
-                  and h.get("x-deltaserve-routing-reason") == "low-confidence"
-                  and "not a confident match" in h.get("x-deltaserve-routing-message", "")
-                  and "x-deltaserve-routing-confidence" in h)
-        finally:
-            stop.set()
-            th.join(5)
+        for _ in range(40):
+            model, h, lora = asyncio.run(one("t:0"))
+            if "x-deltaserve-routing-candidates" in h \
+                    and h.get("x-deltaserve-routing") == "routed":
+                break
+        check("response headers: confidence, and the candidates when several "
+              "were close",
+              "x-deltaserve-routing-confidence" in h
+              and set(h["x-deltaserve-routing-candidates"].split(",")[:2])
+              == {"a0", "a1"})
+        check("the request went on as a base-model request; the adapter is "
+              "on the engine request and in the header",
+              model == "base" and lora == h["x-deltaserve-adapter"]
+              and lora in ("a0", "a1"))
+        for _ in range(40):
+            model, h, lora = asyncio.run(one("u:"))
+            if h.get("x-deltaserve-routing") == "fallback":
+                break
+        check("response headers on a low-confidence fallback: base model, "
+              "reason, message, confidence",
+              model == "base" and lora is None
+              and h.get("x-deltaserve-routing-reason") == "low-confidence"
+              and "not a confident match" in h.get("x-deltaserve-routing-message", "")
+              and "x-deltaserve-routing-confidence" in h)
         rows = [json.loads(x) for x in open(log)]
         check("every decision is logged for calibration, without the request text",
               len(rows) > 50 and {"outcome", "adapter", "confidence", "margin",

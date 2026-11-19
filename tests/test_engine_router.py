@@ -22,7 +22,10 @@ Checks
     hashes of the same prompt sent with that adapter by name, and differ from
     the base model's);
   * the plugin hooks on a scheduler object: held requests count as requests,
-    ``schedule()`` routes them first, aborts reach the router;
+    ``schedule()`` routes them first, aborts reach the router; ``schedule()``
+    calls the router's ``on_busy`` (indexing leaves the GPU) while a routed
+    request is held or an inference request — not a finetuning sample — is in
+    the scheduler;
   * the middleware: the request goes on as a base-model request with the
     encoder tokens for the engine; the response start waits for the engine's
     decision and carries the x-deltaserve-* headers; an error response does
@@ -479,6 +482,37 @@ def test_scheduler_hooks():
           out is not None and calls == ["schedule"]
           and log.added == [("a", (), {})] and len(log.encoded) == 1)
     check("and the held request is gone", not sched.has_requests())
+
+    # [indexing] the scheduler's busy signal: schedule() says "inference is
+    # present" (IndexingPlacement.note_inference) while a routed request is
+    # held or the scheduler has an inference request.
+    r, log = make_router()
+    sched = SimpleNamespace(
+        has_requests=lambda: False, has_unfinished_requests=lambda: False,
+        requests={},
+        schedule=lambda: SimpleNamespace(num_scheduled_tokens={}))
+    _route_in_scheduler(sched, r)
+    check("no on_busy callback by default; schedule() works without one",
+          r.on_busy is None and sched.schedule() is not None)
+    busy = []
+    r.on_busy = lambda: busy.append(int(r.pending))
+    sched.schedule()
+    check("idle engine: schedule() does not report inference", busy == [])
+    r.hold(fake_request("b", [1, 2]))
+    sched.schedule()
+    check("a held routed request → on_busy, before the encode step",
+          busy == [1] and len(log.encoded) == 1)
+    sched.requests["__ft__0"] = object()
+    sched.schedule()
+    check("finetuning samples alone are not inference", busy == [1])
+    sched.requests["chat-1"] = object()
+    sched.schedule()
+    sched.schedule()
+    check("an inference request in the scheduler → on_busy at every schedule()",
+          busy == [1, 0, 0])
+    del sched.requests["chat-1"]
+    sched.schedule()
+    check("... and no longer once it is gone", busy == [1, 0, 0])
 
 
 async def _asgi(mw, body, path="/v1/chat/completions", app=None, registry=None):

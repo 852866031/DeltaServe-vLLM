@@ -150,7 +150,6 @@ def write_config(out: Path, args) -> Path:
         "router_device": args.router_device,
         "router_gpu": args.router_gpu,
         "route_keep_percent": 100,      # one adapter: this run tests the pipeline
-        "route_timeout_ms": 5000,
         "indexing_cpus": args.indexing_cpus,
     }
     cfg["adapters"]["lora_path_0"] = str(
@@ -210,7 +209,7 @@ def external_main(args, out: Path) -> None:
     cfg["adapter_routing"] = {
         "enable_adapter_routing": True, "index_path": str(out / "index"),
         "router_device": args.router_device, "router_gpu": args.router_gpu,
-        "route_timeout_ms": 5000, "route_decision_log": True,
+        "route_decision_log": True,
         # 40 templated lines per adapter: genuine requests sit a few confidence
         # units below every training sample, unrelated ones tens of units.
         "route_confidence_slack": 4.0,

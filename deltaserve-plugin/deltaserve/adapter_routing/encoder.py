@@ -10,7 +10,7 @@ last hidden state over the attention mask, L2-normalise.
 ``CpuIndexerProcess`` runs one in a child process so its threads, its GIL and
 its memory stay out of the vLLM processes. The child runs under ``SCHED_IDLE``,
 can be pinned to a core set, and takes the thread count with every chunk (the
-governor decides it). Its interface is asynchronous — ``submit`` a chunk,
+scheduler's level decides it). Its interface is asynchronous — ``submit`` a chunk,
 ``poll`` for the embeddings — which is what ``runner.IndexingRunner`` expects
 of any executor.
 
@@ -18,8 +18,53 @@ torch / transformers are imported only when an encoder is actually loaded.
 """
 
 import multiprocessing as mp
+import os
 
 import numpy as np
+
+
+def parse_cpu_list(spec: str | None) -> set[int] | None:
+    """'8-15,24' → {8..15, 24}; None / '' → None (no restriction)."""
+    if not spec:
+        return None
+    out: set[int] = set()
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            out.update(range(int(a), int(b) + 1))
+        else:
+            out.add(int(part))
+    return out
+
+
+def apply_idle_priority() -> str:
+    """Put the calling process in the lowest scheduling class. Returns which
+    mechanism took effect."""
+    try:
+        os.sched_setscheduler(0, os.SCHED_IDLE, os.sched_param(0))
+        return "SCHED_IDLE"
+    except (AttributeError, OSError):
+        pass
+    try:
+        os.nice(19)
+        return "nice 19"
+    except OSError:
+        return "none"
+
+
+def pin_to_cpus(cpus: set[int] | None) -> set[int]:
+    """Restrict the calling process to ``cpus`` (intersected with what it may
+    use); returns the resulting set."""
+    allowed = os.sched_getaffinity(0)
+    if cpus:
+        target = allowed & set(cpus)
+        if target:
+            os.sched_setaffinity(0, target)
+            return target
+    return allowed
 
 
 class SentenceEncoder:
@@ -70,7 +115,6 @@ def _cpu_indexer_main(conn, model, prefix, max_tokens, cpus) -> None:
 
     os.environ["CUDA_VISIBLE_DEVICES"] = ""      # this process never uses a GPU
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    from deltaserve.adapter_routing.governor import apply_idle_priority, pin_to_cpus
 
     try:
         from deltaserve.backward_process import arm_parent_death_signal

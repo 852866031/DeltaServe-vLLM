@@ -220,6 +220,33 @@ def _patch_engine_core() -> None:
         def __init__(self, vllm_config, *args, **kwargs):
             # Before the executor spawns the workers (arrival signal).
             self._ds = attach_engine_hooks(self, vllm_config)
+            self._ds_index_grant = None
+            if vllm_config.adapter_routing_config.enable_adapter_routing:
+                # [indexing] May indexing use the GPU? The engine writes it,
+                # the indexing process (a child of a worker) obeys: its name
+                # travels in the workers' environment.
+                import os
+
+                from deltaserve.adapter_routing.index_process import (
+                    GRANT_ENV,
+                    IndexingGrant,
+                )
+
+                try:
+                    from deltaserve.adapter_routing.index_process import socket_path
+                    from deltaserve.adapter_routing.stages import index_dir
+
+                    try:    # a previous run's socket: its process is gone
+                        os.unlink(socket_path(index_dir(
+                            vllm_config.adapter_routing_config)))
+                    except OSError:
+                        pass
+                    self._ds_index_grant = IndexingGrant.create()
+                    os.environ[GRANT_ENV] = self._ds_index_grant.name
+                except Exception as e:  # noqa: BLE001 — indexing stays on the CPU
+                    from deltaserve import dprint
+
+                    dprint(f"[indexing] no GPU grant ({e}): indexing stays on the CPU")
             orig(self, vllm_config, *args, **kwargs)
             # [ft-job] the scheduler saves a finished job's adapter through the
             # engine (worker RPC).
@@ -230,7 +257,8 @@ def _patch_engine_core() -> None:
                 # The only place the engine reaches into deltaserve.adapter_routing.
                 from deltaserve.adapter_routing.engine import AdapterRoutingEngine
 
-                self._ds_routing = AdapterRoutingEngine(self, vllm_config)
+                self._ds_routing = AdapterRoutingEngine(
+                    self, vllm_config, grant=self._ds_index_grant)
                 self.scheduler._adapter_routing = self._ds_routing
                 _route_in_scheduler(self.scheduler, self._ds_routing.router)
         return __init__
@@ -244,7 +272,12 @@ def _patch_engine_core() -> None:
                 ds.on_shutdown()
             routing = getattr(self, "_ds_routing", None)
             if routing is not None:
-                routing.shutdown()          # stops the router service
+                routing.shutdown()
+            grant = getattr(self, "_ds_index_grant", None)
+            if grant is not None:
+                grant.set(False)
+                grant.close()
+                self._ds_index_grant = None
             try:
                 return orig(self, *args, **kwargs)
             finally:
@@ -462,6 +495,8 @@ def _route_in_scheduler(scheduler, router) -> None:
     router.busy = busy
 
     def schedule_routed(*args, **kwargs):
+        if router.on_busy is not None and (router.pending or busy()):
+            router.on_busy()          # [indexing] inference is present
         router.encode_s = 0.0
         router.release_cold()
         router.route_pending()

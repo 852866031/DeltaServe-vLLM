@@ -1,9 +1,7 @@
 #!/usr/bin/env python
-"""The request path of adapter routing: the decision (``service.Router``), the
+"""The request path of adapter routing: the decision (``router.Router``), the
 API-server middleware (``deltaserve.route_middleware``) and the loop it closes
-with the engine's router (``adapter_routing.engine_router``); plus the legacy
-router service + client, which no longer route requests but are still used by
-tools.
+with the engine's router (``adapter_routing.engine_router``).
 
 CPU-only. The encoder is a deterministic fake except in the last, opt-in test:
 
@@ -15,8 +13,6 @@ Checks
     the prompt; token-id prompts: none);
   * the router: top-1, fallback below the threshold / on an empty index / on no
     text, and it follows the index file as it changes;
-  * (legacy) the service over its unix socket; a client that never raises —
-    down, slow or broken service → fallback, and it reconnects;
   * the middleware: only ``model == route name`` is touched — its text is
     tokenized for the route encoder, ``model`` becomes the BASE model, the
     tokens go to the engine (``ROUTE_PAYLOAD`` → ``trace_headers``, by the
@@ -38,7 +34,6 @@ import json
 import os
 import sys
 import tempfile
-import threading
 import time
 from pathlib import Path
 
@@ -135,7 +130,7 @@ def test_extract_text():
 
 def test_router():
     green("router:")
-    from deltaserve.adapter_routing.service import Router
+    from deltaserve.adapter_routing.router import Router
 
     with tempfile.TemporaryDirectory() as d:
         f = str(Path(d) / "centroids.npz")
@@ -164,465 +159,6 @@ def test_router():
               r.route("translate").reason == "no-adapters")
 
 
-class Service:
-    """The router service on a thread, for the protocol tests."""
-
-    def __init__(self, router, path):
-        from deltaserve.adapter_routing.service import serve
-
-        self.stop, ready = threading.Event(), threading.Event()
-        self.thread = threading.Thread(
-            target=serve, args=(router, path, self.stop, ready), daemon=True)
-        self.thread.start()
-        assert ready.wait(5)
-
-    def close(self):
-        self.stop.set()
-        self.thread.join(5)
-
-
-def test_service_and_client():
-    green("router service + client:")
-    from deltaserve.adapter_routing.service import Router, RouterClient, socket_path
-
-    with tempfile.TemporaryDirectory() as d:
-        f = str(Path(d) / "centroids.npz")
-        write_index(f, ["translate", "sql"])
-        path = socket_path(d)
-        check("socket path is short, per user, per index directory",
-              len(path) < 100 and str(os.getuid()) in path
-              and path != socket_path(d + "x"))
-
-        client = RouterClient(path, timeout_s=1.0)
-        dec = client.route("translate")
-        check("service not running → fallback 'router-unavailable', no exception",
-              dec.adapter is None and dec.reason == "router-unavailable")
-        check("... and the client keeps why (it is the only trace of a fallback)",
-              client.failures == 1 and bool(client.last_error))
-
-        enc = FakeEncoder()
-        svc = Service(Router(enc, f, threshold=0.5, reload_s=0.0), path)
-        try:
-            check("socket file is owner-only",
-                  (os.stat(path).st_mode & 0o077) == 0)
-            dec = client.route("translate to english")
-            check("client reconnects once the service is up; routed",
-                  dec.adapter == "dserve-routing-translate" and dec.score > 0.9)
-            check("fallback reason travels through the service",
-                  client.route("a poem").reason == "below-threshold")
-            check("ping reports the index size", client.ping()[0] == 2)
-
-            results = []
-
-            def worker(i):
-                c = RouterClient(path, timeout_s=2.0)
-                for _ in range(10):
-                    results.append(c.route("sql query" if i % 2 else "translate").adapter)
-                c.close()
-
-            ts = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
-            [t.start() for t in ts]
-            [t.join() for t in ts]
-            check("four concurrent clients (API servers) all get right answers",
-                  len(results) == 40 and results.count("dserve-routing-sql") == 20
-                  and results.count("dserve-routing-translate") == 20)
-
-            enc.delay = 0.3
-            slow = RouterClient(path, timeout_s=0.05)
-            dec = slow.route("translate")
-            check("slow service → fallback 'router-timeout'",
-                  dec.adapter is None and dec.reason == "router-timeout")
-            enc.delay = 0.0
-            time.sleep(0.4)
-            check("after a timeout the next answer is not a stale one",
-                  slow.route("sql please").adapter == "dserve-routing-sql")
-        finally:
-            svc.close()
-        check("service stopped → fallback again, and the socket file is gone",
-              client.route("translate").reason == "router-unavailable"
-              and not os.path.exists(path))
-        svc = Service(Router(FakeEncoder(), f, 0.5, 0.0), path)
-        try:
-            check("service restarted → the same client works again",
-                  client.route("translate").adapter == "dserve-routing-translate")
-        finally:
-            svc.close()
-            client.close()
-
-
-def test_client_under_failure():
-    green("router client: circuit breaker, no queueing behind a slow service:")
-    from deltaserve.adapter_routing.service import Router, RouterClient, socket_path
-
-    with tempfile.TemporaryDirectory() as d:
-        path = socket_path(d)
-        now = [0.0]
-        client = RouterClient(path, timeout_s=0.2, breaker_failures=3,
-                              breaker_cooldown_s=2.0, clock=lambda: now[0])
-        for _ in range(3):
-            client.route("translate")
-        check("three failures in a row open the breaker",
-              client.failures == 3 and client.open)
-        t0 = time.monotonic()
-        out = [client.route("translate") for _ in range(50)]
-        check("while open: 'router-unavailable' at once, the service is not asked",
-              all(o.reason == "router-unavailable" for o in out)
-              and client.failures == 3 and client.skipped == 50
-              and time.monotonic() - t0 < 0.1)
-        now[0] = 2.5
-        client.route("translate")
-        check("after the cooldown ONE request probes; it fails → open again, longer",
-              client.failures == 4 and client.open)
-        now[0] = 2.5 + 3.0
-        check("the cooldown doubled (still open after the first one's length)",
-              client.open)
-
-        f = str(Path(d) / "centroids.npz")
-        write_index(f, ["translate", "sql"])
-        svc = Service(Router(FakeEncoder(), f, threshold=0.5, reload_s=0.0), path)
-        try:
-            now[0] = 100.0
-            dec = client.route("translate this")
-            check("service back: the probe is routed and the breaker closes",
-                  dec.adapter == "dserve-routing-translate" and not client.open)
-            check("... and later requests are asked normally",
-                  client.route("translate").adapter == "dserve-routing-translate")
-        finally:
-            svc.close()
-            client.close()
-
-        # A slow service: 8 concurrent requests, each encode 0.3 s, timeout 0.2 s.
-        # With one shared connection they would wait 8 x 0.2 s in a row.
-        svc = Service(Router(FakeEncoder(delay=0.3), f, threshold=0.5,
-                             reload_s=0.0), path)
-        client = RouterClient(path, timeout_s=0.2, breaker_failures=3,
-                              breaker_cooldown_s=5.0)
-        try:
-            res = []
-            def one():
-                t = time.monotonic()
-                r = client.route("translate")
-                res.append((time.monotonic() - t, r.reason))
-            ths = [threading.Thread(target=one) for _ in range(8)]
-            t0 = time.monotonic()
-            [t.start() for t in ths]
-            [t.join(5) for t in ths]
-            wall = time.monotonic() - t0
-            check(f"8 concurrent requests on a too-slow service all fall back within "
-                  f"about one timeout ({wall * 1e3:.0f} ms), not eight",
-                  len(res) == 8 and all(r for _, r in res) and wall < 0.5)
-            t0 = time.monotonic()
-            r = client.route("translate")
-            check("and the next request is not made to wait at all",
-                  r.reason == "router-unavailable" and time.monotonic() - t0 < 0.05)
-        finally:
-            svc.close()
-            client.close()
-
-
-def test_batching():
-    green("request batching in the router service:")
-    from deltaserve.adapter_routing.service import (
-        RouteBatcher,
-        Router,
-        RouterClient,
-        socket_path,
-    )
-
-    class CountingEncoder(FakeEncoder):
-        def __init__(self, delay=0.0):
-            super().__init__(delay)
-            self.sizes = []
-
-        def encode(self, texts):
-            self.sizes.append(len(texts))
-            return super().encode(texts)
-
-    with tempfile.TemporaryDirectory() as d:
-        f = str(Path(d) / "centroids.npz")
-        write_index(f, ["translate", "sql"])
-
-        enc = CountingEncoder()
-        r = Router(enc, f, threshold=0.5, reload_s=0.0)
-        ds = r.route_many(["translate a", "", "sql b", "a poem", None])
-        check("route_many: one encoder call for the texts that need encoding",
-              enc.sizes == [3] and [x.adapter for x in ds]
-              == ["dserve-routing-translate", None, "dserve-routing-sql", None, None])
-        check("...and per-item fallback reasons",
-              [x.reason for x in ds]
-              == ["", "no-text", "", "below-threshold", "no-text"])
-
-        enc = CountingEncoder(delay=0.05)
-        b = RouteBatcher(Router(enc, f, 0.5, 0.0), max_batch=8)
-        t0 = time.time()
-        one = b.submit("translate this")
-        alone = time.time() - t0
-        check("a request to an idle service is encoded alone, at once "
-              f"({alone * 1e3:.0f} ms for a 50 ms encode)",
-              one.adapter == "dserve-routing-translate" and enc.sizes == [1]
-              and alone < 0.12)
-
-        n = 24
-        results = [None] * n
-
-        def worker(i):
-            text = f"sql query {i}" if i % 2 else f"translate {i}"
-            results[i] = (text, b.submit(text))
-
-        ts = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
-        t0 = time.time()
-        [t.start() for t in ts]
-        [t.join() for t in ts]
-        took = time.time() - t0
-        calls = enc.sizes[1:]
-        check(f"24 concurrent requests → {len(calls)} encoder calls "
-              f"(sizes {calls}), not 24",
-              sum(calls) == n and len(calls) <= 6)
-        check("no batch exceeds route_batch_max", max(calls) <= 8)
-        check("every caller gets the decision for ITS text (no cross-wiring)",
-              all(dec.adapter == ("dserve-routing-sql" if "sql" in text
-                                  else "dserve-routing-translate")
-                  for text, dec in results))
-        check(f"batched: {took * 1e3:.0f} ms total; serial would be "
-              f"{n * 50} ms", took < n * 0.05 * 0.5)
-        check("batch statistics are kept", b.largest == max(calls)
-              and b.batches == len(enc.sizes))
-        b.stop()
-
-        enc1 = CountingEncoder(delay=0.01)
-        b1 = RouteBatcher(Router(enc1, f, 0.5, 0.0), max_batch=1)
-        ts = [threading.Thread(target=b1.submit, args=("translate",))
-              for _ in range(6)]
-        [t.start() for t in ts]
-        [t.join() for t in ts]
-        check("route_batch_max = 1 keeps the old one-at-a-time behaviour",
-              enc1.sizes == [1] * 6)
-        b1.stop()
-
-        class Broken(FakeEncoder):
-            def encode(self, texts):
-                raise RuntimeError("cuda out of memory")
-
-        bb = RouteBatcher(Router(Broken(), f, 0.5, 0.0))
-        errs = []
-
-        def bad():
-            try:
-                bb.submit("translate")
-            except RuntimeError as e:
-                errs.append(str(e))
-
-        ts = [threading.Thread(target=bad) for _ in range(3)]
-        [t.start() for t in ts]
-        [t.join() for t in ts]
-        check("an encoder failure reaches every waiting request (nobody hangs)",
-              errs == ["cuda out of memory"] * 3)
-        bb.stop()
-
-        encw = CountingEncoder()
-        bw = RouteBatcher(Router(encw, f, 0.5, 0.0), max_batch=8, wait_s=0.15)
-        ts = [threading.Thread(target=bw.submit, args=("translate",))
-              for _ in range(4)]
-        for t in ts:
-            t.start()
-            time.sleep(0.02)
-        [t.join() for t in ts]
-        check("route_batch_wait_ms holds a batch open so staggered requests "
-              f"share it (sizes {encw.sizes})", encw.sizes == [4])
-        bw.stop()
-
-        enc = CountingEncoder(delay=0.03)
-        path = socket_path(d)
-        svc = Service(Router(enc, f, 0.5, 0.0), path)
-        try:
-            out = []
-
-            def client(i):
-                c = RouterClient(path, timeout_s=5.0)
-                for _ in range(5):
-                    out.append(c.route("sql" if i % 2 else "translate").adapter)
-                c.close()
-
-            ts = [threading.Thread(target=client, args=(i,)) for i in range(8)]
-            [t.start() for t in ts]
-            [t.join() for t in ts]
-            ping = RouterClient(path).ping()
-            check("through the socket: 8 API-server clients × 5 requests, all "
-                  f"correct, in {len(enc.sizes)} encoder calls",
-                  len(out) == 40 and out.count("dserve-routing-sql") == 20
-                  and len(enc.sizes) < 40)
-            check("ping reports batching (batches, largest batch)",
-                  ping is not None and ping[2] == len(enc.sizes) and ping[3] > 1)
-        finally:
-            svc.close()
-
-
-def test_indexing_borrows_the_encoder():
-    green("indexing chunks borrow the router's encoder:")
-    from deltaserve.adapter_routing.runner import RouterEncodeExecutor
-    from deltaserve.adapter_routing.service import (
-        RouteBatcher,
-        Router,
-        RouterClient,
-        socket_path,
-    )
-
-    order = []
-
-    class Enc(FakeEncoder):
-        def encode(self, texts):
-            order.append(("chunk" if texts[0].startswith("sample") else "route",
-                          len(texts)))
-            return super().encode(texts)
-
-    with tempfile.TemporaryDirectory() as d:
-        f = str(Path(d) / "centroids.npz")
-        write_index(f, ["translate", "sql"])
-        enc = Enc(delay=0.03)
-        b = RouteBatcher(Router(enc, f, 0.5, 0.0), max_batch=8)
-        got = {}
-
-        def chunk(i):
-            got[i] = b.encode([f"sample {i} a", f"sample {i} b"])
-
-        def route(i):
-            got[f"r{i}"] = b.submit("translate this")
-
-        ts = [threading.Thread(target=chunk, args=(i,)) for i in range(4)]
-        [t.start() for t in ts]
-        time.sleep(0.045)                      # chunks are being worked through
-        rs = [threading.Thread(target=route, args=(i,)) for i in range(3)]
-        [t.start() for t in rs]
-        [t.join() for t in ts + rs]
-        check("a chunk returns the embeddings of its samples, in order",
-              got[0].shape == (2, DIM) and all(k in got for k in range(4)))
-        first_route = next(i for i, (k, _) in enumerate(order) if k == "route")
-        chunks_after = sum(1 for k, _ in order[first_route:] if k == "chunk")
-        check(f"route requests jump ahead of waiting chunks ({order})",
-              chunks_after >= 1 and first_route <= 2)
-        check("chunks are never merged with route requests or each other",
-              all(n == 2 for k, n in order if k == "chunk") and b.chunks == 4)
-        b.stop()
-
-        path = socket_path(d)
-        svc = Service(Router(FakeEncoder(), f, 0.5, 0.0), path)
-        try:
-            ex = RouterEncodeExecutor(path, timeout_s=5.0)
-            check("the GPU executor reports itself as always loaded",
-                  ex.device == "gpu" and ex.loaded)
-            ex.submit(["sample x", "sample y", "sample z"])
-            t0, emb = time.time(), None
-            while emb is None and time.time() - t0 < 5:
-                emb = ex.poll(0.05)
-            check("executor: a chunk goes over the socket and comes back",
-                  emb is not None and emb.shape == (3, DIM))
-            ex.submit(["sample q"])
-            ex.cancel()
-            time.sleep(0.2)
-            check("a cancelled chunk's result is dropped", ex.poll(0.0) is None)
-            ex.submit(["sample again"])
-            t0, emb = time.time(), None
-            while emb is None and time.time() - t0 < 5:
-                emb = ex.poll(0.05)
-            check("...and the executor is usable for the next chunk",
-                  emb is not None and emb.shape == (1, DIM))
-            check("ping counts the chunks", RouterClient(path).ping()[4] >= 2)
-        finally:
-            svc.close()
-        ex.submit(["sample after shutdown"])
-        failed = False
-        t0 = time.time()
-        while time.time() - t0 < 5:
-            try:
-                if ex.poll(0.05) is not None:
-                    break
-            except Exception:  # noqa: BLE001
-                failed = True
-                break
-        check("with the service gone the executor raises (the runner then uses "
-              "the CPU)", failed)
-        ex.stop()
-
-
-def test_placement():
-    green("which device holds the encoder:")
-    from deltaserve.adapter_routing.service import (
-        apply_router_placement,
-        router_placement,
-    )
-    from deltaserve.config import AdapterRoutingConfig
-
-    def cfg(**kw):
-        return AdapterRoutingConfig(enable_adapter_routing=True, **kw)
-
-    keep_vis = os.environ.get("CUDA_VISIBLE_DEVICES")
-    try:
-        os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
-        check("default (auto): the last GPU the engine can see",
-              router_placement(cfg()) == ("cuda:1", None))
-        os.environ["CUDA_VISIBLE_DEVICES"] = "3"
-        check("auto with one visible GPU: that GPU",
-              router_placement(cfg()) == ("cuda:0", None))
-        os.environ["CUDA_VISIBLE_DEVICES"] = ""
-        check("auto with no GPU: the CPU",
-              router_placement(cfg()) == ("cpu", ""))
-    finally:
-        if keep_vis is None:
-            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-        else:
-            os.environ["CUDA_VISIBLE_DEVICES"] = keep_vis
-    from deltaserve.adapter_routing.service import encoder_self_test
-
-    class Enc:
-        def __init__(self, fail): self.fail, self.seen = fail, None
-        def encode(self, texts):
-            self.seen = texts
-            if self.fail:
-                raise RuntimeError("CUDA error: out of memory")
-            return np.zeros((len(texts), 4), np.float32)
-    ok_enc, bad_enc = Enc(False), Enc(True)
-    c = cfg(route_batch_max=6)
-    check("startup self-test encodes one full batch of the longest input",
-          encoder_self_test(ok_enc, c, "GPU 1") and len(ok_enc.seen) == 6
-          and len(ok_enc.seen[0].split()) >= c.encoder_max_tokens)
-    check("an encoder that cannot do it is reported, the service still starts",
-          encoder_self_test(bad_enc, c, "GPU 1") is False)
-    check("router_device: cpu → CPU, every GPU hidden from the service",
-          router_placement(cfg(router_device="cpu")) == ("cpu", ""))
-    check("router_gpu: 3 → the service sees only physical GPU 3, as cuda:0",
-          router_placement(cfg(router_gpu=3)) == ("cuda:0", "3"))
-    check("router_gpu wins over router_device",
-          router_placement(cfg(router_gpu=1, router_device="cpu")) == ("cuda:0", "1"))
-    check("router_device cuda:N is used as is (within the engine's GPUs)",
-          router_placement(cfg(router_device="cuda:1")) == ("cuda:1", None))
-    check("negative GPU index rejected",
-          error_raised(lambda: cfg(router_gpu=-1)))
-    check("batch size 0 rejected", error_raised(lambda: cfg(route_batch_max=0)))
-    keep = os.environ.get("CUDA_VISIBLE_DEVICES")
-    try:
-        os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
-        dev = apply_router_placement(cfg(router_gpu=1))
-        check("applying it restricts the process to that card",
-              dev == "cuda:0" and os.environ["CUDA_VISIBLE_DEVICES"] == "1")
-        os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
-        apply_router_placement(cfg(router_device="cuda:1"))
-        check("router_device leaves the visible GPUs alone",
-              os.environ["CUDA_VISIBLE_DEVICES"] == "0,1")
-    finally:
-        if keep is None:
-            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-        else:
-            os.environ["CUDA_VISIBLE_DEVICES"] = keep
-
-
-def error_raised(fn):
-    try:
-        fn()
-    except Exception:  # noqa: BLE001
-        return True
-    return False
-
-
 def tokenize(text):
     """Stand-in for the route tokenizer: the text's bytes as token ids."""
     return list(text.encode())
@@ -636,7 +172,7 @@ class Engine:
 
     def __init__(self, index_file, registry, threshold=0.5, auto=True):
         from deltaserve.adapter_routing.engine_router import EngineRouter
-        from deltaserve.adapter_routing.service import Router
+        from deltaserve.adapter_routing.router import Router
 
         self.registry, self.auto = registry, auto
         self.encoder = FakeEncoder()
@@ -1231,7 +767,7 @@ def test_real_encoder():
     green("real e5 on CPU: index two tiny datasets, then route:")
     from deltaserve.adapter_routing.encoder import SentenceEncoder
     from deltaserve.adapter_routing.index import CentroidIndex, Indexer, fingerprint
-    from deltaserve.adapter_routing.service import Router
+    from deltaserve.adapter_routing.router import Router
 
     data = {
         "dserve-routing-translate": [
@@ -1274,11 +810,6 @@ def main():
     green("=== adapter routing: request path ===")
     test_extract_text()
     test_router()
-    test_service_and_client()
-    test_client_under_failure()
-    test_batching()
-    test_indexing_borrows_the_encoder()
-    test_placement()
     test_middleware()
     test_routing_off()
     test_end_to_end()

@@ -96,6 +96,29 @@ class RouteEncodeMixin:
                    "waits for a CPU encode inside the engine step")
         dprint(f"[adapter-routing] route encoder {rc.encoder} loaded in worker "
                f"rank {self._route_tp_rank()} on {device}")
+        if rc.indexing_on_gpu and not on_cpu:
+            self._start_index_process(rc, model, device)
+
+    def _start_index_process(self, rc, model, device) -> None:
+        """[indexing] A process of its own that shares this encoder's weights
+        (CUDA IPC) and encodes indexing chunks while the engine has no
+        inference request. A failure here leaves indexing on the CPU."""
+        from deltaserve import dprint
+        from deltaserve.adapter_routing.index_process import (
+            IndexEncoderProcess,
+            log_started,
+            socket_path,
+        )
+        from deltaserve.adapter_routing.stages import index_dir
+
+        try:
+            self._index_process = IndexEncoderProcess(
+                rc, device, socket_path(index_dir(rc)))
+            log_started(self._index_process.start(model), device)
+        except Exception as e:  # noqa: BLE001
+            self._index_process = None
+            dprint(f"[indexing] GPU indexing process not started "
+                   f"({type(e).__name__}: {e}); indexing stays on the CPU")
 
     def _route_forward(self, batch: list) -> np.ndarray:
         import torch

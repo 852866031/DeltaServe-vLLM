@@ -46,7 +46,7 @@ ACTIVE, RETIRED = "active", "retired"
 RETIRE_LEAST_USED, ADMIT_RETIRED, REJECT = "retire_least_used", "admit_retired", "reject"
 REGISTRY_FILE = "pool.json"
 # The centroids of the adapters that may be selected right now (in the pool and
-# enabled) — what the router service reads. The indexing stage's own file holds
+# enabled) — what the engine's router reads. The indexing stage's own file holds
 # every centroid ever built, including jobs that are not ready yet.
 ROUTABLE_FILE = "routable.npz"
 # Pool adapters get their LoRA int id from the pool, in a range of their own:
@@ -464,7 +464,7 @@ class AdapterPool:
         adapters' centroids + reference samples) goes to a NEW versioned file
         first; the registry — names, paths, LoRA ids, levels, and which
         routable file is current — is then swapped in with a single rename.
-        Readers (the router service, the API servers' resolver) follow the
+        Readers (the engine's router, the API servers' resolver) follow the
         registry, so they see the old pool or the new one, never a mix; the
         pool serves throughout."""
         os.makedirs(directory, exist_ok=True)

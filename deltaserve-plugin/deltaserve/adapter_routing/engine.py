@@ -1,23 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Adapter routing inside the EngineCore process: the pool, its link to vLLM's
-LoRA manager, the router service, and publishing a finished job's adapter.
+"""Adapter routing inside the EngineCore process: the pool, the router that
+chooses a routed request's adapter, indexing's placement, and publishing a
+finished job's adapter.
 
 Created by the plugin right after the engine is built, only with adapter
 routing on. One object ties the loop together::
 
     job reaches 'ready' → trained adapter saved → publish(): centroid + path
     into the pool → registry + routable index written → the API servers'
-    resolver and the router service pick them up → model="auto" is routed.
+    resolver and the engine's router pick them up → model="auto" is routed.
 
-``VllmLoRABackend`` maps the pool's tier moves onto the engine's own LoRA
-calls. Loading and unloading are explicit; which adapter sits in a GPU slot is
-still decided by vLLM (it activates an adapter when a batch needs it and evicts
-least-recently-used), so the pool's ``gpu`` tier is its intent, not yet a fact.
+``VllmLoRABackend`` is the pool's link to vLLM. Nothing is loaded through it:
+vLLM reads an adapter when a step first uses it, and the scheduler arranges a
+background read first (cold start, ``engine_router``). Which adapter sits in a
+GPU slot is decided by vLLM (least-recently-used); ``LoraCacheMirror`` is the
+engine's replay of it, and the pool's own tier is its bookkeeping only.
 """
 
-import multiprocessing as mp
 import os
 import threading
 
@@ -67,76 +68,14 @@ class VllmLoRABackend:
         """vLLM frees a slot by its own least-recently-used eviction."""
 
 
-def _router_service_main(routing_kwargs: dict) -> None:
-    from deltaserve.adapter_routing.service import (
-        apply_router_placement,
-        serve_config,
-    )
-    from deltaserve.config import AdapterRoutingConfig
-
-    cfg = AdapterRoutingConfig(**routing_kwargs)
-    device = apply_router_placement(cfg)     # before anything touches CUDA
-
-    try:
-        from deltaserve.backward_process import arm_parent_death_signal
-
-        arm_parent_death_signal("router")
-    except Exception:  # noqa: BLE001 — never block the service on this
-        pass
-    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    import signal
-    import sys
-
-    # SIGTERM (engine shutdown, or the whole server being stopped) → unwind
-    # through serve()'s cleanup, which removes the socket file.
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    serve_config(cfg, device)
-
-
-class RouterServiceProcess:
-    """The router service as a child of the engine."""
-
-    def __init__(self, cfg) -> None:
-        from dataclasses import asdict
-
-        from deltaserve.adapter_routing.service import socket_path
-
-        self._args = (asdict(cfg),)
-        self._socket = socket_path(index_dir(cfg))
-        self._proc = None
-
-    def start(self) -> None:
-        ctx = mp.get_context("spawn")
-        self._proc = ctx.Process(target=_router_service_main, args=self._args,
-                                 name="deltaserve-router", daemon=True)
-        cur = mp.current_process()
-        was = cur._config.get("daemon", False)   # the engine may be daemonic
-        cur._config["daemon"] = False
-        try:
-            self._proc.start()
-        finally:
-            cur._config["daemon"] = was
-
-    def is_alive(self) -> bool:
-        return self._proc is not None and self._proc.is_alive()
-
-    def stop(self) -> None:
-        proc, self._proc = self._proc, None
-        if proc is None:
-            return
-        proc.terminate()
-        proc.join(timeout=3.0)
-        if proc.is_alive():
-            proc.kill()
-        try:                        # a terminated service cannot remove it
-            os.unlink(self._socket)
-        except OSError:
-            pass
+def route_encoder_on_cpu(cfg) -> bool:
+    """The route encoder was asked onto the CPU (then nothing indexes on a GPU)."""
+    return cfg.router_gpu is None and str(cfg.router_device).lower() == "cpu"
 
 
 class AdapterRoutingEngine:
     def __init__(self, engine, vllm_config, backend=None,
-                 start_service: bool = True, start_driver: bool = True) -> None:
+                 start_driver: bool = True, grant=None) -> None:
         cfg = vllm_config.adapter_routing_config
         lora = vllm_config.lora_config
         if lora is None:
@@ -171,32 +110,35 @@ class AdapterRoutingEngine:
                    "adapters in use at once"
                    + (" + 1." if ft_slot else "."))
         # The adapter of a routed request is chosen here, in the engine: the
-        # scheduler issues the encode step (see engine_router). No router
-        # service process.
-        self.service = None
+        # scheduler issues the encode step (see engine_router).
         self.router = self._make_router(engine, vllm_config)
         if hasattr(self.pool.backend, "mirror"):
             self.pool.backend.mirror = self.router.mirror
             self.pool.backend.preload = self.router.request_preload
 
-        # One encoder process for every job of this server.
-        # Inference seen recently → indexing stays on the CPU; quiet → it may
-        # borrow the router service's encoder when that one is on a GPU.
+        # Indexing runs on its own (IndexingRunner thread); the scheduler only
+        # tells it where it may run, when that changes: on the GPU — the
+        # indexing process that shares the route encoder's weights — while no
+        # inference request is present, on the CPU otherwise.
         from deltaserve.adapter_routing.runner import IndexingPlacement
 
-        self.placement = IndexingPlacement(cfg.indexing_gpu_after_quiet_s)
+        self.grant = grant
+        self.placement = IndexingPlacement(
+            cfg.indexing_gpu_after_quiet_s, grant=grant,
+            idle_threads=cfg.indexing_cpu_max_threads,
+            busy_threads=cfg.indexing_cpu_busy_threads)
+        self.router.on_busy = self.note_inference
 
         def executors():
-            from deltaserve.adapter_routing.runner import RouterEncodeExecutor
-            from deltaserve.adapter_routing.service import (
-                router_placement,
+            from deltaserve.adapter_routing.index_process import (
+                SharedEncoderExecutor,
                 socket_path,
             )
 
             ex = dict(IndexingStage.make_executors(cfg))
-            if self.service is not None and cfg.indexing_on_gpu \
-                    and router_placement(cfg)[0] != "cpu":
-                ex["gpu"] = RouterEncodeExecutor(socket_path(self.dir))
+            if grant is not None and cfg.indexing_on_gpu \
+                    and not route_encoder_on_cpu(cfg):
+                ex["gpu"] = SharedEncoderExecutor(socket_path(self.dir))
             return ex
 
         self.shared_indexer = SharedIndexer(executors, placement=self.placement)
@@ -224,7 +166,7 @@ class AdapterRoutingEngine:
     def _make_router(self, engine, vllm_config):
         from deltaserve.adapter_routing.engine_router import EngineRouter
         from deltaserve.adapter_routing.pool import ROUTABLE_FILE
-        from deltaserve.adapter_routing.service import Router
+        from deltaserve.adapter_routing.router import Router
 
         cfg = self.cfg
         decider = Router(
@@ -419,5 +361,3 @@ class AdapterRoutingEngine:
         if self._driver is not None:
             self._driver.join(timeout=3.0)
         self.shared_indexer.stop()
-        if self.service is not None:
-            self.service.stop()

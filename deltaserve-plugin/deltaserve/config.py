@@ -654,34 +654,18 @@ class AdapterRoutingConfig:
     request naming an adapter or the base model is never touched."""
 
     router_device: str = "auto"
-    """Device of the router service's encoder when ``router_gpu`` is not set.
-    ``"auto"`` (default): the last GPU the engine can see, or the CPU when it
-    sees none. ``"cuda:N"``: that device, counted within the engine's GPUs.
-    ``"cpu"``: only for low request rates — an encode takes 50-130 ms on an
-    idle CPU (3 ms on a GPU), and under a production load nearly every route
-    request times out and falls back to the base model.
-
-    On a GPU the encoder needs about 2 GB next to the model: leave it that
-    room (``gpu_memory_utilization``), or its encodes run out of memory."""
+    """Where the route encoder runs. ``"auto"`` (default): on the GPU, inside
+    the vLLM worker of the last tensor-parallel rank — in the model's own CUDA
+    context, its memory (about 1.3 GiB of weights, fp32) part of what vLLM
+    measures before it sizes the KV cache. ``"cpu"``: inside that worker on
+    the CPU — every routed request then waits for a CPU encode (50-130 ms)
+    inside an engine step; for experiments only, and nothing indexes on a GPU."""
 
     router_gpu: int | None = None
-    """Put the router service's encoder on this PHYSICAL GPU (the nvidia-smi
-    index); it stays resident there (about 1.5 GB). Takes precedence over
-    ``router_device``. May be a card the model does not use at all — with
-    tensor parallelism that keeps the encoder off every rank's GPU."""
+    """The tensor-parallel rank whose worker holds the route encoder (0 ..
+    tp-1), when the default — the last rank — is not wanted. A value outside
+    the model's ranks falls back to the last rank."""
 
-    arrival_on_route: bool = True
-    """A request sent to ``model: "auto"`` has arrived when the router service
-    receives it: routing is the first step of serving it, not something that
-    happens before it. From that moment the co-serving machinery treats it
-    like any arrival — the backward child yields the GPU
-    (``finetune.pause_on_arrival``), an FT-only forward is aborted (tier C
-    under TP), and the scheduler starts no new FT-only step until the request
-    reaches the engine. The encode then shares the card with less finetuning
-    work (route p50 24 → 14 ms on Qwen3-14B TP=2) and the request's prefill
-    finds the GPU already yielded. Its ``arrival_time`` — what the TTFT
-    deadline is computed from — is the moment it reached the API server either
-    way. False = finetuning learns of the request when the engine does."""
 
     route_encode_max_tokens: int = 1024
     """Most tokens (requests x the longest one, as padded) one encode step
@@ -701,16 +685,8 @@ class AdapterRoutingConfig:
     (nothing else was running: the request was scheduled at once). Measured on
     Qwen3-14B TP=2 with the file in the page cache: 11.7 + 1.5 ms."""
 
-    route_batch_max: int = 16
-    """Most route requests encoded together. Requests that arrive while the
-    encoder is busy are batched; one arriving at an idle service is not delayed."""
 
-    route_batch_wait_ms: float = 0.0
-    """Extra time a batch is held open to let it fill (0 = never wait)."""
 
-    route_timeout_ms: float = 200.0
-    """How long an API server waits for the router's answer before serving the
-    request with the base model instead (reported as a fallback)."""
 
     encoder: str = "intfloat/e5-large-v2"
     """Sentence encoder for both the adapter centroids and the request
@@ -822,31 +798,37 @@ class AdapterRoutingConfig:
     chunk is the unit that moves between CPU and GPU (or is redone if dropped)."""
 
     indexing_cpu_max_threads: int = 8
-    """Most CPU threads the CPU indexer may use for one chunk."""
+    """Threads of the CPU indexer while the engine has no inference request.
+    The indexer process runs in the lowest scheduling class either way (it
+    only gets CPU time nothing else wants)."""
 
-    indexing_cpu_reserve_cores: int = 2
-    """Idle cores the CPU indexer always leaves free; it pauses when fewer
-    than ``reserve + 1`` cores are idle."""
+    indexing_cpu_busy_threads: int = 2
+    """Threads of the CPU indexer while inference requests are present: what
+    bounds its memory-bandwidth and cache pressure on the engine. The
+    scheduler switches between the two when the engine's state changes."""
 
-    indexing_min_free_memory_gb: float = 4.0
-    """Host memory that must stay available while the CPU indexer runs; it
-    pauses (and unloads its encoder) below that."""
+
 
     indexing_cpus: str | None = None
     """CPU list the CPU indexer is pinned to, e.g. ``"8-15"``; keep it disjoint
     from the cores the vLLM processes use. None = no pinning."""
 
     indexing_on_gpu: bool = True
-    """Let indexing borrow the router service's encoder when that encoder is
-    on a GPU and inference is quiet. False = indexing stays on the CPU."""
+    """Let indexing use the GPU while the engine has no inference request: a
+    process of its own that shares the route encoder's weights with the worker
+    (no second copy; one more CUDA context, a few hundred MiB outside
+    ``gpu_memory_utilization``). False = indexing stays on the CPU."""
 
     indexing_gpu_chunk_samples: int = 8
-    """Samples per indexing chunk on the GPU. A route request waits for at
-    most one chunk, so keep it small (8 short samples take a few ms)."""
+    """Samples per indexing chunk on the GPU. A chunk interrupted by an
+    arriving request (at its next encoder layer) is redone, so small chunks
+    lose less."""
 
     indexing_gpu_after_quiet_s: float = 3.0
-    """Indexing moves to the GPU only after inference has been quiet this long
-    (and back to the CPU the moment a request arrives)."""
+    """The engine counts as free of inference — indexing may use the GPU, and
+    the CPU indexer its full thread count — only after no inference request
+    has been present for this long. It stops counting the moment one arrives.
+    Keeps the gaps between requests of a steady load from flipping the state."""
 
     def __post_init__(self) -> None:
         if not self.route_model_name:
@@ -860,15 +842,15 @@ class AdapterRoutingConfig:
         for name in ("encoder_max_tokens", "max_active_adapters",
                      "route_encode_max_tokens",
                      "indexing_max_samples", "indexing_chunk_samples",
-                     "indexing_cpu_max_threads", "route_batch_max",
+                     "indexing_cpu_max_threads", "indexing_cpu_busy_threads",
                      "indexing_gpu_chunk_samples",
                      "route_min_pool"):
             if int(getattr(self, name)) < 1:
                 raise ValueError(f"adapter_routing.{name} must be >= 1")
-        for name in ("indexing_cpu_reserve_cores", "indexing_min_free_memory_gb",
+        for name in (
                      "indexing_gpu_after_quiet_s", "pool_protected_slots",
-                     "pool_hit_half_life_s", "route_timeout_ms",
-                     "route_batch_wait_ms", "route_close_band",
+                     "pool_hit_half_life_s",
+                     "route_close_band",
                      "route_confidence_slack", "retire_grace_s",
                      "route_reference_samples"):
             if float(getattr(self, name)) < 0:
