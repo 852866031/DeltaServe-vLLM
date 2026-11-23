@@ -64,13 +64,18 @@ def node(nid, lid, c, r, kind, title, sub, x=None, w=BW, h=BH):
     NODES[nid] = dict(x=x, y=y, w=w, h=h, title=title, sub=sub, kind=kind, lane=lid)
 
 
-def edge(s, t, exit, entry, label="", dashed=False, inherit=False, lpos="c"):
+def edge(s, t, exit, entry, label="", dashed=False, inherit=False, lpos="c",
+         mid=None):
+    """``mid``: y of the horizontal run of a vertical-exit edge (default: halfway)."""
     EDGES.append(dict(s=s, t=t, exit=exit, entry=entry, label=label,
-                      dashed=dashed, inherit=inherit, lpos=lpos))
+                      dashed=dashed, inherit=inherit, lpos=lpos, mid=mid))
 
 
 # rows of lanes
 lane("api", 60, 130, "API server process   (vLLM frontend)")
+LANES["api"]["w"] = 20 + 2 * CSTEP + BW + 20          # three columns ...
+LANES["top"] = dict(x=col(3) - 20, y=60, w=BW + 40, h=130,   # ... the fourth is
+                    title="dserve-top   (own process)")       # another process
 lane("eng", 215, 240, "EngineCore process   (scheduler + executor driver)")
 lane("wrk", 480, 240, "Worker process   (one per TP rank · owns the GPU)")
 lane("shm", 745, 130, "Shared by the worker and its backward child   (CUDA IPC)")
@@ -79,7 +84,9 @@ lane("bwd", 900, 240, "Backward child   (one per TP rank · own CUDA context)")
 node("a1", "api", 0, 1, "stock", "OpenAI-compatible server", "vllm serve · FastAPI")
 node("a3", "api", 1, 1, "stock", "AsyncLLM", "frontend · ZMQ to EngineCore")
 node("a2", "api", 2, 1, "plugin", "deltaserve/api.py",
-     "/start_finetuning · /stop_finetuning\n/save_estimator_state")
+     "finetuning start / stop / status\nsave_adapter · metrics · telemetry")
+node("t1", "top", 3, 1, "plugin", "Live dashboard",
+     "standard library only · polls the\nfeed · web page, scrub, export")
 
 node("b2", "eng", 0, 1, "plugin", "EngineHooks",
      "arrival counter · profiling pass\nestimator save · input-queue swap")
@@ -91,6 +98,8 @@ node("b3", "eng", 1, 2, "plugin", "FinetuneScheduler",
      "scheduler_cls · FT injection\nthrottles · interrupt tiers A / B")
 node("b4", "eng", 2, 2, "plugin", "SLO estimator",
      "5-regime step-time model\nlaunch profiling · online refit")
+node("b7", "eng", 3, 1, "plugin", "MetricsRecorder",
+     "requests / backward / summary files\nLiveFeed: steps for the dashboard")
 
 node("c1", "wrk", 0, 1, "plugin", "DeltaServeWorker",
      "worker_cls · spawns the child\nexports weights + buffers")
@@ -110,7 +119,7 @@ node("s1", "shm", 1, 1, "data", "Base + FT-LoRA weights", "zero-copy CUDA IPC")
 node("s2", "shm", 2, 1, "data", "Activation buffers",
      "layer_in · gate_up · qkv · ctx\nresid_mid · final hidden")
 node("s3", "shm", 3, 1, "data", "Served LoRA slot", "trainer publishes\npunica reads")
-node("s4", "eng", 3, 1, "signal", "FtArrivalSignal",
+node("s4", "eng", 3, 2, "signal", "FtArrivalSignal",
      "shm counter bumped by the input\nthread · read by poller + child")
 
 node("d1", "bwd", 0, 1, "plugin", "BackwardService loop",
@@ -125,12 +134,14 @@ node("d5", "bwd", 1, 2, "plugin", "LM-head backward",
      "batched rows · chunked fp32\neager · pause boundaries")
 node("d6", "bwd", 2, 2, "plugin", "TP collectives",
      "NCCL residual reduces\nbucketed factor grads")
+node("d7", "bwd", 3, 2, "plugin", "Adapter checkpoints",
+     "on request · every N cycles · epoch\nTP shards gathered to rank 0 → PEFT")
 
 # left column: client + launch path
 node("u", None, 0, 100, "stock", "Clients", "HTTP · eval replays", x=LEFT_X, w=LEFT_W)
 LAUNCH = dict(x=LEFT_X - 10, y=215, w=LEFT_W + 20, h=505, title="Launch path")
 node("l1", None, 0, 255, "launch", "configs/*.yaml",
-     "finetune · throttles\nslo · debug", x=LEFT_X, w=LEFT_W)
+     "finetune_param · _features\nthrottles · slo · telemetry", x=LEFT_X, w=LEFT_W)
 node("l2", None, 0, 375, "launch", "config_loader",
      "YAML → CLI args", x=LEFT_X, w=LEFT_W)
 node("l3", None, 0, 495, "launch", "--additional-config",
@@ -143,12 +154,16 @@ R, L_, T, B = (1, .5), (0, .5), (.5, 0), (.5, 1)
 edge("u", "a1", R, L_)
 edge("a1", "a3", R, L_, "submit")
 edge("a2", "a3", L_, R, "RPC")
+edge("t1", "a2", L_, R, "polls")
+edge("b3", "b7", (.85, 0), B, "tokens · step times · acks",
+     mid=LANES["eng"]["y"] + 138)
+edge("d4", "d7", B, T, "save")
 edge("a3", "b1", B, T, "ZMQ")
 edge("b2", "b1", R, L_, "wraps")
 edge("b1", "b3", B, T, "schedule()")
 edge("b3", "b6", L_, R, "extends", inherit=True)
 edge("b3", "b4", R, L_, "predict")
-edge("b3", "b5", (1, .25), (0, .75), "claim")
+edge("b3", "b5", (1, .25), (0, .5), "claim")
 edge("b3", "c2", (.3, 1), (.3, 0), "SchedulerOutput + FT fields", lpos="l")
 edge("c2", "b3", (.7, 0), (.7, 1), "ModelRunnerOutput: timing · ack · abort", lpos="r")
 edge("c1", "c2", R, L_, "adopts")
@@ -193,7 +208,7 @@ def route(e):
     if horiz:
         xm = (x0 + x1) / 2
         return [(x0, y0), (xm, y0), (xm, y1), (x1, y1)]
-    ym = (y0 + y1) / 2
+    ym = (y0 + y1) / 2 if e.get("mid") is None else e["mid"]
     return [(x0, y0), (x0, ym), (x1, ym), (x1, y1)]
 
 
