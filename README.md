@@ -732,6 +732,7 @@ DeltaServe-vLLM/
 │       ├── model_runner.py            DeltaServeModelRunner: the hooks on vLLM's v1 runner
 │       ├── model_runner_v2.py         DeltaServeModelRunnerV2: the hooks on vLLM's v2 runner (finetune_features.model_runner)
 │       ├── runner_select.py           which of the two a launch uses
+│       ├── ft_sizes.py                tokens per optimizer step / per backward batch, from any config object
 │       ├── cudagraph.py               FtCudagraphDispatcher (v1 runner)
 │       ├── cudagraph_v2.py            FtCudaGraphManager (v2 runner): dispatch + the has_ft capture pass
 │       ├── cudagraph_common.py        FtBatchDescriptor, the abort poll between graph segments
@@ -913,7 +914,7 @@ into `--additional-config`. The rest become ordinary vLLM flags.
 
 | Section | Holds |
 |---|---|
-| `finetune_param` | the training job: switch, FT adapter, corpus `data_path`, epochs, lr, weight decay, buffer size `max_saved_finetuning_tokens`, adapter checkpoints (`adapter_save_*`) |
+| `finetune_param` | the training job: switch, FT adapter, corpus `data_path`, epochs, lr, weight decay, buffer size `max_saved_finetuning_tokens` (or `ft_step_size` tokens per optimizer step trained in backward batches of `bwd_batch_size`, gradients accumulated), adapter checkpoints (`adapter_save_*`) |
 | `finetune_features` | how co-serving runs it: backward precision and CUDA graphs, activation saves, mixed-batch forward graphs, interrupts, pauses |
 | `throttles` | admission shapers ([table above](#throttles-and-admission-control)) |
 | `slo` | `ttft_slo`, `avg_tbt_slo`, `max_tbt_slo`, estimator profiling |
@@ -1133,6 +1134,7 @@ tests/run_all.sh /tmp/ds-tests 'test_qwen3_*'  # a subset
 | Backward math (gradcheck vs autograd), graph == eager | `test_{llama3,qwen3}_backward`, `test_{llama3,qwen3}_backward_graph`, `test_{llama3,qwen3}_train_overfit` | 1 GPU |
 | TP sharding and gradients | `test_{llama3,qwen3}_tp_shard`, `test_{llama3,qwen3}_tp_backward_gloo`, `test_tp_bucket_gloo`, `test_tp_timing_relay`, `test_ft_abort_tp` | CPU (gloo) |
 | Hooks on vLLM's v2 model runner | `test_runner_v2` | CPU |
+| Several backward batches per optimizer step: k batches equal one backward of the whole step (both families), the child's row ranges, when batches go out and when admission closes, aborts, the config keys | `test_grad_accum` | CPU |
 | TP on real NCCL | `test_tp_backward_graph_nccl`, `test_tp_trainer_graph_nccl` | 2 GPUs |
 | **Inference is unperturbed by co-serving** (amplified FT adapter + positive control; FT provably co-batched with real prefills and decodes; eager + CUDA graphs) | `test_phase1_m1` (Qwen3-0.6B), `test_tp_inference_leak` (Qwen3-14B TP=2, production preset) | 1 GPU / 2 GPUs + weights |
 | End-to-end engine / server | `test_phase1_m2`, `test_pause_on_arrival`, `test_tp_no_orphans` | GPU(s) + model weights |

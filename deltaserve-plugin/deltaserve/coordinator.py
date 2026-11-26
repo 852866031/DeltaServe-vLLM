@@ -278,6 +278,26 @@ class FinetuneCoordinator:
         self.per_step_budget = int(
             per_step_budget if per_step_budget is not None else capacity
         )
+        # [bwd_batch_size] FT tokens per backward batch. Equal to the capacity
+        # (the default) there is one backward per buffer and everything below
+        # behaves as it always did. Smaller, the buffer holds one OPTIMIZER
+        # STEP: the child trains it ``bwd_batch`` tokens at a time (whole
+        # samples), accumulating gradients, and updates + publishes on the
+        # step's last batch. ``_bwd_rows`` / ``_bwd_samples`` are what the
+        # batches of the current step have consumed; ``_bwd_inflight`` is the
+        # batch on the child, (rows, samples, final).
+        self.bwd_batch = self.capacity
+        self._bwd_rows = 0
+        self._bwd_samples = 0
+        self._bwd_inflight: tuple | None = None
+        # The reservations whose forward has not been committed yet, in step
+        # order: [rows, abortable]. An ABORTABLE one is an FT-only step that a
+        # late inference arrival may still abandon (tier C); its rows are then
+        # given back. Rows are handed out in order, so nothing may be reserved
+        # behind it meanwhile — the later step's rows would stay where they
+        # are, with a hole of unwritten rows before them that the next commit
+        # would count as saved (see ``next_ft_budget``).
+        self._inflight_ft: list = []
         # COMMITTED FT rows — activations actually saved into the buffer
         # (incremented post-forward in record_capture).
         self.fill_count = 0
@@ -481,11 +501,37 @@ class FinetuneCoordinator:
         # Free rows = capacity minus committed AND reserved-in-flight.
         return max(0, self.capacity - self.fill_count - self.reserved_fill)
 
+    @property
+    def multi_batch(self) -> bool:
+        """Several backward batches per optimizer step (``bwd_batch_size``)."""
+        return self.bwd_batch < self.capacity
+
+    @property
+    def backward_blocks_admission(self) -> bool:
+        """A backward is running that ends in a weight update: nothing may be
+        saved with the old weights behind it. (With several batches per step,
+        a batch that only accumulates gradients leaves the weights alone — the
+        forward keeps filling the rest of the step's buffer while it runs.)"""
+        if not self.pending_backward:
+            return False
+        return not (self.multi_batch and self._bwd_inflight is not None
+                    and not self._bwd_inflight[2])
+
     def next_ft_budget(self) -> int:
         """How many FT tokens the scheduler may admit this step."""
-        if not self.ft_started or not self.admission_open or self.pending_backward:
+        if (not self.ft_started or not self.admission_open
+                or self.backward_blocks_admission):
+            return 0
+        if self.multi_batch and self.abortable_in_flight:
+            # One step carries a batch's worth here, so FT-only steps follow
+            # each other while the buffer fills (a single one filled it
+            # before): wait for the abortable one to be committed or aborted.
             return 0
         return min(self.per_step_budget, self.space_remaining())
+
+    @property
+    def abortable_in_flight(self) -> bool:
+        return any(a for _, a in self._inflight_ft)
 
     def check_rps_throttle(self, now: float, close_rps: float,
                            open_rps: float, window_s: float,
@@ -653,6 +699,8 @@ class FinetuneCoordinator:
             "last_backward_gpu_ms": self.last_backward_gpu_ms,
             "buffer_fill": int(self.fill_count),
             "buffer_capacity": int(self.capacity),
+            "bwd_batch_size": int(self.bwd_batch),
+            "step_tokens_trained": int(self._bwd_rows),
             "corpus_tokens_per_epoch": int(self.corpus_total_tokens),
         }
 
@@ -690,7 +738,8 @@ class FinetuneCoordinator:
         # the scheduler reserves a per-step offset via reserve().)
         return self.fill_count + self.reserved_fill
 
-    def reserve(self, n: int, samples: list | None = None) -> int:
+    def reserve(self, n: int, samples: list | None = None,
+                abortable: bool = False) -> int:
         """Reserve n FT rows for a scheduled step and return the buffer write
         offset they own. Called by the scheduler AFTER the FT partition (only the
         rows that actually scheduled). Committed by record_capture post-forward.
@@ -701,6 +750,7 @@ class FinetuneCoordinator:
         activations contributed to that backward."""
         offset = self.fill_count + self.reserved_fill
         self.reserved_fill += int(n)
+        self._inflight_ft.append([int(n), bool(abortable)])
         if samples:
             self.buffer_samples.extend(samples)
         return offset
@@ -715,6 +765,13 @@ class FinetuneCoordinator:
         doesn't try to commit-train samples that never had their activations
         actually saved."""
         self.reserved_fill = max(0, self.reserved_fill - int(n))
+        for i in range(len(self._inflight_ft) - 1, -1, -1):
+            if self._inflight_ft[i][0] == int(n):
+                del self._inflight_ft[i]
+                break
+        else:
+            if self._inflight_ft:
+                self._inflight_ft.pop()
         if samples and self.buffer_samples:
             drop = {s.request_id for s in samples}
             self.buffer_samples = [
@@ -761,7 +818,7 @@ class FinetuneCoordinator:
         call late under pipelining (the next schedule sees correct budget via
         ``reserved_fill`` so this isn't a correctness bug — just lets the engine
         skip an empty FT-only step and reach idle/inference sooner)."""
-        if self.pending_backward:
+        if self.backward_blocks_admission:
             return
         if (self.fill_count + self.reserved_fill + admitted_now) <= 0:
             return
@@ -780,6 +837,9 @@ class FinetuneCoordinator:
         trigger that flushes that tail — gating on admission_open would deadlock
         (admission closed waiting for a flush that can't fire because admission is
         closed). `not pending_backward` already prevents double-firing."""
+        if self.multi_batch:
+            self._next_batch()
+            return
         if (self.epoch_flush_pending and self.reserved_fill == 0
                 and self.fill_count > 0 and not self.pending_backward):
             self._trigger_backward(reason="epoch-end flush")
@@ -798,8 +858,13 @@ class FinetuneCoordinator:
             return
         self.fill_count += n
         self.reserved_fill = max(0, self.reserved_fill - n)
+        if self._inflight_ft:
+            self._inflight_ft.pop(0)          # commits arrive in step order
         if sample_lens:
             self.sample_lens.extend(int(x) for x in sample_lens)
+        if self.multi_batch:
+            self._next_batch()
+            return
         if self.pending_backward or self.reserved_fill > 0:
             return  # wait until all in-flight saves for this buffer are committed
         if self.space_remaining() < self.min_sample_len:
@@ -807,15 +872,58 @@ class FinetuneCoordinator:
         elif self.epoch_flush_pending and self.fill_count > 0:
             self._trigger_backward(reason="epoch-end flush")
 
-    def _trigger_backward(self, reason: str = "buffer FULL") -> None:
+    def _next_batch(self) -> None:
+        """[bwd_batch_size] Hand the child the next backward batch of the
+        current step, if one is ready and none is running.
+
+        A batch is whole samples, in buffer order, of at most ``bwd_batch``
+        tokens. It goes out as soon as the committed rows hold a full one (the
+        next committed sample would not fit, or it is exactly full); once the
+        step is closed (the buffer cannot grow: full, or an epoch flush) the
+        rest goes out too, and the batch that empties the buffer is FINAL — it
+        ends in the clip, the optimizer step and the publish. A step whose rows
+        were all consumed before it closed ends with an empty final batch."""
+        if self.pending_backward or self.profiling:
+            return
+        lens = self.sample_lens[self._bwd_samples:]
+        avail = self.fill_count - self._bwd_rows
+        take, rows = 0, 0
+        for s in lens:
+            if rows + s > self.bwd_batch:
+                break
+            rows += s
+            take += 1
+        closed = self.reserved_fill == 0 and (
+            self.epoch_flush_pending
+            or self.space_remaining() < self.min_sample_len)
+        if take == 0 and lens:
+            # A sample longer than a batch cannot be trained (the store drops
+            # them at load): never wedge on one.
+            take, rows = 1, lens[0]
+        full = rows > 0 and (rows == self.bwd_batch or avail > rows)
+        if not (full or (closed and (rows > 0 or self._bwd_rows > 0))):
+            return
+        final = closed and rows == avail
+        self._trigger_backward(
+            reason="batch", start=self._bwd_rows, rows=rows,
+            lens=lens[:take], final=final)
+
+    def _trigger_backward(self, reason: str = "buffer FULL", *, start: int = 0,
+                          rows: int | None = None, lens: list | None = None,
+                          final: bool = True) -> None:
         # During offline profiling the backward is detached and the buffer is
         # reset between shapes; a full-cap co-serve shape would otherwise fire
         # (and print) a spurious backward signal. Profiling only times forwards.
         if self.profiling:
             return
-        self.admission_open = False
+        if rows is None:                 # one backward per buffer: all of it
+            rows, lens = self.fill_count, self.sample_lens
+        first = start == 0
+        self._bwd_inflight = (int(rows), len(lens), bool(final))
+        if final:
+            self.admission_open = False
+            self.epoch_flush_pending = False
         self.pending_backward = True
-        self.epoch_flush_pending = False
         self._cycle += 1
         # [diag] start a timer so poll_backward can warn if the child never
         # acks within `pending_backward_warn_s` (dead-child symptom).
@@ -853,17 +961,20 @@ class FinetuneCoordinator:
             else:
                 torch.cuda.synchronize()
             self.backward_process.notify_buffer_full(
-                self.fill_count, list(self.sample_lens),
-                epoch=self.current_epoch)
+                rows, list(lens), epoch=self.current_epoch,
+                start=start, first=first, final=final)
         elif self.relay_mode:
             # [M4.1] Scheduler-side coordinator under TP: no local handle. Stash
             # the trigger params for the scheduler to broadcast on SchedulerOutput
             # (→ every worker fires its own backward child, lock-step). The
             # capture-completion sync happens worker-side in execute_trigger.
             self._pending_trigger_cmd = {
-                "n": int(self.fill_count),
-                "sample_lens": list(self.sample_lens),
+                "n": int(rows),
+                "sample_lens": list(lens),
                 "epoch": int(self.current_epoch),
+                # [bwd_batch_size] which rows of the buffer, and whether this
+                # batch starts / ends an optimizer step
+                "start": int(start), "first": bool(first), "final": bool(final),
                 # One int per trigger; the worker forwards it to its child once.
                 "total_tokens_per_epoch": int(self.corpus_total_tokens),
             }
@@ -944,22 +1055,39 @@ class FinetuneCoordinator:
                 and resp.get("event") == "activations_processed"):
             self._write_bwd_log_row(
                 int(resp.get("n", 0)), resp.get("loss"))
+        self._backward_acked()
+
+    def _backward_acked(self) -> None:
+        """A backward finished (tp=1 ``poll_backward`` / the TP relay's
+        ``apply_relayed_done``). The one that ends an optimizer step commits
+        the step's samples as trained, empties the buffer and reopens
+        admission; a batch that only accumulated gradients frees the child for
+        the step's next batch."""
+        rows, samples, final = self._bwd_inflight or (0, 0, True)
+        self._bwd_inflight = None
+        self.pending_backward = False
+        self._pending_backward_t0 = None
+        self._pending_backward_warned = False
+        if not final:
+            self._bwd_rows += rows
+            self._bwd_samples += samples
+            self._next_batch()
+            return
         # Commit the in-buffer claimed samples → trained=True (one-shot
         # snapshot so the hook can mutate state freely).
         if self.on_backward_done is not None and self.buffer_samples:
-            trained_now = list(self.buffer_samples)
             try:
-                self.on_backward_done(trained_now)
-            except Exception as e:
+                self.on_backward_done(list(self.buffer_samples))
+            except Exception as e:  # noqa: BLE001
                 dprint(f"[coord] on_backward_done hook failed: {e}")
         self.fill_count = 0
         self.reserved_fill = 0
+        self._inflight_ft = []
         self.sample_lens = []
         self.buffer_samples = []
-        self.pending_backward = False
+        self._bwd_rows = 0
+        self._bwd_samples = 0
         self.admission_open = True
-        self._pending_backward_t0 = None
-        self._pending_backward_warned = False
 
     # -- [M4.1] TP relay bridge -------------------------------------------
     # Scheduler-side (EngineCore coordinator) helpers: consume what the worker
@@ -992,19 +1120,7 @@ class FinetuneCoordinator:
         if (self.bwd_log_path and isinstance(resp, dict)
                 and resp.get("event") == "activations_processed"):
             self._write_bwd_log_row(int(resp.get("n", 0)), resp.get("loss"))
-        if self.on_backward_done is not None and self.buffer_samples:
-            try:
-                self.on_backward_done(list(self.buffer_samples))
-            except Exception as e:  # noqa: BLE001
-                dprint(f"[coord] on_backward_done (relay) failed: {e}")
-        self.fill_count = 0
-        self.reserved_fill = 0
-        self.sample_lens = []
-        self.buffer_samples = []
-        self.pending_backward = False
-        self.admission_open = True
-        self._pending_backward_t0 = None
-        self._pending_backward_warned = False
+        self._backward_acked()
 
     # Worker-side (per-rank coordinator that owns the backward_process handle).
 
@@ -1030,7 +1146,9 @@ class FinetuneCoordinator:
         self.pending_backward = True
         self.backward_process.notify_buffer_full(
             int(cmd.get("n", 0)),
-            list(cmd.get("sample_lens", [])), epoch=int(cmd.get("epoch", 0)))
+            list(cmd.get("sample_lens", [])), epoch=int(cmd.get("epoch", 0)),
+            start=int(cmd.get("start", 0)), first=bool(cmd.get("first", True)),
+            final=bool(cmd.get("final", True)))
 
     def poll_backward_relay(self) -> dict | None:
         """Worker side: non-blocking poll of this rank's backward child. Returns

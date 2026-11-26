@@ -23,6 +23,9 @@ finetune_param:
   weight_decay: 0.01                 # AdamW weight decay
   gamma: 0.9                         # StepLR decay applied once per epoch
   max_saved_finetuning_tokens: 256   # activation buffer in tokens = FT tokens per backward cycle (also sizes the backward graphs); samples longer than this are dropped
+  # ft_step_size: 1024             # FT tokens per optimizer step (= the activation buffer). Unset: max_saved_finetuning_tokens
+  # bwd_batch_size: 256            # FT tokens per backward batch; must divide ft_step_size. Gradients accumulate over the step's
+  #                                # batches, one update at its end. Smaller = the backward yields the GPU sooner. Unset: one backward per step
   adapter_save_path: ../checkpoints/qwen3-0.6b   # where trained adapters go (PEFT format); also the default of POST /save_adapter
   adapter_save_every_backwards: 500  # save every N backward cycles as backward-<N> (0 = off)
   adapter_save_keep_last: 3          # keep only the newest 3 backward-* saves (0 = keep all)

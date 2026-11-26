@@ -126,7 +126,46 @@ class FinetuneConfig:
 
     max_saved_finetuning_tokens: int = 256
     """Per-backward FT token budget. Also sizes the shared activation buffers and
-    bounds length-bucketed sample selection."""
+    bounds length-bucketed sample selection. The single-size form of
+    ``ft_step_size`` / ``bwd_batch_size`` below: with neither set, both are this
+    value (one backward per optimizer step, as before they existed)."""
+
+    ft_step_size: int | None = None
+    """FT tokens per optimizer step (None = ``max_saved_finetuning_tokens``).
+    Sizes the shared activation buffers: the forward collects a whole step's
+    activations, the backward child works through them ``bwd_batch_size`` tokens
+    at a time, accumulating gradients, and updates + publishes the adapter once
+    per step. The gradients are normalised over the step's tokens, so k
+    backward batches equal one backward of k times the size."""
+
+    bwd_batch_size: int | None = None
+    """FT tokens per backward batch (None = the step size: one backward per
+    step). Must divide ``ft_step_size``. It sets how long the backward child
+    holds the GPU between two points where it can yield (and how much it slows
+    the decode steps it overlaps), the size of the backward graphs, and the
+    longest sample that can be trained. With several batches per step FT
+    admission stays open while the earlier batches run (the weights do not
+    change until the step's update), and a step that carries FT tokens pauses
+    the child like an inference prefill does."""
+
+    @property
+    def step_tokens(self) -> int:
+        """Tokens per optimizer step = the activation buffer's capacity."""
+        return max(1, int(self.ft_step_size if self.ft_step_size is not None
+                          else self.max_saved_finetuning_tokens))
+
+    @property
+    def bwd_tokens(self) -> int:
+        """Tokens per backward batch."""
+        return max(1, int(self.bwd_batch_size if self.bwd_batch_size is not None
+                          else self.step_tokens))
+
+    def check_step_sizes(self) -> None:
+        step, bwd = self.step_tokens, self.bwd_tokens
+        if bwd > step or step % bwd:
+            raise ValueError(
+                f"finetune_param.ft_step_size ({step}) must be a multiple of "
+                f"finetune_param.bwd_batch_size ({bwd})")
 
     save_activations: bool = True
     """Whether to actually accumulate FT activations into the shared buffers.

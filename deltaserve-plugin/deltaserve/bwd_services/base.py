@@ -287,6 +287,11 @@ class BackwardService:
         + optimizer/scheduler step). Returns (loss: float, n_valid: int)."""
         raise NotImplementedError
 
+    def finish_step(self, epoch: int) -> None:
+        """[bwd_batch_size] End an optimizer step whose rows were all trained
+        by earlier batches (an empty final batch): the update alone."""
+        return None
+
     def verify_activations(self, activations: dict, n: int) -> None:
         """Optional per-model check that the captured activations are correct.
         Default no-op; subclasses log assertions (gated on the debug flag)."""
@@ -472,6 +477,13 @@ class BackwardService:
         n = int(msg.get("n", 0))
         sample_lens = msg.get("sample_lens") or []
         epoch = int(msg.get("epoch", 0))
+        # [bwd_batch_size] This backward is rows [start, start+n) of the
+        # buffer; ``first`` / ``final`` mark the optimizer step's ends (both
+        # True without the feature: the whole buffer, one step).
+        start = int(msg.get("start", 0))
+        first = bool(msg.get("first", True))
+        final = bool(msg.get("final", True))
+        self._step_first, self._step_final = first, final
         # Announce the start of a backward cycle. Reports the per-cycle
         # token count + sample count + epoch, plus the current pause-
         # gate state (``gpu_grant`` SET = bwd can run; CLEAR = paused,
@@ -485,9 +497,12 @@ class BackwardService:
                       if self._gpu_grant is not None else None)
         _gate = ("SET" if _grant_set
                  else ("CLEAR" if _grant_set is False else "n/a"))
+        _batch = ("" if first and final else
+                  f" rows={start}..{start + n} "
+                  f"({'first ' if first else ''}{'FINAL' if final else 'accumulate'})")
         dprint(
             f"[backward] start: n={n} samples={len(sample_lens)} "
-            f"epoch={epoch} gpu_grant={_gate}"
+            f"epoch={epoch} gpu_grant={_gate}{_batch}"
             + ("  (will block until released)"
                if _grant_set is False else "")
         )
@@ -515,11 +530,29 @@ class BackwardService:
             and self.activations.get("concat_input_ids") is not None
             and bool(sample_lens)
         )
-        self._before_cycle(epoch, can_compute)
+        # The save policy counts optimizer steps: a batch that only
+        # accumulates gradients is not a cycle of its own.
+        step_open = not first and bool(getattr(self, "_step_open", False))
+        if final:
+            self._before_cycle(epoch, can_compute or step_open)
+        acts = self.activations
+        if can_compute and start > 0:
+            # Views of this batch's rows (no copy).
+            acts = {k: ([t[start:] for t in v] if isinstance(v, list)
+                        else v[start:]) for k, v in acts.items()}
+        if not can_compute and final and step_open:
+            # The step's rows were all trained by earlier batches: only the
+            # update is left.
+            try:
+                self.finish_step(epoch)
+            except Exception as e:  # noqa: BLE001 — keep the cycle alive
+                import traceback
+                dprint(f"[backward] step update failed: {e}")
+                traceback.print_exc()
         if can_compute:
             try:
                 if self._verify:
-                    self.verify_activations(self.activations, n)
+                    self.verify_activations(acts, n)
                 # Time the backward with CUDA events instead of a wall-clock-
                 # after-sync — this lets us defer the host sync to end-of-cycle
                 # (after buffer zeroing), coalescing two syncs into one. The
@@ -530,12 +563,12 @@ class BackwardService:
                     end_evt = torch.cuda.Event(enable_timing=True)
                     start_evt.record()
                     loss, n_valid = self.process_backward(
-                        self.activations, sample_lens, n, epoch)
+                        acts, sample_lens, n, epoch)
                     end_evt.record()
                 else:
                     t0 = time.perf_counter()
                     loss, n_valid = self.process_backward(
-                        self.activations, sample_lens, n, epoch)
+                        acts, sample_lens, n, epoch)
                     cpu_elapsed_ms = (time.perf_counter() - t0) * 1000.0
                 # FT throughput metric: total FT token-rows PROCESSED (raw
                 # ``n`` = sum of this cycle's sample lengths), NOT the CE-valid
@@ -561,7 +594,13 @@ class BackwardService:
         # Clean the shared buffers. The single torch.cuda.synchronize() below covers BOTH the backward (via
         # the recorded events) and the zero-fill — the previous code had a sync
         # right after process_backward + another sync after the zero-loop.
-        if self.activations:
+        # [bwd_batch_size] Not for a batch of a multi-batch step: the forward
+        # is still writing the step's later rows — and after the step's last
+        # batch it starts on the next step as soon as the ack below is read,
+        # while this zero-fill (asynchronous, several GiB for a step-sized
+        # buffer) may still be running. Nothing reads a row that this step's
+        # forward did not write, so the fill is only tidiness.
+        if self.activations and first and final:
             for value in self.activations.values():
                 for t in (value if isinstance(value, list) else [value]):
                     t.zero_()
@@ -615,7 +654,9 @@ class BackwardService:
                     f"learning rate or disable FT to recover."
                 )
 
+        self._step_open = not final
         resp = {"event": "activations_processed", "n": n, "loss": loss,
+                "final": final,
                 # [telemetry] GPU time (CUDA events) and wall time (incl. the
                 # pauses while inference had the GPU) of this cycle.
                 "samples": len(sample_lens),
@@ -630,5 +671,6 @@ class BackwardService:
                            "reserved": torch.cuda.memory_reserved(),
                            "lora_train_state": getattr(self, "_train_state_bytes", 0)}
         conn.send(resp)
-        self._after_cycle(epoch, can_compute)
+        if final:
+            self._after_cycle(epoch, can_compute or step_open)
         #dprint("[backward] cleaned; sent done response")

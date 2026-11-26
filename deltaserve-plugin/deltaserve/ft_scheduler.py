@@ -19,6 +19,7 @@ built FT-only step back when a request landed meanwhile, and an FT-only forward
 the runner aborted (tier C) is rolled back in ``update_from_output``.
 """
 
+from deltaserve.ft_sizes import bwd_tokens_of, step_tokens_of
 import csv
 import datetime
 import os
@@ -71,7 +72,7 @@ class FinetuneScheduler(AsyncScheduler):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         ft_cfg = self.vllm_config.finetune_config
-        capacity = max(1, int(ft_cfg.max_saved_finetuning_tokens))
+        capacity = step_tokens_of(ft_cfg)
 
         # Mirror EngineCore's block hasher so FT requests behave like real ones
         # under prefix caching.
@@ -104,8 +105,12 @@ class FinetuneScheduler(AsyncScheduler):
         # predicted step time vs TTFT/TBT once the estimator is warm; this is the
         # cold-start/idle fallback. Tell it the smallest sample length so it
         # knows when no more samples can fit (full).
+        # With several backward batches per optimizer step (``bwd_batch_size``)
+        # one step carries at most one batch's worth: the forward steps keep
+        # the size they have with a buffer of that size.
         self._coord = get_coordinator(capacity=capacity,
-                                      per_step_budget=capacity)
+                                      per_step_budget=bwd_tokens_of(ft_cfg))
+        self._coord.bwd_batch = bwd_tokens_of(ft_cfg)
         lengths = self._ft_injector.store.sorted_lengths
         if lengths:
             self._coord.min_sample_len = lengths[0]
@@ -352,7 +357,7 @@ class FinetuneScheduler(AsyncScheduler):
                     data_path=job.spec.data_path, tokenize=self._build_tokenize(),
                     adapter=job.spec.adapter_path,
                     total_epochs=job.spec.num_epochs,
-                    max_saved_finetuning_tokens=ft_cfg.max_saved_finetuning_tokens,
+                    max_saved_finetuning_tokens=bwd_tokens_of(ft_cfg),
                     max_prepare=ft_cfg.max_prepare)
                 store.load()
                 state["store"] = store
@@ -608,7 +613,7 @@ class FinetuneScheduler(AsyncScheduler):
             # checks; honor its verdict.
             self._last_admit = (
                 "X" if not coord.ft_started else
-                "B" if coord.pending_backward else
+                "B" if coord.backward_blocks_admission else
                 "T" if not coord.admission_open else "F", 0)
             return 0, []
         store = self._ft_injector.store
@@ -740,7 +745,10 @@ class FinetuneScheduler(AsyncScheduler):
         # admits nothing, leaving the leaky-bucket credit intact so a
         # later step (with more prefill, hence a larger cap) can
         # admit the sample.
-        buffer_cap = self._coord.space_remaining()
+        # The free rows, and at most what one step may carry (one backward
+        # batch when a step has several; the whole buffer otherwise).
+        buffer_cap = min(self._coord.space_remaining(),
+                         self._coord.per_step_budget)
         token_cap = buffer_cap
         if _prop_factor != -1 and has_prefill:
             token_cap = min(buffer_cap, int(feats.t_in * _prop_factor))
@@ -1547,7 +1555,11 @@ class FinetuneScheduler(AsyncScheduler):
             ft_samples = [s for s in ft_samples if s is not None]
             if ft_tokens > 0:
                 output._ft_write_offset = self._coord.reserve(
-                    ft_tokens, samples=ft_samples)
+                    ft_tokens, samples=ft_samples,
+                    # tier C may still abandon an FT-only forward
+                    abortable=bool(
+                        self.vllm_config.finetune_config.forward_interruptible
+                        and self._is_ft_only(output)))
             output._ft_samples = ft_samples
             output._ft_tokens_reserved = ft_tokens
         # Stash the admission snapshot on the output so _rollback_ft_step
@@ -1568,7 +1580,7 @@ class FinetuneScheduler(AsyncScheduler):
         # worker's coordinator mirror carries no buffer accounting.
         _c = self._coord
         output.finetune_admit_state = (
-            bool(_c.admission_open), bool(_c.pending_backward),
+            bool(_c.admission_open), bool(_c.backward_blocks_admission),
             int(_c.fill_count + _c.reserved_fill), int(_c.capacity))
 
         # [Phase 4] Stamp the regime + predicted duration for THIS step now,
@@ -1748,7 +1760,8 @@ class FinetuneScheduler(AsyncScheduler):
             "tensor_parallel_size":
                 self.vllm_config.parallel_config.tensor_parallel_size,
             "max_num_batched_tokens": int(self.max_num_scheduled_tokens),
-            "max_saved_finetuning_tokens": int(ft_cfg.max_saved_finetuning_tokens),
+            "max_saved_finetuning_tokens": int(step_tokens_of(ft_cfg)),
+            "bwd_batch_size": int(bwd_tokens_of(ft_cfg)),
             "num_epochs": int(store.total_epochs),
             "corpus_samples": len(store),
             "admission_phase": getattr(ft_cfg, "coserving_admission_phase", "prefill"),

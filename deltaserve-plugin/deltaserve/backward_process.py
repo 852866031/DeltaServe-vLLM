@@ -423,7 +423,8 @@ class BackwardProcess:
 
     def notify_buffer_full(self, n: int,
                            sample_lens: list[int] | None = None,
-                           epoch: int = 0) -> None:
+                           epoch: int = 0, start: int = 0,
+                           first: bool = True, final: bool = True) -> None:
         """Signal the child that the activation buffer is full (ASYNC, no wait).
 
         The child runs the LoRA backward + optimizer step over the captured rows,
@@ -431,6 +432,10 @@ class BackwardProcess:
         via poll_response(). ``sample_lens`` are the
         per-FT-sample token counts (in buffer-write order) so the child can split
         the flat buffers into samples and shift-by-1 for next-token targets.
+
+        [bwd_batch_size] ``start`` is the buffer row the batch begins at;
+        ``first`` / ``final`` say whether it starts / ends an optimizer step
+        (both True: one backward per step, the form without the feature).
         """
         # Tolerate a torn-down child (e.g. during engine shutdown a final FT
         # batch can fill the buffer after the backward process is already gone):
@@ -441,6 +446,7 @@ class BackwardProcess:
             self._conn.send({
                 "cmd": "process_activations", "n": int(n),
                 "sample_lens": list(sample_lens or []), "epoch": int(epoch),
+                "start": int(start), "first": bool(first), "final": bool(final),
             })
         except (BrokenPipeError, OSError, EOFError, ValueError) as e:
             dprint(f"[backward] notify_buffer_full skipped (child gone): {e}")

@@ -94,20 +94,55 @@ Runs in `eval-tp/output/cleanup/v2port_{v1,v2,v034}`. What v0.34 changed for us:
 - `metrics.final_flush` could write the final window before the last periodic one
   (writer-thread buffer): fixed (`_Writer.drain`), `tests/test_metrics.py` H2.
 
-**Agreed next steps (2026-11-25, after the A100 check), in order:**
-1. Gradient accumulation: `ft_step_size` (tokens per optimizer step; replaces
-   `max_saved_finetuning_tokens`, which stays as an alias) and `bwd_batch_size`
-   (tokens per backward; must divide `ft_step_size`). Buffer capacity = `ft_step_size`
-   (+ an optional cap for small GPUs). Gradients are normalised over the step, so k
-   batches equal one large batch. A step that carries FT tokens pauses the backward
-   like an inference prefill does, so FT forwards never overlap a backward (keeps the
-   estimator's regimes clean); the next step's forwards start only after the publish.
-   Later phases: backward batch size as an estimator feature, a larger batch while no
-   inference runs, sizing by the overlapping decode batch. A100 presets → 2048 / 512;
-   try 1024 / 256 on the 5090s.
+**Gradient accumulation (branch `grad-accumulation`, 2026-11-25).**
+`finetune_param.ft_step_size` = FT tokens per optimizer step = the activation buffer;
+`bwd_batch_size` = tokens per backward batch (must divide it). Neither set: both are
+`max_saved_finetuning_tokens`, and every path is the one before the feature
+(`coordinator.multi_batch` False). With several batches per step:
+- the coordinator sends the child whole samples of ≤ `bwd_batch_size` tokens as soon as
+  the committed rows hold a batch (`_next_batch`), one at a time; the batch that empties
+  a closed buffer is FINAL (clip + update + publish); an empty final batch ends a step
+  whose rows were all trained already. The command carries `start` / `first` / `final`
+  (also on the TP relay command).
+- FT admission stays open while a non-final batch runs (the weights do not change) and
+  closes only for the final one (`backward_blocks_admission`); a step carries at most
+  one batch's worth (`per_step_budget`), so forward steps keep their size.
+- the trainer weights each batch's gradient by its predicting rows and divides by the
+  step's total: k batches == one backward of the step (`tests/test_grad_accum.py`).
+- a step that carries FT tokens pauses the child like an inference prefill
+  (`FtRunnerMixin._ft_pauses_backward`): FT forwards never overlap a backward, so the
+  estimator is unchanged (FT steps taken with a batch in flight: pred/actual 1.01).
+Invariants it added:
+- **Nothing is reserved behind an abortable FT-only step** (`abortable_in_flight`): rows
+  are handed out in order, and a tier-C abort gives the aborted step's rows back; a
+  later step already in flight keeps ITS rows, leaving a hole of unwritten rows the
+  next commit counts as saved (zeros → loss ln(vocab) → NaN after the update).
+- **The save op moves `op_rows` (= one backward batch) rows per step**, not the buffer:
+  a step with more FT rows must take the hook path (`_build_finetune_mask`), and the
+  admission loop caps a step at `per_step_budget`.
+- **No zero-fill behind a batch of a multi-batch step** (the forward is writing the
+  step's later rows, and the next step's right after the final ack).
+- `ft_sizes.py` stays import-free (the child's handover thread reads it; importing
+  vLLM's config there made the adapter switch time out).
+Qwen3-14B TP=2, production timeline, v0.34, 16 × 48 backward budget, single runs —
+256 / 256 → 1024 / 256 (`gpu_memory_utilization` 0.86): 100 % TTFT SLO both; FT 490 →
+524 tok/s; TTFT p50 68 → 72, p99 88 → 99 ms; avg TBT p50 20.5 → 23.1 ms (a decode step
+overlapping a backward takes 23.7 vs 12.7 ms in both; 40 % of them overlap one instead
+of 20 %); loss after 185 s 0.83 → 1.00 (a quarter of the updates); KV 26,624 tokens;
+worker 26.8 GiB, child 2.35 GiB. For comparison 1024 / 1024: FT 592, TTFT p99 188 ms.
+Both leak gates pass with 1024 / 256 (`DSERVE_M1_FT_SIZES`, `DSERVE_M1_GPU_MEM_UTIL`,
+`DSERVE_M1_FT_EXTRA`). Runs: `eval-tp/output/cleanup/ga_1024_256_r2`, `v034_bwd_bn16_l48`.
+Known: batches are whole samples, so a 1024-token step is 4 batches of ~247 + a tail of
+~38 (one more cycle's fixed cost); steps taken with a paused backward in flight are
+still excluded from the estimator's fits (as inference prefills always were).
+
+**Agreed next steps (2026-11-25), in order:**
+1. Gradient accumulation, later phases: backward batch size as an estimator feature, a
+   larger batch while no inference runs, sizing by the overlapping decode batch; A100
+   presets → 2048 / 512 (not runnable here).
 2. Pick the backward attention budget from the FT dataset (coverage vs padded cost,
    under a memory limit; `auto`); several graph shapes / length-bucketed batches as
-   options. Belongs with step 1: the budget follows `bwd_batch_size`.
+   options. The budget follows `bwd_batch_size`.
 3. Fill the graph padding: admit FT tokens up to the next captured graph size.
 4. Worker-side dummy runs instead of the launch profiling pass.
 5. FT graph path on the breakable CUDA graph (FT batches run without a graph there

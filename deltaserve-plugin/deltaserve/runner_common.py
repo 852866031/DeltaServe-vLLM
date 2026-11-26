@@ -136,7 +136,7 @@ class FtRunnerMixin:
                 if feats is not None:
                     inf_prefill = int(feats.t_in) - int(feats.t_ft)
                     thr = int(cfg.fwd_token_throttle)
-                    if inf_prefill > 0 or (
+                    if inf_prefill > 0 or self._ft_pauses_backward(feats, coord) or (
                             cfg.fwd_token_throttle_enable and thr > 0
                             and inf_prefill + int(feats.b_d) >= thr):
                         coord.gpu_pause_backward()
@@ -209,7 +209,8 @@ class FtRunnerMixin:
                     # ``>=``: with a threshold of 1 the throttle must also cover
                     # the single-token decode step after a burst's first prefill.
                     pause_throttle = inf_prefill + int(feats.b_d) >= thr
-            pause_bwd = inf_prefill > 0 or pause_throttle
+            pause_bwd = (inf_prefill > 0 or pause_throttle
+                         or self._ft_pauses_backward(feats, coord))
         if getattr(self, "_ds_route_hold", False):
             # [adapter routing] The encode step paused the child for the
             # prefill in this step (``_ft_before_step`` kept the pause): this
@@ -231,11 +232,23 @@ class FtRunnerMixin:
             coord.fwd_throttle_active = pause_throttle
         return pause_bwd, pause_throttle
 
+    @staticmethod
+    def _ft_pauses_backward(feats, coord) -> bool:
+        """[bwd_batch_size] With several backward batches per optimizer step
+        the forward keeps collecting FT activations while a batch runs. Such a
+        step pauses the child exactly like an inference prefill does, so a
+        forward that carries FT tokens never shares the GPU with a backward —
+        the SLO estimator's FT regimes stay what they were fitted on. Without
+        the feature FT is never admitted during a backward: always False."""
+        return bool(getattr(coord, "multi_batch", False)
+                    and int(feats.t_ft) > 0)
+
     def _ft_timing_end(self, scheduler_output, coord, slot, ok, cudagraph_mode,
                        t_wall0, t_host0, pause_bwd, pause_throttle) -> None:
         feats = getattr(scheduler_output, "_ft_step_features", None)
         if (ok and coord.relay_mode and feats is not None
-                and int(feats.t_in) > int(feats.t_ft)):
+                and (int(feats.t_in) > int(feats.t_ft)
+                     or self._ft_pauses_backward(feats, coord))):
             # Completion of this step's inference prefill, for a backward
             # trigger that arrives while it is still running (_ft_before_step).
             evt = torch.cuda.Event()
@@ -390,7 +403,10 @@ class FtRunnerMixin:
         _cfg = self.vllm_config.finetune_config
         if ((n < total or _cfg.graph_ft_only_batches)
                 and _acc is not None and getattr(_acc, "op_ready", False)
-                and _cfg.graph_ft_batches and _cfg.save_activations):
+                and _cfg.graph_ft_batches and _cfg.save_activations
+                # the save op moves a fixed number of rows per step: a step
+                # with more FT rows than that keeps the hook path
+                and n <= getattr(_acc, "op_rows", n)):
             self._ft_positions_np = np.flatnonzero(mask)
             self._ft_graph_step = True
 
@@ -444,7 +460,9 @@ class FtRunnerMixin:
             # No stamp (non-FinetuneScheduler step): read the local coordinator.
             # Under TP that mirror carries no buffer accounting — the stamped
             # scheduler-side state above is the truthful source.
-            _st = (coord.admission_open, coord.pending_backward,
+            _st = (coord.admission_open,
+                   getattr(coord, "backward_blocks_admission",
+                           coord.pending_backward),
                    coord.fill_count + coord.reserved_fill, coord.capacity)
         if _st is not None:
             _open, _pending, _fill, _cap = _st

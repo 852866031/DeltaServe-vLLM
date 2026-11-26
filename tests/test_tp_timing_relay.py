@@ -115,7 +115,7 @@ class _FakeChild:
     def set_corpus_meta(self, total):
         self.sent.append(("set_corpus_meta", int(total)))
 
-    def notify_buffer_full(self, n, sample_lens=None, epoch=0):
+    def notify_buffer_full(self, n, sample_lens=None, epoch=0, **batch):
         self.sent.append(("process_activations", int(n)))
 
     def poll_response(self):

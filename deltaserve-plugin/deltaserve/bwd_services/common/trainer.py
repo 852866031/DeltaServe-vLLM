@@ -523,7 +523,16 @@ class LoraSftTrainerService(BackwardService):
             self._diag_remat_check(activations, n, seq_lens, b_start,
                                    cos, sin)
 
-        self.optimizer.zero_grad(set_to_none=True)
+        # [bwd_batch_size] One backward per optimizer step (``single``: the
+        # form without the feature — nothing below differs from it), or one
+        # batch of a step: its gradients are added to the step's sum, and only
+        # the step's last batch clips, updates and publishes.
+        first = bool(getattr(self, "_step_first", True))
+        final = bool(getattr(self, "_step_final", True))
+        single = first and final
+        if first:
+            self.optimizer.zero_grad(set_to_none=True)
+            self._acc_grads, self._acc_valid = {}, 0
 
         # Head: loss + grad w.r.t. final_in (pre-final-norm residual = layer_in[L]).
         loss, n_valid, g = head_backward(
@@ -632,7 +641,7 @@ class LoraSftTrainerService(BackwardService):
                         pa.grad = grads[proj + "A"].float()
                         pb.grad = grads[proj + "B"].float()
                         layer_params += [pa, pb]
-                if layer_params:
+                if layer_params and single:
                     torch.nn.utils.clip_grad_norm_(layer_params, max_norm=1.0)
             else:
                 # [M4.3] Sharded factor grads are already this rank's shard →
@@ -663,8 +672,56 @@ class LoraSftTrainerService(BackwardService):
                     prm = ld.get(key[0], {}).get(key[1])
                     if prm is not None:
                         prm.grad = bucket.view(i, key).float()
-            clip_layers_symmetric_(self.lora, self.L, self._all_reduce, max_norm=1.0)
+            if single:
+                clip_layers_symmetric_(self.lora, self.L, self._all_reduce,
+                                       max_norm=1.0)
 
+        if not single:
+            self._accumulate_batch(n_valid)
+            if not final:
+                return loss, n_valid
+            self._apply_accumulated()
+        self._step_and_publish(epoch)
+        return loss, n_valid
+
+    def _step_params(self):
+        for ld in self.lora.values():
+            for ab in ld.values():
+                yield from ab.values()
+
+    def _accumulate_batch(self, n_valid: int) -> None:
+        """[bwd_batch_size] Add this batch's gradients to the step's sum. A
+        batch's gradients are the mean over ITS predicting rows, so each is
+        weighted by that count: the step's gradient is then the mean over all
+        of the step's rows — what one backward over the whole step computes.
+        (Under TP every rank holds the same counts and the same replicated
+        gradients, so the sums stay rank-symmetric.)"""
+        w = float(n_valid)
+        acc = self._acc_grads
+        for prm in self._step_params():
+            g = prm.grad
+            if g is None:
+                continue
+            prev = acc.get(prm)
+            acc[prm] = g * w if prev is None else prev.add_(g, alpha=w)
+        self._acc_valid += int(n_valid)
+
+    def _apply_accumulated(self) -> None:
+        """The step's gradient into ``.grad``, then the per-layer clip — on
+        the whole step's gradient, as a single backward of that size has it."""
+        total = float(max(1, self._acc_valid))
+        for prm, g in self._acc_grads.items():
+            prm.grad = g.div_(total)
+        self._acc_grads, self._acc_valid = {}, 0
+        clip_layers_symmetric_(self.lora, self.L, self._all_reduce, max_norm=1.0)
+
+    def finish_step(self, epoch: int) -> None:
+        if not getattr(self, "_acc_grads", None):
+            return
+        self._apply_accumulated()
+        self._step_and_publish(epoch)
+
+    def _step_and_publish(self, epoch: int) -> None:
         self.optimizer.step()
         if epoch > self.current_epoch:
             self.scheduler.step()
@@ -674,8 +731,6 @@ class LoraSftTrainerService(BackwardService):
         # tensors inference reads). Safe with no locking: FT admission is closed for
         # the whole backward, so the adapter is idle until the done-reply reopens it.
         self._publish_to_served()
-
-        return loss, n_valid
 
     def switch_adapter(self, ft: dict, hparams: dict) -> dict:
         """[ft-job] Start training ANOTHER adapter (the next finetuning job)

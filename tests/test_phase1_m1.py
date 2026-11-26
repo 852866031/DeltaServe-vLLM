@@ -178,6 +178,11 @@ def run_worker(mode: str) -> None:
     engine_kwargs, ft_cfg, _ = split_config(raw)
     graph = mode.endswith("-graph")
     engine_kwargs["enforce_eager"] = not graph
+    # DSERVE_M1_GPU_MEM_UTIL: every mode (a larger FT buffer needs more of the
+    # GPU than the preset's first-bring-up value leaves the KV cache).
+    if os.environ.get("DSERVE_M1_GPU_MEM_UTIL"):
+        engine_kwargs["gpu_memory_utilization"] = float(
+            os.environ["DSERVE_M1_GPU_MEM_UTIL"])
     adapter = os.environ.get("DSERVE_M1_ADAPTER", ft_cfg.finetuning_lora_path)
     enabled = mode.startswith("ft")
     common = dict(
@@ -189,6 +194,16 @@ def run_worker(mode: str) -> None:
         print_engine_batch_exec=enabled,
         coserving_admission_phase="both" if "-both" in mode else "prefill",
     )
+    # DSERVE_M1_FT_SIZES="<ft_step_size>,<bwd_batch_size>": the gate with several
+    # backward batches per optimizer step (FT is then also admitted while a
+    # backward batch runs). Unset: the config's own single size.
+    sizes = os.environ.get("DSERVE_M1_FT_SIZES")
+    if sizes and enabled:
+        step, bwd = (int(x) for x in sizes.split(","))
+        common.update(ft_step_size=step, bwd_batch_size=bwd)
+    # DSERVE_M1_FT_EXTRA='{"key": value, ...}': more finetune keys for the ft runs.
+    if os.environ.get("DSERVE_M1_FT_EXTRA") and enabled:
+        common.update(json.loads(os.environ["DSERVE_M1_FT_EXTRA"]))
     if _PROFILE["preset"]:
         # the YAML's whole finetune / throttles / slo config, as served; only
         # admission opens at launch (no /start_finetuning offline)
@@ -283,6 +298,9 @@ def _spawn(mode: str, adapter: Path) -> dict:
         "prefill": sum(1 for p, f, _ in steps if f and p),
         "decode": sum(1 for p, f, d in steps if f and not p and d),
     }
+    # the most FT tokens any step carried, over the whole run (warm-up included)
+    result["max_ft"] = max((int(f) for _, f, _ in _BATCH_RE.findall(log)),
+                           default=0)
     return result
 
 
@@ -326,6 +344,14 @@ def main():
     for m in _MODES:
         check(f"{m}: one output per prompt (no FT output leak, no hang)",
               runs[m]["num_outputs"] == n)
+    sizes = os.environ.get("DSERVE_M1_FT_SIZES")
+    if sizes:
+        bwd = int(sizes.split(",")[1])
+        for m in _MODES:
+            if m.startswith("ft"):
+                check(f"{m}: no step carries more FT tokens than one backward "
+                      f"batch ({runs[m]['max_ft']} <= {bwd})",
+                      0 < runs[m]["max_ft"] <= bwd)
     ctl_m = next(m for m in _MODES if m.startswith("control"))
     ctl_base = "baseline-graph" if ctl_m.endswith("-graph") else "baseline"
     ctl = min(_drift(runs[ctl_base], runs[ctl_m], i, 0) for i in range(n))

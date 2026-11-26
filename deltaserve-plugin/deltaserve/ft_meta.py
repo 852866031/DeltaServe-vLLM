@@ -12,6 +12,8 @@ trainer's ``_build_state`` consumes.
 
 from __future__ import annotations
 
+from deltaserve.ft_sizes import bwd_tokens_of, step_tokens_of
+
 import json
 import os
 from typing import Any
@@ -180,8 +182,8 @@ def build_backward_meta(hf_config: Any, ft_cfg: Any, *, lm_head_key: str | None,
         "gamma": float(ft_cfg.gamma),
         "backward_fp32": bool(ft_cfg.backward_fp32),
         # CUDA-graph backward (Phase 5): bn_max/l_max bound the padded-attention
-        # region; s_max comes from max_saved_finetuning_tokens (the same value
-        # sizes the activation buffers, so graphs and the pool are aligned).
+        # region; s_max is the backward batch (``bwd_tokens``: all of the
+        # activation buffer unless ``bwd_batch_size`` splits a step).
         "backward_cuda_graph": bool(ft_cfg.backward_cuda_graph),
         "backward_run_ahead_boundaries":
             int(getattr(ft_cfg, "backward_run_ahead_boundaries", 0)),
@@ -190,8 +192,8 @@ def build_backward_meta(hf_config: Any, ft_cfg: Any, *, lm_head_key: str | None,
             int(ft_cfg.backward_cuda_graph_attn_bn_max),
         "backward_cuda_graph_attn_l_max":
             int(ft_cfg.backward_cuda_graph_attn_l_max),
-        "max_saved_finetuning_tokens":
-            int(ft_cfg.max_saved_finetuning_tokens),
+        # the child's sizes follow the backward batch, not the step
+        "max_saved_finetuning_tokens": int(bwd_tokens_of(ft_cfg)),
         # Forward-side activation saves the backward may short-circuit on:
         # post-RoPE q/k/v per layer (``attn_qh/kh/vh``) and the attention
         # context (``attn_ctx``). The child re-checks ``save_attn_qkv`` against

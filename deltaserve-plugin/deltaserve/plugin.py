@@ -166,6 +166,7 @@ def _patch_config() -> None:
                 self.additional_config = DeltaServeConfig(
                     FinetuneConfig(**ac.get(DeltaServeConfig.KEY, {})), extra,
                     None if routing is None else AdapterRoutingConfig(**routing))
+                self.additional_config.finetune.check_step_sizes()
             configure_vllm_config(self)
             rc = self.adapter_routing_config
             lora = getattr(self, "lora_config", None)
