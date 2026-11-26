@@ -390,7 +390,8 @@ def main():
         print(f"  -- {tag}: {base_m} vs {ft_m}  (mixed steps: {mixed['prefill']} "
               f"with a real prefill, {mixed['decode']} decode-only; "
               f"{fton.get('mixed_graph', 0)} of them on a CUDA graph)")
-        if _PROFILE.get("mixed_on_graph") and "graph" in ft_m:
+        if (_PROFILE.get("mixed_on_graph")
+                or os.environ.get("DSERVE_M1_EXPECT_GRAPH") == "1") and "graph" in ft_m:
             check(f"[{tag}] the mixed steps replayed the has_ft CUDA graphs",
                   fton.get("mixed_graph", 0) > 0)
         check(f"[{tag}] FT co-batched with real {kind} tokens", mixed[kind] > 0)

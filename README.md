@@ -435,6 +435,11 @@ Every step is one vLLM batch. What runs depends on what the batch contains:
   tokens, and are invisible to clients.
 - Only hidden states are saved (no logits). The backward child computes the
   LM head itself.
+- With vLLM's **breakable CUDA graph** (`VLLM_USE_BREAKABLE_CUDAGRAPH=1`: the forward is
+  recorded as it runs, no `torch.compile` split) the `has_ft` set is captured the same
+  way — the hooks' save op is executed during the capture pass and recorded — and the
+  abort poll runs between the replayed segments. Measured equal to the compiled path on
+  Qwen3-14B TP=2 (FT 595 vs 589 tok/s, TTFT p99 112.5 vs 113.2 ms).
 - The `has_ft` graphs are their own capture set (keyed by `FtBatchDescriptor`), so
   inference-only steps keep replaying vLLM's unmodified graphs. The graph-affecting
   FT flags feed vLLM's compile-cache hash, so toggling one recompiles instead of
@@ -1225,6 +1230,7 @@ tests/run_all.sh /tmp/ds-tests 'test_qwen3_*'  # a subset
 | Several backward batches per optimizer step: k batches equal one backward of the whole step (both families), the child's row ranges, when batches go out and when admission closes, aborts, whole batches, the per-step caps, the config keys | `test_grad_accum` | CPU |
 | Backward attention graph budget chosen from the dataset (`auto`) and the smaller shapes inside it, the launch note for a configured one, eager-cycle accounting, the child started without torch's `_native` overrides | `test_bwd_budget` | CPU |
 | FT samples in the padding of the graph a step already replays | `test_fill_padding` | CPU |
+| FT batches on vLLM's breakable CUDA graph (`VLLM_USE_BREAKABLE_CUDAGRAPH=1`): the inference gate, and that mixed steps replay a graph there | `test_breakable_ft_graph` | 1 GPU + weights |
 | The average-TBT window, the backward gate, the overload hold | `test_tbt_window` | CPU |
 | TP on real NCCL | `test_tp_backward_graph_nccl`, `test_tp_trainer_graph_nccl` | 2 GPUs |
 | **Inference is unperturbed by co-serving** (amplified FT adapter + positive control; FT provably co-batched with real prefills and decodes; eager + CUDA graphs) | `test_phase1_m1` (Qwen3-0.6B), `test_llama3_inference_leak` (Llama-3-8B; also that its mixed steps replay the `has_ft` graphs), `test_tp_inference_leak` (Qwen3-14B TP=2, production preset) | 1 GPU / 2 GPUs + weights |

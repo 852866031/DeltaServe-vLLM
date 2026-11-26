@@ -56,3 +56,16 @@ def segment_poll(poll):
         yield
     finally:
         _SEGMENT_POLL = prev
+
+
+def polled_segment(segment):
+    """One replayed segment of a breakable CUDA graph capture, with the
+    FT-only abort poll in front of it (``segment_poll`` sets the poll for the
+    duration of an abortable step; one global read otherwise)."""
+    def run():
+        poll = _SEGMENT_POLL
+        if poll is not None:
+            poll()
+        return segment()
+
+    return run

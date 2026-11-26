@@ -19,6 +19,10 @@ swap right after the runner builds its manager) adds the FT rules on top:
   replays the second graph set and never the plain one of the same shape.
 * ``capture`` runs upstream's capture, then a second pass over the ``has_ft``
   sizes with the save op live.
+* The breakable CUDA graph (``VLLM_USE_BREAKABLE_CUDAGRAPH``; no
+  ``torch.compile``) takes the same path: its wrapper keys its captures by the
+  forward context's descriptor too, the capture pass executes the hooks' save
+  op, and the abort poll is put between the replayed segments.
 
 The runner sets ``ft_mode`` per step; the scheduler's graph-eligibility query
 (``will_use_graph``) passes the mode explicitly and touches no shared state.
@@ -31,7 +35,7 @@ from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
 
-from deltaserve.cudagraph_common import FtBatchDescriptor
+from deltaserve.cudagraph_common import FtBatchDescriptor, polled_segment
 from deltaserve.ft_save_op import active_state
 
 logger = init_logger(__name__)
@@ -72,13 +76,11 @@ class FtCudaGraphManager(ModelCudaGraphManager):
             return
         if self.cudagraph_mode.mixed_mode() != CUDAGraphMode.PIECEWISE:
             return
-        if self.use_breakable_cg:
-            # The save op is traced into the compiled forward; the breakable
-            # graph does not run it.
-            logger.warning("[deltaserve] graph_ft_batches needs the compiled "
-                           "piecewise CUDA graphs; with the breakable CUDA graph "
-                           "FT batches run without a graph")
-            return
+        # With the breakable CUDA graph (VLLM_USE_BREAKABLE_CUDAGRAPH) the
+        # forward is recorded as it runs, hooks included: the save op the
+        # hooks issue is executed during the has_ft capture pass and its
+        # gathers land in the recorded segments — the same second graph set,
+        # keyed by the same FtBatchDescriptor, without Dynamo.
         # Same sizes up to graph_ft_max_tokens, LoRA cases with an adapter
         # active (an FT batch always carries the FT adapter).
         ft_max = int(ft_cfg.graph_ft_max_tokens)
@@ -167,3 +169,24 @@ class FtCudaGraphManager(ModelCudaGraphManager):
         finally:
             self._ft_capturing = False
             self._capture_descs = saved
+        self._ft_poll_breakable_segments()
+
+    def _ft_poll_breakable_segments(self) -> None:
+        """[breakable CUDA graph] The tier-C abort poll of an FT-only graph
+        step runs between segments. A breakable capture replays a list of
+        callables (graph segment, eager attention, graph segment, ...): each
+        callable of a has_ft capture is given the poll in front of it."""
+        runner = getattr(self, "breakable_cg_runner", None)
+        if not self.use_breakable_cg or runner is None:
+            return
+        n = 0
+        for entry in runner.entries.values():
+            cap = entry.capture
+            if (cap is None or getattr(cap, "_dserve_polled", False)
+                    or not isinstance(entry.batch_descriptor, FtBatchDescriptor)):
+                continue
+            cap.segments = [polled_segment(seg) for seg in cap.segments]
+            cap._dserve_polled = True
+            n += 1
+        logger.info("[deltaserve] has_ft breakable CUDA graphs: %d captures, "
+                    "abort poll between their segments", n)

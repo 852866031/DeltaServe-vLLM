@@ -212,18 +212,28 @@ the code. step-1024 preset (`ga_final_step1024b`): FT 481 / 922 / 751 (+38 / +47
 All 58 test scripts pass on v0.34 with this state (three leak gates, live adapter
 routing); the m1 gate and the template launches also on v0.33 (v1 and v2 runner).
 
+**FT graphs on the breakable CUDA graph (2026-11-26).** `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
+(vLLM's default for other architectures, not Qwen3 / Llama-3) records the forward as it
+runs instead of splitting a compiled graph. The `has_ft` set works there with the same
+dispatch: the wrapper keys its captures by the forward context's descriptor
+(`FtBatchDescriptor` → a second set), the capture pass EXECUTES the hooks' save op so its
+gathers are recorded (no Dynamo), and the tier-C poll goes in front of every replayed
+segment (`cudagraph_common.polled_segment`, wrapped after the capture pass). 14B TP=2,
+compiled → breakable: production FT 595 → 589 tok/s, TTFT p50 / p99 72.9 / 112.5 →
+74.5 / 113.2 ms, FT-only step 53.5 → 53.2 ms, loss curve identical, tier-C aborts fire;
+graphs 4.18 → 4.26 GiB. Equal, not better: the FT-only step is host-bound either way.
+`tests/test_breakable_ft_graph.py` (m1 gate + "the mixed steps ran a graph"; also on
+v0.33 / v2); the TP=2 gate passes with the env set.
+
 **Next steps (2026-11-26), not done:**
-1. Worker-side dummy runs instead of the launch profiling pass: v2's `_dummy_run` makes
-   equal-length prefills or a uniform decode; the estimator needs mixed prefill + decode
-   steps with real contexts and FT rows, which only the scheduler path produces now.
-2. FT graph path on the breakable CUDA graph: vLLM 0.34 enables it by default only for
-   other architectures (not Qwen3 / Llama-3) and never with LoRA's decoder replay; FT
-   batches run without a graph there (checked 2026-11-26: with
-   `VLLM_USE_BREAKABLE_CUDAGRAPH=1` the m1 gate passes 28/28, its mixed steps eager).
-   Measure abort latency and prefill TTFT first.
-3. Drop the v1 host (`model_runner.py`, `cudagraph.py`, `runner_select`) once v0.34 is
+1. Worker-side dummy runs instead of the launch profiling pass. The pass is 18 s of a
+   70 s launch (96 shapes, 206 steps, 14B TP=2); `vllm/v1/worker/gpu/warmup.py` shows
+   the way (hand-built SchedulerOutputs with block ids from 1), but our shapes need
+   several decode requests with contexts + FT rows, i.e. a scheduler of our own in the
+   worker, against vLLM-private helpers. Not started: little to gain.
+2. Drop the v1 host (`model_runner.py`, `cudagraph.py`, `runner_select`) once v0.34 is
    confirmed on the A100s.
-4. A100 presets are at `ft_step_size: 2048` / `bwd_batch_size: 512` (not run anywhere);
+3. A100 presets are at `ft_step_size: 2048` / `bwd_batch_size: 512` (not run anywhere);
    by the numbers above `max_saved_finetuning_tokens: 2048` + `ft_tokens_per_step: 512`
    + `ft_only_tokens_per_step: 2048` should be faster where the child's memory allows.
 Candidates, measure first: one graph set instead of plain + `has_ft`; refusing
