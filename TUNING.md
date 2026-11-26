@@ -87,6 +87,7 @@ know; the SLO checks of §3 adapt on their own.
 | `ft_tokens_per_step` | cap of a mixed step | this, not the backward, is what protects TTFT with a large buffer: 256 → TTFT p99 125 ms, 512 → 138, uncapped → 185 (FT 795 / 860 / 860) |
 | `ft_only_tokens_per_step` | cap of an FT-only step | leave it at the buffer size: such a step is aborted when a request arrives (FT-only 1659 → 1877) |
 | `bwd_whole_batches` | with several backwards per step | on: no remainder backward (FT 589 → 624 for 1024 / 256) |
+| `ft_buffer_size` | the activation buffer when it is smaller than the step (a ring of batch slots; needs several backwards per step) | for memory, not speed: 1024 / 256 in a 512-token buffer gives FT 659 (TTFT 82 / 128 ms) for 1.3 GiB instead of 2.6 — between the 256 preset (602) and one 1024-token backward (795) |
 | `bwd_batch_size_idle` | a larger backward only while no inference request is around | measured below one large backward at all times (FT 708 vs 795, KV 6k vs 17k tokens): off |
 
 The step-1024 preset is `max_saved_finetuning_tokens: 1024`,
