@@ -482,7 +482,7 @@ backward is three graphs per layer rather than one graph per step.
 | **`has_ft` forward set** | worker | **piecewise** (one segment per layer), captured at startup next to vLLM's | mixed (and opt-in FT-only) forward + the FT row saves | attention (piecewise split); the tier-C abort poll runs **between** segments | `graph_ft_batches` (off; on in Qwen3 YAMLs), `graph_ft_only_batches` (off; on in the Qwen3-14B TP=2 preset), `graph_ft_max_tokens: 512` |
 | **Backward Graph 1**: forward recompute | backward child | full-region graph, **per layer** | in-norm, (Q/K/V + RoPE), padded attention fwd, O proj, residual: only the parts not saved | the O-proj all-reduce under TP (graph split at `static_o`) | `backward_cuda_graph` (off; on in TP YAMLs) |
 | **Backward Graph 2**: FFN bwd | backward child | full-region graph, **per layer** | SwiGLU + RMSNorm backward | residual all-reduce | same |
-| **Backward Graph 3**: attention bwd | backward child | full-region graph, **one, shared** across layers (no per-layer weights in the core) | padded GQA attention backward | residual all-reduce | same; fits ≤ `backward_cuda_graph_attn_bn_max` (8) samples × ≤ `…_l_max` (64) tokens, otherwise eager for that cycle |
+| **Backward Graph 3**: attention bwd | backward child | full-region graph, **one, shared** across layers (no per-layer weights in the core) | padded GQA attention backward | residual all-reduce | same; fits ≤ `backward_cuda_graph_attn_bn_max` samples × ≤ `…_l_max` tokens, otherwise eager for that cycle. Both default to `auto`: chosen at launch from the FT dataset (the cheapest shape holding 99 % of an epoch's backward batches; a `[bwd-graph]` log line says what was chosen, or what share a configured budget holds). Eager cycles are counted: `backwards_attn_eager` in `/finetuning_status`, column `attn_graph` in `backward.csv` |
 | — | backward child | — | — | LM head, AdamW, all collectives, `_maybe_pause` | — |
 
 Every backward graph falls back to eager per layer on a capture or shape-fit
@@ -582,6 +582,8 @@ own in 72–80 % of the cases in every arm, which no admission setting can chang
 | Mixed-batch forward CUDA graphs | mixed-step FT cost 14 → 4–8 ms; FT +8–39 % at the same TTFT | `graph_ft_batches` |
 | FT-only forward CUDA graphs (abortable) | removes ~63 ms of host dispatch per FT-only step on Qwen3-14B TP=2; production FT +5 % | `graph_ft_only_batches` |
 | Backward CUDA graphs (3 per layer) | ~5 ms less dispatch per cycle | `backward_cuda_graph` |
+| Backward attention graph budget from the dataset | the attention graph is used instead of falling back to eager every cycle: cycle 147 → 122 ms, FT +6 % (Qwen3-14B TP=2) | `backward_cuda_graph_attn_bn_max` / `_l_max` = `auto` (default) |
+| Backward child without torch's `_native` op overrides | torch 2.14 adds Python dispatch checks to the eager backward's small ops; on a slow-CPU host 2111 → 1764 µs per FT token (A100 VM, Qwen3-14B TP=4). Set for the child only, never for the serving processes | `backward_disable_torch_native` (on) |
 | Save MLP gate/up pre-activation | skips the gate_up GEMM recompute | `save_activations` (on) |
 | Save q/k/v | skips Q/K/V projection (+ RoPE on Llama-3), ~400–500 GFLOPs per backward on Llama-3-8B | `save_attn_qkv` |
 | Save attention context | skips the attention forward recompute | `save_attn_ctx` |
@@ -739,6 +741,7 @@ DeltaServe-vLLM/
 │       ├── accumulate.py              per-layer activation-save hooks
 │       ├── ft_save_op.py              torch.ops.vllm.dserve_save_rows
 │       ├── backward_process.py        child process launch / IPC
+│       ├── bwd_budget.py              backward attention graph budget chosen from the FT dataset (auto)
 │       ├── adapter_io.py              trained-adapter checkpoints: PEFT writer, TP shard merge, save results
 │       ├── metrics.py                 system metrics recorder (telemetry.metrics_dir) + per-GPU memory snapshot
 │       ├── live.py                    live feed for the dashboard: step stream, per-second series, rolling step log
@@ -1135,6 +1138,7 @@ tests/run_all.sh /tmp/ds-tests 'test_qwen3_*'  # a subset
 | TP sharding and gradients | `test_{llama3,qwen3}_tp_shard`, `test_{llama3,qwen3}_tp_backward_gloo`, `test_tp_bucket_gloo`, `test_tp_timing_relay`, `test_ft_abort_tp` | CPU (gloo) |
 | Hooks on vLLM's v2 model runner | `test_runner_v2` | CPU |
 | Several backward batches per optimizer step: k batches equal one backward of the whole step (both families), the child's row ranges, when batches go out and when admission closes, aborts, the config keys | `test_grad_accum` | CPU |
+| Backward attention graph budget chosen from the dataset (`auto`), the launch note for a configured one, eager-cycle accounting, the child started without torch's `_native` overrides | `test_bwd_budget` | CPU |
 | TP on real NCCL | `test_tp_backward_graph_nccl`, `test_tp_trainer_graph_nccl` | 2 GPUs |
 | **Inference is unperturbed by co-serving** (amplified FT adapter + positive control; FT provably co-batched with real prefills and decodes; eager + CUDA graphs) | `test_phase1_m1` (Qwen3-0.6B), `test_tp_inference_leak` (Qwen3-14B TP=2, production preset) | 1 GPU / 2 GPUs + weights |
 | End-to-end engine / server | `test_phase1_m2`, `test_pause_on_arrival`, `test_tp_no_orphans` | GPU(s) + model weights |

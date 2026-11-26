@@ -109,16 +109,32 @@ class FinetuneConfig:
     backward-side reduces, run eagerly between the replays. Default
     off; mirrors DeltaServe's SFT_service_graph.py."""
 
-    backward_cuda_graph_attn_bn_max: int = 8
+    backward_cuda_graph_attn_bn_max: int | str = "auto"
     """[backward_cuda_graph] Padded-attention max distinct samples per backward.
-    Batches with more samples silently fall back to the eager per-sample attention
-    loop for that one backward. Mirrors DeltaServe's ATTN_BN_MAX (=8 default)."""
+    A backward with more samples runs its attention EAGER for that cycle (the
+    rest stays graphed) — several thousand Python-issued kernels instead of one
+    replay. ``auto`` (default) picks it, with ``_l_max``, from the finetuning
+    dataset at launch (``deltaserve/bwd_budget.py``: the cheapest shape that
+    holds 99 % of the epoch's backward batches); a number is taken as it is,
+    and the launch log says how much of the data it holds. (The old default
+    8 x 64 held no cycle of a 512-token buffer of ~20-token samples.)"""
 
-    backward_cuda_graph_attn_l_max: int = 64
-    """[backward_cuda_graph] Padded-attention max per-sample sequence length.
-    Batches whose max sample length exceeds this fall back to eager attention.
-    Quadratic in compute (scores tensor is [bn_max, Hq, l_max, l_max]); oversizing
-    tanks throughput. Mirrors DeltaServe's ATTN_L_MAX (=64 default)."""
+    backward_cuda_graph_attn_l_max: int | str = "auto"
+    """[backward_cuda_graph] Padded-attention max per-sample sequence length;
+    ``auto`` as above. A backward with a longer sample falls back to eager
+    attention. Quadratic in compute (the scores tensor is
+    [bn_max, Hq, l_max, l_max])."""
+
+    backward_disable_torch_native: bool = True
+    """Start the backward child with ``TORCH_DISABLE_NATIVE_JIT=1``. torch 2.14
+    added ``torch/_native``: Python-level overrides of bmm / sum / rmsnorm /
+    scatter_add / topk ... on CUDA that run a dispatch check before every
+    call. The eager parts of the backward issue thousands of small calls per
+    cycle; on a host with a slow CPU that check cost 13-18 % per token (A100
+    cloud VM, Qwen3-14B TP=4: 2111 -> 1764 µs/token with it off, vs 1801 on
+    torch 2.11). Only the child is affected — the variable is set around its
+    spawn, the serving processes keep torch's default — and for the child it
+    is the torch <= 2.13 behaviour. False: leave torch's default."""
 
     max_prepare: int | None = None
     """Cap on how many corpus lines to load (None = all). DeltaServe's

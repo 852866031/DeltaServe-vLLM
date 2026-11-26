@@ -132,7 +132,8 @@ def saved_qkv_pre_transform(arch: str) -> bool:
 
 def build_backward_meta(hf_config: Any, ft_cfg: Any, *, lm_head_key: str | None,
                         embed_weight_key: str | None, has_final_norm: bool,
-                        lora_scaling: float, tp_size: int, tp_rank: int) -> dict:
+                        lora_scaling: float, tp_size: int, tp_rank: int,
+                        tokenizer: str | None = None) -> dict:
     """The ``meta`` dict shipped to the backward child with the shared weights.
 
     Model dims (for the per-layer forward rematerialization), the LM-head /
@@ -142,6 +143,17 @@ def build_backward_meta(hf_config: Any, ft_cfg: Any, *, lm_head_key: str | None,
     ``head_dim`` falls back to ``hidden_size // num_attention_heads`` for
     configs that omit it (Llama-3); Qwen3 states it explicitly (and its
     ``head_dim * num_heads`` may differ from ``hidden_size``)."""
+    # The padded-attention budget of the backward graph: numbers from the
+    # config, or chosen from the dataset (``auto``). Only looked at when the
+    # backward graphs are on (it tokenizes the corpus).
+    attn_bn, attn_l, attn_note = 8, 64, None
+    if bool(getattr(ft_cfg, "backward_cuda_graph", False)):
+        from deltaserve import bwd_budget
+
+        _heads = int(hf_config.num_attention_heads) // max(1, int(tp_size))
+        attn_bn, attn_l, _info = bwd_budget.resolve(
+            ft_cfg, tokenizer, local_heads=_heads)
+        attn_note = bwd_budget.describe(attn_bn, attn_l, _info)
     num_heads = int(hf_config.num_attention_heads)
     head_dim = int(getattr(hf_config, "head_dim", None)
                    or hf_config.hidden_size // num_heads)
@@ -188,10 +200,10 @@ def build_backward_meta(hf_config: Any, ft_cfg: Any, *, lm_head_key: str | None,
         "backward_run_ahead_boundaries":
             int(getattr(ft_cfg, "backward_run_ahead_boundaries", 0)),
         "pause_on_arrival": bool(getattr(ft_cfg, "pause_on_arrival", False)),
-        "backward_cuda_graph_attn_bn_max":
-            int(ft_cfg.backward_cuda_graph_attn_bn_max),
-        "backward_cuda_graph_attn_l_max":
-            int(ft_cfg.backward_cuda_graph_attn_l_max),
+        "backward_cuda_graph_attn_bn_max": attn_bn,
+        "backward_cuda_graph_attn_l_max": attn_l,
+        # one line for the launch log (how the budget was chosen / what it holds)
+        "attn_budget_note": attn_note,
         # the child's sizes follow the backward batch, not the step
         "max_saved_finetuning_tokens": int(bwd_tokens_of(ft_cfg)),
         # Forward-side activation saves the backward may short-circuit on:

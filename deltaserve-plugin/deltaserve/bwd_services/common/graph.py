@@ -387,6 +387,17 @@ class GraphedBackward:
             and bn <= self.bn_max
             and max_l <= self.l_max
         )
+        # Never silent: count the cycles whose attention ran eager, and say so
+        # again every 200 cycles while it keeps happening.
+        self.cycles = getattr(self, "cycles", 0) + 1
+        if not self._attn_fit:
+            self.eager_cycles = getattr(self, "eager_cycles", 0) + 1
+        if self.cycles % 200 == 0 and getattr(self, "eager_cycles", 0):
+            dprint(f"[bwd-graph] !!! attention ran EAGER in {self.eager_cycles} of "
+                   f"{self.cycles} backward cycles (budget {self.bn_max} samples x "
+                   f"{self.l_max} tokens; last cycle {bn} x {max_l}). Set "
+                   f"finetune_features.backward_cuda_graph_attn_{{bn_max,l_max}} "
+                   f"to 'auto' or larger values.")
 
         # Stage cos/sin ALWAYS (used by both the graphed forward and the
         # eager forward fallback when the padded-attention budget overflows

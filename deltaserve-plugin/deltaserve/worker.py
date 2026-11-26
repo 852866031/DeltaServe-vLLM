@@ -73,6 +73,8 @@ class DeltaServeWorker(RouteEncodeMixin, Worker):
             mps_percentage=ft_cfg.backward_mps_percentage,
             device_index=self.local_rank,
             service_name=arch,
+            disable_torch_native=bool(
+                getattr(ft_cfg, "backward_disable_torch_native", True)),
         )
         self.backward_process.start()
         dprint(f"Worker rank={self.rank} local_rank={self.local_rank}: backward "
@@ -254,7 +256,10 @@ class DeltaServeWorker(RouteEncodeMixin, Worker):
             embed_weight_key=embed_weight_key,
             has_final_norm="model.norm.weight" in _norm2raw,
             lora_scaling=read_lora_scaling(path),
-            tp_size=tp_size, tp_rank=tp_rank)
+            tp_size=tp_size, tp_rank=tp_rank,
+            tokenizer=getattr(self.model_config, "tokenizer", None))
+        if meta.get("attn_budget_note") and tp_rank == 0:
+            dprint(f"[bwd-graph] {meta['attn_budget_note']}")
 
         dprint(
             f"sharing weights with backward process: base={len(base_state)} "

@@ -670,6 +670,8 @@ class FinetuneCoordinator:
             return
         self.backwards_done += 1
         self.tokens_trained += int(resp.get("n", 0) or 0)
+        if resp.get("attn_graph") is False:
+            self.backwards_attn_eager = getattr(self, "backwards_attn_eager", 0) + 1
         loss = resp.get("loss")
         if loss is not None:
             try:
@@ -692,6 +694,8 @@ class FinetuneCoordinator:
             "backward_in_flight": bool(self.pending_backward),
             "epoch": int(self.current_epoch),
             "backwards_done": int(self.backwards_done),
+            # cycles whose attention fell back to eager (budget too small)
+            "backwards_attn_eager": int(getattr(self, "backwards_attn_eager", 0)),
             "tokens_trained": int(self.tokens_trained),
             "last_loss": self.last_loss,
             "mean_loss_last_20": (sum(recent) / len(recent)) if recent else None,
