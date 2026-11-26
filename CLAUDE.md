@@ -58,7 +58,7 @@ dummy adapters (v1's selects none), so the v2 runner removes the pinned FT adapt
 before it instead of after (the first FT request reloads it, on both runners).
 
 **v0.34 port (2026-11-25), validated on the 5090s; A100 verification by the user
-pending.** Every test passes on v0.33/v1, v0.33/v2 and v0.34 (56 scripts: both leak
+pending.** Every test passes on v0.33/v1, v0.33/v2 and v0.34 (55 scripts: both leak
 gates, the live adapter-routing run). Qwen3-14B TP=2 timelines (tight-half /
 loose-half / production-600-800), all 100 % TTFT SLO:
 - v0.33 v1 → v2: FT tok/s 349→372 / 627→630 / 466→463, TTFT p50 within 2 ms.
@@ -81,10 +81,22 @@ Runs in `eval-tp/output/cleanup/v2port_{v1,v2,v034}`. What v0.34 changed for us:
 
 **Findings of the same day (v0.34, production timeline, single runs):**
 - FT-only forward graphs off: FT-only step 53.7 → 61.7 ms, FT −2.6 %.
-- Backward graphs made no difference in the presets because the padded-attention budget
-  (`backward_cuda_graph_attn_bn_max: 8`, `_l_max: 64`) never fits a cycle (13 samples of
-  ≤ ~40 tokens): every cycle's attention ran eager. With 16 × 48: cycle 147 → 122 ms, FT
-  +6 %, no fallback. The 14B template has 16 × 48; the presets still have 8 × 64.
+- **The backward's attention never used its graph**: the padded-attention budget
+  (`backward_cuda_graph_attn_bn_max` 8 × `_l_max` 64) held no real cycle (13 samples per
+  256-token cycle, 15-26 per 512), so every cycle's attention ran eager, on both hosts and
+  on the old fork too, with one log line at the first overflow. Now: both keys default to
+  `auto` (`bwd_budget.py`: replays the epoch's batches — admission is smallest-first — and
+  takes the cheapest shape that holds 99 %); a configured budget gets a launch line with
+  the share of the data it holds; eager cycles are counted (ack `attn_graph`,
+  `backward.csv`, `/finetuning_status`, a log line every 200 cycles while it happens).
+  5090, 16 × 48 vs 8 × 64: cycle 147 → 122 ms, FT +6 %.
+- **torch 2.14's `torch/_native` layer slows the eager backward on a slow-CPU host**
+  (Python dispatch checks before bmm / sum / rmsnorm / ... on CUDA): A100 cloud VM,
+  Qwen3-14B TP=4, FT only: 2111 µs/token vs 1801 on torch 2.11, and 1764 with
+  `TORCH_DISABLE_NATIVE_JIT=1`. `finetune_features.backward_disable_torch_native`
+  (default true) sets it around the backward child's spawn ONLY; never for the serving
+  processes (their overridden ops would change numerics). No slowdown was seen on the
+  5090 desktop CPU.
 - Activation buffer memory, 14B TP=2, all saves on: 2.70 MB per token per GPU (256 →
   0.65 GiB, 1024 → 2.58, 2048 → 5.16; gate_up is 52 % of it). A 1024-token buffer AND
   backward (`max_saved_finetuning_tokens: 1024`) with `gpu_memory_utilization: 0.86`

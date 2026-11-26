@@ -50,7 +50,10 @@ _REQ_FIELDS = ("finish_unix_time", "request_id", "prompt_tokens",
 _BWD_FIELDS = ("unix_time", "cycle", "epoch", "tokens", "samples", "loss",
                "gpu_ms", "wall_ms", "train_tokens_per_gpu_s",
                "child_mem_alloc_gib", "child_mem_peak_gib",
-               "child_mem_reserved_gib")
+               "child_mem_reserved_gib",
+               # 1 = attention replayed its graph, 0 = fell back to eager
+               # (budget too small), empty = no backward graphs
+               "attn_graph")
 GIB = float(1 << 30)
 
 
@@ -460,7 +463,8 @@ class MetricsRecorder:
             r(n / (gpu_ms / 1000.0), 1) if gpu_ms else "",
             r(mem.get("alloc", 0) / GIB) if mem else "",
             r(mem.get("peak", 0) / GIB) if mem else "",
-            r(mem.get("reserved", 0) / GIB) if mem else ""))
+            r(mem.get("reserved", 0) / GIB) if mem else "",
+            "" if resp.get("attn_graph") is None else int(bool(resp["attn_graph"]))))
 
     # -- summaries ------------------------------------------------------------
 

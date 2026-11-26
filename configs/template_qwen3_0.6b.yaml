@@ -34,8 +34,9 @@ finetune_features:
   backward_mps_percentage: 0         # 0 = no MPS (the pause contract protects prefill); >0 needs an MPS daemon and caps the child's SMs
   backward_fp32: false               # false = bf16 bulk backward GEMMs (scores, softmax, norms, LM head, masters stay fp32)
   backward_cuda_graph: false  # per-layer backward CUDA graphs; off here as in the validated 0.6B preset (the 0.6B backward is short)
-  backward_cuda_graph_attn_bn_max: 8 # padded attention graph fits ≤ 8 samples per cycle, else that cycle runs eager
-  backward_cuda_graph_attn_l_max: 64 # ... and samples ≤ 64 tokens (cost is quadratic in this)
+  backward_cuda_graph_attn_bn_max: auto # padded attention graph: most samples per backward cycle. auto = chosen from the dataset at launch; a cycle that does not fit runs its attention eager (slow)
+  backward_cuda_graph_attn_l_max: auto  # ... and the longest sample in tokens (cost is quadratic in this). The launch log prints the chosen values
+  backward_disable_torch_native: true   # backward child only: TORCH_DISABLE_NATIVE_JIT=1 (torch 2.14's per-call dispatch checks cost 13-18 % on a slow-CPU host)
   # activation saves (skip parts of the backward's forward recompute)
   save_activations: true             # false only to measure the save overhead (nothing is trained)
   save_attn_qkv: true                # save q/k/v: skips the Q/K/V projection (exact for Qwen3: saved before q_norm/k_norm)

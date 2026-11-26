@@ -72,6 +72,7 @@ FINETUNE_SECTIONS: dict[str, tuple[str, ...]] = {
     "finetune_features": (
         "backward_mps_percentage", "backward_fp32", "backward_cuda_graph",
         "backward_cuda_graph_attn_bn_max", "backward_cuda_graph_attn_l_max",
+        "backward_disable_torch_native",
         "backward_run_ahead_boundaries", "save_activations", "save_attn_qkv",
         "save_attn_ctx", "save_resid_mid", "graph_ft_batches",
         "graph_ft_max_tokens", "graph_ft_only_batches", "forward_interruptible",

@@ -38,6 +38,8 @@ import torch.multiprocessing as mp
 from deltaserve import dprint
 
 _MPS_PERCENTAGE_ENV = "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"
+# torch >= 2.14: skip registering the torch/_native operator overrides
+_TORCH_NATIVE_ENV = "TORCH_DISABLE_NATIVE_JIT"
 _MAX_CONNECTIONS_ENV = "CUDA_DEVICE_MAX_CONNECTIONS"
 
 
@@ -187,8 +189,12 @@ class BackwardProcess:
     """Parent-side handle: spawns and talks to the backward stub process."""
 
     def __init__(self, mps_percentage: int = 10, device_index: int = 0,
-                 service_name: str = "LlamaForCausalLM"):
+                 service_name: str = "LlamaForCausalLM",
+                 disable_torch_native: bool = False):
         self.mps_percentage = int(mps_percentage)
+        # [backward_disable_torch_native] TORCH_DISABLE_NATIVE_JIT=1 for the
+        # child (see FinetuneConfig): set around its spawn only.
+        self.disable_torch_native = bool(disable_torch_native)
         self.device_index = int(device_index)
         # Selects the per-model child service in bwd_services/ (e.g. the model's
         # HF architecture string "Qwen3ForCausalLM").
@@ -240,6 +246,9 @@ class BackwardProcess:
         prev_mps = os.environ.get(_MPS_PERCENTAGE_ENV)
         if self.mps_percentage > 0:
             os.environ[_MPS_PERCENTAGE_ENV] = str(self.mps_percentage)
+        prev_native = os.environ.get(_TORCH_NATIVE_ENV)
+        if self.disable_torch_native:
+            os.environ[_TORCH_NATIVE_ENV] = "1"
         try:
             self._proc = self._ctx.Process(
                 target=service_main,
@@ -259,6 +268,7 @@ class BackwardProcess:
         finally:
             # Restore parent env immediately so inference keeps the full GPU.
             _restore_env(_MPS_PERCENTAGE_ENV, prev_mps)
+            _restore_env(_TORCH_NATIVE_ENV, prev_native)
 
         # Parent doesn't use the child's end of the pipe.
         child_conn.close()

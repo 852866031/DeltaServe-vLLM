@@ -615,7 +615,13 @@ class BackwardService:
                     f"learning rate or disable FT to recover."
                 )
 
+        _runner = getattr(self, "graph_runner", None)
         resp = {"event": "activations_processed", "n": n, "loss": loss,
+                # [backward_cuda_graph] did this cycle's attention replay its
+                # graph (True), fall back to eager (False), or is there no
+                # graph runner (None)
+                "attn_graph": (None if _runner is None or not can_compute
+                               else bool(getattr(_runner, "_attn_fit", False))),
                 # [telemetry] GPU time (CUDA events) and wall time (incl. the
                 # pauses while inference had the GPU) of this cycle.
                 "samples": len(sample_lens),
