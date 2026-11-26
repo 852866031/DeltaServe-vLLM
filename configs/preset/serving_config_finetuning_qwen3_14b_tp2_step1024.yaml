@@ -1,0 +1,116 @@
+# DeltaServe-on-vLLM serving config — Qwen3-14B TP=2, a 1024-token optimizer step
+# trained in ONE backward, filled by forward steps of at most 256 FT tokens.
+#
+# serving_config_finetuning_qwen3_14b_tp2.yaml with these changes:
+#   - max_saved_finetuning_tokens: 1024  (buffer = step = backward batch)
+#   - ft_tokens_per_step: 256            (a step with inference tokens carries at most 256 FT tokens)
+#   - ft_only_tokens_per_step: 1024      (an FT-only step, which a request can abort, may fill the buffer)
+#   - gpu_memory_utilization: 0.86       (room for the larger buffer + backward child)
+#   - avg_tbt_headroom: 0.8, avg_tbt_admission_headroom: 0.9, overload_hold_s: 1.0
+#     (the larger backward pushes FT to the limit of the TBT target: without these
+#      77.5 % of the requests are within it on loose-half, with them 100 %)
+# A backward of 1024 tokens costs far less per token than four of 256 (FT only,
+# no inference: 1877 vs 1263 tok/s), and it yields between its per-layer graphs
+# anyway; what made a 1024-token buffer slow for inference was the FORWARD step
+# of 1024 FT tokens next to inference tokens, which this keeps at 256.
+#
+# 2026-11-26, vLLM 0.34, 2x RTX 5090, TTFT SLO 0.4 s, average-TBT target 35 ms,
+# against the 256-token preset on vLLM 0.33 (eval-tp/output/cleanup/v2port_v1):
+#   tight-half   FT 349 -> 481 tok/s, TTFT p50 101 -> 70, p99 138 -> 167 ms, TBT avg 35.8 -> 28.4 ms
+#   loose-half   FT 627 -> 922,       TTFT p50  86 -> 66, p99 129 -> 170,    TBT avg 27.4 -> 23.9
+#   production   FT 466 -> 751,       TTFT p50  69 -> 92, p99  89 -> 127,    TBT avg 20.3 -> 23.6
+# 100 % TTFT everywhere; the TTFT tail is the price (runs: ga_final_step1024b).
+#
+# Memory (per 5090): worker ~26.6 GiB, backward child <= 5.2 GiB. The KV cache
+# that leaves is 17,408 tokens (the 256-token preset: 63,488): enough for the
+# timelines above (short requests), not for many long concurrent ones.
+
+finetune_param:
+  enable_finetuning: true
+  start_on_launch: false             # hold FT admission closed (M1: launch-only)
+  finetuning_lora_path: ../../adapters/qwen3-14b-toy-lora-ft
+  data_path: ../../data/alpaca_1000.txt
+  max_saved_finetuning_tokens: 1024
+  ft_tokens_per_step: 256           # FT tokens a step with inference tokens may carry
+  ft_only_tokens_per_step: 1024     # ... and a step without (abortable by an arriving request)
+  num_epochs: 20
+  learning_rate: 0.000005
+  weight_decay: 0.01
+  gamma: 0.9
+
+finetune_features:
+  backward_mps_percentage: 0         # no MPS daemon on this box; the pause contract protects prefill
+  graph_ft_batches: true             # [mixed-fwd-cuda-graph] mixed batches (inference + FT) replay has_ft CUDA graphs (FT-only too with graph_ft_only_batches)
+  graph_ft_max_tokens: 512           # capture the has_ft set up to this padded size
+  graph_ft_only_batches: true       # FT-only steps replay the has_ft graphs too (tier-C abort polled between segments); production FT +5 %
+  backward_run_ahead_boundaries: 2   # child CPU ≤2 _maybe_pause boundaries ahead of its GPU → a pause lands within ~3-6 ms (0 = unbounded)
+  pause_on_arrival: true            # yield the GPU when a request arrives during a cycle (production TTFT p99 270 → 99 ms, FT −1.5 %)
+  backward_fp32: false
+  forward_interruptible: true        # tiers A/B (scheduler) + tier C rank-symmetric under TP
+  ft_only_admission_grace_ms: 2.0
+  backward_cuda_graph: true         # TP-safe since M5 (2-GPU gated; live A/B pending)
+  save_attn_qkv: true                # pre-norm q/k + v saved: skips the Q/K/V GEMM (exact for Qwen3)
+  save_attn_ctx: true                # attention context saved: skips the attention forward
+  save_resid_mid: true               # save post-attn residual: drops the forward-remat o all-reduce (7 → 6 collectives/layer) + the O-proj GEMM; +100 MB
+
+throttles:
+  fwd_token_throttle_enable: false
+  fwd_token_throttle: 200
+  ft_tokens_admission_constrain_factor: -1
+  match_prefill_workload_factor: 0
+
+slo:
+  admission_margin: legacy           # pinned: reproduces the published runs (the default is now relative)
+  ttft_slo: 0.4
+  avg_tbt_slo: 0.035                 # the token target (s): kept over avg_tbt_window_s, and what TBT attainment is measured against
+  avg_tbt_headroom: 0.8              # the backward gate steers the window average to this fraction of the target
+  avg_tbt_admission_headroom: 0.9    # ... and FT admission to this one
+  overload_hold_s: 1.0               # FT stands down for 1 s after inference was last at / over its SLO
+  max_tbt_slo: 0.1 
+  # M4.2: the runner's per-step timing samples and the profiling pass's
+  # record gate now ride the TP relay (ModelRunnerOutput.finetune_timing /
+  # SchedulerOutput.finetune_record_timing), so the launch-time profiling
+  # pass fits a real, TP-calibrated estimator and FT admission is SLO-gated
+  # under TP exactly as on a single GPU. Set false to fall back to the
+  # cold-start fixed buffer-cap budget (no SLO gate).
+  profile_on_launch: true
+  profile_num_repeats: 2
+  decode_only_ft_safety_margin: 0.7
+
+debug:
+  print_weight_hash: false
+  print_activation_hash: false
+  print_scheduler_add: true
+  print_engine_batch_exec: true
+  print_engine_batch_done: false
+  print_engine_req_recv: false
+
+adapters:
+  lora_path_0: ../../adapters/qwen3-14b-toy-lora
+
+lora:
+  enable_lora: true
+  max_loras: 2
+  max_lora_rank: 16
+
+server:
+  host: 127.0.0.1
+  port: 8000
+  rank_id: 0
+  # Single frontend for TP bring-up (fewer moving parts in the launch prints).
+  api_server_count: 1
+
+model:
+  model: Qwen/Qwen3-14B-Base
+  tokenizer_mode: auto
+  trust_remote_code: false
+  dtype: auto
+  max_model_len: 2048
+
+engine:
+  gpu_memory_utilization: 0.86          # the 1024-token buffer + backward child; see header
+  enforce_eager: false
+  disable_log_stats: true
+
+parallel:
+  tensor_parallel_size: 2            # <<< TP=2

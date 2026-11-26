@@ -19,7 +19,9 @@ built FT-only step back when a request landed meanwhile, and an FT-only forward
 the runner aborted (tier C) is rolled back in ``update_from_output``.
 """
 
-from deltaserve.ft_sizes import bwd_tokens_of, step_tokens_of
+from deltaserve.ft_sizes import (bwd_tokens_of, ft_only_tokens_of, fwd_tokens_of,
+                                step_tokens_of)
+import bisect
 import csv
 import datetime
 import os
@@ -58,6 +60,7 @@ ADMIT_CODES = {
     "T": "admission closed (throttle / epoch flush)",
     "X": "finetuning not started / disabled",
     "E": "corpus finished",
+    "O": "inference at / over its SLO (overload_hold_s)",
     "D": "decode-only step (admission phase prefill)",
     "K": "waiting for prefill credit (match_prefill_workload_factor)",
     "": "no admission attempted",
@@ -109,8 +112,10 @@ class FinetuneScheduler(AsyncScheduler):
         # one step carries at most one batch's worth: the forward steps keep
         # the size they have with a buffer of that size.
         self._coord = get_coordinator(capacity=capacity,
-                                      per_step_budget=bwd_tokens_of(ft_cfg))
+                                      per_step_budget=fwd_tokens_of(ft_cfg))
         self._coord.bwd_batch = bwd_tokens_of(ft_cfg)
+        self._coord.ft_only_budget = ft_only_tokens_of(ft_cfg)
+        self._coord.whole_batches = bool(getattr(ft_cfg, "bwd_whole_batches", False))
         lengths = self._ft_injector.store.sorted_lengths
         if lengths:
             self._coord.min_sample_len = lengths[0]
@@ -166,6 +171,20 @@ class FinetuneScheduler(AsyncScheduler):
         # batches stay eager → two different cost models; split the FT regime
         # by composition only when the feature is on (off = bit-identical).
         self._graph_ft_batches = bool(getattr(ft_cfg, "graph_ft_batches", False))
+        self._graph_ft_only = bool(getattr(ft_cfg, "graph_ft_only_batches", False))
+        # [fill_graph_padding] the sizes of the has_ft graphs (the captured
+        # sizes up to graph_ft_max_tokens), or () when the key is off
+        self._ft_graph_sizes: tuple = ()
+        self._pad_fill_tokens = 0
+        if (getattr(ft_cfg, "fill_graph_padding", False) and self._graph_ft_batches
+                and not self.vllm_config.model_config.enforce_eager):
+            _cap = getattr(self.vllm_config.compilation_config,
+                           "cudagraph_capture_sizes", None) or ()
+            _mx = int(getattr(ft_cfg, "graph_ft_max_tokens", 0))
+            self._ft_graph_sizes = tuple(sorted(
+                int(x) for x in _cap if int(x) <= _mx))
+            dprint(f"[ft-sched] fill_graph_padding: {len(self._ft_graph_sizes)} "
+                   f"graph sizes up to {_mx}")
         if self._graph_ft_batches:
             from deltaserve.estimator import set_ft_mixed_split
             set_ft_mixed_split(True)
@@ -222,6 +241,12 @@ class FinetuneScheduler(AsyncScheduler):
         self._avg_tbt_admit = float(ft_cfg.avg_tbt_slo) * float(
             getattr(ft_cfg, "avg_tbt_admission_headroom", 1.0))
         self._tbt_gate_stats = {"paused": 0, "overlapped": 0}
+        # [overload_hold_s] FT stands down while inference is at / over its
+        # SLO: no admission and a paused backward until this long after the
+        # last sign of it.
+        self._overload_hold_s = float(getattr(ft_cfg, "overload_hold_s", 0.0) or 0.0)
+        self._overload_until = 0.0
+        self._overload_stats = {"holds": 0, "steps_held": 0}
         # [async] Under pipelined (async) scheduling, schedule(N+1) runs while
         # forward(N) is still on the GPU, so a request admitted now isn't
         # prefilled until the in-flight step(s) finish. We add that queue wait to
@@ -756,8 +781,15 @@ class FinetuneScheduler(AsyncScheduler):
         # admit the sample.
         # The free rows, and at most what one step may carry (one backward
         # batch when a step has several; the whole buffer otherwise).
-        buffer_cap = min(self._coord.space_remaining(),
-                         self._coord.per_step_budget)
+        # [bwd_whole_batches] ... of the batch the next sample goes into.
+        _first = store.pop_next() if self._coord.whole_batches else None
+        buffer_cap = min(
+            self._coord.space_remaining(
+                _first.input_len if _first is not None else None),
+            # a step without inference tokens may carry more
+            # (ft_only_tokens_per_step)
+            self._coord.per_step_budget if (feats.t_in > 0 or feats.b_d > 0)
+            else self._coord.ft_only_budget)
         token_cap = buffer_cap
         if _prop_factor != -1 and has_prefill:
             token_cap = min(buffer_cap, int(feats.t_in * _prop_factor))
@@ -782,6 +814,8 @@ class FinetuneScheduler(AsyncScheduler):
             else []
 
         stop = "A"                  # why the loop ended (telemetry)
+        pad_room = None             # [fill_graph_padding] rows left in the graph
+        padded = 0
         cap_code = "C" if budget_left < buffer_cap else "F"
         while True:
             if max_iterations is not None and len(admitted) >= max_iterations:
@@ -818,23 +852,33 @@ class FinetuneScheduler(AsyncScheduler):
                 t_with_ft = self._estimator.predict(
                     hypothetical, regime=hypothetical.regime()) + t_load
                 # SLO checks on the hypothetical-with-FT prediction.
+                over_slo = False
                 if feats.b_d > 0:
                     effective_tbt = self._max_tbt_slo * decode_only_margin
                     if t_with_ft + t_encode > effective_tbt:
-                        stop = "S"
-                        break
+                        over_slo = True
                     # [avg_tbt_window_s] The average over the last window,
                     # this step included, stays within ``avg_tbt_slo``.
-                    if (self._tbt_window is not None
+                    elif (self._tbt_window is not None
                             and self._tbt_window.average_with(
                                 time.monotonic(), feats.b_d,
                                 t_with_ft + t_encode) > self._avg_tbt_admit):
-                        stop = "S"
-                        break
-                if ttft_deadline is not None:
+                        over_slo = True
+                if not over_slo and ttft_deadline is not None:
                     if (ttft_deadline - now - queue_wait - t_with_ft) <= 0:
+                        over_slo = True
+                if over_slo:
+                    # [fill_graph_padding] The step already runs a has_ft
+                    # graph of a captured size; a sample that still fits that
+                    # size rides in rows the graph computes anyway.
+                    if pad_room is None:
+                        pad_room = self._graph_padding_room(feats, cur_t_ft) \
+                            if admitted else 0
+                    if candidate.input_len > pad_room:
                         stop = "S"
                         break
+                    pad_room -= candidate.input_len
+                    padded += candidate.input_len
             # (Cold-start: estimator not ready; admit up to token_cap unchecked.
             # Matches the pre-redesign cold-start behavior where the coord
             # buffer budget was the only cap.)
@@ -856,9 +900,26 @@ class FinetuneScheduler(AsyncScheduler):
         # admitted: "A" = everything it could take; "S" / "F" / "C" = cut
         # short by the SLO / the buffer / the step's token budget.
         self._last_admit = (stop, int(cur_t_ft))
+        if padded:
+            self._pad_fill_tokens += padded
         store.claim(admitted)
         reqs = [self._ft_injector._make_request(s) for s in admitted]
         return int(cur_t_ft), reqs
+
+    def _graph_padding_room(self, feats: StepFeatures, t_ft: float) -> int:
+        """[fill_graph_padding] FT tokens that still fit the CUDA graph this
+        step will replay: the distance from its token count (inference + the
+        FT admitted so far) to the captured size it is padded to. 0 when the
+        key is off or the step does not replay a has_ft graph."""
+        sizes = self._ft_graph_sizes
+        if not sizes:
+            return 0
+        inference = int(feats.t_in) + int(feats.b_d)
+        if inference <= 0 and not self._graph_ft_only:
+            return 0                  # an FT-only step runs eager
+        total = inference + int(t_ft)
+        i = bisect.bisect_left(sizes, total)
+        return int(sizes[i] - total) if i < len(sizes) else 0
 
     # ─── SLO estimator: feature extraction + graph predicate ────────────
     def _features_from_output(
@@ -911,6 +972,37 @@ class FinetuneScheduler(AsyncScheduler):
             t_in=t_in, p=len(prefill_lens), t_ft=t_ft, b_d=b_d, k=k,
             prefill_lens=prefill_lens or None)
         return feats, lora_ids
+
+    def _overloaded(self) -> bool:
+        """[overload_hold_s] Is inference at or over its SLO right now, or was
+        it within the last ``overload_hold_s`` seconds? Two signs, both
+        measured, neither a prediction: the window's average time between
+        tokens is above ``avg_tbt_slo``, or the oldest waiting inference
+        request has already waited 0.9 x ``ttft_slo``. FT then stands down —
+        the admission checks only ask whether ONE step still fits, which lets
+        FT keep a share of a system that cannot meet its SLO even alone."""
+        if self._overload_hold_s <= 0 or self._profiling_mode:
+            return False
+        mono = time.monotonic()
+        over = False
+        if self._tbt_window is not None:
+            avg = self._tbt_window.average(mono)
+            over = avg is not None and avg > self._avg_tbt_slo
+        if not over:
+            now = time.time()
+            for req in self.waiting:
+                if getattr(req, "is_finetuning", False):
+                    continue
+                over = (now - req.arrival_time) > 0.9 * self._ttft_slo
+                break
+        if over:
+            if mono >= self._overload_until:
+                self._overload_stats["holds"] += 1
+            self._overload_until = mono + self._overload_hold_s
+        held = mono < self._overload_until
+        if held:
+            self._overload_stats["steps_held"] += 1
+        return held
 
     def _backward_would_break_avg_tbt(self, feats: StepFeatures) -> bool:
         """[avg_tbt_pause_backward] A decode-only step about to share the GPU
@@ -1170,6 +1262,10 @@ class FinetuneScheduler(AsyncScheduler):
             # [avg_tbt_pause_backward] decode-only steps taken with a backward
             # in flight: how many paused it / let it overlap
             "avg_tbt_backward_gate": dict(getattr(self, "_tbt_gate_stats", None) or {}),
+            # [overload_hold_s] times FT stood down, and the steps it lasted
+            "overload_hold": dict(getattr(self, "_overload_stats", None) or {}),
+            # [fill_graph_padding] FT tokens admitted into graph padding
+            "graph_padding_fill_tokens": int(getattr(self, "_pad_fill_tokens", 0)),
         })
         return st
 
@@ -1461,7 +1557,12 @@ class FinetuneScheduler(AsyncScheduler):
             [None, None, None, None, 0, None, None, None, None]
             if self._trace is not None else None)
         self._last_admit = ("", 0)
-        admitted_now, ft_reqs = self.admit_ft_to_step()
+        self._in_overload = self._overloaded()
+        if self._in_overload:
+            admitted_now, ft_reqs = 0, []
+            self._last_admit = ("O", 0)
+        else:
+            admitted_now, ft_reqs = self.admit_ft_to_step()
         for req in ft_reqs:
             self._enqueue_waiting_request(req)
             self.requests[req.request_id] = req
@@ -1617,13 +1718,18 @@ class FinetuneScheduler(AsyncScheduler):
         # state the runner will execute in. Paired with the measured duration in
         # `update_from_output` to feed the tracker (which can't reclassify the
         # sample later — was_graph is frozen here).
+        if getattr(self, "_in_overload", False) and self._coord.pending_backward:
+            # [overload_hold_s] every step keeps the child paused (the mark is
+            # broadcast with the step; the first step without it releases)
+            output.finetune_pause_backward = True
         if output.total_num_scheduled_tokens > 0:
             feats, lora_ids = self._features_from_output(output)
             # [decode_bwd] The backward child has work in flight: a decode-only
             # step will share the GPU with it (it never pauses the child), so
             # the estimator routes it to its own regime; a prefill-carrying
             # step is excluded from the fits (see estimator.py).
-            feats.bwd = bool(self._coord.pending_backward)
+            feats.bwd = bool(self._coord.pending_backward) and not getattr(
+                output, "finetune_pause_backward", False)
             if self._backward_would_break_avg_tbt(feats):
                 # Broadcast with the step (every rank pauses its child); the
                 # step then runs without the overlap: the plain decode regime.

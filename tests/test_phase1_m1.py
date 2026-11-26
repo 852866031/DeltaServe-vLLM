@@ -72,6 +72,7 @@ _TIE_NATS = 0.4
 _CONTROL_MIN_NATS = 5.0
 # Profiles (DSERVE_M1_PROFILE; the worker subprocesses inherit it):
 #   tp1  Qwen3-0.6B on one GPU, eager + graph, a minimal FT config (the default).
+#   llama3  Llama-3-8B on one GPU, the tp1 method.
 #   tp2  Qwen3-14B TP=2 with the production preset's FT config unchanged (graphs,
 #        rank-symmetric tier-C aborts, pause_on_arrival, every activation save),
 #        graph mode only. tests/test_tp_inference_leak.py runs it.
@@ -88,6 +89,23 @@ _PROFILES = {
         modes=("baseline", "ft", "ft-both", "control",
                "baseline-graph", "ft-graph", "ft-both-graph"),
         # (label, baseline mode, ft mode, step kind the ft run must co-batch with)
+        pairs=(("eager / prefill", "baseline", "ft", "prefill"),
+               ("eager / both", "baseline", "ft-both", "decode"),
+               ("graph / prefill", "baseline-graph", "ft-graph", "prefill"),
+               ("graph / both", "baseline-graph", "ft-both-graph", "decode")),
+    ),
+    # Llama-3-8B on one GPU: the tp1 method on the other model family (post-RoPE
+    # q/k/v saves; its mixed batches replay the has_ft graphs through the same
+    # hook-issued save op). DSERVE_M1_PROFILE=llama3.
+    "llama3": dict(
+        config="serving_config_finetuning_llama3.yaml",
+        preset=False,
+        mixed_on_graph=True,
+        amplify=10.0,
+        arrivals=[0.0, 0.0, 0.25, 0.5],
+        timeout=1200,
+        modes=("baseline", "ft", "ft-both", "control",
+               "baseline-graph", "ft-graph", "ft-both-graph"),
         pairs=(("eager / prefill", "baseline", "ft", "prefill"),
                ("eager / both", "baseline", "ft-both", "decode"),
                ("graph / prefill", "baseline-graph", "ft-graph", "prefill"),
@@ -116,6 +134,9 @@ _ARRIVALS = _PROFILE["arrivals"]
 _MODES = _PROFILE["modes"]
 _PAIRS = _PROFILE["pairs"]
 _BATCH_RE = re.compile(r"\[batch [^\]]*\] prefill=(\d+) ft=(\d+) decode=\[([^\]]*)\]")
+# the same line with the step's path (graph / eager) after the token total
+_PATH_RE = re.compile(r"\[batch [^\]]*\] prefill=(\d+) ft=(\d+) decode=\[([^\]]*)\]"
+                      r" \(total=\d+\) \| (\w+)[^|]*\|")
 
 _TTY = sys.stdout.isatty()
 _GREEN = "\033[92m" if _TTY else ""
@@ -298,6 +319,10 @@ def _spawn(mode: str, adapter: Path) -> dict:
         "prefill": sum(1 for p, f, _ in steps if f and p),
         "decode": sum(1 for p, f, d in steps if f and not p and d),
     }
+    # how many of those mixed steps replayed a CUDA graph
+    result["mixed_graph"] = sum(
+        1 for p, f, d, path in _PATH_RE.findall(log[a:b] if 0 <= a < b else "")
+        if int(f) and (int(p) or d.strip()) and path == "graph")
     # the most FT tokens any step carried, over the whole run (warm-up included)
     result["max_ft"] = max((int(f) for _, f, _ in _BATCH_RE.findall(log)),
                            default=0)
@@ -363,7 +388,11 @@ def main():
         base, fton = runs[base_m], runs[ft_m]
         mixed = fton["mixed"]
         print(f"  -- {tag}: {base_m} vs {ft_m}  (mixed steps: {mixed['prefill']} "
-              f"with a real prefill, {mixed['decode']} decode-only)")
+              f"with a real prefill, {mixed['decode']} decode-only; "
+              f"{fton.get('mixed_graph', 0)} of them on a CUDA graph)")
+        if _PROFILE.get("mixed_on_graph") and "graph" in ft_m:
+            check(f"[{tag}] the mixed steps replayed the has_ft CUDA graphs",
+                  fton.get("mixed_graph", 0) > 0)
         check(f"[{tag}] FT co-batched with real {kind} tokens", mixed[kind] > 0)
         for i, (b, f) in enumerate(zip(base["token_ids"], fton["token_ids"])):
             j = next((k for k in range(min(len(b), len(f))) if b[k] != f[k]), None)

@@ -24,6 +24,10 @@ finetune_param:
   # ft_step_size: 1024             # FT tokens per optimizer step (= the activation buffer). Unset: max_saved_finetuning_tokens
   # bwd_batch_size: 256            # FT tokens per backward batch; must divide ft_step_size. Gradients accumulate over the step's
   #                                # batches, one update at its end. Smaller = the backward yields the GPU sooner. Unset: one backward per step
+  # ft_tokens_per_step: 256        # FT tokens one forward step may carry (default: the backward batch). With a 1024-token buffer and this at 256
+  #                                # the backward stays one large (cheap per token) batch and no forward step is long: see preset/..._tp2_step1024.yaml
+  # ft_only_tokens_per_step: 1024  # FT tokens a step WITHOUT inference tokens may carry (default: ft_tokens_per_step); such a step is abortable, so it can be large
+  # bwd_whole_batches: true      # end the step when its batches are full (no small remainder backward at the price of a whole one)
   adapter_save_path: ../checkpoints/qwen3-14b   # where trained adapters go (PEFT format); also the default of POST /save_adapter
   adapter_save_every_backwards: 500  # save every N backward cycles as backward-<N> (0 = off)
   adapter_save_keep_last: 3          # keep only the newest 3 backward-* saves (0 = keep all)
@@ -45,6 +49,7 @@ finetune_features:
   save_resid_mid: true               # save the post-attention residual: skips the O projection + one all-reduce per layer (~100 MB)
   # forward graphs for batches carrying FT samples
   graph_ft_batches: true             # mixed (inference + FT) batches replay their own has_ft piecewise CUDA graphs
+  fill_graph_padding: false          # admit FT samples the SLO check refuses while they fit the padding of the graph size the step already runs at
   graph_ft_max_tokens: 512           # capture the has_ft graphs up to this padded batch size; larger mixed batches run without a graph
   graph_ft_only_batches: true        # FT-only batches (idle GPU) replay the same has_ft graphs (+5 % FT on production)
   # protecting inference latency
@@ -77,6 +82,7 @@ slo:
   avg_tbt_pause_backward: true       # a decode step that would take the window average past the target pauses the backward (predicted with the overlap)
   avg_tbt_headroom: 0.9              # ... steering the window average to this fraction of avg_tbt_slo (the SLO is met per request)
   avg_tbt_admission_headroom: 1.0    # FT admission steers the window average to this fraction of avg_tbt_slo (1.0 = the target itself; 0.9 at a 20 ms target, 2x load: attainment 53 -> 68 %, FT -11 %)
+  overload_hold_s: 1.0               # FT stands down (no admission, backward paused) until this long after inference was last at / over its SLO; 0 = off
   max_tbt_slo: 0.1                   # upper bound on ONE step with decodes + FT (s, predicted): a backstop, the average is the target
   profile_on_launch: true            # profile synthetic batches at launch to fit the estimator (~1-2 min)
   profile_num_repeats: 2             # recorded passes per profiling shape
@@ -127,7 +133,7 @@ model:
   max_model_len: 2048                # context length
 
 engine:
-  gpu_memory_utilization: 0.80       # vLLM's share of each GPU; the rest is left to the backward child (fp32 logits, temporaries)
+  gpu_memory_utilization: 0.88       # vLLM's share of each GPU; the rest is the backward child's (<= 2.25 GiB with a 256-token backward). The KV cache is what is left of this share: 63k tokens here, 31k at 0.80
   enforce_eager: false               # CUDA graphs on
   disable_log_stats: true            # vLLM's per-step stats stream (forced on when finetuning: it stalls the frontend)
 

@@ -60,6 +60,38 @@ uniform = B.choose_budget([20] * 500, 256)
 C.ok("uniform samples: exactly what a batch holds, plus the margin",
      uniform["l_max"] == 20 and uniform["bn_max"] == 14, str(uniform["bn_max"]))
 
+print("B2. several shapes inside the budget")
+bn0, l0 = info["bn_max"], info["l_max"]
+ex = B.choose_shapes(bt, bn0, l0, 3)
+def padded(shapes):
+    tot = 0
+    for bn, lo in bt:
+        if bn > bn0 or lo > l0:
+            continue
+        tot += min(b * l * l for b, l in shapes + [(bn0, l0)] if bn <= b and lo <= l)
+    return tot
+C.ok("3 shapes: two more, each inside the budget", len(ex) == 2
+     and all(b <= bn0 and l <= l0 and (b, l) != (bn0, l0) for b, l in ex), str(ex))
+C.ok("... and the padded work drops by more than half",
+     padded(ex) < 0.5 * padded([]), f"{padded(ex)} vs {padded([])}")
+ex2 = B.choose_shapes(bt, bn0, l0, 2)
+C.ok("2 shapes cost at least as much as 3, less than 1",
+     padded(ex) <= padded(ex2) < padded([]) and len(ex2) == 1, str(ex2))
+C.ok("1 shape / nothing to cut: no extra shape",
+     B.choose_shapes(bt, bn0, l0, 1) == []
+     and B.choose_shapes([(4, 30)], 8, 64, 4) == [])
+C.ok("every batch the budget holds is held by the shape chosen for it",
+     all(any(bn <= b and lo <= l for b, l in ex + [(bn0, l0)])
+         for bn, lo in bt if bn <= bn0 and lo <= l0))
+cfg = NS(max_saved_finetuning_tokens=256, backward_cuda_graph_attn_shapes=3)
+C.ok("from the config: the key's count, [] at the default",
+     B.extra_shapes(cfg, bn0, l0, lengths=lengths) == ex
+     and B.extra_shapes(NS(max_saved_finetuning_tokens=256), bn0, l0,
+                        lengths=lengths) == [])
+C.ok("the key: default 1, in finetune_features",
+     FinetuneConfig().backward_cuda_graph_attn_shapes == 1
+     and "backward_cuda_graph_attn_shapes" in FINETUNE_SECTIONS["finetune_features"])
+
 print("C. from the config")
 cfg = NS(max_saved_finetuning_tokens=256, backward_cuda_graph_attn_bn_max="auto",
          backward_cuda_graph_attn_l_max="auto")

@@ -323,7 +323,9 @@ class LoraSftTrainerService(BackwardService):
 
         try:
             self.graph_runner = GraphedBackward(
-                self, s_max=s_max, bn_max=bn_max, l_max=l_max)
+                self, s_max=s_max, bn_max=bn_max, l_max=l_max,
+                extra_shapes=meta.get("backward_cuda_graph_attn_extra_shapes")
+                or ())
         except Exception as e:  # noqa: BLE001
             import traceback
             dprint(f"[backward] graph runner init failed: {e}; "

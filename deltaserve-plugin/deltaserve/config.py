@@ -125,6 +125,17 @@ class FinetuneConfig:
     attention. Quadratic in compute (the scores tensor is
     [bn_max, Hq, l_max, l_max])."""
 
+    backward_cuda_graph_attn_shapes: int = 1
+    """[backward_cuda_graph] How many padded-attention shapes to capture. One
+    (the default) is the budget above alone: every backward pays for its whole
+    padding (15 x 57 on the alpaca corpus with 256-token batches, when a batch
+    is 13 samples of 19 tokens at the start of an epoch and 4 of 63 at its
+    end). With more, smaller shapes INSIDE the budget are chosen from the
+    dataset and a backward replays the cheapest one that holds it. The
+    attention graph is shared by all layers, so a shape costs its input slabs
+    (a few MB) and one graph, not a graph per layer. Qwen3-14B TP=2: the
+    attention backward of a cycle 8.6 ms -> ~4.2 ms."""
+
     backward_disable_torch_native: bool = True
     """Start the backward child with ``TORCH_DISABLE_NATIVE_JIT=1``. torch 2.14
     added ``torch/_native``: Python-level overrides of bmm / sum / rmsnorm /
@@ -163,6 +174,33 @@ class FinetuneConfig:
     admission stays open while the earlier batches run (the weights do not
     change until the step's update), and a step that carries FT tokens pauses
     the child like an inference prefill does."""
+
+    ft_tokens_per_step: int | None = None
+    """FT tokens ONE forward step may carry (None = ``bwd_batch_size``: a
+    step fills a whole backward batch when nothing else limits it). Smaller
+    than the backward batch, it separates the two costs of a large batch: the
+    backward of 1024 tokens is far cheaper per token than four of 256 (bigger
+    GEMMs, one LM head, one publish), and it yields between its per-layer
+    graphs anyway, while a FORWARD step of 1024 FT tokens is 200 ms that an
+    arriving request waits behind or has to abort. With ``ft_step_size`` =
+    ``bwd_batch_size`` = 1024 and this at 256, the buffer fills over four
+    steps and trains in one backward."""
+
+    ft_only_tokens_per_step: int | None = None
+    """FT tokens a step WITHOUT inference tokens may carry (None =
+    ``ft_tokens_per_step``; at most a backward batch). An FT-only forward is
+    abandoned when a request arrives (``forward_interruptible``), so it can be
+    large — a 1024-token one costs less per token than four of 256 — while a
+    step that also carries inference tokens keeps the smaller cap."""
+
+    bwd_whole_batches: bool = False
+    """With several backward batches per step: end the step when its
+    ``ft_step_size / bwd_batch_size`` batches are full, not when its rows are.
+    A batch is whole samples, so filling the rows leaves a remainder (1024 rows
+    of ~19-token samples: four batches of 247 and 36 rows over) that becomes a
+    fifth backward of a few dozen tokens at the price of a whole one — the
+    backward graphs are padded to the batch size. On: no such batch; a step
+    trains slightly fewer tokens. False: the behaviour before this key."""
 
     @property
     def step_tokens(self) -> int:
@@ -273,6 +311,17 @@ class FinetuneConfig:
     window average to. Below 1 because the SLO is met per request: with the
     window average ON the target, about half the requests' own averages are
     above it."""
+
+    overload_hold_s: float = 0.0
+    """FT stands down while inference is at or over its SLO. When the window's
+    average time between tokens is above ``avg_tbt_slo``, or the oldest
+    waiting inference request has waited 0.9 x ``ttft_slo``, no FT is admitted
+    and the backward stays paused until this many seconds after the last such
+    moment. The per-step checks only ask whether one more step fits, so
+    without this FT keeps a share of a system that cannot meet its SLO even
+    alone (Qwen3-14B TP=2 at an overloading request rate: TTFT attainment 96 %
+    inference only, 81.5 % with FT at 275 tok/s). 0 = off, the behaviour
+    before this key."""
 
     avg_tbt_admission_headroom: float = 1.0
     """The fraction of ``avg_tbt_slo`` FT ADMISSION steers the window average
@@ -611,6 +660,16 @@ class FinetuneConfig:
     ``has_ft`` piecewise graphs for (capped by the compilation config's
     ``max_cudagraph_capture_size``). Mixed FT steps above it run the compiled
     forward without a graph."""
+
+    fill_graph_padding: bool = False
+    """A step that replays a ``has_ft`` graph is padded to a captured size and
+    pays for all of its rows. With this on, an FT sample the SLO check would
+    refuse is admitted anyway while it fits the rows of the size the step
+    already runs at (inference tokens + the FT admitted so far, rounded up to
+    the next captured size): it adds no kernel work, only its activation
+    saves. Applies once the step carries FT (the first sample still has to
+    pass the SLO check). Requires ``graph_ft_batches``. Off: the behaviour
+    before this key."""
 
     graph_ft_only_batches: bool = False
     """FT-ONLY steps (no inference tokens) replay the same ``has_ft`` graphs as

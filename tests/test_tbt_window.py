@@ -194,11 +194,69 @@ def test_backward_gate():
           r._ft_pause_decision(out(True), co) == (False, False) and log == [])
 
 
+def test_overload_hold():
+    print("Overload hold (overload_hold_s)")
+    import time as _t
+    import types
+
+    from deltaserve.config import FinetuneConfig
+    from deltaserve.config_loader import FINETUNE_SECTIONS
+    from deltaserve.ft_scheduler import ADMIT_CODES, FinetuneScheduler
+    from deltaserve.tbt_window import TbtWindow
+
+    over = FinetuneScheduler._overloaded
+
+    def sched(hold=1.0, waiting=(), window=True):
+        return types.SimpleNamespace(
+            _overload_hold_s=hold, _profiling_mode=False, _overload_until=0.0,
+            _overload_stats={"holds": 0, "steps_held": 0},
+            _tbt_window=TbtWindow(1.0) if window else None,
+            _avg_tbt_slo=0.035, _ttft_slo=0.4, waiting=list(waiting))
+
+    def fill(s, gap):
+        now = _t.monotonic()
+        for i in range(12):
+            s._tbt_window.step_done(now - 0.5 + gap * i, 8, True)
+
+    def req(age, ft=False):
+        return types.SimpleNamespace(arrival_time=_t.time() - age, is_finetuning=ft)
+
+    s = sched()
+    fill(s, 0.020)
+    check("window average 20 ms under a 35 ms target, nobody waiting: no hold",
+          not over(s) and s._overload_stats == {"holds": 0, "steps_held": 0})
+    s = sched()
+    fill(s, 0.040)
+    check("window average above the target: FT stands down",
+          over(s) and s._overload_stats["holds"] == 1)
+    s._tbt_window = TbtWindow(1.0)            # the load is gone
+    check("... and stays down for the hold after the last sign of it",
+          over(s) and s._overload_stats == {"holds": 1, "steps_held": 2})
+    s._overload_until = _t.monotonic() - 0.01
+    check("... then FT is back", not over(s))
+    check("an inference request that has waited 0.9 x the TTFT SLO: hold",
+          over(sched(waiting=[req(0.37)])))
+    check("one that just arrived: no hold", not over(sched(waiting=[req(0.05)])))
+    check("an FT request in the queue is not a waiting inference request",
+          not over(sched(waiting=[req(5.0, ft=True)]))
+          and over(sched(waiting=[req(5.0, ft=True), req(0.39)])))
+    check("no window (avg_tbt_window_s 0): the TTFT sign alone",
+          over(sched(window=False, waiting=[req(0.39)]))
+          and not over(sched(window=False)))
+    s = sched(hold=0.0)
+    fill(s, 0.040)
+    check("off (0, the default): never", not over(s)
+          and FinetuneConfig().overload_hold_s == 0.0
+          and "overload_hold_s" in FINETUNE_SECTIONS["slo"]
+          and "O" in ADMIT_CODES)
+
+
 if __name__ == "__main__":
     test_average()
     test_gaps()
     test_switch()
     test_backward_gate()
+    test_overload_hold()
     if FAILED:
         print(f"\n{len(FAILED)} of {N[0]} checks FAILED")
         sys.exit(1)

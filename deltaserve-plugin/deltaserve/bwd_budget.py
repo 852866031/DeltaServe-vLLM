@@ -50,7 +50,8 @@ def _pack(lengths, cap: int) -> list[list[int]]:
 
 
 def simulate_batches(lengths, batch_tokens: int,
-                     step_tokens: int | None = None) -> list[tuple[int, int]]:
+                     step_tokens: int | None = None,
+                     whole_batches: bool = False) -> list[tuple[int, int]]:
     """One epoch packed the way it is trained — the admission loop takes the
     SMALLEST untrained sample first (``FinetuningStore.pop_next``) until the
     step's buffer (``step_tokens``) is full, and a backward batch is whole
@@ -60,6 +61,8 @@ def simulate_batches(lengths, batch_tokens: int,
     last batch of a step is a partial one. Samples longer than a batch are
     skipped (the store drops them at load)."""
     cap = int(batch_tokens)
+    if whole_batches:                 # the step ends on a batch boundary
+        step_tokens = None
     step = max(cap, int(step_tokens or cap))
     order = sorted(int(x) for x in lengths if 0 < int(x) <= cap)
     return [(len(b), max(b)) for st in _pack(order, step) for b in _pack(st, cap)]
@@ -123,9 +126,96 @@ def choose_budget(lengths, batch_tokens: int, *, step_tokens: int | None = None,
             "mean_longest_x_bn": real}
 
 
+def choose_shapes(batches, bn_max: int, l_max: int, k: int,
+                  margin: float = 1.15) -> list[tuple[int, int]]:
+    """``k - 1`` more attention shapes INSIDE the budget ``bn_max x l_max``
+    (``backward_cuda_graph_attn_shapes``), so that a backward pays for the
+    padding of the smallest shape that holds it. An epoch runs from batches of
+    many short samples to batches of few long ones, so the batches the budget
+    holds are cut by their longest sample into ``k`` runs, each with the shape
+    of its largest batch; the cut that minimises the padded work
+    (Σ ``bn · l²`` over the batches) is found exactly. Returns the extra
+    shapes (the budget itself keeps the last run and everything else)."""
+    k = int(k)
+    fit = sorted(((lo, bn) for bn, lo in batches if bn <= bn_max and lo <= l_max))
+    if k <= 1 or len(fit) < 2:
+        return []
+    # distinct longest lengths: (l, count, max bn among batches up to here)
+    groups: list[list[int]] = []
+    for lo, bn in fit:
+        if groups and groups[-1][0] == lo:
+            groups[-1][1] += 1
+            groups[-1][2] = max(groups[-1][2], bn)
+        else:
+            groups.append([lo, 1, bn])
+    n = len(groups)
+    k = min(k, n)
+
+    def shape(i: int, j: int) -> tuple[int, int, int]:
+        """Groups i..j as one run: (bn with margin, l, batches)."""
+        bn = max(g[2] for g in groups[i:j + 1])
+        cnt = sum(g[1] for g in groups[i:j + 1])
+        return min(bn_max, int(math.ceil(bn * margin))), groups[j][0], cnt
+
+    def cost(i: int, j: int, last: bool) -> float:
+        bn, lo, cnt = shape(i, j)
+        if last:                      # the budget takes the last run
+            bn, lo = bn_max, l_max
+        return float(cnt) * bn * lo * lo
+
+    INF = float("inf")
+    # best[c][j]: groups 0..j in c runs (the run ending at n-1 is the budget)
+    best = [[INF] * n for _ in range(k + 1)]
+    cut = [[-1] * n for _ in range(k + 1)]
+    for j in range(n):
+        best[1][j] = cost(0, j, j == n - 1)
+    for c in range(2, k + 1):
+        for j in range(c - 1, n):
+            for i in range(c - 1, j + 1):
+                v = best[c - 1][i - 1] + cost(i, j, j == n - 1)
+                if v < best[c][j]:
+                    best[c][j], cut[c][j] = v, i
+    c = min(range(1, k + 1), key=lambda x: best[x][n - 1])
+    runs: list[tuple[int, int]] = []          # (first group, last group)
+    j = n - 1
+    while c >= 1:
+        i = cut[c][j] if c > 1 else 0
+        runs.append((i, j))
+        j, c = i - 1, c - 1
+    out = {shape(i, j)[:2] for i, j in runs if j != n - 1}
+    out.discard((int(bn_max), int(l_max)))
+    return sorted(out, key=lambda x: x[0] * x[1] * x[1])
+
+
+def extra_shapes(ft_cfg, bn_max: int, l_max: int, tokenizer_name=None, *,
+                 lengths=None) -> list[tuple[int, int]]:
+    """The extra attention shapes for a resolved budget ([] with
+    ``backward_cuda_graph_attn_shapes`` <= 1 or without a dataset)."""
+    k = int(getattr(ft_cfg, "backward_cuda_graph_attn_shapes", 1) or 1)
+    if k <= 1:
+        return []
+    try:
+        if lengths is None:
+            lengths = dataset_lengths(ft_cfg, tokenizer_name)
+    except Exception:  # noqa: BLE001 — only a speed-up
+        return []
+    if not lengths:
+        return []
+    batches = simulate_batches(lengths, batch_tokens_of(ft_cfg), _step_of(ft_cfg))
+    return choose_shapes(batches, int(bn_max), int(l_max), k)
+
+
 def batch_tokens_of(ft_cfg) -> int:
     """FT tokens per backward batch (``bwd_batch_size``)."""
     return bwd_tokens_of(ft_cfg)
+
+
+def _step_of(ft_cfg) -> int | None:
+    """The step size the packing follows (None with ``bwd_whole_batches``: a
+    step then ends on a batch boundary, every batch is a full one)."""
+    if getattr(ft_cfg, "bwd_whole_batches", False):
+        return None
+    return step_tokens_of(ft_cfg)
 
 
 def coverage_of(lengths, batch_tokens: int, bn_max: int, l_max: int,
@@ -137,7 +227,18 @@ def coverage_of(lengths, batch_tokens: int, bn_max: int, l_max: int,
     return sum(1 for bn, lo in batches if bn <= bn_max and lo <= l_max) / len(batches)
 
 
+_LENGTHS: dict = {}
+
+
 def dataset_lengths(ft_cfg, tokenizer_name: str | None) -> list[int]:
+    key = (getattr(ft_cfg, "data_path", None), tokenizer_name,
+           batch_tokens_of(ft_cfg), getattr(ft_cfg, "max_prepare", None))
+    if key not in _LENGTHS:
+        _LENGTHS[key] = _dataset_lengths(ft_cfg, tokenizer_name)
+    return _LENGTHS[key]
+
+
+def _dataset_lengths(ft_cfg, tokenizer_name: str | None) -> list[int]:
     """Token length of every sample the store would train on (tokenized like
     the scheduler's store does; empty when there is no corpus or tokenizer)."""
     path = getattr(ft_cfg, "data_path", None)
@@ -176,9 +277,9 @@ def resolve(ft_cfg, tokenizer_name: str | None = None, *, lengths=None,
                 info = {"configured": True, "batch_tokens": batch_tokens_of(ft_cfg),
                         "coverage": coverage_of(lengths, batch_tokens_of(ft_cfg),
                                                 int(bn), int(l),
-                                                step_tokens_of(ft_cfg)),
+                                                _step_of(ft_cfg)),
                         "suggest": choose_budget(lengths, batch_tokens_of(ft_cfg),
-                                                 step_tokens=step_tokens_of(ft_cfg),
+                                                 step_tokens=_step_of(ft_cfg),
                                                  local_heads=local_heads)}
         except Exception:  # noqa: BLE001 — only a diagnostic
             info = None
@@ -198,7 +299,7 @@ def resolve(ft_cfg, tokenizer_name: str | None = None, *, lengths=None,
         return (DEFAULT_BN_MAX if _is_auto(bn) else int(bn),
                 DEFAULT_L_MAX if _is_auto(l) else int(l), info)
     info = choose_budget(lengths, batch_tokens_of(ft_cfg),
-                         step_tokens=step_tokens_of(ft_cfg), local_heads=local_heads)
+                         step_tokens=_step_of(ft_cfg), local_heads=local_heads)
     return (info["bn_max"] if _is_auto(bn) else int(bn),
             info["l_max"] if _is_auto(l) else int(l), info)
 

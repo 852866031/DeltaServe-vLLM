@@ -48,6 +48,7 @@ model runner, and `finetune_features.model_runner` picks between the two there.)
 5. [Implementation](#implementation)
    - [Forward pass](#forward-pass)
    - [Backward pass](#backward-pass)
+   - [Step, backward batch and per-step sizes](#step-backward-batch-and-per-step-sizes)
    - [CUDA graphs at a glance](#cuda-graphs-at-a-glance)
    - [Interrupts and pauses](#interrupts-and-pauses-protecting-inference-latency)
    - [Throttles and admission control](#throttles-and-admission-control)
@@ -426,7 +427,7 @@ Every step is one vLLM batch. What runs depends on what the batch contains:
 | Batch type | Contains | How it runs | CUDA graph | Activation save |
 |---|---|---|---|---|
 | **Inference-only** | prefill and/or decode | stock vLLM | ✅ stock: piecewise, plus FULL for uniform decode | — |
-| **Mixed** | inference + FT samples | compiled forward | ✅ **`has_ft` piecewise set** (`graph_ft_batches`, Qwen3), up to `graph_ft_max_tokens` (512) padded tokens; larger batches run compiled without a graph. Never FULL | `torch.ops.vllm.dserve_save_rows`, a capturable op fed by persistent index tensors |
+| **Mixed** | inference + FT samples | compiled forward | ✅ **`has_ft` piecewise set** (`graph_ft_batches`; Qwen3 and Llama-3), up to `graph_ft_max_tokens` (512) padded tokens; larger batches run compiled without a graph. Never FULL | `torch.ops.vllm.dserve_save_rows`, a capturable op fed by persistent index tensors |
 | **Mixed** (graphs off / Llama-3) | inference + FT | eager | ❌ | Python forward hooks (slice fast path) |
 | **FT-only** | only FT samples (idle GPU) | compiled + graphs with `graph_ft_only_batches`, else eager | ✅ with `graph_ft_only_batches`: replays the mixed batches' `has_ft` graphs; ❌ otherwise (default) | same as above |
 
@@ -473,6 +474,61 @@ A new family follows the same table by providing those functions
 `_maybe_pause` is called **between** the graphs of every layer and inside the LM
 head's chunk loop. It cannot sit inside a captured region, which is why the
 backward is three graphs per layer rather than one graph per step.
+
+### Step, backward batch and per-step sizes
+
+Four sizes, all in FT tokens (`finetune_param`). With none of them set, all are
+`max_saved_finetuning_tokens` — one buffer, one backward, one step.
+
+| Key | What it sizes | Default |
+|---|---|---|
+| `ft_step_size` | one **optimizer step** = the activation buffer the forward fills | `max_saved_finetuning_tokens` |
+| `bwd_batch_size` | one **backward**: the child trains the step this many tokens at a time (whole samples), accumulating gradients, and updates + publishes once per step. Must divide `ft_step_size`. Also the size of the backward graphs and the longest trainable sample | `ft_step_size` |
+| `ft_tokens_per_step` | the FT tokens one **forward step with inference tokens** may carry | `bwd_batch_size` |
+| `ft_only_tokens_per_step` | the FT tokens a **forward step without inference tokens** may carry (it is abandoned when a request arrives, so it can be large) | `ft_tokens_per_step` |
+| `bwd_whole_batches` | with several backwards per step: end the step when its batches are full, not when its rows are — otherwise the remainder of whole-sample packing becomes one more backward of a few dozen tokens at the price of a whole one | `false` |
+
+What the sizes cost and buy (Qwen3-14B TP=2, 2× RTX 5090, vLLM 0.34, production
+timeline, TTFT SLO 0.4 s, average-TBT target 35 ms, single runs; `idle` = no
+inference traffic):
+
+| buffer / backward / mixed-step / FT-only-step | FT tok/s | TTFT p50 / p99 | requests within the TBT target | FT tok/s idle |
+|---|---|---|---|---|
+| 256 / 256 / 256 / 256 (the default preset) | 602 | 74 / 112 ms | 100 % | 1263 |
+| 1024 / 256 / 256 / 256 | 589 | 75 / 122 ms | 97.8 % | — |
+| 1024 / 256 / 256 / 256, `bwd_whole_batches` | 624 | 77 / 122 ms | 98.5 % | 1276 |
+| 1024 / 1024 / 256 / 256 | 767 | 86 / 125 ms | 99.3 % | 1659 |
+| **1024 / 1024 / 256 / 1024** | **795** | 86 / 125 ms | 99.4 % | **1877** |
+| 1024 / 1024 / 512 / 1024 | 860 | 93 / 138 ms | 98.3 % | — |
+| 1024 / 1024 / 1024 / 1024 | 860 | 94 / 185 ms | 98.5 % | 1885 |
+
+- **A large backward is cheap per token** (bigger GEMMs, one LM head, one publish), and
+  it still yields between its per-layer graphs: the backward batch is not what makes a
+  large buffer slow for inference.
+- **A large forward step next to inference tokens is**: the admission fills it up to
+  the TTFT SLO, so TTFT moves towards the SLO (p99 125 → 185 ms, still 100 % within
+  0.4 s). `ft_tokens_per_step` caps that; FT-only steps need no cap.
+- **Several backwards per step** (`bwd_batch_size` < `ft_step_size`) keep FT admission
+  open while the earlier batches run, and a step that carries FT tokens pauses the
+  child like an inference prefill does. At equal memory they are slower than one
+  backward of the whole step; they are for when the backward batch must stay small
+  (GPU memory of the child, or a longer yield than one layer graph is too much).
+- `configs/preset/serving_config_finetuning_qwen3_14b_tp2_step1024.yaml` is the
+  1024 / 1024 / 256 / 1024 row plus `avg_tbt_headroom: 0.8`,
+  `avg_tbt_admission_headroom: 0.9` and `overload_hold_s: 1.0`: the larger backward
+  pushes FT to the limit of the TBT target (loose-half: 77.5 % of the requests within
+  it), and with these it is 100 % again. Against the 256-token preset on vLLM 0.33:
+
+  | timeline | FT tok/s | TTFT p50 | TTFT p99 | average TBT p50 | within the TBT target |
+  |---|---|---|---|---|---|
+  | tight-half | 349 → 481 | 101 → 70 ms | 138 → 167 ms | 35.8 → 28.4 ms | 45 → 100 % |
+  | loose-half | 627 → 922 | 86 → 66 ms | 129 → 170 ms | 27.4 → 23.9 ms | 100 → 100 % |
+  | production | 466 → 751 | 69 → 92 ms | 89 → 127 ms | 20.3 → 23.6 ms | 100 → 99.6 % |
+
+  100 % of the requests within the 0.4 s TTFT SLO everywhere; the TTFT tail is the price.
+- Memory: the buffer is 2.70 MB per token per GPU on Qwen3-14B TP=2 (1024 → 2.6 GiB);
+  the child of a 1024-token backward peaks at 5.2 GiB (256: 2.25). On the 5090s this
+  needs `gpu_memory_utilization: 0.86`.
 
 ### CUDA graphs at a glance
 
@@ -530,6 +586,7 @@ applies. The throttles shape admission further:
 | `slo.avg_tbt_window_s` | how `avg_tbt_slo` is enforced: FT joins a step with decode requests only while the average time between tokens over the last N seconds (every decode token of the window, that step included) stays within it. `0` = only the per-step maximum is checked | `1.0` |
 | `slo.avg_tbt_pause_backward` (on), `slo.avg_tbt_headroom` (0.9) | the same target against the backward: a decode-only step that would share the GPU with a running backward is predicted WITH the overlap (the estimator's decode-with-backward regime); if the window average would then pass `avg_tbt_headroom` × `avg_tbt_slo`, the step pauses the backward child, as an inference prefill does. At a 20 ms target (Qwen3-14B TP=2, production timeline at 1× / 2× rate): requests within the target 58 → 88 % / 37 → 53 %, FT unchanged |
 | `slo.avg_tbt_admission_headroom` (1.0) | the fraction of `avg_tbt_slo` FT admission steers the window average to. 0.9 on the same runs: 88 → 81 % / 53 → 68 %, FT −5 / −11 % — worth it only near capacity |
+| `slo.overload_hold_s` (0 = off; 1.0 in the templates) | FT stands down while inference is at or over its SLO: when the window's average time between tokens is above `avg_tbt_slo`, or the oldest waiting request has waited 0.9 × `ttft_slo`, no FT is admitted and the backward stays paused until this long after the last such moment. The per-step checks only ask whether one more step fits, which lets FT keep a share of a system that cannot meet its target even alone. See the table below |
 | **Step-time estimator** (`slo.profile_on_launch`, `profile_num_repeats`) | 6-parameter model `T ≈ α·S + β·T_in + γ·T_ft + δ·B_d + ε·K + c`, with separate coefficients for 5 regimes (inference prefill, FT-only, decode-only, decode with backward running, FT-mixed). Seeded by a profiling pass at launch, refit online every 256 steps | profiling on |
 | `slo.coserving_admission_phase` | `prefill`: FT rides only steps that carry inference prefill (or idle steps). `both`: FT may also ride decode-only / mixed steps (`BothPhaseFinetuneScheduler`) | `prefill` |
 | `slo.decode_only_ft_safety_margin` | with `both`: scale `max_tbt_slo` on decode-only steps | `0.7` |
@@ -577,6 +634,29 @@ margin also inflates decode-only predictions (≈ 4.7 % relative error there), u
 Steps without FT are not affected; inference-only prefill steps exceeded 50 ms on their
 own in 72–80 % of the cases in every arm, which no admission setting can change.
 
+**Near and over capacity** (Qwen3-14B TP=2, the production timeline with prompts and outputs
+scaled up; average-TBT target 35 ms, TTFT SLO 0.4 s; requests within the TBT target / FT tok/s;
+single runs):
+
+| workload (prompt × / output ×, rate) | inference only | + FT (default) | + `avg_tbt_admission_headroom: 0.9` | + `overload_hold_s: 1.0` |
+|---|---|---|---|---|
+| production (1 / 1) | 100 % | 100 % / 602 | — | 100 % / 574 |
+| 3 / 3: at capacity | 100 % | 92.5 % / 346 | 98.3 % / 338 | 98.3 % / 320 |
+| 4 / 3: just over | 83.9 % | 69.1 % / 267 | 78.8 % / 261 | 83.0 % / 251 |
+| 3 / 2 at twice the rate: overloaded (TTFT 95.9 % alone) | 36.1 % | 28.7 % / 275, TTFT 81.5 % | — | 34.1 % / 252, TTFT 82.6 %; with a 63k-token KV cache 33.7 % / 259, TTFT 96.1 % |
+
+With the hold, the TBT attainment of a system at or over its capacity is the one it has
+without FT, for 5–8 % of the FT throughput (a 5 s hold costs 29 % at the normal rate and
+buys nothing more).
+
+The TTFT lost in the overloaded row is **KV cache capacity, not FT**. On vLLM 0.34 the
+KV cache is what is left of `gpu_memory_utilization` after the CUDA graphs (the `has_ft`
+set included) and the FT buffers: 30,720 tokens at 0.80, against 89,088 for an
+inference-only server. The burst's decode contexts reached 28k tokens and requests
+queued for KV. At `gpu_memory_utilization: 0.88` (63,488 tokens; the preset's value now)
+the same run is at 96.1 % TTFT attainment with FT still at 259 tok/s. The `GPU KV cache
+size` line of the launch log tells which case a deployment is in.
+
 ### Optimizations
 
 | Optimization | Effect | Flag |
@@ -585,6 +665,9 @@ own in 72–80 % of the cases in every arm, which no admission setting can chang
 | FT-only forward CUDA graphs (abortable) | removes ~63 ms of host dispatch per FT-only step on Qwen3-14B TP=2; production FT +5 % | `graph_ft_only_batches` |
 | Backward CUDA graphs (3 per layer) | ~5 ms less dispatch per cycle | `backward_cuda_graph` |
 | Backward attention graph budget from the dataset | the attention graph is used instead of falling back to eager every cycle: cycle 147 → 122 ms, FT +6 % (Qwen3-14B TP=2) | `backward_cuda_graph_attn_bn_max` / `_l_max` = `auto` (default) |
+| Several attention graph shapes | a backward replays the smallest padded-attention shape that holds it, chosen from the dataset (15 × 27, 11 × 37, 7 × 50 inside 15 × 57): the attention backward of a cycle 8.6 → ~4.2 ms in isolation, within the noise of a timeline run (cycle 232 → 230 ms) | `backward_cuda_graph_attn_shapes` (1 = off) |
+| One large backward, small mixed steps | see [sizes](#step-backward-batch-and-per-step-sizes): FT +32 % on production, +49 % with no inference | `ft_tokens_per_step`, `ft_only_tokens_per_step` |
+| Fill the graph padding | admit FT samples the SLO check refuses while they fit the rows of the graph size the step already replays; no measurable effect on tight-half (FT 415 → 417 tok/s: the captured sizes are 8–64 tokens apart) | `fill_graph_padding` (off) |
 | Backward child without torch's `_native` op overrides | torch 2.14 adds Python dispatch checks to the eager backward's small ops; on a slow-CPU host 2111 → 1764 µs per FT token (A100 VM, Qwen3-14B TP=4). Set for the child only, never for the serving processes | `backward_disable_torch_native` (on) |
 | Save MLP gate/up pre-activation | skips the gate_up GEMM recompute | `save_activations` (on) |
 | Save q/k/v | skips Q/K/V projection (+ RoPE on Llama-3), ~400–500 GFLOPs per backward on Llama-3-8B | `save_attn_qkv` |
@@ -919,7 +1002,7 @@ into `--additional-config`. The rest become ordinary vLLM flags.
 
 | Section | Holds |
 |---|---|
-| `finetune_param` | the training job: switch, FT adapter, corpus `data_path`, epochs, lr, weight decay, buffer size `max_saved_finetuning_tokens` (or `ft_step_size` tokens per optimizer step trained in backward batches of `bwd_batch_size`, gradients accumulated), adapter checkpoints (`adapter_save_*`) |
+| `finetune_param` | the training job: switch, FT adapter, corpus `data_path`, epochs, lr, weight decay, buffer size `max_saved_finetuning_tokens` (or the four [sizes](#step-backward-batch-and-per-step-sizes): `ft_step_size`, `bwd_batch_size`, `ft_tokens_per_step`, `ft_only_tokens_per_step`), adapter checkpoints (`adapter_save_*`) |
 | `finetune_features` | how co-serving runs it: backward precision and CUDA graphs, activation saves, mixed-batch forward graphs, interrupts, pauses |
 | `throttles` | admission shapers ([table above](#throttles-and-admission-control)) |
 | `slo` | `ttft_slo`, `avg_tbt_slo`, `max_tbt_slo`, estimator profiling |
@@ -1139,10 +1222,12 @@ tests/run_all.sh /tmp/ds-tests 'test_qwen3_*'  # a subset
 | Backward math (gradcheck vs autograd), graph == eager | `test_{llama3,qwen3}_backward`, `test_{llama3,qwen3}_backward_graph`, `test_{llama3,qwen3}_train_overfit` | 1 GPU |
 | TP sharding and gradients | `test_{llama3,qwen3}_tp_shard`, `test_{llama3,qwen3}_tp_backward_gloo`, `test_tp_bucket_gloo`, `test_tp_timing_relay`, `test_ft_abort_tp` | CPU (gloo) |
 | Hooks on vLLM's v2 model runner | `test_runner_v2` | CPU |
-| Several backward batches per optimizer step: k batches equal one backward of the whole step (both families), the child's row ranges, when batches go out and when admission closes, aborts, the config keys | `test_grad_accum` | CPU |
-| Backward attention graph budget chosen from the dataset (`auto`), the launch note for a configured one, eager-cycle accounting, the child started without torch's `_native` overrides | `test_bwd_budget` | CPU |
+| Several backward batches per optimizer step: k batches equal one backward of the whole step (both families), the child's row ranges, when batches go out and when admission closes, aborts, whole batches, the per-step caps, the config keys | `test_grad_accum` | CPU |
+| Backward attention graph budget chosen from the dataset (`auto`) and the smaller shapes inside it, the launch note for a configured one, eager-cycle accounting, the child started without torch's `_native` overrides | `test_bwd_budget` | CPU |
+| FT samples in the padding of the graph a step already replays | `test_fill_padding` | CPU |
+| The average-TBT window, the backward gate, the overload hold | `test_tbt_window` | CPU |
 | TP on real NCCL | `test_tp_backward_graph_nccl`, `test_tp_trainer_graph_nccl` | 2 GPUs |
-| **Inference is unperturbed by co-serving** (amplified FT adapter + positive control; FT provably co-batched with real prefills and decodes; eager + CUDA graphs) | `test_phase1_m1` (Qwen3-0.6B), `test_tp_inference_leak` (Qwen3-14B TP=2, production preset) | 1 GPU / 2 GPUs + weights |
+| **Inference is unperturbed by co-serving** (amplified FT adapter + positive control; FT provably co-batched with real prefills and decodes; eager + CUDA graphs) | `test_phase1_m1` (Qwen3-0.6B), `test_llama3_inference_leak` (Llama-3-8B; also that its mixed steps replay the `has_ft` graphs), `test_tp_inference_leak` (Qwen3-14B TP=2, production preset) | 1 GPU / 2 GPUs + weights |
 | End-to-end engine / server | `test_phase1_m2`, `test_pause_on_arrival`, `test_tp_no_orphans` | GPU(s) + model weights |
 | Finetuning jobs, adapter save | `test_ft_job`, `test_adapter_save` | CPU |
 | Adapter routing: switch, indexing, decision, pool, resolver, route path, engine | `test_adapter_routing_switch`, `test_adapter_indexing`, `test_adapter_decision`, `test_adapter_pool`, `test_adapter_pool_resolver`, `test_adapter_route_path`, `test_adapter_engine` | CPU (+ the e5-large-v2 weights) |

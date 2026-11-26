@@ -147,6 +147,7 @@ def build_backward_meta(hf_config: Any, ft_cfg: Any, *, lm_head_key: str | None,
     # config, or chosen from the dataset (``auto``). Only looked at when the
     # backward graphs are on (it tokenizes the corpus).
     attn_bn, attn_l, attn_note = 8, 64, None
+    attn_extra: list = []
     if bool(getattr(ft_cfg, "backward_cuda_graph", False)):
         from deltaserve import bwd_budget
 
@@ -154,6 +155,11 @@ def build_backward_meta(hf_config: Any, ft_cfg: Any, *, lm_head_key: str | None,
         attn_bn, attn_l, _info = bwd_budget.resolve(
             ft_cfg, tokenizer, local_heads=_heads)
         attn_note = bwd_budget.describe(attn_bn, attn_l, _info)
+        attn_extra = [list(x) for x in bwd_budget.extra_shapes(
+            ft_cfg, attn_bn, attn_l, tokenizer)]
+        if attn_extra:
+            attn_note += ("; smaller shapes inside it: "
+                          + ", ".join(f"{b} x {l}" for b, l in attn_extra))
     num_heads = int(hf_config.num_attention_heads)
     head_dim = int(getattr(hf_config, "head_dim", None)
                    or hf_config.hidden_size // num_heads)
@@ -202,6 +208,8 @@ def build_backward_meta(hf_config: Any, ft_cfg: Any, *, lm_head_key: str | None,
         "pause_on_arrival": bool(getattr(ft_cfg, "pause_on_arrival", False)),
         "backward_cuda_graph_attn_bn_max": attn_bn,
         "backward_cuda_graph_attn_l_max": attn_l,
+        # [backward_cuda_graph_attn_shapes] smaller shapes inside the budget
+        "backward_cuda_graph_attn_extra_shapes": attn_extra,
         # one line for the launch log (how the budget was chosen / what it holds)
         "attn_budget_note": attn_note,
         # the child's sizes follow the backward batch, not the step

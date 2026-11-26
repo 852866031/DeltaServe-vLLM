@@ -13,9 +13,12 @@
 #   - profile_on_launch          : ON since M4.2 (timing samples ride the TP relay)
 #
 # Memory (per 5090): ~14.8 GB weight shard + 1.5 GB all-gathered lm_head in the
-# backward child + activation buffers; gpu_memory_utilization starts at 0.80
-# to leave the child its fp32 logits / attention temporaries. Raise once the
-# first run reports headroom.
+# backward child + activation buffers. gpu_memory_utilization 0.88 (was 0.80
+# until 2026-11-26): on vLLM 0.34 the KV cache is what is left of that share
+# after the graphs and FT buffers, 30,720 tokens at 0.80 against 89,088 for an
+# inference-only server; an overloading burst filled it and requests queued for
+# KV (TTFT attainment 96 % -> 82 %). At 0.88: 63,488 tokens, 96 %. The child of
+# a 256-token backward needs <= 2.25 GiB of the remaining 3.8.
 #
 # Qwen3-14B-Base geometry: 40 layers, hidden 5120, 40 q / 8 kv heads (head_dim
 # 128), intermediate 17408, vocab 151936 (multiple of 64 → no vLLM padding),
@@ -99,7 +102,7 @@ model:
   max_model_len: 2048
 
 engine:
-  gpu_memory_utilization: 0.80          # first bring-up; see header
+  gpu_memory_utilization: 0.88          # KV 63,488 tokens (0.80: 30,720, which a burst of long requests fills); see header
   enforce_eager: false
   disable_log_stats: true
 

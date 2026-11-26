@@ -22,7 +22,8 @@ finetuning is off, so a plain deployment pays one is None check per hook).
   engine serves inference, instead of dying after it reported ready.
 """
 
-from deltaserve.ft_sizes import bwd_tokens_of, step_tokens_of
+from deltaserve.ft_sizes import (bwd_tokens_of, ft_only_tokens_of, fwd_tokens_of,
+                                step_tokens_of)
 import queue
 
 from deltaserve import dprint
@@ -285,7 +286,7 @@ def profile_execution_model(engine) -> None:
 
     gen = ProfilingShapeGenerator(
         batch_max_tokens=engine.vllm_config.scheduler_config.max_num_batched_tokens,
-        max_saved_finetuning_tokens=bwd_tokens_of(ft_cfg),   # FT tokens one step may carry
+        max_saved_finetuning_tokens=ft_only_tokens_of(ft_cfg),   # FT tokens one step may carry
         max_req_len=engine.vllm_config.model_config.max_model_len,
     )
     warmup, recorded = gen.prepare()
@@ -308,6 +309,7 @@ def profile_execution_model(engine) -> None:
         coord.fill_count = 0
         coord.reserved_fill = 0
         coord.sample_lens = []
+        coord._step_lens = []
         coord.admission_open = True
         coord.pending_backward = False
         coord.epoch_flush_pending = False

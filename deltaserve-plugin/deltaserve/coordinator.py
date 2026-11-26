@@ -278,6 +278,8 @@ class FinetuneCoordinator:
         self.per_step_budget = int(
             per_step_budget if per_step_budget is not None else capacity
         )
+        # [ft_only_tokens_per_step] the cap of a step without inference tokens
+        self.ft_only_budget = self.per_step_budget
         # [bwd_batch_size] FT tokens per backward batch. Equal to the capacity
         # (the default) there is one backward per buffer and everything below
         # behaves as it always did. Smaller, the buffer holds one OPTIMIZER
@@ -287,6 +289,14 @@ class FinetuneCoordinator:
         # batches of the current step have consumed; ``_bwd_inflight`` is the
         # batch on the child, (rows, samples, final).
         self.bwd_batch = self.capacity
+        # [bwd_whole_batches] The step ends when its capacity / bwd_batch
+        # batches are full instead of when its rows are: batches are whole
+        # samples, so filling the rows leaves a remainder that becomes one more
+        # backward of a few dozen tokens at the cost of a whole one (the
+        # backward graphs are padded to the batch size). ``_step_lens``: the
+        # lengths of the step's samples, committed and reserved, in row order.
+        self.whole_batches = False
+        self._step_lens: list[int] = []
         self._bwd_rows = 0
         self._bwd_samples = 0
         self._bwd_inflight: tuple | None = None
@@ -497,9 +507,34 @@ class FinetuneCoordinator:
         self._completed_samples = []
         return out
 
-    def space_remaining(self) -> int:
-        # Free rows = capacity minus committed AND reserved-in-flight.
-        return max(0, self.capacity - self.fill_count - self.reserved_fill)
+    def space_remaining(self, next_len: int | None = None,
+                        admitted_now: int = 0) -> int:
+        """Free rows = capacity minus committed AND reserved-in-flight.
+
+        [bwd_whole_batches] Then: the rows the next admission may take, which
+        is what is left of the batch being filled, or a whole new batch when
+        the next sample (``next_len``; the smallest sample when not given)
+        does not fit there and the step has a batch left. One admission so
+        stays inside one batch, and the count is exact. ``admitted_now``: rows
+        admitted in this schedule call and not reserved yet."""
+        base = max(0, self.capacity - self.fill_count - self.reserved_fill)
+        if not (self.whole_batches and self.multi_batch):
+            return base
+        b = self.bwd_batch
+        slot, used = 0, 0
+        for s in self._step_lens:
+            if used and used + s > b:
+                slot, used = slot + 1, 0
+            used += s
+        if admitted_now:
+            if used and used + admitted_now > b:
+                slot, used = slot + 1, 0
+            used += admitted_now
+        left = b - used
+        need = int(next_len) if next_len is not None else self.min_sample_len
+        if need > left:
+            left = b if slot + 1 < self.capacity // b else 0
+        return max(0, min(base - admitted_now, left)) + admitted_now
 
     @property
     def multi_batch(self) -> bool:
@@ -522,12 +557,14 @@ class FinetuneCoordinator:
         if (not self.ft_started or not self.admission_open
                 or self.backward_blocks_admission):
             return 0
-        if self.multi_batch and self.abortable_in_flight:
+        if ((self.multi_batch or self.per_step_budget < self.capacity)
+                and self.abortable_in_flight):
             # One step carries a batch's worth here, so FT-only steps follow
             # each other while the buffer fills (a single one filled it
             # before): wait for the abortable one to be committed or aborted.
             return 0
-        return min(self.per_step_budget, self.space_remaining())
+        return min(max(self.per_step_budget, self.ft_only_budget),
+                   self.space_remaining())
 
     @property
     def abortable_in_flight(self) -> bool:
@@ -755,6 +792,8 @@ class FinetuneCoordinator:
         offset = self.fill_count + self.reserved_fill
         self.reserved_fill += int(n)
         self._inflight_ft.append([int(n), bool(abortable)])
+        lens = [int(getattr(s, "input_len", 0)) for s in (samples or [])]
+        self._step_lens.extend(lens if lens and sum(lens) == int(n) else [int(n)])
         if samples:
             self.buffer_samples.extend(samples)
         return offset
@@ -769,6 +808,9 @@ class FinetuneCoordinator:
         doesn't try to commit-train samples that never had their activations
         actually saved."""
         self.reserved_fill = max(0, self.reserved_fill - int(n))
+        gone = 0                      # the step's last rows: newest reservation
+        while self._step_lens and gone < int(n):
+            gone += self._step_lens.pop()
         for i in range(len(self._inflight_ft) - 1, -1, -1):
             if self._inflight_ft[i][0] == int(n):
                 del self._inflight_ft[i]
@@ -826,7 +868,8 @@ class FinetuneCoordinator:
             return
         if (self.fill_count + self.reserved_fill + admitted_now) <= 0:
             return
-        effective_space = self.space_remaining() - admitted_now
+        effective_space = self.space_remaining(
+            next_sample_len, admitted_now) - admitted_now
         if next_sample_len is None or next_sample_len > effective_space:
             self.epoch_flush_pending = True
             self.admission_open = False
@@ -1089,6 +1132,7 @@ class FinetuneCoordinator:
         self._inflight_ft = []
         self.sample_lens = []
         self.buffer_samples = []
+        self._step_lens = []
         self._bwd_rows = 0
         self._bwd_samples = 0
         self.admission_open = True

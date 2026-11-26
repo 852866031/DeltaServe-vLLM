@@ -420,6 +420,82 @@ C.ok("... its ack resets and reopens", c.fill_count == 0 and c.admission_open
      and len(c.trained) == 1 and len(c.trained[0]) == 3)
 
 
+# -- [bwd_whole_batches] the step ends when its batches are full --------------
+def run_step(c, sample_len, child=None, max_steps=50):
+    """The scheduler's side of one optimizer step with samples of one length:
+    ask for the cap, admit what fits, tell the coordinator, reserve, commit.
+    Acks every batch at once. Returns the rows admitted per engine step."""
+    took = []
+    for _ in range(max_steps):
+        if c.next_ft_budget() <= 0:
+            break
+        cap = min(c.space_remaining(sample_len), c.per_step_budget)
+        k = cap // sample_len
+        if k:
+            lens = [sample_len] * k
+            samples = [NS(request_id=f"w{id(c)}-{len(c.buffer_samples) + i}",
+                          input_len=sample_len) for i in range(k)]
+        else:
+            lens, samples = [], []
+        c.note_injection(sample_len, admitted_now=sum(lens))
+        if lens:
+            c.reserve(sum(lens), samples)
+            c.record_capture(sum(lens), lens)
+            took.append(sum(lens))
+        else:
+            c.try_epoch_flush()
+        while child is not None and c.pending_backward:
+            child.done()
+            c.poll_backward()
+        if child is not None and child.calls and child.calls[-1].final \
+                and c.fill_count == 0:
+            break                     # the step's last batch was acked
+    return took
+
+
+c = coord()                           # 48 rows, batches of 16, samples of 6
+ch = c.backward_process
+took = run_step(c, 6, ch)
+C.ok("rows-full step (default): 48 rows of 6-token samples = 4 backwards, the "
+     "last of them the remainder",
+     [b.n for b in ch.calls] == [12, 12, 12, 12] and ch.calls[-1].final
+     and sum(took) == 48, str([b.n for b in ch.calls]))
+c = coord(capacity=48, bwd=16)
+c.whole_batches = True
+ch = c.backward_process
+took = run_step(c, 6, ch)
+C.ok("whole batches: the step ends with its 3 batches full (36 rows), no "
+     "fourth backward",
+     [b.n for b in ch.calls] == [12, 12, 12] and ch.calls[-1].final
+     and [b.final for b in ch.calls] == [False, False, True]
+     and sum(took) == 36, str([(b.n, b.final) for b in ch.calls]))
+C.ok("... one admission stays inside one batch", all(t <= 12 for t in took),
+     str(took))
+C.ok("... and the next step starts clean",
+     c.fill_count == 0 and c.admission_open and c._step_lens == []
+     and c.space_remaining(6) == 16)
+c = coord(capacity=64, bwd=16)
+c.whole_batches = True
+ch = c.backward_process
+took = run_step(c, 5, ch)             # 3 samples of 5 per batch
+C.ok("whole batches, 64 / 16 with 5-token samples: 4 batches of 15",
+     [b.n for b in ch.calls] == [15, 15, 15, 15] and ch.calls[-1].final,
+     str([b.n for b in ch.calls]))
+c = coord(capacity=48, bwd=16)
+c.whole_batches = True
+s1 = [NS(request_id="r1", input_len=6), NS(request_id="r2", input_len=6)]
+c.reserve(12, s1)
+s2 = [NS(request_id="r3", input_len=6)]
+c.reserve(6, s2, abortable=True)
+c.release_reserve(6, s2)
+C.ok("an aborted reservation gives its place in the batch back",
+     c._step_lens == [6, 6] and c.space_remaining(4) == 4
+     and c.space_remaining(6) == 16)
+c = coord(capacity=16, bwd=16)
+c.whole_batches = True
+C.ok("one batch per step: the key changes nothing",
+     c.space_remaining(6) == 16 and not c.multi_batch)
+
 # ─── D. config ──────────────────────────────────────────────────────────────
 print("D. config")
 from deltaserve.accumulate import FinetuneAccumulator  # noqa: E402
@@ -450,6 +526,40 @@ for bad in (dict(ft_step_size=1000, bwd_batch_size=512),
     C.ok(f"{bad} is refused", refused)
 C.ok("both keys listed under finetune_param",
      {"ft_step_size", "bwd_batch_size"} <= set(FINETUNE_SECTIONS["finetune_param"]))
+from deltaserve.ft_sizes import fwd_tokens_of  # noqa: E402
+C.ok("ft_tokens_per_step: unset = the backward batch; set = itself, never "
+     "above the batch",
+     fwd_tokens_of(FinetuneConfig(ft_step_size=1024, bwd_batch_size=256)) == 256
+     and fwd_tokens_of(FinetuneConfig(max_saved_finetuning_tokens=1024,
+                                      ft_tokens_per_step=256)) == 256
+     and fwd_tokens_of(FinetuneConfig(max_saved_finetuning_tokens=256,
+                                      ft_tokens_per_step=999)) == 256
+     and FinetuneConfig().ft_tokens_per_step is None
+     and "ft_tokens_per_step" in FINETUNE_SECTIONS["finetune_param"])
+from deltaserve.ft_sizes import ft_only_tokens_of  # noqa: E402
+_c = FinetuneConfig(max_saved_finetuning_tokens=1024, ft_tokens_per_step=256)
+C.ok("ft_only_tokens_per_step: unset = ft_tokens_per_step; set = itself, "
+     "between that and the backward batch",
+     ft_only_tokens_of(_c) == 256
+     and ft_only_tokens_of(FinetuneConfig(
+         max_saved_finetuning_tokens=1024, ft_tokens_per_step=256,
+         ft_only_tokens_per_step=1024)) == 1024
+     and ft_only_tokens_of(FinetuneConfig(
+         max_saved_finetuning_tokens=1024, ft_tokens_per_step=256,
+         ft_only_tokens_per_step=64)) == 256
+     and ft_only_tokens_of(FinetuneConfig(
+         max_saved_finetuning_tokens=512, ft_only_tokens_per_step=4096)) == 512
+     and "ft_only_tokens_per_step" in FINETUNE_SECTIONS["finetune_param"])
+c = FinetuneCoordinator(64, per_step_budget=16)      # one backward of 64, steps of 16
+c.ft_started = True
+c.min_sample_len = 4
+C.ok("one backward per step, filled over several forward steps: not "
+     "multi_batch, 16 tokens a step", not c.multi_batch and c.next_ft_budget() == 16)
+c.reserve(16, [NS(request_id="a", input_len=16)], abortable=True)
+C.ok("... and nothing is reserved behind an FT-only step that may still be "
+     "aborted (its rows would leave a hole)", c.next_ft_budget() == 0)
+c.record_capture(16, [16])
+C.ok("... its commit reopens the budget", c.next_ft_budget() == 16)
 old = NS(max_saved_finetuning_tokens=16)
 C.ok("a config object with only the old key resolves",
      (step_tokens_of(old), bwd_tokens_of(old)) == (16, 16))
