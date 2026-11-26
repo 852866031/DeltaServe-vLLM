@@ -20,7 +20,7 @@ the runner aborted (tier C) is rolled back in ``update_from_output``.
 """
 
 from deltaserve.ft_sizes import (bwd_tokens_of, ft_only_tokens_of, fwd_tokens_of,
-                                step_tokens_of)
+                                idle_bwd_tokens_of, step_tokens_of)
 import bisect
 import csv
 import datetime
@@ -115,6 +115,7 @@ class FinetuneScheduler(AsyncScheduler):
                                       per_step_budget=fwd_tokens_of(ft_cfg))
         self._coord.bwd_batch = bwd_tokens_of(ft_cfg)
         self._coord.ft_only_budget = ft_only_tokens_of(ft_cfg)
+        self._coord.bwd_batch_idle = idle_bwd_tokens_of(ft_cfg)
         self._coord.whole_batches = bool(getattr(ft_cfg, "bwd_whole_batches", False))
         lengths = self._ft_injector.store.sorted_lengths
         if lengths:
@@ -1515,6 +1516,11 @@ class FinetuneScheduler(AsyncScheduler):
         # Terminal/partial epoch flush fallback (guarded by reserved==0 inside,
         # so it can't race in-flight saves): fires when no further FT forward
         # will carry the flush.
+        # [bwd_batch_size_idle] no inference request running or waiting
+        if self._coord.bwd_batch_idle > self._coord.bwd_batch:
+            self._coord.idle_now = not self._profiling_mode and not any(
+                not getattr(r, "is_finetuning", False)
+                for r in self.requests.values())
         self._coord.try_epoch_flush()
 
         # [rps_throttle] Per-step gate: close admission_open when the

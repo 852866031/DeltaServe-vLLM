@@ -496,6 +496,65 @@ c.whole_batches = True
 C.ok("one batch per step: the key changes nothing",
      c.space_remaining(6) == 16 and not c.multi_batch)
 
+# -- [bwd_batch_size_idle] one larger backward while no inference is around ---
+def fill(c, lens_per_step):
+    for lens in lens_per_step:
+        samples = [NS(request_id=f"i{id(c)}-{len(c.buffer_samples) + i}",
+                      input_len=l) for i, l in enumerate(lens)]
+        c.note_injection(6, admitted_now=sum(lens))
+        c.reserve(sum(lens), samples)
+        c.record_capture(sum(lens), lens)
+
+
+c = coord(capacity=48, bwd=16)
+c.bwd_batch_idle = 48
+c.idle_now = True
+ch = c.backward_process
+fill(c, [[6, 6], [6, 6], [6, 6]])
+C.ok("idle: no small batch goes out while the step is still filling",
+     not ch.calls and c.next_ft_budget() > 0)
+fill(c, [[6, 6]])                      # 48 rows: the step is full
+b = ch.calls[-1]
+C.ok("idle: the whole step in ONE backward, first and final",
+     len(ch.calls) == 1 and (b.n, b.start, b.first, b.final) == (48, 0, True, True)
+     and c.idle_batches == 1, str(vars(b)))
+ch.done()
+c.poll_backward()
+c.idle_now = False                     # a request arrived
+fill(c, [[6, 6], [6, 5]])
+b = ch.calls[-1]
+C.ok("inference present: batches of the normal size again",
+     len(ch.calls) == 2 and (b.n, b.first, b.final) == (12, True, False), str(vars(b)))
+c.idle_now = True                      # it left again, mid-step
+ch.done()
+c.poll_backward()
+fill(c, [[6, 6], [6, 6]])              # 47 of 48 rows, nothing (>= 4) fits
+b = ch.calls[-1]
+C.ok("idle again mid-step: the rest of the step in one backward, final",
+     len(ch.calls) == 3 and (b.n, b.start, b.first, b.final) == (35, 12, False, True),
+     str(vars(b)))
+c = coord(capacity=48, bwd=16)
+c.idle_now = True
+ch = c.backward_process
+fill(c, [[6, 6], [6, 5]])
+C.ok("key unset (idle size = batch size): idle changes nothing",
+     len(ch.calls) == 1 and ch.calls[-1].n == 12 and c.idle_batches == 0)
+from deltaserve.ft_sizes import idle_bwd_tokens_of  # noqa: E402
+from deltaserve.config import FinetuneConfig as _FC  # noqa: E402
+C.ok("bwd_batch_size_idle: unset = the batch; set = itself, at most the step; "
+     "an FT-only step may then carry as much",
+     idle_bwd_tokens_of(_FC(ft_step_size=1024, bwd_batch_size=256)) == 256
+     and idle_bwd_tokens_of(_FC(ft_step_size=1024, bwd_batch_size=256,
+                                bwd_batch_size_idle=1024)) == 1024
+     and idle_bwd_tokens_of(_FC(ft_step_size=1024, bwd_batch_size=256,
+                                bwd_batch_size_idle=4096)) == 1024)
+try:
+    _FC(ft_step_size=1024, bwd_batch_size=256, bwd_batch_size_idle=128).check_step_sizes()
+    _bad = False
+except ValueError:
+    _bad = True
+C.ok("an idle size below the batch is refused", _bad)
+
 # ─── D. config ──────────────────────────────────────────────────────────────
 print("D. config")
 from deltaserve.accumulate import FinetuneAccumulator  # noqa: E402

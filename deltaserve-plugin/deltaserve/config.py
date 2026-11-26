@@ -175,6 +175,23 @@ class FinetuneConfig:
     change until the step's update), and a step that carries FT tokens pauses
     the child like an inference prefill does."""
 
+    bwd_batch_size_idle: int | None = None
+    """FT tokens per backward batch while NO inference request is running or
+    waiting (None = ``bwd_batch_size``: off). Up to ``ft_step_size``. A larger
+    backward costs less per token; with this the child keeps the small batch
+    (a short yield, a small share of a decode step's time) whenever inference
+    is present and takes what the step holds, up to this size, when it is not.
+    The backward graphs are padded to one batch size, so the child captures a
+    second set for this size and needs the memory of the larger backward
+    (Qwen3-14B TP=2: ~2.25 GiB for 256, ~5.2 GiB for 1024) on top.
+    OFF BY DEFAULT: MEASURED, WORSE THAN ONE LARGE BACKWARD ALWAYS. Qwen3-14B
+    TP=2, 1024 / 256 without -> with an idle size of 1024: FT only 1276 -> 1619
+    tok/s, production 624 -> 708, loose-half 882 — but
+    ``max_saved_finetuning_tokens: 1024`` with ``ft_tokens_per_step: 256``
+    (preset ..._tp2_step1024) gives 1877 / 795 / 922 with a KV cache of 17,408
+    tokens, against 6,144 here (two graph sets in 32 GB). For a deployment
+    that must keep the small backward while inference is present."""
+
     ft_tokens_per_step: int | None = None
     """FT tokens ONE forward step may carry (None = ``bwd_batch_size``: a
     step fills a whole backward batch when nothing else limits it). Smaller
@@ -220,6 +237,11 @@ class FinetuneConfig:
             raise ValueError(
                 f"finetune_param.ft_step_size ({step}) must be a multiple of "
                 f"finetune_param.bwd_batch_size ({bwd})")
+        idle = self.bwd_batch_size_idle
+        if idle is not None and not (bwd <= int(idle) <= step):
+            raise ValueError(
+                f"finetune_param.bwd_batch_size_idle ({idle}) must lie between "
+                f"bwd_batch_size ({bwd}) and ft_step_size ({step})")
 
     save_activations: bool = True
     """Whether to actually accumulate FT activations into the shared buffers.
@@ -311,6 +333,18 @@ class FinetuneConfig:
     window average to. Below 1 because the SLO is met per request: with the
     window average ON the target, about half the requests' own averages are
     above it."""
+
+    profile_extra_shapes: bool = False
+    """Add to the launch profiling pass the shapes served traffic has and the
+    base sweep leaves out: one short prompt prefilled alone (16-48 tokens) and
+    many decode requests with short contexts (8-64 requests of 48 / 160
+    tokens). ~10 shapes, 2 s. OFF BY DEFAULT: MEASURED, NO GAIN — the estimator
+    is refit on live steps while serving, so what it predicts at run time does
+    not depend on the launch sweep (Qwen3-14B TP=2, actual / predicted with
+    and without: prefill + decode steps 1.02-1.08 vs 0.98-1.04, decode-only
+    with 17-48 requests 0.82 vs 0.84, a lone short prefill 1.13 vs 1.10). The
+    base sweep is enough; what is left is the model's form, not its data.
+    False: the sweep before this key."""
 
     overload_hold_s: float = 0.0
     """FT stands down while inference is at or over its SLO. When the window's
@@ -660,6 +694,20 @@ class FinetuneConfig:
     ``has_ft`` piecewise graphs for (capped by the compilation config's
     ``max_cudagraph_capture_size``). Mixed FT steps above it run the compiled
     forward without a graph."""
+
+    ft_breakable_cudagraph: bool = False
+    """Serve on vLLM's breakable CUDA graph (what ``VLLM_USE_BREAKABLE_CUDAGRAPH=1``
+    selects: the forward is recorded as it runs, no ``torch.compile`` split)
+    and capture the ``has_ft`` graph set on it — the hooks' save op is executed
+    during the capture pass, so no Dynamo trace is involved, and the tier-C
+    abort poll runs between the replayed segments.
+    OFF BY DEFAULT: MEASURED, NO GAIN. Qwen3-14B TP=2, compiled -> breakable:
+    production FT 595 -> 589 tok/s, TTFT p50 / p99 72.9 / 112.5 -> 74.5 / 113.2
+    ms, FT-only step 53.5 -> 53.2 ms, graphs 4.18 -> 4.26 GiB (2026-11-26). It
+    runs the same kernels; kept for a vLLM that makes the breakable graph the
+    default for these models. With this off and the env variable set by hand,
+    vLLM serves on the breakable graph and FT batches run without a graph
+    (the behaviour before this key)."""
 
     fill_graph_padding: bool = False
     """A step that replays a ``has_ft`` graph is padded to a captured size and

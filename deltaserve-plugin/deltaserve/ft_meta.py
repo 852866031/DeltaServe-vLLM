@@ -12,7 +12,7 @@ trainer's ``_build_state`` consumes.
 
 from __future__ import annotations
 
-from deltaserve.ft_sizes import bwd_tokens_of, step_tokens_of
+from deltaserve.ft_sizes import bwd_tokens_of, idle_bwd_tokens_of, step_tokens_of
 
 import json
 import os
@@ -160,6 +160,19 @@ def build_backward_meta(hf_config: Any, ft_cfg: Any, *, lm_head_key: str | None,
         if attn_extra:
             attn_note += ("; smaller shapes inside it: "
                           + ", ".join(f"{b} x {l}" for b, l in attn_extra))
+    # [bwd_batch_size_idle] a second graph set for the larger backward
+    idle_tokens = int(idle_bwd_tokens_of(ft_cfg))
+    idle_bn = idle_l = 0
+    if idle_tokens <= int(bwd_tokens_of(ft_cfg)):
+        idle_tokens = 0
+    elif bool(getattr(ft_cfg, "backward_cuda_graph", False)):
+        from deltaserve import bwd_budget
+
+        idle_bn, idle_l = bwd_budget.resolve_idle(
+            ft_cfg, tokenizer,
+            local_heads=int(hf_config.num_attention_heads) // max(1, int(tp_size)))
+        attn_note = ((attn_note or "") + f"; idle backward of <= {idle_tokens} "
+                     f"tokens: {idle_bn} samples x {idle_l} tokens")
     num_heads = int(hf_config.num_attention_heads)
     head_dim = int(getattr(hf_config, "head_dim", None)
                    or hf_config.hidden_size // num_heads)
@@ -214,6 +227,11 @@ def build_backward_meta(hf_config: Any, ft_cfg: Any, *, lm_head_key: str | None,
         "attn_budget_note": attn_note,
         # the child's sizes follow the backward batch, not the step
         "max_saved_finetuning_tokens": int(bwd_tokens_of(ft_cfg)),
+        # [bwd_batch_size_idle] 0 = off; else the largest backward and the
+        # attention budget of its graph set
+        "bwd_batch_idle_tokens": idle_tokens,
+        "bwd_batch_idle_attn_bn_max": idle_bn,
+        "bwd_batch_idle_attn_l_max": idle_l,
         # Forward-side activation saves the backward may short-circuit on:
         # post-RoPE q/k/v per layer (``attn_qh/kh/vh``) and the attention
         # context (``attn_ctx``). The child re-checks ``save_attn_qkv`` against

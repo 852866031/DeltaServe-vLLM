@@ -288,6 +288,7 @@ def profile_execution_model(engine) -> None:
         batch_max_tokens=engine.vllm_config.scheduler_config.max_num_batched_tokens,
         max_saved_finetuning_tokens=ft_only_tokens_of(ft_cfg),   # FT tokens one step may carry
         max_req_len=engine.vllm_config.model_config.max_model_len,
+        extra_shapes=bool(getattr(ft_cfg, "profile_extra_shapes", False)),
     )
     warmup, recorded = gen.prepare()
     n_repeats = max(1, ft_cfg.profile_num_repeats)

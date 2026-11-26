@@ -655,7 +655,8 @@ class BackwardService:
                 )
 
         self._step_open = not final
-        _runner = getattr(self, "graph_runner", None)
+        _runner = getattr(self, "_last_runner",
+                          getattr(self, "graph_runner", None))
         resp = {"event": "activations_processed", "n": n, "loss": loss,
                 # [backward_cuda_graph] did this cycle's attention replay its
                 # graph (True), fall back to eager (False), or is there no

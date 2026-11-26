@@ -76,11 +76,20 @@ class FtCudaGraphManager(ModelCudaGraphManager):
             return
         if self.cudagraph_mode.mixed_mode() != CUDAGraphMode.PIECEWISE:
             return
-        # With the breakable CUDA graph (VLLM_USE_BREAKABLE_CUDAGRAPH) the
-        # forward is recorded as it runs, hooks included: the save op the
-        # hooks issue is executed during the has_ft capture pass and its
-        # gathers land in the recorded segments — the same second graph set,
-        # keyed by the same FtBatchDescriptor, without Dynamo.
+        # With the breakable CUDA graph the forward is recorded as it runs,
+        # hooks included: the save op the hooks issue is executed during the
+        # has_ft capture pass and its gathers land in the recorded segments —
+        # the same second graph set, keyed by the same FtBatchDescriptor,
+        # without Dynamo. Behind ``ft_breakable_cudagraph`` (default OFF:
+        # measured equal to the compiled path, no gain — see config.py);
+        # without the key FT batches run without a graph on the breakable
+        # graph, as before.
+        if self.use_breakable_cg and not getattr(
+                ft_cfg, "ft_breakable_cudagraph", False):
+            logger.warning("[deltaserve] vLLM serves on the breakable CUDA "
+                           "graph but finetune_features.ft_breakable_cudagraph "
+                           "is off: FT batches run without a graph")
+            return
         # Same sizes up to graph_ft_max_tokens, LoRA cases with an adapter
         # active (an FT batch always carries the FT adapter).
         ft_max = int(ft_cfg.graph_ft_max_tokens)

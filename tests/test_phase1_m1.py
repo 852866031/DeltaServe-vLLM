@@ -294,6 +294,13 @@ def _spawn(mode: str, adapter: Path) -> dict:
     fd, result_path = tempfile.mkstemp(suffix=f"_m1_{mode}.json")
     os.close(fd)
     os.unlink(result_path)
+    # DSERVE_M1_BASELINE_ENV="NAME=value": an env variable for the runs WITHOUT
+    # finetuning (the ft runs get the same setting through a finetune key in
+    # DSERVE_M1_FT_EXTRA), so both sides run the same forward path.
+    base_env = os.environ.get("DSERVE_M1_BASELINE_ENV")
+    if base_env and not mode.startswith("ft"):
+        name, _, value = base_env.partition("=")
+        env[name] = value
     env["DSERVE_M1_RESULT"] = result_path
     env["DSERVE_M1_ADAPTER"] = str(adapter)
     proc = subprocess.run(

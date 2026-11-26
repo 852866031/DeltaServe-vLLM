@@ -1,5 +1,6 @@
 #!/usr/bin/env python
-"""FT batches on vLLM's breakable CUDA graph (VLLM_USE_BREAKABLE_CUDAGRAPH=1).
+"""FT batches on vLLM's breakable CUDA graph (finetune_features.ft_breakable_cudagraph;
+off by default — measured equal to the compiled path).
 
 The breakable graph records the forward as it runs instead of splitting a
 torch.compile'd graph, so the activation save reaches the ``has_ft`` graphs
@@ -17,7 +18,8 @@ import os
 import sys
 from pathlib import Path
 
-os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
+os.environ["DSERVE_M1_FT_EXTRA"] = '{"ft_breakable_cudagraph": true}'
+os.environ["DSERVE_M1_BASELINE_ENV"] = "VLLM_USE_BREAKABLE_CUDAGRAPH=1"
 os.environ["DSERVE_M1_EXPECT_GRAPH"] = "1"
 os.environ.setdefault("DSERVE_M1_PROFILE", "tp1")
 sys.path.insert(0, str(Path(__file__).resolve().parent))

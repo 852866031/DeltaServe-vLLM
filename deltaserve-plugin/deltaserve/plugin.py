@@ -182,6 +182,29 @@ def _patch_config() -> None:
 
     _wrap(VllmConfig, "__post_init__", post_init)
 
+    # [ft_breakable_cudagraph] (default off: measured, no gain) vLLM decides
+    # the breakable CUDA graph from the environment / the architecture in this
+    # small method; the key turns it on for the co-serving launch the same way
+    # the env variable would.
+    if hasattr(VllmConfig, "_maybe_enable_breakable_cudagraph"):
+        def breakable(orig):
+            def _maybe_enable_breakable_cudagraph(self):
+                import os
+
+                ft = self.finetune_config
+                name = "VLLM_USE_BREAKABLE_CUDAGRAPH"
+                if not (ft.enable_finetuning and ft.ft_breakable_cudagraph) \
+                        or name in os.environ:
+                    return orig(self)
+                os.environ[name] = "1"
+                try:
+                    return orig(self)
+                finally:
+                    del os.environ[name]
+            return _maybe_enable_breakable_cudagraph
+
+        _wrap(VllmConfig, "_maybe_enable_breakable_cudagraph", breakable)
+
     from deltaserve.runner_select import wants_v2
 
     def v2_unsupported(orig):

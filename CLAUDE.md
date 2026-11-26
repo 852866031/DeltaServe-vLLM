@@ -168,9 +168,13 @@ average-TBT target 35 ms, single runs — README "Step, backward batch and per-s
   backward pushes FT to the limit of the TBT target: loose-half 77.5 % of the requests
   within it; with them 100 %). Its KV cache is 17,408 tokens (worker 26.6 + child 5.2
   GiB of 32): short requests only.
-  → **"A larger backward batch while idle" and "batch by the overlapping decode batch"
-  are not built**: the backward graphs are padded to one size, so a second size is a
-  second set of per-layer graphs; the per-step caps get the gain without it.
+- `bwd_batch_size_idle` (off): while no inference request is running or waiting
+  (`coord.idle_now`, set each `_schedule_step`), `_next_batch` takes up to that many rows
+  and waits for the step to close; the child replays a second graph set
+  (`graph_runner_idle`, chosen by `_runner_for(n)`). 1024 / 256 → + idle 1024: FT only
+  1276 → 1619, production 624 → 708, loose-half 882; the step-1024 preset gives 1877 /
+  795 / 922 and a KV cache of 17,408 tokens against 6,144 (two graph sets). Dominated:
+  off. "Batch by the overlapping decode batch" is not built (same second-graph-set cost).
 - `backward_cuda_graph_attn_shapes` (default 1): smaller attention shapes inside the
   budget, chosen from the dataset by an exact cut (`bwd_budget.choose_shapes`); the
   attention graph is shared by all layers, so a shape costs slabs + one graph. Each
@@ -222,15 +226,27 @@ segment (`cudagraph_common.polled_segment`, wrapped after the capture pass). 14B
 compiled → breakable: production FT 595 → 589 tok/s, TTFT p50 / p99 72.9 / 112.5 →
 74.5 / 113.2 ms, FT-only step 53.5 → 53.2 ms, loss curve identical, tier-C aborts fire;
 graphs 4.18 → 4.26 GiB. Equal, not better: the FT-only step is host-bound either way.
+Behind `finetune_features.ft_breakable_cudagraph` (off: no gain; the key turns the mode on
+through a wrapper of `VllmConfig._maybe_enable_breakable_cudagraph`; with the env set by
+hand and the key off, FT batches run without a graph as before).
 `tests/test_breakable_ft_graph.py` (m1 gate + "the mixed steps ran a graph"; also on
 v0.33 / v2); the TP=2 gate passes with the env set.
 
+**Estimator accuracy and profiling shapes (2026-11-26).** actual / predicted from step
+traces (14B TP=2): prefill + decode 1.01-1.08, mixed FT 0.99-1.02, FT-only 1.00-1.02,
+decode-only 0.87-1.00 (17-48 requests on tight-half 0.82), a lone short prefill
+1.12-1.23, **decode under a running backward: median 0.65-1.17, 5-95 % 0.3-2.2** (how
+much of the step the backward overlaps is not a feature; that regime has no launch
+samples and is fitted on live steps). `slo.profile_extra_shapes` (off) adds the missing
+corners (one short prompt alone, 8-64 decode requests with short contexts): run-time
+ratios unchanged, because the estimator refits on live steps — the launch sweep (18 s)
+is enough, the error left is the model's form.
+
 **Next steps (2026-11-26), not done:**
-1. Worker-side dummy runs instead of the launch profiling pass. The pass is 18 s of a
-   70 s launch (96 shapes, 206 steps, 14B TP=2); `vllm/v1/worker/gpu/warmup.py` shows
-   the way (hand-built SchedulerOutputs with block ids from 1), but our shapes need
-   several decode requests with contexts + FT rows, i.e. a scheduler of our own in the
-   worker, against vLLM-private helpers. Not started: little to gain.
+1. (Dropped, the user's call 2026-11-26: worker-side dummy runs instead of the launch
+   profiling pass — the pass is 18 s of a 70 s launch.) Open instead: a smaller
+   activation buffer than the step (rows of an acked backward batch reused by later
+   forwards — the `bwd_whole_batches` slots as a ring; no allocation at run time).
 2. Drop the v1 host (`model_runner.py`, `cudagraph.py`, `runner_select`) once v0.34 is
    confirmed on the A100s.
 3. A100 presets are at `ft_step_size: 2048` / `bwd_batch_size: 512` (not run anywhere);

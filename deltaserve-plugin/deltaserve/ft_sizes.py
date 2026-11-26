@@ -34,6 +34,15 @@ def ft_only_tokens_of(cfg) -> int:
     """FT tokens a step WITHOUT inference tokens may carry
     (``ft_only_tokens_per_step``): between ``ft_tokens_per_step`` (the
     default) and a backward batch."""
-    f, b = fwd_tokens_of(cfg), bwd_tokens_of(cfg)
+    f, b = fwd_tokens_of(cfg), max(bwd_tokens_of(cfg), idle_bwd_tokens_of(cfg))
     v = getattr(cfg, "ft_only_tokens_per_step", None)
     return int(f if v is None else max(f, min(int(v), b)))
+
+
+def idle_bwd_tokens_of(cfg) -> int:
+    """FT tokens per backward batch while no inference request is in the
+    system (``bwd_batch_size_idle``): between a backward batch (= off, the
+    default) and the step."""
+    b, st = bwd_tokens_of(cfg), step_tokens_of(cfg)
+    v = getattr(cfg, "bwd_batch_size_idle", None)
+    return int(b if v is None else max(b, min(int(v), st)))

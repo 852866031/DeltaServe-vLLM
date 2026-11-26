@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import math
 
-from deltaserve.ft_sizes import bwd_tokens_of, step_tokens_of
+from deltaserve.ft_sizes import bwd_tokens_of, idle_bwd_tokens_of, step_tokens_of
 
 AUTO = "auto"
 # Fallback when there is no dataset to look at (the values before ``auto``).
@@ -259,6 +259,23 @@ def _dataset_lengths(ft_cfg, tokenizer_name: str | None) -> list[int]:
 
 def _is_auto(v) -> bool:
     return isinstance(v, str) and v.strip().lower() == AUTO
+
+
+def resolve_idle(ft_cfg, tokenizer_name: str | None = None, *, lengths=None,
+                 local_heads: int = 1) -> tuple[int, int]:
+    """The attention budget of the SECOND graph set (``bwd_batch_size_idle``):
+    always chosen from the dataset, for batches of the idle size (the
+    built-in values scaled by the size ratio without one)."""
+    big, small = idle_bwd_tokens_of(ft_cfg), batch_tokens_of(ft_cfg)
+    try:
+        if lengths is None:
+            lengths = dataset_lengths(ft_cfg, tokenizer_name)
+    except Exception:  # noqa: BLE001 — the budget is only a speed-up
+        lengths = []
+    if not lengths:
+        return DEFAULT_BN_MAX * max(1, big // max(1, small)), DEFAULT_L_MAX
+    info = choose_budget(lengths, big, local_heads=local_heads)
+    return int(info["bn_max"]), int(info["l_max"])
 
 
 def resolve(ft_cfg, tokenizer_name: str | None = None, *, lengths=None,

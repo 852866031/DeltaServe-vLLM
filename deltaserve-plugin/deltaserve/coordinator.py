@@ -296,6 +296,13 @@ class FinetuneCoordinator:
         # backward graphs are padded to the batch size). ``_step_lens``: the
         # lengths of the step's samples, committed and reserved, in row order.
         self.whole_batches = False
+        # [bwd_batch_size_idle] the batch size while no inference request is
+        # in the system (``idle_now``, set by the scheduler every step).
+        # Off by default: measured below one large backward at all times
+        # (config.py has the numbers).
+        self.bwd_batch_idle = 0               # 0 = off
+        self.idle_now = False
+        self.idle_batches = 0
         self._step_lens: list[int] = []
         self._bwd_rows = 0
         self._bwd_samples = 0
@@ -741,6 +748,8 @@ class FinetuneCoordinator:
             "buffer_fill": int(self.fill_count),
             "buffer_capacity": int(self.capacity),
             "bwd_batch_size": int(self.bwd_batch),
+            # [bwd_batch_size_idle] backwards larger than a batch so far
+            "bwd_idle_batches": int(self.idle_batches),
             "step_tokens_trained": int(self._bwd_rows),
             "corpus_tokens_per_epoch": int(self.corpus_total_tokens),
         }
@@ -934,9 +943,15 @@ class FinetuneCoordinator:
             return
         lens = self.sample_lens[self._bwd_samples:]
         avail = self.fill_count - self._bwd_rows
+        # [bwd_batch_size_idle] with no inference request around, one larger
+        # batch: it waits for the step to close (or for that many rows)
+        # instead of going out a small batch at a time.
+        cap = self.bwd_batch
+        if self.idle_now and self.bwd_batch_idle > cap:
+            cap = self.bwd_batch_idle
         take, rows = 0, 0
         for s in lens:
-            if rows + s > self.bwd_batch:
+            if rows + s > cap:
                 break
             rows += s
             take += 1
@@ -947,10 +962,12 @@ class FinetuneCoordinator:
             # A sample longer than a batch cannot be trained (the store drops
             # them at load): never wedge on one.
             take, rows = 1, lens[0]
-        full = rows > 0 and (rows == self.bwd_batch or avail > rows)
+        full = rows > 0 and (rows == cap or avail > rows)
         if not (full or (closed and (rows > 0 or self._bwd_rows > 0))):
             return
         final = closed and rows == avail
+        if rows > self.bwd_batch:
+            self.idle_batches += 1
         self._trigger_backward(
             reason="batch", start=self._bwd_rows, rows=rows,
             lens=lens[:take], final=final)

@@ -64,6 +64,7 @@ class LoraSftTrainerService(BackwardService):
         # CUDA-graph runner (Phase 5). Attached in _build_state when
         # meta["backward_cuda_graph"] is True; None means all-eager.
         self.graph_runner = None
+        self.graph_runner_idle = None
         # Persistent grad_qh/kh/vh buffers (allocated in _build_state once
         # dims + cdt are known). Reused across layers and backwards by the
         # eager attn_backward_core path via its grad_*_buf kwargs.
@@ -267,7 +268,8 @@ class LoraSftTrainerService(BackwardService):
         # s_max so they fit any backward, sliced to [:n] per call. Saves 3·L
         # zero-fill kernel launches per backward. The graphed path has its own
         # static buffers in GraphedBackward.
-        s_max = int(meta.get("max_saved_finetuning_tokens", 0))
+        s_max = max(int(meta.get("max_saved_finetuning_tokens", 0)),
+                    int(meta.get("bwd_batch_idle_tokens", 0) or 0))
         if s_max > 0:
             dev = self.lm_w.device
             cdt = self.bwd_dtype
@@ -332,6 +334,27 @@ class LoraSftTrainerService(BackwardService):
                    f"falling back to eager backward")
             traceback.print_exc()
             self.graph_runner = None
+        # [bwd_batch_size_idle] The graphs are padded to one batch size: a
+        # backward larger than the batch replays a second set of that size.
+        big = int(meta.get("bwd_batch_idle_tokens", 0) or 0)
+        if self.graph_runner is not None and big > s_max:
+            try:
+                self.graph_runner_idle = GraphedBackward(
+                    self, s_max=big,
+                    bn_max=int(meta.get("bwd_batch_idle_attn_bn_max", bn_max)),
+                    l_max=int(meta.get("bwd_batch_idle_attn_l_max", l_max)))
+            except Exception as e:  # noqa: BLE001
+                dprint(f"[backward] idle graph runner ({big} tokens) init "
+                       f"failed: {e}; larger backwards run eager")
+                self.graph_runner_idle = None
+
+    def _runner_for(self, n: int):
+        """The graph set of a backward of ``n`` rows: the batch's, or the
+        larger one's (``bwd_batch_size_idle``); None = eager."""
+        small = self.graph_runner
+        if small is None or n <= small.s_max:
+            return small
+        return self.graph_runner_idle
 
     # -- trained-adapter checkpoints (deltaserve/adapter_io.py) ---------------
 
@@ -508,7 +531,8 @@ class LoraSftTrainerService(BackwardService):
             raise RuntimeError(
                 f"{self.family.name} backward state not built (weights not shared)")
         # Mode tag for the one-line cycle log (set in BackwardService dispatcher).
-        self._last_mode = "graph" if self.graph_runner is not None else "eager"
+        self._last_mode = ("graph" if self._runner_for(n) is not None
+                           else "eager")
         seq_lens = [int(s) for s in sample_lens]
         b_start, acc = [], 0
         for s in seq_lens:
@@ -565,7 +589,7 @@ class LoraSftTrainerService(BackwardService):
         # If the graphed runner is attached, build per-backward scatter indices
         # + key-pad mask once (re-used across all L layers' padded-attention
         # replays). Eager fallback for batches that overflow the padded budget.
-        runner = self.graph_runner
+        runner = self._last_runner = self._runner_for(n)
         if runner is not None:
             runner.begin_backward(n, seq_lens, b_start)
 
