@@ -62,7 +62,7 @@ throttles:
 slo:
   admission_margin: legacy           # pinned: reproduces the published runs (the default is now relative)
   ttft_slo: 0.25                      # time-to-first-token target (seconds)
-  avg_tbt_slo: 0.02                   # avg time-between-tokens target (seconds)
+  avg_tbt_slo: 0.035                 # the token target (s): kept over avg_tbt_window_s, and what TBT attainment is measured against
   max_tbt_slo: 0.1                    # max single-step time while admitting FT (seconds)
   profile_on_launch: true            # offline profiling pass before serving
   profile_num_repeats: 2             # recorded passes per profiling shape

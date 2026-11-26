@@ -74,7 +74,7 @@ throttles:
 # ── slo: inference targets + the step-time estimator that enforces them ──────
 slo:
   ttft_slo: 0.25                      # time-to-first-token target (s): FT is admitted only while the predicted step keeps it
-  avg_tbt_slo: 0.02                  # average time between tokens (s): the token-latency target, kept over a sliding window, and what the TBT attainment is measured against
+  avg_tbt_slo: 0.035                 # average time between tokens (s): the token-latency target, kept over a sliding window, and what the TBT attainment is measured against
   avg_tbt_window_s: 1.0              # the window (s) avg_tbt_slo is kept over; 0 = not enforced
   avg_tbt_pause_backward: true       # a decode step that would take the window average past the target pauses the backward (predicted with the overlap)
   avg_tbt_headroom: 0.9              # ... steering the window average to this fraction of avg_tbt_slo (the SLO is met per request)

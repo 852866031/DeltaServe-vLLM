@@ -51,7 +51,7 @@ slo:
   # repo-root/eval/estimator/. (Path resolution applies to the finetune section.)
   estimator_validation_path: ../../eval/estimator/estimator_validation_production.csv
   ttft_slo: 0.3
-  avg_tbt_slo: 0.02
+  avg_tbt_slo: 0.035                 # the token target (s): kept over avg_tbt_window_s, and what TBT attainment is measured against
   max_tbt_slo: 0.1
   profile_on_launch: true              # seeds the estimator so predicted is non-null from step 1
   profile_num_repeats: 2

@@ -365,7 +365,8 @@ single runs, TTFT 100 % everywhere:
   498 / 377 (unchanged by the gate); + admission headroom 0.9: 81 / 68 %, FT 472 / 335.
   A pause hysteresis was tried and dropped (83 / 50 %). What is left of the gap: the
   child's yield latency on the step that asks for the pause, and mixed steps.
-Most presets still say `avg_tbt_slo: 0.02`: not reachable at 2× (the user's call).
+Presets and templates that said `avg_tbt_slo: 0.02` say 0.035 since 2026-11-26 (20 ms
+is not reachable at 2×, inference alone gets 88 %).
 Postponed: FT suppression when the system is at / over capacity (a milder
 long-request workload; the ones tried overload inference alone).
 Not done: `validation` stage; adapter load cost from profiling (config constants
