@@ -213,6 +213,15 @@ class FinetuneScheduler(AsyncScheduler):
             self._tbt_window = TbtWindow(float(ft_cfg.avg_tbt_window_s))
             dprint(f"[ft-sched] average TBT kept within {self._avg_tbt_slo}s "
                    f"over a {ft_cfg.avg_tbt_window_s}s window")
+        # [avg_tbt_pause_backward] steps on which the average-TBT gate paused
+        # the backward child / decode-only steps taken with one in flight
+        self._tbt_pause_backward = bool(
+            getattr(ft_cfg, "avg_tbt_pause_backward", True))
+        self._tbt_headroom = float(getattr(ft_cfg, "avg_tbt_headroom", 0.9))
+        # [avg_tbt_admission_headroom] the average FT admission steers to
+        self._avg_tbt_admit = float(ft_cfg.avg_tbt_slo) * float(
+            getattr(ft_cfg, "avg_tbt_admission_headroom", 1.0))
+        self._tbt_gate_stats = {"paused": 0, "overlapped": 0}
         # [async] Under pipelined (async) scheduling, schedule(N+1) runs while
         # forward(N) is still on the GPU, so a request admitted now isn't
         # prefilled until the in-flight step(s) finish. We add that queue wait to
@@ -694,7 +703,7 @@ class FinetuneScheduler(AsyncScheduler):
             # [avg_tbt_window_s] Already over the average without FT.
             if self._tbt_window is not None and self._tbt_window.average_with(
                     time.monotonic(), feats.b_d,
-                    t_baseline + t_encode) >= self._avg_tbt_slo:
+                    t_baseline + t_encode) >= self._avg_tbt_admit:
                 self._last_admit = ("S", 0)
                 return 0, []
         if ttft_deadline is not None and self._estimator.is_ready:
@@ -819,7 +828,7 @@ class FinetuneScheduler(AsyncScheduler):
                     if (self._tbt_window is not None
                             and self._tbt_window.average_with(
                                 time.monotonic(), feats.b_d,
-                                t_with_ft + t_encode) > self._avg_tbt_slo):
+                                t_with_ft + t_encode) > self._avg_tbt_admit):
                         stop = "S"
                         break
                 if ttft_deadline is not None:
@@ -902,6 +911,23 @@ class FinetuneScheduler(AsyncScheduler):
             t_in=t_in, p=len(prefill_lens), t_ft=t_ft, b_d=b_d, k=k,
             prefill_lens=prefill_lens or None)
         return feats, lora_ids
+
+    def _backward_would_break_avg_tbt(self, feats: StepFeatures) -> bool:
+        """[avg_tbt_pause_backward] A decode-only step about to share the GPU
+        with a running backward: would the window's average time between
+        tokens, with this step at its predicted time WITH the overlap, pass
+        the target? Then the step pauses the child. (Steps with an inference
+        prefill or FT tokens pause it anyway.)"""
+        if not (self._tbt_pause_backward and self._tbt_window is not None
+                and feats.bwd and feats.b_d > 0 and feats.t_in == 0
+                and self._estimator.is_ready):
+            return False
+        t_overlap = self._estimator.predict(feats)   # decode-with-backward regime
+        over = self._tbt_window.average_with(
+            time.monotonic(), feats.b_d, t_overlap
+        ) > self._avg_tbt_slo * self._tbt_headroom
+        self._tbt_gate_stats["paused" if over else "overlapped"] += 1
+        return over
 
     def _will_use_graph(self, feats: StepFeatures, lora_ids: set[int],
                         total_tokens: int) -> bool:
@@ -1141,6 +1167,9 @@ class FinetuneScheduler(AsyncScheduler):
             "corpus_samples": int(n),
             "samples_trained_this_epoch": int(sum(store.trained)) if n else 0,
             "estimator_fitted": self._estimator.eager_rmse is not None,
+            # [avg_tbt_pause_backward] decode-only steps taken with a backward
+            # in flight: how many paused it / let it overlap
+            "avg_tbt_backward_gate": dict(getattr(self, "_tbt_gate_stats", None) or {}),
         })
         return st
 
@@ -1595,6 +1624,11 @@ class FinetuneScheduler(AsyncScheduler):
             # the estimator routes it to its own regime; a prefill-carrying
             # step is excluded from the fits (see estimator.py).
             feats.bwd = bool(self._coord.pending_backward)
+            if self._backward_would_break_avg_tbt(feats):
+                # Broadcast with the step (every rank pauses its child); the
+                # step then runs without the overlap: the plain decode regime.
+                output.finetune_pause_backward = True
+                feats.bwd = False
             was_graph = self._will_use_graph(
                 feats, lora_ids, output.total_num_scheduled_tokens)
             # Composition-derived regime selection (was_graph stays as an
@@ -1771,6 +1805,7 @@ class FinetuneScheduler(AsyncScheduler):
             root, interval_s=interval_s,
             ttft_slo=getattr(ft_cfg, "ttft_slo", None),
             max_tbt_slo=getattr(ft_cfg, "max_tbt_slo", None),
+            avg_tbt_slo=getattr(ft_cfg, "avg_tbt_slo", None),
             steps_log_max_mb=float(getattr(ft_cfg, "steps_log_max_mb", 256.0)),
             meta=meta)
         self._coord.metrics = self._metrics

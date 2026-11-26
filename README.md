@@ -526,8 +526,10 @@ applies. The throttles shape admission further:
 
 | Knob (YAML section) | What it controls | Default |
 |---|---|---|
-| **SLO gate** (`slo.ttft_slo`, `max_tbt_slo`, `avg_tbt_slo`) | admit FT tokens only while the estimator predicts the step stays within 0.9 × TTFT SLO for the oldest waiting request and within `max_tbt_slo` | always on |
-| `slo.avg_tbt_window_s` | enforce `avg_tbt_slo`: FT joins a step with decode requests only while the average time between tokens over the last N seconds (every decode token of the window, that step included) stays within it. `0` = only the per-step maximum is checked | `0` |
+| **SLO gate** (`slo.ttft_slo`, `avg_tbt_slo`, `max_tbt_slo`) | admit FT tokens only while the estimator predicts the step stays within 0.9 × TTFT SLO for the oldest waiting request, the average time between tokens stays within `avg_tbt_slo` (the token-latency target, kept over `avg_tbt_window_s`), and the step itself within `max_tbt_slo` (a 100 ms backstop: a step with an inference prefill next to decodes is slow whatever FT does) | always on |
+| `slo.avg_tbt_window_s` | how `avg_tbt_slo` is enforced: FT joins a step with decode requests only while the average time between tokens over the last N seconds (every decode token of the window, that step included) stays within it. `0` = only the per-step maximum is checked | `1.0` |
+| `slo.avg_tbt_pause_backward` (on), `slo.avg_tbt_headroom` (0.9) | the same target against the backward: a decode-only step that would share the GPU with a running backward is predicted WITH the overlap (the estimator's decode-with-backward regime); if the window average would then pass `avg_tbt_headroom` × `avg_tbt_slo`, the step pauses the backward child, as an inference prefill does. At a 20 ms target (Qwen3-14B TP=2, production timeline at 1× / 2× rate): requests within the target 58 → 88 % / 37 → 53 %, FT unchanged |
+| `slo.avg_tbt_admission_headroom` (1.0) | the fraction of `avg_tbt_slo` FT admission steers the window average to. 0.9 on the same runs: 88 → 81 % / 53 → 68 %, FT −5 / −11 % — worth it only near capacity |
 | **Step-time estimator** (`slo.profile_on_launch`, `profile_num_repeats`) | 6-parameter model `T ≈ α·S + β·T_in + γ·T_ft + δ·B_d + ε·K + c`, with separate coefficients for 5 regimes (inference prefill, FT-only, decode-only, decode with backward running, FT-mixed). Seeded by a profiling pass at launch, refit online every 256 steps | profiling on |
 | `slo.coserving_admission_phase` | `prefill`: FT rides only steps that carry inference prefill (or idle steps). `both`: FT may also ride decode-only / mixed steps (`BothPhaseFinetuneScheduler`) | `prefill` |
 | `slo.decode_only_ft_safety_margin` | with `both`: scale `max_tbt_slo` on decode-only steps | `0.7` |
@@ -978,7 +980,7 @@ vllm serve Qwen/Qwen3-14B-Base --tensor-parallel-size 2 \
     --additional-config '{"deltaserve": {"enable_finetuning": true,
         "finetuning_lora_path": "adapters/qwen3-14b-toy-lora-ft",
         "data_path": "data/alpaca_1000.txt", "start_on_launch": false,
-        "ttft_slo": 0.4, "max_tbt_slo": 0.05, "backward_cuda_graph": true}}'
+        "ttft_slo": 0.4, "avg_tbt_slo": 0.02, "backward_cuda_graph": true}}'
 ```
 
 ### HTTP endpoints

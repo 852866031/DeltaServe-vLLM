@@ -16,7 +16,8 @@ finetune_param:
   start_on_launch: false             # hold FT admission closed (M1: launch-only)
   finetuning_lora_path: /home/jiaxuan_chen/DeltaServe-Baselines/deltaserve/adapters/qwen3-32b-lora-r8-ft
   data_path: /home/jiaxuan_chen/DeltaServe-Baselines/common/data/alpaca.txt
-  max_saved_finetuning_tokens: 512
+  ft_step_size: 2048                 # FT tokens per optimizer step (= the activation buffer)
+  bwd_batch_size: 512                # FT tokens per backward batch: 4 accumulated backwards per step (was one 512-token buffer)
   num_epochs: 20
   learning_rate: 0.0003
   weight_decay: 0.01

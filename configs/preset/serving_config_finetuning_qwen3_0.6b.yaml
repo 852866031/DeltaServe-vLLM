@@ -47,7 +47,7 @@ slo:
   admission_margin: legacy           # pinned: reproduces the published runs (the default is now relative)
   ttft_slo: 0.25
   avg_tbt_slo: 0.02
-  max_tbt_slo: 0.05
+  max_tbt_slo: 0.1 
   profile_on_launch: true
   profile_num_repeats: 2
   decode_only_ft_safety_margin: 0.7

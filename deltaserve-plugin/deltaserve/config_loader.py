@@ -88,7 +88,9 @@ FINETUNE_SECTIONS: dict[str, tuple[str, ...]] = {
         "rps_throttle_close_time",
     ),
     "slo": (
-        "ttft_slo", "avg_tbt_slo", "avg_tbt_window_s", "max_tbt_slo",
+        "ttft_slo", "avg_tbt_slo", "avg_tbt_window_s", "avg_tbt_pause_backward",
+        "avg_tbt_headroom", "avg_tbt_admission_headroom",
+        "max_tbt_slo",
         "decode_only_ft_safety_margin", "admission_margin", "admission_margin_k",
         "profile_on_launch", "profile_num_repeats", "validate_estimator",
         "estimator_validation_path", "estimator_state_save_path",

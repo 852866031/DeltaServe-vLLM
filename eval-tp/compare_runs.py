@@ -7,7 +7,7 @@ timeline_results<suffix>.csv, step_trace<suffix>.csv, bwd_log<suffix>.csv,
 bench_meta<suffix>.json, server<suffix>.log.
 
     python eval-tp/compare_runs.py --suffix _qwen3-14b_tp2_co_factor_off_phase_prefill_tight \
-        --a /path/baseline --b eval-tp/output [--ttft-slo 0.4] [--tbt-slo 0.05]
+        --a /path/baseline --b eval-tp/output [--ttft-slo 0.4] [--avg-tbt-slo 0.02] [--tbt-slo 0.1]
 """
 
 from __future__ import annotations
@@ -27,7 +27,8 @@ from analyze_step_trace import load_trace, pct  # noqa: E402
 _BWD_RE = re.compile(r"\[backward\]\s+(\d+(?:\.\d+)?)\s*ms")
 
 
-def load(dirpath: str, suffix: str, ttft_slo: float, tbt_slo: float) -> dict:
+def load(dirpath: str, suffix: str, ttft_slo: float, tbt_slo: float,
+         avg_tbt_slo: float = 0.02) -> dict:
     d = Path(dirpath)
     out: dict = {}
     res = list(csv.DictReader(open(d / f"timeline_results{suffix}.csv")))
@@ -37,6 +38,10 @@ def load(dirpath: str, suffix: str, ttft_slo: float, tbt_slo: float) -> dict:
     out["ttft_p50_ms"] = pct(ttft, .5) * 1e3
     out["ttft_p95_ms"] = pct(ttft, .95) * 1e3
     out["ttft_p99_ms"] = pct(ttft, .99) * 1e3
+    # TBT attainment: requests whose own mean token gap is within avg_tbt_slo
+    # (the token-latency target; max_tbt_slo only bounds single steps).
+    avg = [float(r["avg_tbt_s"]) for r in res if r.get("avg_tbt_s") not in (None, "")]
+    out["avg_tbt_ok_%"] = 100.0 * sum(1 for a in avg if a <= avg_tbt_slo) / max(1, len(avg))
     out["worst_tbt>slo"] = sum(1 for r in res if float(r["worst_tbt_s"]) > tbt_slo)
     out["avg_tbt_p50_ms"] = pct(sorted(float(r["avg_tbt_s"]) for r in res), .5) * 1e3
     t0 = dt.datetime.fromisoformat(json.load(open(d / f"bench_meta{suffix}.json"))["t_first_wall_iso"]).timestamp()
@@ -99,12 +104,15 @@ def main() -> int:
     ap.add_argument("--a", required=True, help="baseline dir")
     ap.add_argument("--b", required=True, help="new dir")
     ap.add_argument("--ttft-slo", type=float, default=0.4)
-    ap.add_argument("--tbt-slo", type=float, default=0.05)
+    ap.add_argument("--avg-tbt-slo", type=float, default=0.02,
+                    help="avg_tbt_slo: a request meets it when its mean token gap is within it")
+    ap.add_argument("--tbt-slo", type=float, default=0.1,
+                    help="max_tbt_slo: counts requests whose worst gap exceeds it")
     ap.add_argument("--label-a", default="eager FT (baseline)")
     ap.add_argument("--label-b", default="graphed mixed FT")
     args = ap.parse_args()
-    A = load(args.a, args.suffix, args.ttft_slo, args.tbt_slo)
-    B = load(args.b, args.suffix, args.ttft_slo, args.tbt_slo)
+    A = load(args.a, args.suffix, args.ttft_slo, args.tbt_slo, args.avg_tbt_slo)
+    B = load(args.b, args.suffix, args.ttft_slo, args.tbt_slo, args.avg_tbt_slo)
     print(f"{'metric':<26}{args.label_a:>22}{args.label_b:>22}")
     for k in A:
         va, vb = A.get(k), B.get(k)

@@ -243,19 +243,49 @@ class FinetuneConfig:
     DeltaServe slo.ttft_slo."""
 
     avg_tbt_slo: float = 0.1
-    """Average time-between-tokens SLO (seconds) for running decode requests."""
+    """Average time-between-tokens SLO (seconds) for running decode requests:
+    THE token-latency target. Enforced over a sliding window
+    (``avg_tbt_window_s``), and what the TBT attainment is measured against (a
+    request meets it when the mean of its own token gaps is within it)."""
 
-    avg_tbt_window_s: float = 0.0
-    """Enforce ``avg_tbt_slo``: FT is admitted to a step with decode requests
-    only while the average time between tokens over the last
+    avg_tbt_window_s: float = 1.0
+    """How ``avg_tbt_slo`` is enforced: FT is admitted to a step with decode
+    requests only while the average time between tokens over the last
     ``avg_tbt_window_s`` seconds, that step included, stays within
     ``avg_tbt_slo`` (``deltaserve/tbt_window.py``: every decode token of the
-    window, averaged). 0 (default) = off: only the per-step ``max_tbt_slo``
-    check runs and ``avg_tbt_slo`` is not enforced, as before."""
+    window, averaged). Default 1 s. 0 = off: only the per-step ``max_tbt_slo``
+    bound runs and ``avg_tbt_slo`` is not enforced."""
 
-    max_tbt_slo: float = 0.2
-    """Max time-between-tokens SLO (seconds): a single step's predicted time must
-    not exceed this while FT tokens are admitted."""
+    avg_tbt_pause_backward: bool = True
+    """Keep ``avg_tbt_slo`` against the backward too. A decode-only step that
+    shares the GPU with a running backward takes about twice as long, and FT
+    admission has no say in it: the backward was triggered earlier. With this
+    on, the scheduler predicts such a step WITH the overlap (the estimator's
+    decode-with-backward regime) and, if the window's average time between
+    tokens would then pass ``avg_tbt_headroom`` × ``avg_tbt_slo``, the step
+    pauses the backward child, exactly as an inference prefill does. The
+    backward so uses only the slack the target leaves and gives way when it is
+    gone. Needs ``avg_tbt_window_s`` > 0. False: the backward overlaps decode
+    steps freely (the behaviour before this key)."""
+
+    avg_tbt_headroom: float = 0.9
+    """The fraction of ``avg_tbt_slo`` the backward gate above steers the
+    window average to. Below 1 because the SLO is met per request: with the
+    window average ON the target, about half the requests' own averages are
+    above it."""
+
+    avg_tbt_admission_headroom: float = 1.0
+    """The fraction of ``avg_tbt_slo`` FT ADMISSION steers the window average
+    to (the check that decides how many FT tokens join a step with decode
+    requests). 1.0 = the target itself (the behaviour before this key); below
+    1 for the same reason as ``avg_tbt_headroom``."""
+
+    max_tbt_slo: float = 0.1
+    """Upper bound on ONE step that carries decode requests and FT tokens
+    (seconds, predicted). A backstop, not the target: a step that carries an
+    inference prefill next to decodes is slow whatever FT does, so a tight
+    value here mostly shuts FT out of the steps it rides best. The average is
+    what ``avg_tbt_slo`` keeps."""
 
     ft_tokens_admission_constrain_factor: float = -1.0
     """Cap FT tokens admitted per step relative to that step's INFERENCE PREFILL

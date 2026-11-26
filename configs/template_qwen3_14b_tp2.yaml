@@ -72,8 +72,12 @@ throttles:
 # ── slo: inference targets + the step-time estimator that enforces them ──────
 slo:
   ttft_slo: 0.4                      # time-to-first-token target (s): FT is admitted only while the predicted step keeps it
-  avg_tbt_slo: 0.02                  # average time-between-tokens target (s) for running decodes
-  max_tbt_slo: 0.05                  # max single-step time (s) while FT is admitted
+  avg_tbt_slo: 0.02                  # average time between tokens (s): the token-latency target, kept over a sliding window, and what the TBT attainment is measured against
+  avg_tbt_window_s: 1.0              # the window (s) avg_tbt_slo is kept over; 0 = not enforced
+  avg_tbt_pause_backward: true       # a decode step that would take the window average past the target pauses the backward (predicted with the overlap)
+  avg_tbt_headroom: 0.9              # ... steering the window average to this fraction of avg_tbt_slo (the SLO is met per request)
+  avg_tbt_admission_headroom: 1.0    # FT admission steers the window average to this fraction of avg_tbt_slo (1.0 = the target itself; 0.9 at a 20 ms target, 2x load: attainment 53 -> 68 %, FT -11 %)
+  max_tbt_slo: 0.1                   # upper bound on ONE step with decodes + FT (s, predicted): a backstop, the average is the target
   profile_on_launch: true            # profile synthetic batches at launch to fit the estimator (~1-2 min)
   profile_num_repeats: 2             # recorded passes per profiling shape
   decode_only_ft_safety_margin: 0.7  # ("both" phase only) max_tbt_slo × this on decode-only steps

@@ -152,9 +152,8 @@ still excluded from the estimator's fits (as inference prefills always were).
 1. Gradient accumulation, later phases: backward batch size as an estimator feature, a
    larger batch while no inference runs, sizing by the overlapping decode batch; A100
    presets → 2048 / 512 (not runnable here).
-2. Pick the backward attention budget from the FT dataset (coverage vs padded cost,
-   under a memory limit; `auto`); several graph shapes / length-bucketed batches as
-   options. The budget follows `bwd_batch_size`.
+2. Backward attention budget: `auto` is done (`bwd_budget.py`, follows `ft_step_size`
+   / `bwd_batch_size`). Left as options: several graph shapes / length-bucketed batches.
 3. Fill the graph padding: admit FT tokens up to the next captured graph size.
 4. Worker-side dummy runs instead of the launch profiling pass.
 5. FT graph path on the breakable CUDA graph (FT batches run without a graph there
@@ -350,9 +349,25 @@ vs 71/99/104 named, FT −4 % (README). `max_loras` ≥ adapters in use at once 
 `GET /adapters/available` (API server, reads the pool registry) tells a client
 what it can use. The encode time given to the TBT check is the worker's own
 (the engine's wall time also holds the wait for the step in flight).
-**`slo.avg_tbt_window_s`** (0 = off; 1.0 in the adapter routing preset, target
-35 ms) enforces `avg_tbt_slo` over a sliding window (`deltaserve/tbt_window.py`);
-without it only `max_tbt_slo` is checked and `avg_tbt_slo` is not enforced.
+**SLO semantics (branch `grad-accumulation`, 2026-11-26).** `avg_tbt_slo` is THE token
+target: enforced over a sliding window (`slo.avg_tbt_window_s`, default 1.0 s,
+`deltaserve/tbt_window.py`; 0 = off), and TBT attainment is per request against it
+(metrics, `dserve-top`, `compare_runs.py --avg-tbt-slo`). `max_tbt_slo` is a per-step
+backstop, 0.1 s by default and in every config (a step with a prefill is slow anyway).
+`slo.avg_tbt_pause_backward` (default on) + `avg_tbt_headroom` (0.9): a decode-only step
+under a running backward is predicted with the overlap, and pauses the child when the
+window average would pass headroom × target (the mark rides `SchedulerOutput`, held like
+the throttle's pause). `slo.avg_tbt_admission_headroom` (default 1.0): the same fraction
+for FT admission. 14B TP=2, v0.34, production timeline at 1× / 2× rate, 256 / 256,
+single runs, TTFT 100 % everywhere:
+- target 50 ms: 100 % TBT attainment up to 3×, FT 598 / 533 / 482 tok/s.
+- target 20 ms (inference only: 100 / 87.8 %): no gate 58 / 37 %; gate 88 / 53 %, FT
+  498 / 377 (unchanged by the gate); + admission headroom 0.9: 81 / 68 %, FT 472 / 335.
+  A pause hysteresis was tried and dropped (83 / 50 %). What is left of the gap: the
+  child's yield latency on the step that asks for the pause, and mixed steps.
+Most presets still say `avg_tbt_slo: 0.02`: not reachable at 2× (the user's call).
+Postponed: FT suppression when the system is at / over capacity (a milder
+long-request workload; the ones tried overload inference alone).
 Not done: `validation` stage; adapter load cost from profiling (config constants
 now); the "tight" indexing level; recovery when phase 2 of an adapter switch
 fails; giving up on a dead indexing process; threshold calibration on a real

@@ -209,6 +209,10 @@ class _Window:
         self.gaps = LogHistogram(max_tbt_slo)   # one per token: bucketed
         self.e2e: list[float] = []
         self.requests = 0
+        # requests finished here that had a token gap, and how many of them
+        # kept their mean gap within avg_tbt_slo
+        self.tbt_requests = 0
+        self.tbt_met = 0
         self.prompt_tokens = 0
         self.output_tokens = 0
         # forward steps: kind -> [count, gpu_s]
@@ -230,12 +234,14 @@ class MetricsRecorder:
 
     def __init__(self, root: str, interval_s: float = 10.0,
                  ttft_slo: float | None = None, max_tbt_slo: float | None = None,
+                 avg_tbt_slo: float | None = None,
                  clock=time.time, start_ticker: bool = True,
                  steps_log_max_mb: float = 256.0, meta: dict | None = None) -> None:
         self.root = root
         self.interval_s = max(0.5, float(interval_s))
         self.ttft_slo = ttft_slo
         self.max_tbt_slo = max_tbt_slo
+        self.avg_tbt_slo = avg_tbt_slo
         self._clock = clock
         self.meta = dict(meta or {})
         self._w = _Writer(root, steps_log_max_mb)
@@ -256,7 +262,9 @@ class MetricsRecorder:
         # requests = finished; first_tokens = requests that produced one (the
         # TTFT population); ttft_slo_met counts against first_tokens.
         self.tot = {"requests": 0, "first_tokens": 0, "prompt_tokens": 0,
-                    "output_tokens": 0, "ttft_slo_met": 0, "backwards": 0, "trained_tokens": 0,
+                    "output_tokens": 0, "ttft_slo_met": 0,
+                    "tbt_requests": 0, "avg_tbt_slo_met": 0,
+                    "backwards": 0, "trained_tokens": 0,
                     "ft_fwd_tokens": 0, "fwd_gpu_s": 0.0, "bwd_gpu_s": 0.0}
         # The window is touched by the engine loop and by the ticker that
         # closes windows while the engine idles (no steps → no flush otherwise).
@@ -282,6 +290,7 @@ class MetricsRecorder:
             with open(os.path.join(self.root, "run.json"), "w") as f:
                 json.dump({**self.meta, "start_unix_time": round(now, 3),
                            "interval_s": self.interval_s, "ttft_slo": self.ttft_slo,
+                           "avg_tbt_slo": self.avg_tbt_slo,
                            "max_tbt_slo": self.max_tbt_slo}, f, indent=2, default=str)
         except OSError:
             pass
@@ -368,6 +377,12 @@ class MetricsRecorder:
         t["requests"] += 1
         t["prompt_tokens"] += prompt
         t["output_tokens"] += n
+        if tbt_mean is not None:
+            met = bool(self.avg_tbt_slo and tbt_mean <= self.avg_tbt_slo)
+            w.tbt_requests += 1
+            w.tbt_met += met
+            t["tbt_requests"] += 1
+            t["avg_tbt_slo_met"] += met
         self.feed.finished(now, prompt, tbt_mean)
         self._w.row("requests.csv", _REQ_FIELDS, (
             round(now, 3), rid, prompt, n, round(ttft, 5),
@@ -522,9 +537,11 @@ class MetricsRecorder:
         slo = None
         if self.ttft_slo and ttft:
             slo = round(sum(1 for x in ttft if x <= self.ttft_slo) / len(ttft), 4)
+        # TBT attainment: the requests finished in this window whose own mean
+        # token gap is within avg_tbt_slo (per request, like the TTFT one).
         tbt_slo = None
-        if self.max_tbt_slo and gaps.n:
-            tbt_slo = round(gaps.at_or_below / gaps.n, 4)
+        if self.avg_tbt_slo and w.tbt_requests:
+            tbt_slo = round(w.tbt_met / w.tbt_requests, 4)
         return {
             "unix_time": round(now, 3),
             "window_s": round(dt, 3),
@@ -539,7 +556,8 @@ class MetricsRecorder:
                           "p99": rd(gaps.pct(99)), "max": rd(gaps.max if gaps.n else None),
                           "mean": rd(gaps.mean()), "tokens": gaps.n},
                 "ttft_slo": self.ttft_slo, "ttft_slo_attainment": slo,
-                "max_tbt_slo": self.max_tbt_slo, "tbt_slo_attainment": tbt_slo,
+                "avg_tbt_slo": self.avg_tbt_slo, "tbt_slo_attainment": tbt_slo,
+                "max_tbt_slo": self.max_tbt_slo,
                 "prompt_tokens_per_s": round(w.prompt_tokens / dt, 1),
                 "output_tokens_per_s": round(w.output_tokens / dt, 1),
                 "in_flight": len(self._live),

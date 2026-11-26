@@ -113,6 +113,8 @@ class FtRunnerMixin:
                 if thr > 0:
                     release = (int(feats.t_in) - int(feats.t_ft)
                                + int(feats.b_d)) < thr
+            if getattr(scheduler_output, "finetune_pause_backward", False):
+                release = False     # [avg_tbt_pause_backward] still held
             if release:
                 coord.gpu_resume_backward()
                 self._throttle_held = False
@@ -138,7 +140,8 @@ class FtRunnerMixin:
                     thr = int(cfg.fwd_token_throttle)
                     if inf_prefill > 0 or self._ft_pauses_backward(feats, coord) or (
                             cfg.fwd_token_throttle_enable and thr > 0
-                            and inf_prefill + int(feats.b_d) >= thr):
+                            and inf_prefill + int(feats.b_d) >= thr
+                    ) or getattr(scheduler_output, "finetune_pause_backward", False):
                         coord.gpu_pause_backward()
                 # Under async scheduling the PREVIOUS step may still be on the
                 # GPU. If it carried an inference prefill, that prefill decided
@@ -209,6 +212,14 @@ class FtRunnerMixin:
                     # ``>=``: with a threshold of 1 the throttle must also cover
                     # the single-token decode step after a burst's first prefill.
                     pause_throttle = inf_prefill + int(feats.b_d) >= thr
+            # [avg_tbt_pause_backward] The scheduler found that this decode
+            # step, sharing the GPU with the backward, would take the average
+            # time between tokens past its target. Held like the throttle's
+            # pause: across consecutive such steps, without a resume in the
+            # gap between two of them (the child would run a segment into the
+            # next step), and released by the first step that does not ask.
+            if getattr(scheduler_output, "finetune_pause_backward", False):
+                pause_throttle = True
             pause_bwd = (inf_prefill > 0 or pause_throttle
                          or self._ft_pauses_backward(feats, coord))
         if getattr(self, "_ds_route_hold", False):
