@@ -69,5 +69,8 @@ its attention actually replayed its graph. The default preset buys more FT on th
 production timeline with the room the new SLO settings give it — TTFT p99 89 → 112 ms
 and the average TBT 20 → 26 ms, both far inside their targets. The step-1024 preset
 moves the TTFT tail further (up to 170 ms) for 38–61 % more FT and a lower average TBT.
+The default-preset column was run at `gpu_memory_utilization: 0.80`; the preset is at
+0.88 since (a KV cache of 63k instead of 31k tokens) and repeats it within noise
+(FT 407 / 721 / 595 tok/s, TTFT p99 125 / 125 / 113 ms).
 Runs: `eval-tp/output/cleanup/{v2port_v1, ga_final_oldslo, ga_final_default,
-ga_final_step1024b}`.
+ga_final_default88, ga_final_step1024b}`.

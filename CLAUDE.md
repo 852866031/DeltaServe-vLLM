@@ -218,7 +218,9 @@ routing); the m1 gate and the template launches also on v0.33 (v1 and v2 runner)
    steps with real contexts and FT rows, which only the scheduler path produces now.
 2. FT graph path on the breakable CUDA graph: vLLM 0.34 enables it by default only for
    other architectures (not Qwen3 / Llama-3) and never with LoRA's decoder replay; FT
-   batches run without a graph there. Measure abort latency and prefill TTFT first.
+   batches run without a graph there (checked 2026-11-26: with
+   `VLLM_USE_BREAKABLE_CUDAGRAPH=1` the m1 gate passes 28/28, its mixed steps eager).
+   Measure abort latency and prefill TTFT first.
 3. Drop the v1 host (`model_runner.py`, `cudagraph.py`, `runner_select`) once v0.34 is
    confirmed on the A100s.
 4. A100 presets are at `ft_step_size: 2048` / `bwd_batch_size: 512` (not run anywhere);
