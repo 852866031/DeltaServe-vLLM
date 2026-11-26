@@ -10,7 +10,7 @@ breaking inference TTFT / TBT.
 
 It is a **vLLM general plugin** (`deltaserve-plugin/`, import `deltaserve`) on
 **stock, unpatched vLLM** (`vllm-upstream/`, submodule pinned at the v0.34.0 release,
-`62d4bc3c7`, on branch `v2-runner-port`; `main` is still at v0.33.0, `4ba787ec9`). vLLM
+`62d4bc3c7`; `main` carries it since 2026-11-26, v0.33.0 `4ba787ec9` before). vLLM
 supplies multi-LoRA batching, paged KV, the scheduler and the multi-process engine;
 the plugin adds activation capture, the backward process, the FT-admission
 scheduler + estimator, and the interrupt/pause machinery.
@@ -233,6 +233,13 @@ the code. step-1024 preset (`ga_final_step1024b`): FT 481 / 922 / 751 (+38 / +47
 
 All 58 test scripts pass on v0.34 with this state (three leak gates, live adapter
 routing); the m1 gate and the template launches also on v0.33 (v1 and v2 runner).
+
+**Merged into `main` (2026-11-26)** after a review of the whole branch (fixes in the
+MPS / TUNING commit) and a last run: 59 test scripts on v0.34, the m1 gate and the CPU
+tests on v0.33 / v1, and the three timelines again (`eval-tp/output/cleanup/merge_*`):
+default preset FT 411 / 728 / 592 tok/s, step-1024 398–481 / 921 / 751, 100 % TTFT.
+tight-half is 23 s long: its TTFT p99 (127–183 ms) and the step-1024 FT move from run
+to run; do not read a single run of it.
 
 **FT graphs on the breakable CUDA graph (2026-11-26).** `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
 (vLLM's default for other architectures, not Qwen3 / Llama-3) records the forward as it

@@ -74,3 +74,9 @@ The default-preset column was run at `gpu_memory_utilization: 0.80`; the preset 
 (FT 407 / 721 / 595 tok/s, TTFT p99 125 / 125 / 113 ms).
 Runs: `eval-tp/output/cleanup/{v2port_v1, ga_final_oldslo, ga_final_default,
 ga_final_default88, ga_final_step1024b}`.
+
+Repeated on the code as merged into `main` (`merge_default`, `merge_step1024`, tight-half
+three times): default preset FT 408–416 / 728 / 592 tok/s, step-1024 398–481 / 921 /
+751. tight-half lasts 23 s (240 requests): its TTFT p99 came out at 127, 130 and 183 ms
+for the same configuration, and the step-1024 FT there spans 398–481 — about ten
+optimizer steps fit in the window.
