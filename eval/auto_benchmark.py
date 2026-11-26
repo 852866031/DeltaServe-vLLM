@@ -354,7 +354,14 @@ async def send_one_request(
     ttft: Optional[float] = None
     chunk_times: List[float] = []
     try:
-        async with session.post(url, json=payload) as resp:
+        try:
+            resp_cm = await session.post(url, json=payload)
+        except aiohttp.ServerDisconnectedError:
+            # A pooled connection the server had already closed (see the
+            # connector's keepalive_timeout): nothing was sent. Once more on a
+            # fresh connection; the latency still counts from t_send.
+            resp_cm = await session.post(url, json=payload)
+        async with resp_cm as resp:
             if resp.status != 200:
                 await resp.read()
                 return (idx, t_rel, time.monotonic() - t_send,
@@ -515,7 +522,13 @@ async def _run_rows(server: str, rows: List[TimelineRow], stop: asyncio.Event,
     # (subtract base_ts → first row fires at t0); record honours the
     # leading valley (subtract 0 → first row fires at t0 + base_ts).
     schedule_shift = base_ts if not record else 0.0
-    connector = aiohttp.TCPConnector(limit=0)
+    # Idle connections are dropped after 2 s, before the server drops them:
+    # vLLM's HTTP keep-alive is 5 s (VLLM_HTTP_TIMEOUT_KEEP_ALIVE), aiohttp's
+    # default is 15 s, so a pooled connection that sat idle for 5-15 s was
+    # already closed on the server side when the client reused it — the request
+    # failed in 0.2 ms with ServerDisconnectedError and never reached the
+    # engine (3 requests in 161 saved runs, 2026-11-26).
+    connector = aiohttp.TCPConnector(limit=0, keepalive_timeout=2)
     timeout = aiohttp.ClientTimeout(total=request_timeout_s)
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         t0 = time.monotonic()
