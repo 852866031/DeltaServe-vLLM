@@ -108,11 +108,15 @@ def test_backward_gate():
     gate = FinetuneScheduler._backward_would_break_avg_tbt
     CLEAN, OVERLAP = 0.013, 0.024         # a decode step alone / with a backward
 
-    def sched(avg_slo, window=True, on=True, ready=True):
+    def sched(avg_slo, window=True, on=True, ready=True, fitted=True):
         w = TbtWindow(1.0) if window else None
         est = types.SimpleNamespace(
             is_ready=ready,
-            predict=lambda f: OVERLAP if f.bwd else CLEAN)
+            predict=lambda f: (OVERLAP if fitted else CLEAN) if f.bwd else CLEAN,
+            # the regime whose coefficients predict() used: the decode-with-
+            # backward one once it has been fitted, the clean decode fit before
+            select_regime=lambda f: ("decode_bwd" if f.bwd and fitted
+                                     else "decode_only"))
         return types.SimpleNamespace(
             _tbt_pause_backward=on, _tbt_window=w, _estimator=est,
             _avg_tbt_slo=avg_slo, _tbt_headroom=0.9,
@@ -139,6 +143,12 @@ def test_backward_gate():
     check("the admission headroom is off by default",
           cfg2.avg_tbt_admission_headroom == 1.0
           and "avg_tbt_admission_headroom" in FINETUNE_SECTIONS["slo"])
+    # before the decode-with-backward regime has data, predict() answers with
+    # the CLEAN decode time (13 ms): the gate doubles it
+    check("regime not fitted yet: the clean prediction counts twice "
+          "(26 ms breaks a 20 ms target, fits a 50 ms one)",
+          gate(sched(0.02, fitted=False), decode())
+          and not gate(sched(0.05, fitted=False), decode()))
     check("no backward in flight: nothing to decide",
           not gate(sched(0.02), decode(bwd=False)))
     check("a step with an inference prefill or FT tokens is not its business "

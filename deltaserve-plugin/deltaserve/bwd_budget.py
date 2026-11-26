@@ -279,7 +279,8 @@ def resolve_idle(ft_cfg, tokenizer_name: str | None = None, *, lengths=None,
 
 
 def resolve(ft_cfg, tokenizer_name: str | None = None, *, lengths=None,
-            local_heads: int = 1) -> tuple[int, int, dict | None]:
+            local_heads: int = 1, diagnose: bool = True
+            ) -> tuple[int, int, dict | None]:
     """``(bn_max, l_max, info)`` for the backward child. A number in the config
     is taken as it is; ``auto`` on either key is chosen from the dataset
     (``info`` then says how; None when nothing was chosen)."""
@@ -287,6 +288,8 @@ def resolve(ft_cfg, tokenizer_name: str | None = None, *, lengths=None,
     l = getattr(ft_cfg, "backward_cuda_graph_attn_l_max", DEFAULT_L_MAX)
     if not (_is_auto(bn) or _is_auto(l)):
         info = None
+        if not diagnose:
+            return int(bn), int(l), None
         try:
             if lengths is None:
                 lengths = dataset_lengths(ft_cfg, tokenizer_name)

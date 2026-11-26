@@ -994,6 +994,11 @@ python -c "from vllm import LLM; print(LLM('facebook/opt-125m').generate('Hello'
 all-reduce is disabled and every collective goes through host memory. This is
 the TP floor on that hardware. No MPS daemon is assumed
 (`backward_mps_percentage: 0`); latency protection comes from the pause contract.
+An MPS daemon is optional and worth it (`scripts/mps.sh start`,
+`configs/preset/serving_config_finetuning_qwen3_14b_tp2_mps.yaml`): a decode step that
+overlaps a backward takes 1.2× a clean one instead of 1.87×. [TUNING.md](TUNING.md)
+has the numbers, next to every other key that trades inference latency against FT
+throughput.
 
 ### Models and adapters
 

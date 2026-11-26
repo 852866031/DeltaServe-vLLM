@@ -31,6 +31,7 @@ from vllm.config import CUDAGraphMode
 from deltaserve import dprint
 from deltaserve.coordinator import get_coordinator
 from deltaserve.estimator import (
+    REGIME_DECODE_BWD,
     MergedExecutionEstimator,
     StepExecutionTracker,
     StepFeatures,
@@ -51,6 +52,11 @@ def _ts() -> str:
 
 
 # [telemetry] FT admission decision per step (``StepFeatures.admit``).
+# A decode step sharing the GPU with the backward, relative to a clean one,
+# before the decode-with-backward regime has been fitted (measured 1.87-2.0x
+# on Qwen3-14B TP=2 without MPS; ~1.2x under MPS, where it only errs safe).
+_COLD_OVERLAP_FACTOR = 2.0
+
 ADMIT_CODES = {
     "A": "admitted",
     "S": "SLO: no headroom / cut short",
@@ -1018,6 +1024,13 @@ class FinetuneScheduler(AsyncScheduler):
                 and self._estimator.is_ready):
             return False
         t_overlap = self._estimator.predict(feats)   # decode-with-backward regime
+        if self._estimator.select_regime(feats) != REGIME_DECODE_BWD:
+            # That regime has no launch samples (no backward runs during the
+            # profiling pass) and borrows the CLEAN decode fit until its first
+            # live refit: the gate would see no overlap at all. Without MPS an
+            # overlapped decode step takes twice a clean one (two contexts,
+            # time-sliced): assume that until the regime has data of its own.
+            t_overlap *= _COLD_OVERLAP_FACTOR
         over = self._tbt_window.average_with(
             time.monotonic(), feats.b_d, t_overlap
         ) > self._avg_tbt_slo * self._tbt_headroom
@@ -1520,9 +1533,15 @@ class FinetuneScheduler(AsyncScheduler):
         # will carry the flush.
         # [bwd_batch_size_idle] no inference request running or waiting
         if self._coord.bwd_batch_idle > self._coord.bwd_batch:
-            self._coord.idle_now = not self._profiling_mode and not any(
-                not getattr(r, "is_finetuning", False)
-                for r in self.requests.values())
+            _routing = getattr(self, "_adapter_routing", None)
+            self._coord.idle_now = (
+                not self._profiling_mode
+                # a routed request held for its encode step / a cold adapter
+                # is not in ``self.requests`` yet, and is inference
+                and not (_routing is not None
+                         and getattr(_routing.router, "pending", False))
+                and not any(not getattr(r, "is_finetuning", False)
+                            for r in self.requests.values()))
         self._coord.try_epoch_flush()
 
         # [rps_throttle] Per-step gate: close admission_open when the
@@ -1569,6 +1588,11 @@ class FinetuneScheduler(AsyncScheduler):
         if self._in_overload:
             admitted_now, ft_reqs = 0, []
             self._last_admit = ("O", 0)
+            if float(getattr(self.vllm_config.finetune_config,
+                             "match_prefill_workload_factor", 0.0)) > 0:
+                # the inference prefill of a held step still earns FT its
+                # credit (admit_ft_to_step, which books it, is not run)
+                self._unspent_prefill += int(self._current_step_features()[0].t_in)
         else:
             admitted_now, ft_reqs = self.admit_ft_to_step()
         for req in ft_reqs:

@@ -465,6 +465,8 @@ class FinetuneCoordinator:
         # backward ack (tp=1 poll_backward and the TP relay alike).
         # [telemetry] MetricsRecorder (set by the scheduler) or None.
         self.metrics = None
+        # backward cycles whose attention fell back to eager (budget too small)
+        self.backwards_attn_eager = 0
         self.backwards_done = 0
         self.tokens_trained = 0
         self.last_loss: float | None = None
@@ -792,7 +794,7 @@ class FinetuneCoordinator:
         self.backwards_done += 1
         self.tokens_trained += int(resp.get("n", 0) or 0)
         if resp.get("attn_graph") is False:
-            self.backwards_attn_eager = getattr(self, "backwards_attn_eager", 0) + 1
+            self.backwards_attn_eager += 1
         loss = resp.get("loss")
         if loss is not None:
             try:
@@ -816,7 +818,7 @@ class FinetuneCoordinator:
             "epoch": int(self.current_epoch),
             "backwards_done": int(self.backwards_done),
             # cycles whose attention fell back to eager (budget too small)
-            "backwards_attn_eager": int(getattr(self, "backwards_attn_eager", 0)),
+            "backwards_attn_eager": int(self.backwards_attn_eager),
             "tokens_trained": int(self.tokens_trained),
             "last_loss": self.last_loss,
             "mean_loss_last_20": (sum(recent) / len(recent)) if recent else None,

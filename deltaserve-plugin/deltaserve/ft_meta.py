@@ -152,8 +152,10 @@ def build_backward_meta(hf_config: Any, ft_cfg: Any, *, lm_head_key: str | None,
         from deltaserve import bwd_budget
 
         _heads = int(hf_config.num_attention_heads) // max(1, int(tp_size))
+        # A budget given as numbers needs the corpus only for its coverage
+        # note: one rank prints it, the others skip the tokenization.
         attn_bn, attn_l, _info = bwd_budget.resolve(
-            ft_cfg, tokenizer, local_heads=_heads)
+            ft_cfg, tokenizer, local_heads=_heads, diagnose=int(tp_rank) == 0)
         attn_note = bwd_budget.describe(attn_bn, attn_l, _info)
         attn_extra = [list(x) for x in bwd_budget.extra_shapes(
             ft_cfg, attn_bn, attn_l, tokenizer)]

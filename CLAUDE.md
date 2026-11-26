@@ -15,6 +15,11 @@ supplies multi-LoRA batching, paged KV, the scheduler and the multi-process engi
 the plugin adds activation capture, the backward process, the FT-admission
 scheduler + estimator, and the interrupt/pause machinery.
 
+**`TUNING.md` (repo root) is required reading before changing or explaining anything
+that trades inference latency against FT throughput** — SLO targets and headrooms,
+throttles, step / backward / per-step sizes, MPS, KV capacity — with the measured effect
+of each key. Keep it current: a new measurement that changes its advice goes there.
+
 **`README.md` is the user-facing reference** — architecture figure, supported
 models, the forward/backward/CUDA-graph/interrupt/throttle/optimization tables,
 install, launch, experiments, tests. Read it first.

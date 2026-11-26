@@ -191,11 +191,19 @@ def _patch_config() -> None:
             def _maybe_enable_breakable_cudagraph(self):
                 import os
 
+                from deltaserve.runner_select import wants_v2
+
                 ft = self.finetune_config
                 name = "VLLM_USE_BREAKABLE_CUDAGRAPH"
                 if not (ft.enable_finetuning and ft.ft_breakable_cudagraph) \
                         or name in os.environ:
                     return orig(self)
+                if not wants_v2(ft):
+                    # The has_ft capture on the breakable graph lives in the
+                    # v2 host (cudagraph_v2.py) only.
+                    raise ValueError(
+                        "finetune_features.ft_breakable_cudagraph needs the v2 "
+                        "model runner (finetune_features.model_runner: v2)")
                 os.environ[name] = "1"
                 try:
                     return orig(self)

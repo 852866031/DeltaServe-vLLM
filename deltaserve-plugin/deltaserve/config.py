@@ -713,8 +713,10 @@ class FinetuneConfig:
     the graph-capturable ``dserve_save_rows`` op (``deltaserve/ft_save_op.py``)
     fed by persistent index tensors, and a second piecewise capture set keyed
     ``has_ft`` is captured at startup. FT-ONLY batches stay eager (they are
-    the ones the mid-forward abort applies to). Requires a model family with
-    the save call sites (Qwen3); other families silently keep the eager path.
+    the ones the mid-forward abort applies to; ``graph_ft_only_batches`` puts
+    them on the graphs too). The op is issued by the accumulator's hooks, so
+    it works for every family (Qwen3 and Llama-3 are both gated:
+    ``tests/test_phase1_m1.py``, ``tests/test_llama3_inference_leak.py``).
     Off (default) is bit-identical to before."""
 
     graph_ft_max_tokens: int = 512
