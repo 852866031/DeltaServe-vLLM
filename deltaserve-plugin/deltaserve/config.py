@@ -175,6 +175,23 @@ class FinetuneConfig:
     change until the step's update), and a step that carries FT tokens pauses
     the child like an inference prefill does."""
 
+    ft_buffer_size: int | None = None
+    """Rows of the activation buffer when it is SMALLER than the step (None =
+    ``ft_step_size``). A multiple of ``bwd_batch_size``; needs several
+    backward batches per step. The buffer then is a ring of batch slots: batch
+    j of a step is filled in slot j mod (ft_buffer_size / bwd_batch_size), and
+    a slot is given to a later batch once its backward is acked — nothing is
+    allocated or freed while serving, the forward waits when every slot is
+    still being trained. The buffer's memory follows this size, not the step:
+    Qwen3-14B TP=2, 2.70 MB per token per GPU, so a 1024-token step in a
+    512-token buffer is 1.3 GiB instead of 2.6, and a 4096-token step costs no
+    more. Not together with ``bwd_batch_size_idle`` (a larger backward needs
+    its rows in one piece).
+    Measured (2026-11-26, production timeline, 0.88): 1024 / 256 with the whole
+    step buffered -> in 512 rows: FT 624 -> 659 tok/s, FT only 1276 -> 1286,
+    KV cache 53,248 tokens; 2048 / 256 in 512 rows: 670 tok/s, the same KV.
+    Off by default (the buffer holds the step), as before the key."""
+
     bwd_batch_size_idle: int | None = None
     """FT tokens per backward batch while NO inference request is running or
     waiting (None = ``bwd_batch_size``: off). Up to ``ft_step_size``. A larger
@@ -237,6 +254,17 @@ class FinetuneConfig:
             raise ValueError(
                 f"finetune_param.ft_step_size ({step}) must be a multiple of "
                 f"finetune_param.bwd_batch_size ({bwd})")
+        buf = self.ft_buffer_size
+        if buf is not None and (int(buf) < bwd or int(buf) % bwd
+                                or int(buf) > step):
+            raise ValueError(
+                f"finetune_param.ft_buffer_size ({buf}) must be a multiple of "
+                f"bwd_batch_size ({bwd}) and at most ft_step_size ({step})")
+        if (buf is not None and int(buf) < step
+                and self.bwd_batch_size_idle not in (None, bwd)):
+            raise ValueError(
+                "finetune_param.ft_buffer_size below the step and "
+                "bwd_batch_size_idle cannot be combined")
         idle = self.bwd_batch_size_idle
         if idle is not None and not (bwd <= int(idle) <= step):
             raise ValueError(

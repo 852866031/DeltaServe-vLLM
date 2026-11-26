@@ -64,7 +64,7 @@ FINETUNE_SECTIONS: dict[str, tuple[str, ...]] = {
         "enable_finetuning", "start_on_launch", "finetuning_lora_path",
         "data_path", "max_prepare", "num_epochs", "learning_rate",
         "weight_decay", "gamma", "max_saved_finetuning_tokens",
-        "ft_step_size", "bwd_batch_size", "bwd_batch_size_idle", "ft_tokens_per_step", "ft_only_tokens_per_step", "bwd_whole_batches",
+        "ft_step_size", "bwd_batch_size", "ft_buffer_size", "bwd_batch_size_idle", "ft_tokens_per_step", "ft_only_tokens_per_step", "bwd_whole_batches",
         "adapter_save_path", "adapter_save_every_backwards",
         "adapter_save_every_epoch", "adapter_save_keep_last",
     ),

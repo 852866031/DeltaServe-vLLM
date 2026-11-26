@@ -296,6 +296,18 @@ class FinetuneCoordinator:
         # backward graphs are padded to the batch size). ``_step_lens``: the
         # lengths of the step's samples, committed and reserved, in row order.
         self.whole_batches = False
+        # [ft_buffer_size] The activation buffer as a ring of batch slots,
+        # smaller than the step: ``ring_slots`` slots of ``bwd_batch`` rows
+        # (0 = off: the buffer holds the step). Batch j of a step is filled in
+        # slot j mod ring_slots, at that slot's first row, and the slot is
+        # given to a later batch once its backward is acked. Per step, by
+        # batch index: ``_rg_used`` rows placed (reserved or committed),
+        # ``_rg_done`` rows committed, ``_rg_lens`` committed sample lengths;
+        # ``_rg_res`` the batch of every reservation in flight (parallel to
+        # ``_inflight_ft``); ``_rg_bwd`` the next batch to train, ``_rg_acked``
+        # batches trained, ``_rg_sealed`` batches that take no more rows.
+        self.ring_slots = 0
+        self._rg_reset()
         # [bwd_batch_size_idle] the batch size while no inference request is
         # in the system (``idle_now``, set by the scheduler every step).
         # Off by default: measured below one large backward at all times
@@ -514,6 +526,67 @@ class FinetuneCoordinator:
         self._completed_samples = []
         return out
 
+    # -- [ft_buffer_size] the buffer as a ring of batch slots ----------------
+    def _rg_reset(self) -> None:
+        self._rg_used: list[int] = []
+        self._rg_done: list[int] = []
+        self._rg_lens: list[list[int]] = []
+        self._rg_res: list[int] = []
+        self._rg_bwd = 0
+        self._rg_acked = 0
+        self._rg_sealed = 0
+        self._rg_next_len: int | None = None
+
+    @property
+    def ring(self) -> bool:
+        return (self.ring_slots > 0 and self.multi_batch
+                and self.ring_slots < self.capacity // self.bwd_batch)
+
+    def _rg_place(self, need: int, admitted: int = 0) -> tuple[int, int, str]:
+        """Where a sample of ``need`` rows goes after ``admitted`` more rows
+        were placed in this schedule call: ``(batch, room, why)``. ``room`` is
+        what that batch still takes; 0 with ``why`` = "full" (the step has no
+        batch left) or "wait" (its slot is still being trained)."""
+        b = self.bwd_batch
+        j = max(len(self._rg_used) - 1, 0)
+        used = self._rg_used[j] if self._rg_used else 0
+        if j < self._rg_sealed:               # that batch went to the child
+            j, used = self._rg_sealed, 0
+        if admitted:
+            if used and used + admitted > b:
+                j, used = j + 1, 0
+            used += admitted
+        if need > b - used:                   # the next batch
+            j, used = j + 1, 0
+        if j >= self.capacity // b:
+            return j, 0, "full"
+        if j >= self._rg_acked + self.ring_slots:
+            return j, 0, "wait"
+        return j, b - used, ""
+
+    def _rg_need(self) -> int:
+        n = self._rg_next_len
+        return int(n) if n is not None else int(self.min_sample_len)
+
+    def _rg_next_batch(self) -> None:
+        b, j = self.bwd_batch, self._rg_bwd
+        need = self._rg_need()
+        closed = self.reserved_fill == 0 and (
+            self.epoch_flush_pending or self._rg_place(need)[2] == "full")
+        last = len(self._rg_used) - 1
+        rows = self._rg_done[j] if j <= last else 0
+        if rows > 0 and self._rg_done[j] == self._rg_used[j] and (
+                j < last or closed or b - self._rg_used[j] < need):
+            final = closed and not any(self._rg_used[j + 1:])
+            self._rg_sealed = max(self._rg_sealed, j + 1)
+            self._trigger_backward(
+                reason="batch", start=(j % self.ring_slots) * b, rows=rows,
+                lens=list(self._rg_lens[j]), final=final, first=(j == 0))
+        elif closed and rows == 0 and j > 0 and not any(self._rg_used[j:]):
+            # every row of the step was trained before it closed
+            self._trigger_backward(reason="batch", start=0, rows=0, lens=[],
+                                   final=True, first=False)
+
     def space_remaining(self, next_len: int | None = None,
                         admitted_now: int = 0) -> int:
         """Free rows = capacity minus committed AND reserved-in-flight.
@@ -525,6 +598,10 @@ class FinetuneCoordinator:
         stays inside one batch, and the count is exact. ``admitted_now``: rows
         admitted in this schedule call and not reserved yet."""
         base = max(0, self.capacity - self.fill_count - self.reserved_fill)
+        if self.ring:
+            need = int(next_len) if next_len is not None else self.min_sample_len
+            room = self._rg_place(need, admitted_now)[1]
+            return max(0, min(base - admitted_now, room)) + admitted_now
         if not (self.whole_batches and self.multi_batch):
             return base
         b = self.bwd_batch
@@ -748,6 +825,10 @@ class FinetuneCoordinator:
             "buffer_fill": int(self.fill_count),
             "buffer_capacity": int(self.capacity),
             "bwd_batch_size": int(self.bwd_batch),
+            # [ft_buffer_size] rows of the activation buffer (the step when it
+            # is not a ring)
+            "buffer_rows": int(self.ring_slots * self.bwd_batch if self.ring
+                               else self.capacity),
             # [bwd_batch_size_idle] backwards larger than a batch so far
             "bwd_idle_batches": int(self.idle_batches),
             "step_tokens_trained": int(self._bwd_rows),
@@ -799,6 +880,15 @@ class FinetuneCoordinator:
         backward-done hook can later commit-train exactly the samples whose
         activations contributed to that backward."""
         offset = self.fill_count + self.reserved_fill
+        if self.ring:
+            j = self._rg_place(int(n))[0]
+            while len(self._rg_used) <= j:
+                self._rg_used.append(0)
+                self._rg_done.append(0)
+                self._rg_lens.append([])
+            offset = (j % self.ring_slots) * self.bwd_batch + self._rg_used[j]
+            self._rg_used[j] += int(n)
+            self._rg_res.append(j)
         self.reserved_fill += int(n)
         self._inflight_ft.append([int(n), bool(abortable)])
         lens = [int(getattr(s, "input_len", 0)) for s in (samples or [])]
@@ -822,11 +912,14 @@ class FinetuneCoordinator:
             gone += self._step_lens.pop()
         for i in range(len(self._inflight_ft) - 1, -1, -1):
             if self._inflight_ft[i][0] == int(n):
-                del self._inflight_ft[i]
                 break
         else:
-            if self._inflight_ft:
-                self._inflight_ft.pop()
+            i = len(self._inflight_ft) - 1
+        if i >= 0:
+            del self._inflight_ft[i]
+            if i < len(self._rg_res):
+                j = self._rg_res.pop(i)
+                self._rg_used[j] = max(0, self._rg_used[j] - int(n))
         if samples and self.buffer_samples:
             drop = {s.request_id for s in samples}
             self.buffer_samples = [
@@ -877,6 +970,15 @@ class FinetuneCoordinator:
             return
         if (self.fill_count + self.reserved_fill + admitted_now) <= 0:
             return
+        if self.ring:
+            # the step ends when its LAST batch cannot take the next sample;
+            # a slot still being trained only makes the forward wait
+            self._rg_next_len = next_sample_len
+            if next_sample_len is None or self._rg_place(
+                    int(next_sample_len), admitted_now)[2] == "full":
+                self.epoch_flush_pending = True
+                self.admission_open = False
+            return
         effective_space = self.space_remaining(
             next_sample_len, admitted_now) - admitted_now
         if next_sample_len is None or next_sample_len > effective_space:
@@ -916,6 +1018,10 @@ class FinetuneCoordinator:
         self.reserved_fill = max(0, self.reserved_fill - n)
         if self._inflight_ft:
             self._inflight_ft.pop(0)          # commits arrive in step order
+        if self._rg_res:
+            j = self._rg_res.pop(0)
+            self._rg_done[j] += int(n)
+            self._rg_lens[j].extend(int(x) for x in (sample_lens or [n]))
         if sample_lens:
             self.sample_lens.extend(int(x) for x in sample_lens)
         if self.multi_batch:
@@ -940,6 +1046,9 @@ class FinetuneCoordinator:
         ends in the clip, the optimizer step and the publish. A step whose rows
         were all consumed before it closed ends with an empty final batch."""
         if self.pending_backward or self.profiling:
+            return
+        if self.ring:
+            self._rg_next_batch()
             return
         lens = self.sample_lens[self._bwd_samples:]
         avail = self.fill_count - self._bwd_rows
@@ -974,7 +1083,7 @@ class FinetuneCoordinator:
 
     def _trigger_backward(self, reason: str = "buffer FULL", *, start: int = 0,
                           rows: int | None = None, lens: list | None = None,
-                          final: bool = True) -> None:
+                          final: bool = True, first: bool | None = None) -> None:
         # During offline profiling the backward is detached and the buffer is
         # reset between shapes; a full-cap co-serve shape would otherwise fire
         # (and print) a spurious backward signal. Profiling only times forwards.
@@ -982,7 +1091,8 @@ class FinetuneCoordinator:
             return
         if rows is None:                 # one backward per buffer: all of it
             rows, lens = self.fill_count, self.sample_lens
-        first = start == 0
+        if first is None:
+            first = start == 0
         self._bwd_inflight = (int(rows), len(lens), bool(final))
         if final:
             self.admission_open = False
@@ -1135,6 +1245,8 @@ class FinetuneCoordinator:
         if not final:
             self._bwd_rows += rows
             self._bwd_samples += samples
+            self._rg_bwd += 1                 # its slot is free again
+            self._rg_acked += 1
             self._next_batch()
             return
         # Commit the in-buffer claimed samples → trained=True (one-shot
@@ -1150,6 +1262,7 @@ class FinetuneCoordinator:
         self.sample_lens = []
         self.buffer_samples = []
         self._step_lens = []
+        self._rg_reset()
         self._bwd_rows = 0
         self._bwd_samples = 0
         self.admission_open = True

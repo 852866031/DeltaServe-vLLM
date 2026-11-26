@@ -24,6 +24,7 @@ finetune_param:
   # ft_step_size: 1024             # FT tokens per optimizer step (= the activation buffer). Unset: max_saved_finetuning_tokens
   # bwd_batch_size: 256            # FT tokens per backward batch; must divide ft_step_size. Gradients accumulate over the step's
   #                                # batches, one update at its end. Smaller = the backward yields the GPU sooner. Unset: one backward per step
+  # ft_buffer_size: 512          # an activation buffer SMALLER than the step: a ring of batch slots, reused as their backwards finish (memory follows this, not the step)
   # bwd_batch_size_idle: 1024      # a larger backward batch while no inference request is around (a second graph set in the child). Tested: below one
   #                                # large backward at all times (FT 708 vs 795 tok/s, KV 6k vs 17k tokens on 2x 5090): off
   # ft_tokens_per_step: 256        # FT tokens one forward step may carry (default: the backward batch). With a 1024-token buffer and this at 256

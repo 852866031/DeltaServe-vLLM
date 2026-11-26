@@ -175,6 +175,19 @@ average-TBT target 35 ms, single runs — README "Step, backward batch and per-s
   1276 → 1619, production 624 → 708, loose-half 882; the step-1024 preset gives 1877 /
   795 / 922 and a KV cache of 17,408 tokens against 6,144 (two graph sets). Dominated:
   off. "Batch by the overlapping decode batch" is not built (same second-graph-set cost).
+- **`ft_buffer_size`: the activation buffer as a ring of batch slots** (`coordinator.ring`,
+  `_rg_*`): batch j of a step is filled in slot j mod M at that slot's first row —
+  `reserve` returns the PHYSICAL offset, the batch command carries the physical start
+  and an explicit `first` — and a slot is reused once its batch is acked (`_rg_acked`).
+  `_rg_place` answers where the next sample goes: room, or 0 with "full" (the step's
+  last batch: `note_injection` closes the step) or "wait" (the slot is still being
+  trained: the forward waits, the step stays open). A batch goes out when a later one
+  was started, the step closed, or the next sample cannot join it (it is then sealed).
+  The accumulator and the shared buffers have `buffer_tokens_of` rows; `capacity` stays
+  the step. 14B TP=2, 0.88: 1024 / 256 in 512 rows — production FT 624 → 659, FT only
+  1276 → 1286, KV 53,248 tokens; 2048 / 256 in 512 rows: 670, same KV. Gates: m1 with
+  512 / 128 in 256 rows (32/32), the TP=2 gate with 1024 / 256 in 512. Not with
+  `bwd_batch_size_idle` (refused at launch).
 - `backward_cuda_graph_attn_shapes` (default 1): smaller attention shapes inside the
   budget, chosen from the dataset by an exact cut (`bwd_budget.choose_shapes`); the
   attention graph is shared by all layers, so a shape costs slabs + one graph. Each
@@ -244,9 +257,7 @@ is enough, the error left is the model's form.
 
 **Next steps (2026-11-26), not done:**
 1. (Dropped, the user's call 2026-11-26: worker-side dummy runs instead of the launch
-   profiling pass — the pass is 18 s of a 70 s launch.) Open instead: a smaller
-   activation buffer than the step (rows of an acked backward batch reused by later
-   forwards — the `bwd_whole_batches` slots as a ring; no allocation at run time).
+   profiling pass — the pass is 18 s of a 70 s launch.)
 2. Drop the v1 host (`model_runner.py`, `cudagraph.py`, `runner_select`) once v0.34 is
    confirmed on the A100s.
 3. A100 presets are at `ft_step_size: 2048` / `bwd_batch_size: 512` (not run anywhere);

@@ -16,8 +16,8 @@ code. On top of the stock worker it
 - answers the ``deltaserve_{start,stop}_finetuning`` collective RPCs.
 """
 
-from deltaserve.ft_sizes import (bwd_tokens_of, ft_only_tokens_of, fwd_tokens_of,
-                                step_tokens_of)
+from deltaserve.ft_sizes import (buffer_tokens_of, bwd_tokens_of, ft_only_tokens_of,
+                                fwd_tokens_of, ring_slots_of, step_tokens_of)
 import os
 
 import torch
@@ -344,7 +344,7 @@ class DeltaServeWorker(RouteEncodeMixin, Worker):
 
         accumulator = FinetuneAccumulator(
             model=model,
-            max_saved=step_tokens_of(ft_cfg),
+            max_saved=buffer_tokens_of(ft_cfg),   # the step, or a ring of batch slots
             op_rows=ft_only_tokens_of(ft_cfg),
             hidden_size=hidden_size,
             device=self.device,
@@ -383,6 +383,7 @@ class DeltaServeWorker(RouteEncodeMixin, Worker):
         coordinator.bwd_batch = bwd_tokens_of(ft_cfg)
         coordinator.ft_only_budget = ft_only_tokens_of(ft_cfg)
         coordinator.whole_batches = bool(getattr(ft_cfg, "bwd_whole_batches", False))
+        coordinator.ring_slots = ring_slots_of(ft_cfg)
         coordinator.backward_process = backward_process
         # [DeltaServe] Phase 7 / M4.1: under TP>1 this worker-side coordinator is
         # a DIFFERENT process from the EngineCore scheduler. Relay mode makes it

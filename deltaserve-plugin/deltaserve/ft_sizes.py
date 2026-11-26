@@ -46,3 +46,20 @@ def idle_bwd_tokens_of(cfg) -> int:
     b, st = bwd_tokens_of(cfg), step_tokens_of(cfg)
     v = getattr(cfg, "bwd_batch_size_idle", None)
     return int(b if v is None else max(b, min(int(v), st)))
+
+
+def buffer_tokens_of(cfg) -> int:
+    """Rows of the activation buffer (``ft_buffer_size``): the step (the
+    default), or fewer — whole backward batches, at least one — when the
+    buffer is a ring of batch slots."""
+    b, st = bwd_tokens_of(cfg), step_tokens_of(cfg)
+    v = getattr(cfg, "ft_buffer_size", None)
+    if v is None:
+        return int(st)
+    return int(max(b, min(int(v) // b * b, st)))
+
+
+def ring_slots_of(cfg) -> int:
+    """Batch slots of the ring (0 = the buffer holds the step: no ring)."""
+    buf, st = buffer_tokens_of(cfg), step_tokens_of(cfg)
+    return 0 if buf >= st else buf // bwd_tokens_of(cfg)

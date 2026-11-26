@@ -311,6 +311,7 @@ def profile_execution_model(engine) -> None:
         coord.reserved_fill = 0
         coord.sample_lens = []
         coord._step_lens = []
+        coord._rg_reset()
         coord.admission_open = True
         coord.pending_backward = False
         coord.epoch_flush_pending = False

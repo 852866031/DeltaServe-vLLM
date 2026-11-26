@@ -555,6 +555,126 @@ except ValueError:
     _bad = True
 C.ok("an idle size below the batch is refused", _bad)
 
+# -- [ft_buffer_size] the buffer as a ring of batch slots ---------------------
+def ring_step(c, n_samples, sample_len=6):
+    """One forward step in ring mode: returns the write offset (None when the
+    coordinator gives no room)."""
+    room = min(c.space_remaining(sample_len), c.per_step_budget)
+    k = min(n_samples, room // sample_len)
+    if k <= 0:
+        c.note_injection(sample_len, admitted_now=0)
+        c.try_epoch_flush()
+        return None
+    samples = [NS(request_id=f"r{id(c)}-{len(c.buffer_samples) + i}",
+                  input_len=sample_len) for i in range(k)]
+    c.note_injection(sample_len, admitted_now=k * sample_len)
+    off = c.reserve(k * sample_len, samples)
+    c.record_capture(k * sample_len, [sample_len] * k)
+    return off
+
+
+c = coord(capacity=64, bwd=16)        # a 4-batch step in a 2-slot buffer
+c.ring_slots = 2
+ch = c.backward_process
+C.ok("ring: 2 slots for a 4-batch step", c.ring and c.multi_batch)
+offs = [ring_step(c, 1), ring_step(c, 1)]
+C.ok("batch 0 is written at the start of slot 0, and goes out as soon as the "
+     "next sample cannot join it",
+     offs == [0, 6] and len(ch.calls) == 1 and ch.calls[-1].n == 12)
+offs = [ring_step(c, 2)]
+b = ch.calls[-1]
+C.ok("batch 1 goes to slot 1 (row 16); batch 0 goes out: rows 0.., first",
+     offs == [16] and len(ch.calls) == 1
+     and (b.n, b.lens, b.start, b.first, b.final) == (12, [6, 6], 0, True, False),
+     str(vars(b)))
+C.ok("both slots hold a batch that is not trained yet: the forward waits, "
+     "the step stays open",
+     c.space_remaining(6) == 0 and ring_step(c, 2) is None
+     and c.admission_open and not c.epoch_flush_pending and len(ch.calls) == 1)
+ch.done()
+c.poll_backward()
+b = ch.calls[-1]
+C.ok("batch 0 acked: batch 1 goes out from row 16, and slot 0 is free again",
+     len(ch.calls) == 2 and (b.n, b.start, b.first, b.final) == (12, 16, False, False)
+     and c.space_remaining(6) == 16, str(vars(b)))
+offs = [ring_step(c, 2)]
+C.ok("batch 2 is written into slot 0 again (row 0)", offs == [0])
+C.ok("... batch 3 has to wait for slot 1", ring_step(c, 2) is None
+     and c.admission_open)
+ch.done()
+c.poll_backward()
+b = ch.calls[-1]
+C.ok("batch 1 acked: batch 2 goes out from row 0, not first, not final",
+     len(ch.calls) == 3 and (b.n, b.start, b.first, b.final) == (12, 0, False, False),
+     str(vars(b)))
+offs = [ring_step(c, 2)]
+C.ok("batch 3 into slot 1 (row 16); it is the step's last batch: admission "
+     "closes when the next sample does not fit it",
+     offs == [16] and not c.admission_open and c.next_ft_budget() == 0)
+ch.done()
+c.poll_backward()
+b = ch.calls[-1]
+C.ok("batch 3 is the FINAL one",
+     len(ch.calls) == 4 and (b.n, b.start, b.first, b.final) == (12, 16, False, True),
+     str(vars(b)))
+C.ok("... 48 rows trained through a 32-row buffer",
+     sum(x.n for x in ch.calls) == 48 and c.fill_count == 48)
+ch.done()
+c.poll_backward()
+C.ok("its ack ends the step: everything reset, slot 0 first again",
+     c.fill_count == 0 and c.admission_open and c._rg_used == []
+     and len(c.trained) == 1 and len(c.trained[0]) == 8
+     and ring_step(c, 1) == 0)
+
+c = coord(capacity=64, bwd=16)        # an abort gives the slot rows back
+c.ring_slots = 2
+ring_step(c, 1)
+s_ab = [NS(request_id="ab", input_len=6)]
+off = c.reserve(6, s_ab, abortable=True)
+c.release_reserve(6, s_ab)
+C.ok("an aborted reservation gives its rows in the slot back",
+     off == 6 and c._rg_used == [6] and c._rg_res == []
+     and c.space_remaining(6) == 10 and ring_step(c, 1) == 6)
+
+c = coord(capacity=64, bwd=16)        # the epoch ends mid-step
+c.ring_slots = 2
+ch = c.backward_process
+ring_step(c, 2)
+ring_step(c, 1)
+c.note_injection(None, admitted_now=0)        # corpus drained
+c.try_epoch_flush()
+b = ch.calls[-1]
+C.ok("epoch end mid-step: batch 0 goes out, not final (batch 1 has rows)",
+     len(ch.calls) == 1 and (b.n, b.start, b.final) == (12, 0, False), str(vars(b)))
+ch.done()
+c.poll_backward()
+b = ch.calls[-1]
+C.ok("... then the partial batch 1 as the final one",
+     len(ch.calls) == 2 and (b.n, b.start, b.final) == (6, 16, True), str(vars(b)))
+
+from deltaserve.ft_sizes import buffer_tokens_of, ring_slots_of  # noqa: E402
+from deltaserve.config_loader import FINETUNE_SECTIONS  # noqa: E402
+_r = _FC(ft_step_size=1024, bwd_batch_size=256, ft_buffer_size=512)
+_r.check_step_sizes()
+C.ok("ft_buffer_size: unset = the step (no ring); 512 of 1024 / 256 = 2 slots; "
+     "the step's size = no ring",
+     (buffer_tokens_of(_FC(ft_step_size=1024, bwd_batch_size=256)),
+      ring_slots_of(_FC(ft_step_size=1024, bwd_batch_size=256))) == (1024, 0)
+     and (buffer_tokens_of(_r), ring_slots_of(_r)) == (512, 2)
+     and ring_slots_of(_FC(ft_step_size=1024, bwd_batch_size=256,
+                           ft_buffer_size=1024)) == 0
+     and "ft_buffer_size" in FINETUNE_SECTIONS["finetune_param"])
+_bad = []
+for kw in (dict(ft_buffer_size=300), dict(ft_buffer_size=2048),
+           dict(ft_buffer_size=512, bwd_batch_size_idle=1024)):
+    try:
+        _FC(ft_step_size=1024, bwd_batch_size=256, **kw).check_step_sizes()
+        _bad.append(False)
+    except ValueError:
+        _bad.append(True)
+C.ok("refused: not a multiple of the batch, above the step, with an idle size",
+     all(_bad), str(_bad))
+
 # ─── D. config ──────────────────────────────────────────────────────────────
 print("D. config")
 from deltaserve.accumulate import FinetuneAccumulator  # noqa: E402

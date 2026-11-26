@@ -20,7 +20,7 @@ the runner aborted (tier C) is rolled back in ``update_from_output``.
 """
 
 from deltaserve.ft_sizes import (bwd_tokens_of, ft_only_tokens_of, fwd_tokens_of,
-                                idle_bwd_tokens_of, step_tokens_of)
+                                idle_bwd_tokens_of, ring_slots_of, step_tokens_of)
 import bisect
 import csv
 import datetime
@@ -116,6 +116,7 @@ class FinetuneScheduler(AsyncScheduler):
         self._coord.bwd_batch = bwd_tokens_of(ft_cfg)
         self._coord.ft_only_budget = ft_only_tokens_of(ft_cfg)
         self._coord.bwd_batch_idle = idle_bwd_tokens_of(ft_cfg)
+        self._coord.ring_slots = ring_slots_of(ft_cfg)
         self._coord.whole_batches = bool(getattr(ft_cfg, "bwd_whole_batches", False))
         lengths = self._ft_injector.store.sorted_lengths
         if lengths:
@@ -783,7 +784,8 @@ class FinetuneScheduler(AsyncScheduler):
         # The free rows, and at most what one step may carry (one backward
         # batch when a step has several; the whole buffer otherwise).
         # [bwd_whole_batches] ... of the batch the next sample goes into.
-        _first = store.pop_next() if self._coord.whole_batches else None
+        _first = (store.pop_next()
+                  if self._coord.whole_batches or self._coord.ring else None)
         buffer_cap = min(
             self._coord.space_remaining(
                 _first.input_len if _first is not None else None),

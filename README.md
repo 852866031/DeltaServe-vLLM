@@ -493,6 +493,7 @@ Four sizes, all in FT tokens (`finetune_param`). With none of them set, all are
 | `bwd_batch_size` | one **backward**: the child trains the step this many tokens at a time (whole samples), accumulating gradients, and updates + publishes once per step. Must divide `ft_step_size`. Also the size of the backward graphs and the longest trainable sample | `ft_step_size` |
 | `ft_tokens_per_step` | the FT tokens one **forward step with inference tokens** may carry | `bwd_batch_size` |
 | `ft_only_tokens_per_step` | the FT tokens a **forward step without inference tokens** may carry (it is abandoned when a request arrives, so it can be large) | `ft_tokens_per_step` |
+| `ft_buffer_size` | the **activation buffer** when it is smaller than the step: a ring of batch slots, each given to a later batch once its backward is acked (nothing is allocated or freed while serving; the forward waits when every slot is still being trained). A multiple of `bwd_batch_size` | `ft_step_size` |
 | `bwd_batch_size_idle` | the backward batch while **no inference request is running or waiting** (a second graph set of that size in the child). Tested, off: see below | `bwd_batch_size` |
 | `bwd_whole_batches` | with several backwards per step: end the step when its batches are full, not when its rows are — otherwise the remainder of whole-sample packing becomes one more backward of a few dozen tokens at the price of a whole one | `false` |
 
@@ -506,6 +507,8 @@ inference traffic):
 | 1024 / 256 / 256 / 256 | 589 | 75 / 122 ms | 97.8 % | — |
 | 1024 / 256 / 256 / 256, `bwd_whole_batches` | 624 | 77 / 122 ms | 98.5 % | 1276 |
 | 1024 / 256 / 256 / 1024, `bwd_whole_batches`, `bwd_batch_size_idle: 1024` | 708 | 77 / 128 ms | 98.7 % | 1619 |
+| 1024 / 256 / 256 / 256, `ft_buffer_size: 512` | 659 | 82 / 128 ms | 98.9 % | 1286 |
+| 2048 / 256 / 256 / 256, `ft_buffer_size: 512` | 670 | 84 / 132 ms | 99.1 % | — |
 | 1024 / 1024 / 256 / 256 | 767 | 86 / 125 ms | 99.3 % | 1659 |
 | **1024 / 1024 / 256 / 1024** | **795** | 86 / 125 ms | 99.4 % | **1877** |
 | 1024 / 1024 / 512 / 1024 | 860 | 93 / 138 ms | 98.3 % | — |
@@ -540,6 +543,12 @@ inference traffic):
   1024-token backwards, but the child holds two graph sets, which leaves a KV cache of
   6,144 tokens on the 5090s (17,408 with one 1024-token backward, 63,488 with the
   256-token preset). One large backward at all times is faster and cheaper: off.
+- **The buffer need not hold the step** (`ft_buffer_size`): with several backwards per
+  step it can be a ring of batch slots. A 1024-token step in a 512-token buffer is
+  1.3 GiB per GPU instead of 2.6 and no slower (659 vs 624 tok/s); a 2048-token step
+  costs the same memory (KV cache 53,248 tokens at `gpu_memory_utilization: 0.88` in
+  both). This is what makes a long optimizer step affordable on a small GPU; one
+  large backward (the rows above it) is still the faster choice where it fits.
 - Memory: the buffer is 2.70 MB per token per GPU on Qwen3-14B TP=2 (1024 → 2.6 GiB);
   the child of a 1024-token backward peaks at 5.2 GiB (256: 2.25). On the 5090s this
   needs `gpu_memory_utilization: 0.86`.
@@ -1236,7 +1245,7 @@ tests/run_all.sh /tmp/ds-tests 'test_qwen3_*'  # a subset
 | Backward math (gradcheck vs autograd), graph == eager | `test_{llama3,qwen3}_backward`, `test_{llama3,qwen3}_backward_graph`, `test_{llama3,qwen3}_train_overfit` | 1 GPU |
 | TP sharding and gradients | `test_{llama3,qwen3}_tp_shard`, `test_{llama3,qwen3}_tp_backward_gloo`, `test_tp_bucket_gloo`, `test_tp_timing_relay`, `test_ft_abort_tp` | CPU (gloo) |
 | Hooks on vLLM's v2 model runner | `test_runner_v2` | CPU |
-| Several backward batches per optimizer step: k batches equal one backward of the whole step (both families), the child's row ranges, when batches go out and when admission closes, aborts, whole batches, the per-step caps, the config keys | `test_grad_accum` | CPU |
+| Several backward batches per optimizer step: k batches equal one backward of the whole step (both families), the child's row ranges, when batches go out and when admission closes, aborts, whole batches, the per-step caps, the idle batch, the buffer as a ring of slots, the config keys | `test_grad_accum` | CPU |
 | Backward attention graph budget chosen from the dataset (`auto`) and the smaller shapes inside it, the launch note for a configured one, eager-cycle accounting, the child started without torch's `_native` overrides | `test_bwd_budget` | CPU |
 | FT samples in the padding of the graph a step already replays | `test_fill_padding` | CPU |
 | FT batches on vLLM's breakable CUDA graph (`ft_breakable_cudagraph`): the inference gate, and that mixed steps replay a graph there | `test_breakable_ft_graph` | 1 GPU + weights |
