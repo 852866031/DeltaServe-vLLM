@@ -162,12 +162,13 @@ def _serve(llm, lora) -> list:
 
 def run_worker(mode: str) -> None:
     """Build an LLM, serve the prompts, write token ids + logprobs."""
-    # Every run on the v1 model runner. FT runs land there anyway (the plugin
-    # routes finetuning to it), so the baselines must too: v2 differs in
-    # numerics, and at the pinned vLLM commit v2 + LoRA + CUDA graphs fails at
-    # warmup ("CUDA graphs must be captured on a non-default stream") even with
-    # plugins disabled (VLLM_PLUGINS=) — an upstream issue, not ours.
-    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+    # Every run of one gate on the same vLLM model runner — baselines and
+    # control included: v1 and v2 differ in bf16 numerics. On a vLLM with both
+    # (<= 0.33) that is v1, or v2 with DSERVE_MODEL_RUNNER=v2 (the plugin reads
+    # the same variable for the FT runs); later versions only have v2.
+    from deltaserve.runner_select import pin_vllm_runner
+
+    pin_vllm_runner()
     from vllm import LLM, SamplingParams
     from vllm.lora.request import LoRARequest
 

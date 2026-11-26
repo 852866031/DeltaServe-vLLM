@@ -38,7 +38,10 @@ def main() -> None:
     os.environ.setdefault("HF_HOME", "/home/jiaxuan/.cache/huggingface")
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
-    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+    # v1 runner unless DSERVE_MODEL_RUNNER=v2 (the plugin reads it too)
+    from deltaserve.runner_select import pin_vllm_runner
+
+    pin_vllm_runner()
     from vllm import LLM, SamplingParams
     from vllm.lora.request import LoRARequest
     from vllm.sampling_params import RequestOutputKind

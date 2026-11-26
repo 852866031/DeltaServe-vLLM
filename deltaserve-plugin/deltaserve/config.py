@@ -564,6 +564,14 @@ class FinetuneConfig:
     stepping while a backward is outstanding, so the check always runs). Cost:
     the child yields for the whole prefill instead of one layer."""
 
+    model_runner: str = "auto"
+    """Which vLLM model runner hosts the co-serving hooks: ``v1``
+    (``gpu_model_runner.py``; ``deltaserve/model_runner.py``), ``v2``
+    (``vllm/v1/worker/gpu``; ``deltaserve/model_runner_v2.py``) or ``auto``
+    (default): v1 where vLLM still ships it (up to v0.33), else v2. vLLM
+    removed the v1 runner after v0.33, so v2 is the only choice from v0.34 on;
+    on v0.33 both exist, which is what lets the two be compared on one vLLM."""
+
     # --- fwd-token throttle (extends the prefill-gated pause) ---
     fwd_token_throttle_enable: bool = False
     """Master switch for the fwd-token-throttle pause source. When False

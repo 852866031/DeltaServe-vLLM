@@ -37,13 +37,30 @@ class DeltaServeWorker(RouteEncodeMixin, Worker):
 
             arm_parent_death_signal(f"worker rank={self.rank}")
 
+    def _ds_use_v2_runner(self) -> bool:
+        # vLLM <= 0.33 decides per launch (the plugin steers it by
+        # finetune_features.model_runner); later versions only have v2.
+        return bool(getattr(self.vllm_config, "use_v2_model_runner", True))
+
+    def _make_model_runner(self):
+        if (self._ds_use_v2_runner()
+                and not getattr(self.vllm_config, "is_mm_encoder_only", False)):
+            from deltaserve.model_runner_v2 import DeltaServeModelRunnerV2
+
+            return DeltaServeModelRunnerV2(self.vllm_config, self.device)
+        return super()._make_model_runner()
+
     def init_device(self):
         super().init_device()
         from deltaserve import dprint
         from deltaserve.backward_process import BackwardProcess
-        from deltaserve.model_runner import DeltaServeModelRunner
 
-        DeltaServeModelRunner.adopt(self.model_runner)
+        if not self._ds_use_v2_runner():
+            from deltaserve.model_runner import DeltaServeModelRunner
+
+            DeltaServeModelRunner.adopt(self.model_runner)
+        dprint(f"Worker rank={self.rank}: co-serving hooks on the "
+               f"{type(self.model_runner).__name__}")
 
         ft_cfg = self.vllm_config.finetune_config
         arch = self.model_config.hf_config.architectures[0]

@@ -232,8 +232,11 @@ def external_main(args, out: Path) -> None:
           f"{os.environ['CUDA_VISIBLE_DEVICES']}, TP={args.tp}, "
           f"{args.api_servers} API server(s)) ===\n    out dir: {out}")
     env = dict(os.environ, HF_HUB_OFFLINE="1", VLLM_USE_FLASHINFER_SAMPLER="0",
-               TOKENIZERS_PARALLELISM="false",
-               VLLM_USE_V2_MODEL_RUNNER="0")   # v2 + LoRA + CUDA graphs fails upstream
+               TOKENIZERS_PARALLELISM="false")
+    # v1 runner unless DSERVE_MODEL_RUNNER=v2 (the plugin reads it too)
+    from deltaserve.runner_select import pin_vllm_runner
+
+    pin_vllm_runner(env)
     env.setdefault("HF_HOME", "/home/jiaxuan/.cache/huggingface")
     log = open(log_path, "w")
     server = subprocess.Popen(

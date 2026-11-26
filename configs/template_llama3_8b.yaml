@@ -48,6 +48,7 @@ finetune_features:
   forward_interruptible: true        # tiers A/B/C: a request that arrives during an FT-only step pre-empts it
   ft_only_admission_grace_ms: 0  # tier A wait before an FT-only step (0 = off; B and C stay on)
   pause_until_prefill_done: true     # the backward child stays paused until the inference prefill has finished on the GPU
+  model_runner: auto                 # vLLM model runner hosting the hooks: auto (v1 where vLLM has it, else v2) | v1 | v2
   pause_on_arrival: false  # yield the child as soon as a request arrives (on in the Qwen3-14B template)
   pause_prefill_always: false        # pause the child on every prefill step, not only while a backward runs (fewer FT cycles)
   backward_run_ahead_boundaries: 2   # the child's CPU runs ≤ 2 pause boundaries ahead of its GPU, so a pause lands in ~3-6 ms

@@ -271,6 +271,28 @@ def part_idle(root):
     m.close()
 
 
+def part_final_order(root):
+    print("\nH2. the final window is the last line, behind a slow writer")
+    import time as _t
+    m = MetricsRecorder(root, interval_s=10.0, start_ticker=False)
+    m.start_serving()
+    m.on_step(feats(t_in=10), 0.01)
+    opened = m._w._open
+
+    def slow_open(name, fields):       # the writer thread is busy elsewhere
+        _t.sleep(0.2)
+        return opened(name, fields)
+
+    m._w._open = slow_open
+    m.maybe_flush(force=True)          # a periodic window, still with the writer
+    m.on_step(feats(t_in=20), 0.02)
+    m.final_flush()                    # the stop request arrives right behind it
+    w = [json.loads(l) for l in open(os.path.join(root, "summary.jsonl"))]
+    C.ok("the periodic window, then the final one",
+         len(w) == 2 and w[0].get("final") is None and w[1].get("final") is True,
+         str([x.get("final") for x in w]))
+
+
 def part_live_ttft(root):
     print("\nI. TTFT counts where the first token came out")
     clk = Clock(0.0)
@@ -363,5 +385,6 @@ if __name__ == "__main__":
         part_live_ttft(os.path.join(root, "live"))
         part_hist()
         part_idle(os.path.join(root, "idle"))
+        part_final_order(os.path.join(root, "final_order"))
         part_f(os.path.join(root, "perf"))
     C.finish()

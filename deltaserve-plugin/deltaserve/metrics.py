@@ -140,13 +140,27 @@ class _Writer:
             self._files[name] = f
         return f
 
+    def drain(self, timeout: float) -> bool:
+        """Wait until everything queued so far is on disk (flushed). False on
+        a timeout."""
+        done = threading.Event()
+        self._q.put(("sync", None, None, done))
+        return done.wait(timeout)
+
     def _run(self) -> None:
+        dirty: set = set()        # files written to since their last flush
         while True:
             item = self._q.get()
             if item is None:
                 break
             kind, name, fields, payload = item
             try:
+                if kind == "sync":
+                    for f in dirty:
+                        f.flush()
+                    dirty.clear()
+                    payload.set()
+                    continue
                 if kind == "gz":
                     from deltaserve.live import RollingGz
                     g = self._gz.get(name)
@@ -156,14 +170,20 @@ class _Writer:
                     if time.monotonic() - self._gz_flushed > 5.0:   # stays readable
                         self._gz_flushed = time.monotonic()
                         g.flush()
-                    continue
-                f = self._open(name, fields)
-                if kind == "csv":
-                    csv.writer(f).writerow(payload)
                 else:
-                    f.write(json.dumps(payload) + "\n")
-                if self._q.empty():
-                    f.flush()
+                    f = self._open(name, fields)
+                    if kind == "csv":
+                        csv.writer(f).writerow(payload)
+                    else:
+                        f.write(json.dumps(payload) + "\n")
+                    dirty.add(f)
+                # Whenever the queue runs empty, whatever item emptied it: a
+                # line written while step-log items were still queued used to
+                # stay in its buffer until that file's next line.
+                if dirty and self._q.empty():
+                    for f in dirty:
+                        f.flush()
+                    dirty.clear()
             except Exception:  # noqa: BLE001 — metrics never break serving
                 pass
         for f in list(self._files.values()) + list(self._gz.values()):
@@ -576,6 +596,11 @@ class MetricsRecorder:
             self._last = snap
             self._win = _Window(self._clock(), self.max_tbt_slo)
             self.feed.flush_open_run()
+        # The final window is the LAST line of summary.jsonl: let the writer
+        # put the windows it still holds on disk first (bounded — the process
+        # may be killed any moment, and the final line matters more than its
+        # place).
+        self._w.drain(0.5)
         try:
             with open(os.path.join(self.root, "summary.jsonl"), "a") as f:
                 f.write(json.dumps({**snap, "final": True}) + "\n")

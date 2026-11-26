@@ -32,8 +32,8 @@ finetune_features:
   backward_mps_percentage: 0         # 0 = no MPS (the pause contract protects prefill); >0 needs an MPS daemon and caps the child's SMs
   backward_fp32: false               # false = bf16 bulk backward GEMMs (scores, softmax, norms, LM head, masters stay fp32)
   backward_cuda_graph: true          # per-layer backward CUDA graphs (forward recompute, FFN bwd, shared attention bwd); TP-safe
-  backward_cuda_graph_attn_bn_max: 8 # padded attention graph fits ≤ 8 samples per cycle, else that cycle runs eager
-  backward_cuda_graph_attn_l_max: 64 # ... and samples ≤ 64 tokens (cost is quadratic in this)
+  backward_cuda_graph_attn_bn_max: 16 # padded attention graph fits ≤ 16 samples per cycle, else that cycle's attention runs eager (a 256-token cycle of ~19-token samples holds 13)
+  backward_cuda_graph_attn_l_max: 48 # ... and samples ≤ 48 tokens (cost is quadratic in this). 8 x 64 made every cycle fall back: 147 -> 122 ms per cycle, FT +6 %
   # activation saves (skip parts of the backward's forward recompute)
   save_activations: true             # false only to measure the save overhead (nothing is trained)
   save_attn_qkv: true                # save q/k/v: skips the Q/K/V projection (exact for Qwen3: saved before q_norm/k_norm)
@@ -47,6 +47,7 @@ finetune_features:
   forward_interruptible: true        # tiers A/B/C: a request that arrives during an FT-only step pre-empts it
   ft_only_admission_grace_ms: 2.0    # tier A: wait this long for a request before scheduling an FT-only step (0 = off)
   pause_until_prefill_done: true     # the backward child stays paused until the inference prefill has finished on the GPU
+  model_runner: auto                 # vLLM model runner hosting the hooks: auto (v1 where vLLM has it, else v2) | v1 | v2
   pause_on_arrival: true             # the child also yields as soon as a request arrives (production TTFT p99 270 → 99 ms)
   pause_prefill_always: false        # pause the child on every prefill step, not only while a backward runs (fewer FT cycles)
   backward_run_ahead_boundaries: 2   # the child's CPU runs ≤ 2 pause boundaries ahead of its GPU, so a pause lands in ~3-6 ms

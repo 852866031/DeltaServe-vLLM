@@ -173,13 +173,15 @@ def main():
     sig.close()
 
     # 5) sentinel field round-trips the worker → engine serialisation.
-    from vllm.v1.outputs import ModelRunnerOutput
-    out = ModelRunnerOutput(req_ids=[], req_id_to_index={})
+    from vllm.v1.outputs import ModelRunnerOutput  # noqa: F401
+
+    from deltaserve.runner_common import _empty_output
+    out = _empty_output()
     out.finetune_aborted = True
     back = pickle.loads(pickle.dumps(out))
     C.ok("ModelRunnerOutput.finetune_aborted survives pickle", back.finetune_aborted is True)
     C.ok("absent on an ordinary output",
-         not getattr(ModelRunnerOutput(req_ids=[], req_id_to_index={}),
+         not getattr(_empty_output(),
                      "finetune_aborted", False))
     C.finish()
 

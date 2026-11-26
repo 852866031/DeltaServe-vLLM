@@ -59,8 +59,9 @@ def test_timing_round_trip():
         worker.push_sample(g, dur(g), False, 0.01)
 
     # sample_tokens: drain onto the output; the executor pickles it across.
-    out = ModelRunnerOutput(req_ids=[], req_id_to_index={}, sampled_token_ids=[],
-                            logprobs=None, prompt_logprobs_dict={}, pooler_output=[])
+    from deltaserve.runner_common import _empty_output
+
+    out = _empty_output()      # vLLM <= 0.33 also wants req_id_to_index
     C.ok("ModelRunnerOutput carries no finetune_timing by default",
          getattr(out, "finetune_timing", None) is None)
     out.finetune_timing = worker.drain_completed_samples() or None

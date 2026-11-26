@@ -76,7 +76,7 @@ FINETUNE_SECTIONS: dict[str, tuple[str, ...]] = {
         "save_attn_ctx", "save_resid_mid", "graph_ft_batches",
         "graph_ft_max_tokens", "graph_ft_only_batches", "forward_interruptible",
         "ft_only_admission_grace_ms", "pause_on_arrival", "pause_prefill_always",
-        "pause_until_prefill_done",
+        "pause_until_prefill_done", "model_runner",
     ),
     "throttles": (
         "coserving_admission_phase", "ft_tokens_admission_constrain_factor",

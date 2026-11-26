@@ -31,9 +31,11 @@ not have:
 All of it ships as a **vLLM general plugin** (`deltaserve`, in `deltaserve-plugin/`).
 **vLLM itself is unmodified:** `vllm-upstream/` is a git submodule pinned at
 the
-[`v0.33.0`](https://github.com/vllm-project/vllm/releases/tag/v0.33.0) release
-(`4ba787ec9`), with no patches. Co-serving is enabled per launch through
+[`v0.34.0`](https://github.com/vllm-project/vllm/releases/tag/v0.34.0) release
+(`62d4bc3c7`), with no patches. Co-serving is enabled per launch through
 vLLM's own `--additional-config`. Without it, the server is plain vLLM.
+(v0.33.0 still works with the same plugin: it is the last release with vLLM's v1
+model runner, and `finetune_features.model_runner` picks between the two there.)
 
 ---
 
@@ -76,7 +78,7 @@ git clone --recurse-submodules https://github.com/852866031/DeltaServe-vLLM.git
 cd DeltaServe-vLLM
 ```
 
-**2. Install** vLLM v0.33.0 (precompiled kernels, no CUDA build) and the plugin into
+**2. Install** vLLM v0.34.0 (precompiled kernels, no CUDA build) and the plugin into
 a fresh env. On an RTX 5090, use the [RTX 5090 steps](#rtx-5090-blackwell-sm_120)
 instead (it needs CUDA 13 inside the env first).
 
@@ -84,14 +86,14 @@ instead (it needs CUDA 13 inside the env first).
 conda create -n deltaserve python=3.12 -y && conda activate deltaserve
 pip install uv
 cd vllm-upstream
-VLLM_VERSION_OVERRIDE=0.33.0 \
-    VLLM_PRECOMPILED_WHEEL_COMMIT=4ba787ec9959e566d3b587a796dff07673324da5 \
+VLLM_VERSION_OVERRIDE=0.34.0 \
+    VLLM_PRECOMPILED_WHEEL_COMMIT=62d4bc3c7e33b1b6c906e233e6af2d3506c482ca \
     VLLM_USE_PRECOMPILED=1 \
     uv pip install --editable . --torch-backend=auto
 cd ..
 uv pip install --editable deltaserve-plugin --no-deps
 pip install peft datasets pandas matplotlib
-uv pip uninstall torchaudio     # vLLM 0.33 pins a torchaudio built for an older torch
+uv pip uninstall torchaudio     # vLLM pins a torchaudio built for an older torch
 ```
 
 **3. Download the model.** The launchers run with `HF_HUB_OFFLINE=1`, so fetch the
@@ -726,8 +728,13 @@ DeltaServe-vLLM/
 │       ├── ft_injector.py             builds the FT requests
 │       ├── coordinator.py             buffer flags, relay, FtArrivalSignal, FtAbortPoller
 │       ├── worker.py                  DeltaServeWorker: child spawn, CUDA-IPC export
-│       ├── model_runner.py            DeltaServeModelRunner: mask, timing, tier C, relay
-│       ├── cudagraph.py               FtCudagraphDispatcher + FtBatchDescriptor
+│       ├── runner_common.py           FtRunnerMixin: mask, pause, timing ring, save, tier-C outcome, relay (both runners)
+│       ├── model_runner.py            DeltaServeModelRunner: the hooks on vLLM's v1 runner
+│       ├── model_runner_v2.py         DeltaServeModelRunnerV2: the hooks on vLLM's v2 runner (finetune_features.model_runner)
+│       ├── runner_select.py           which of the two a launch uses
+│       ├── cudagraph.py               FtCudagraphDispatcher (v1 runner)
+│       ├── cudagraph_v2.py            FtCudaGraphManager (v2 runner): dispatch + the has_ft capture pass
+│       ├── cudagraph_common.py        FtBatchDescriptor, the abort poll between graph segments
 │       ├── accumulate.py              per-layer activation-save hooks
 │       ├── ft_save_op.py              torch.ops.vllm.dserve_save_rows
 │       ├── backward_process.py        child process launch / IPC
@@ -742,7 +749,7 @@ DeltaServe-vLLM/
 │       │   ├── llama3.py              Llama-3 / 3.1 / 3.2 / 3.3 family
 │       │   └── qwen3.py               Qwen3 family
 │       └── api.py                     HTTP routes: start/stop, finetuning_status, save_adapter, save_estimator_state
-├── vllm-upstream/                     stock vLLM v0.33.0 (git submodule, no patches)
+├── vllm-upstream/                     stock vLLM v0.34.0 (git submodule, no patches)
 ├── configs/                           template_*.yaml (commented starting points, one per model)
 │   └── preset/                        the configs behind experiments + tests (5090 + A100)
 ├── adapters/                          toy LoRA adapters (inference + "-ft" training target)
@@ -787,8 +794,8 @@ pip install uv            # for --torch-backend=auto
 # 3. Stock vLLM, editable, with its precompiled kernels (no CUDA build).
 #    VLLM_PRECOMPILED_WHEEL_COMMIT pins the .so files to the submodule commit.
 cd vllm-upstream
-VLLM_VERSION_OVERRIDE=0.33.0 \
-    VLLM_PRECOMPILED_WHEEL_COMMIT=4ba787ec9959e566d3b587a796dff07673324da5 \
+VLLM_VERSION_OVERRIDE=0.34.0 \
+    VLLM_PRECOMPILED_WHEEL_COMMIT=62d4bc3c7e33b1b6c906e233e6af2d3506c482ca \
     VLLM_USE_PRECOMPILED=1 \
     uv pip install --editable . --torch-backend=auto
 cd ..
@@ -796,7 +803,7 @@ cd ..
 # 4. The plugin (pure Python; vLLM discovers it through its entry point)
 uv pip install --editable deltaserve-plugin --no-deps
 
-# vLLM 0.33 pins torchaudio 2.11 next to torch 2.14; transformers imports it and
+# vLLM pins torchaudio 2.11 next to torch 2.14; transformers imports it and
 # its CUDA-version check fails. Text-only serving does not need it:
 uv pip uninstall torchaudio
 
@@ -848,14 +855,14 @@ which nvcc && nvcc --version     # MUST be $CONDA_PREFIX/bin/nvcc, release 13.0
 # vLLM (precompiled, pulls torch cu130) + the plugin
 pip install uv
 cd vllm-upstream
-VLLM_VERSION_OVERRIDE=0.33.0 \
-    VLLM_PRECOMPILED_WHEEL_COMMIT=4ba787ec9959e566d3b587a796dff07673324da5 \
+VLLM_VERSION_OVERRIDE=0.34.0 \
+    VLLM_PRECOMPILED_WHEEL_COMMIT=62d4bc3c7e33b1b6c906e233e6af2d3506c482ca \
     VLLM_USE_PRECOMPILED=1 \
     uv pip install --editable . --torch-backend=auto
 cd ..
 uv pip install --editable deltaserve-plugin --no-deps
 pip install peft datasets pandas matplotlib
-uv pip uninstall torchaudio     # vLLM 0.33 pins torchaudio 2.11 next to torch 2.14
+uv pip uninstall torchaudio     # vLLM pins torchaudio 2.11 next to torch 2.14
 
 # Check, then trigger the one-time FlashInfer JIT
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_capability())"
@@ -1125,6 +1132,7 @@ tests/run_all.sh /tmp/ds-tests 'test_qwen3_*'  # a subset
 | Graph-capturable save op, CUDA-IPC weight sharing | `test_ft_save_op`, `test_phase1_step3` | 1 GPU |
 | Backward math (gradcheck vs autograd), graph == eager | `test_{llama3,qwen3}_backward`, `test_{llama3,qwen3}_backward_graph`, `test_{llama3,qwen3}_train_overfit` | 1 GPU |
 | TP sharding and gradients | `test_{llama3,qwen3}_tp_shard`, `test_{llama3,qwen3}_tp_backward_gloo`, `test_tp_bucket_gloo`, `test_tp_timing_relay`, `test_ft_abort_tp` | CPU (gloo) |
+| Hooks on vLLM's v2 model runner | `test_runner_v2` | CPU |
 | TP on real NCCL | `test_tp_backward_graph_nccl`, `test_tp_trainer_graph_nccl` | 2 GPUs |
 | **Inference is unperturbed by co-serving** (amplified FT adapter + positive control; FT provably co-batched with real prefills and decodes; eager + CUDA graphs) | `test_phase1_m1` (Qwen3-0.6B), `test_tp_inference_leak` (Qwen3-14B TP=2, production preset) | 1 GPU / 2 GPUs + weights |
 | End-to-end engine / server | `test_phase1_m2`, `test_pause_on_arrival`, `test_tp_no_orphans` | GPU(s) + model weights |
@@ -1135,7 +1143,10 @@ tests/run_all.sh /tmp/ds-tests 'test_qwen3_*'  # a subset
 | The inference gate with routing on (`DSERVE_M1_ROUTING=1`) | `test_phase1_m1`, `test_tp_inference_leak` | 1 GPU / 2 GPUs + weights |
 
 **Moving to a newer vLLM:** check out the new commit in `vllm-upstream`, reinstall
-with its SHA, and run `tests/run_all.sh`. The plugin depends only on the vLLM APIs
+with its SHA, and run `tests/run_all.sh`. In an env that already has a working torch
+(same torch pin), `uv pip install --no-deps --editable .` replaces only vLLM itself;
+with dependencies, `--torch-backend=auto` may download torch and the CUDA libraries
+again. Then install the few packages `requirements/` changed. The plugin depends only on the vLLM APIs
 it imports and the methods `deltaserve/plugin.py` wraps (listed in that file's
 docstring).
 

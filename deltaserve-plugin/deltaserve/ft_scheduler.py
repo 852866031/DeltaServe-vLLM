@@ -913,6 +913,15 @@ class FinetuneScheduler(AsyncScheduler):
             return False
         has_lora = self.lora_config is not None and len(lora_ids) > 0
         uniform_decode = feats.t_in == 0 and feats.b_d > 0
+        query = getattr(disp, "will_use_graph", None)
+        if query is not None:
+            # The v2 runner's graph manager (cudagraph_v2.FtCudaGraphManager).
+            return query(
+                num_tokens=int(total_tokens),
+                num_reqs=max(int(feats.b_d), 1),
+                uniform_decode=uniform_decode,
+                num_active_loras=len(lora_ids) if has_lora else 0,
+                has_ft=_mixed_graph if feats.has_ft else None)
         mode, _ = disp.dispatch(
             num_tokens=int(total_tokens),
             uniform_decode=uniform_decode,
@@ -1478,7 +1487,10 @@ class FinetuneScheduler(AsyncScheduler):
                 # queue it would be scheduled later with no entry in
                 # self.requests and kill the engine (KeyError in
                 # _update_after_schedule).
-                for name in ("skipped_waiting", "kv_holding_waiting"):
+                # (``async_kv_waiting``: vLLM >= 0.34, requests whose KV a
+                # connector loads in the background.)
+                for name in ("skipped_waiting", "kv_holding_waiting",
+                             "async_kv_waiting"):
                     queue = getattr(self, name, None)
                     if queue:
                         queue.remove_requests([req])

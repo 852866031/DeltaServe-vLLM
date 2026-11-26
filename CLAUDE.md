@@ -9,8 +9,8 @@ an **SLO-aware scheduler** decides each step how much FT work to admit without
 breaking inference TTFT / TBT.
 
 It is a **vLLM general plugin** (`deltaserve-plugin/`, import `deltaserve`) on
-**stock, unpatched vLLM** (`vllm-upstream/`, submodule pinned at the v0.33.0 release,
-`4ba787ec9`; branch `vllm-v0.33`). vLLM
+**stock, unpatched vLLM** (`vllm-upstream/`, submodule pinned at the v0.34.0 release,
+`62d4bc3c7`, on branch `v2-runner-port`; `main` is still at v0.33.0, `4ba787ec9`). vLLM
 supplies multi-LoRA batching, paged KV, the scheduler and the multi-process engine;
 the plugin adds activation capture, the backward process, the FT-admission
 scheduler + estimator, and the interrupt/pause machinery.
@@ -40,13 +40,84 @@ tests/                          standalone scripts (python, NOT pytest); tests/r
 docs/figures/                   overview + architecture figures + generators (make_overview.py, make_architecture.py), result plots
 ```
 
-**vLLM version.** v0.33.0 is the last release with the v1 model runner, where every
-runner hook lives (`model_runner.py`, `cudagraph.py`). vLLM `main` removed v1 on
-2026-11-07 (vllm-project/vllm#63373), so the next upgrade means re-hosting those hooks
-on the v2 runner (`vllm/v1/worker/gpu/`): `prepare_inputs` for the FT mask, a wrapper
-around the inline forward for timing / pause / tier-C, and a `CudaGraphManager`
-subclass for the `has_ft` set. Scheduler, EngineCore, LoRA and model internals carry
-over (checked statically against main).
+**vLLM version and model runner.** vLLM has two model runners: v1
+(`gpu_model_runner.py`, gone after v0.33) and v2 (`vllm/v1/worker/gpu`, the only one
+from v0.34). The plugin hosts its hooks on either: `runner_common.FtRunnerMixin` holds
+the per-step logic, `model_runner.py` + `cudagraph.py` host it on v1,
+`model_runner_v2.py` + `cudagraph_v2.py` on v2. `finetune_features.model_runner` =
+`auto` (default: v1 where vLLM has it, else v2) | `v1` | `v2`; `DSERVE_MODEL_RUNNER`
+overrides it. The v1 host stays until v0.34 is confirmed on the A100 machine, so a
+v0.33 env remains a fallback (the same plugin runs on both).
+
+The v2 runner has no `_model_forward` and dispatches before it prepares inputs, so on
+v2: mask + FT mode in `gather_batch_req_state`, forward begin on
+`step_timing.forward_start()`, `skip_compiled` from a forward pre-hook on the model,
+forward end after the stock `execute_model`, retired FT requests in `finish_requests`,
+the `has_ft` set as a second `capture()` pass. Its profile run selects `max_loras`
+dummy adapters (v1's selects none), so the v2 runner removes the pinned FT adapter
+before it instead of after (the first FT request reloads it, on both runners).
+
+**v0.34 port (2026-11-25), validated on the 5090s; A100 verification by the user
+pending.** Every test passes on v0.33/v1, v0.33/v2 and v0.34 (56 scripts: both leak
+gates, the live adapter-routing run). Qwen3-14B TP=2 timelines (tight-half /
+loose-half / production-600-800), all 100 % TTFT SLO:
+- v0.33 v1 → v2: FT tok/s 349→372 / 627→630 / 466→463, TTFT p50 within 2 ms.
+- v0.33 v2 → v0.34: FT 372→369 / 630→629 / 463→465, TTFT p50 within 4 ms, step times
+  within 0.1 ms.
+Runs in `eval-tp/output/cleanup/v2port_{v1,v2,v034}`. What v0.34 changed for us:
+- **Compile cache key:** `VllmConfig.compile_factors()` replaces `compute_hash()`;
+  `DeltaServeConfig` implements both (without `compile_factors` every finetune knob
+  would key the cache).
+- **Extensible KV cache (default on):** the KV cache is sized ONCE, from the device
+  memory free after warmup + graph capture, within `gpu_memory_utilization`. On 14B
+  TP=2 at 0.8: 30,720 tokens (v0.33: 50,448), no effect on the three timelines. The
+  backward child keeps growing after that measurement (0.8 → 2.25 GiB per GPU; 1.3 →
+  5.2 GiB peak with a 1024-token backward), and nothing resizes the cache later: **keep
+  `gpu_memory_utilization` below 1 as the child's headroom** (vLLM's startup warning
+  suggests dropping it; its own exception list covers our case).
+- `VLLM_USE_V2_MODEL_RUNNER=0` is an error on v0.34: tests pin FT-off baselines through
+  `runner_select.pin_vllm_runner`.
+- New scheduler queue `async_kv_waiting` (KV connector loads): in the FT cleanup list.
+
+**Findings of the same day (v0.34, production timeline, single runs):**
+- FT-only forward graphs off: FT-only step 53.7 → 61.7 ms, FT −2.6 %.
+- Backward graphs made no difference in the presets because the padded-attention budget
+  (`backward_cuda_graph_attn_bn_max: 8`, `_l_max: 64`) never fits a cycle (13 samples of
+  ≤ ~40 tokens): every cycle's attention ran eager. With 16 × 48: cycle 147 → 122 ms, FT
+  +6 %, no fallback. The 14B template has 16 × 48; the presets still have 8 × 64.
+- Activation buffer memory, 14B TP=2, all saves on: 2.70 MB per token per GPU (256 →
+  0.65 GiB, 1024 → 2.58, 2048 → 5.16; gate_up is 52 % of it). A 1024-token buffer AND
+  backward (`max_saved_finetuning_tokens: 1024`) with `gpu_memory_utilization: 0.86`
+  runs on the 5090s without OOM: worker 26.6 GiB, child ≤ 5.2 GiB, KV 22,528 tokens;
+  FT 462 → 592 tok/s, but backward cycle 147 → 468 ms and TTFT p99 87 → 188 ms (still
+  100 % SLO) — the cost of a coarser yield, which a 256-token backward avoids.
+- `metrics.final_flush` could write the final window before the last periodic one
+  (writer-thread buffer): fixed (`_Writer.drain`), `tests/test_metrics.py` H2.
+
+**Agreed next steps (2026-11-25, after the A100 check), in order:**
+1. Gradient accumulation: `ft_step_size` (tokens per optimizer step; replaces
+   `max_saved_finetuning_tokens`, which stays as an alias) and `bwd_batch_size`
+   (tokens per backward; must divide `ft_step_size`). Buffer capacity = `ft_step_size`
+   (+ an optional cap for small GPUs). Gradients are normalised over the step, so k
+   batches equal one large batch. A step that carries FT tokens pauses the backward
+   like an inference prefill does, so FT forwards never overlap a backward (keeps the
+   estimator's regimes clean); the next step's forwards start only after the publish.
+   Later phases: backward batch size as an estimator feature, a larger batch while no
+   inference runs, sizing by the overlapping decode batch. A100 presets → 2048 / 512;
+   try 1024 / 256 on the 5090s.
+2. Pick the backward attention budget from the FT dataset (coverage vs padded cost,
+   under a memory limit; `auto`); several graph shapes / length-bucketed batches as
+   options. Belongs with step 1: the budget follows `bwd_batch_size`.
+3. Fill the graph padding: admit FT tokens up to the next captured graph size.
+4. Worker-side dummy runs instead of the launch profiling pass.
+5. FT graph path on the breakable CUDA graph (FT batches run without a graph there
+   now); accept only after measuring abort latency and prefill TTFT under a paused
+   backward against the compiled path.
+6. Drop the v1 host (`model_runner.py`, `cudagraph.py`, `runner_select`).
+Candidates, measure first: one graph set instead of plain + `has_ft`; Llama-3 save
+call sites; refusing unvalidated combinations at launch (context / pipeline
+parallel); speculative decoding (the user's call). Not doing: FT samples resident on
+the GPU; skipping FT rows in the KV write (the attention reads K/V back from the cache).
 
 ## Rules
 
@@ -79,12 +150,12 @@ Co-serving is switched on per launch with `--additional-config '{"deltaserve": {
 
 | What | Seam |
 |---|---|
-| `FinetuneConfig` | parsed from `additional_config` into a `DeltaServeConfig` (compile-cache hash = graph-affecting fields only); `VllmConfig.finetune_config` property |
+| `FinetuneConfig` | parsed from `additional_config` into a `DeltaServeConfig` (compile-cache key = graph-affecting fields only: `compile_factors` / `compute_hash`); `VllmConfig.finetune_config` property |
 | worker / scheduler / async defaults | `VllmConfig.__post_init__` wrapper → `engine_config.configure_vllm_config` |
-| v1 model runner forced | `_get_v2_model_runner_unsupported_features` wrapper (all hooks live in the v1 runner) |
+| model runner choice (vLLM ≤ 0.33) | `_get_v2_model_runner_unsupported_features` + `use_v2_model_runner` wrappers, by `finetune_features.model_runner` (`runner_select.py`) |
 | backward child, weight + activation + served-LoRA sharing | `worker.DeltaServeWorker` |
-| FT mask, save arming, timing ring, backward pause, tier-C abort, relay | `model_runner.DeltaServeModelRunner` (adopted by class swap) |
-| `has_ft` CUDA-graph set | `cudagraph.FtCudagraphDispatcher` + `FtBatchDescriptor` |
+| FT mask, save arming, timing ring, backward pause, tier-C abort, relay | `runner_common.FtRunnerMixin`, hosted by `model_runner_v2.DeltaServeModelRunnerV2` (built by `Worker._make_model_runner`) or, on the v1 runner, `model_runner.DeltaServeModelRunner` (class swap) |
+| `has_ft` CUDA-graph set | v2: `cudagraph_v2.FtCudaGraphManager` (class swap after `initialize_kv_cache`); v1: `cudagraph.FtCudagraphDispatcher`; `FtBatchDescriptor` keys the set in both |
 | graph-path abort | `CUDAGraphWrapper.__call__` wrapper: poll between piecewise segments |
 | activation save in graphs | accumulator hooks issue `torch.ops.vllm.dserve_save_rows` (traced by Dynamo) |
 | tiers A/B, rollback, rps / recv bookkeeping | `ft_scheduler.FinetuneScheduler` (`BothPhaseFinetuneScheduler` for phase `both`) |
@@ -127,7 +198,8 @@ Co-serving is switched on per launch with `--additional-config '{"deltaserve": {
 - **Vocab padding:** use the real local `lm_head.shape[0]`, not `vocab // tp`.
 - **An FT request vLLM did not schedule can sit in more than one queue** (skipped
   because the batch already holds `max_loras` adapters: `waiting` /
-  `kv_holding_waiting` + the `deferred_waiting` set in vLLM 0.33). The cleanup in
+  `kv_holding_waiting` + the `deferred_waiting` set in vLLM 0.33, `async_kv_waiting`
+  in 0.34). The cleanup in
   `_schedule_step` removes it from all of them; left in a queue without its
   `self.requests` entry it kills the engine. `tests/test_ft_lora_limit.py`.
 - **`_publish_to_served` stays under `torch.no_grad()`** — otherwise every publish
@@ -163,10 +235,11 @@ FT-off baselines, eager and CUDA-graph, admission phase `prefill` and `both`, wi
 staggered arrivals so FT provably co-batches with real prefills and decodes. Measured
 drift is bf16 batch-shape noise (≤ 0.19 nats); divergences are exact or near ties.
 
-**Upstream issue (not ours):** at the previous pin (117afeea4), the v2 model runner + LoRA +
-CUDA graphs fails at warmup ("CUDA graphs must be captured on a non-default stream"),
-plugins disabled or not. Qwen3 defaults to v2 when finetuning is off, so FT-off Qwen3
-+ LoRA runs need `VLLM_USE_V2_MODEL_RUNNER=0` (finetuning runs are routed to v1).
+**Upstream issue (not ours), gone at v0.33.0:** at the pin before it (117afeea4), the v2
+model runner + LoRA + CUDA graphs failed at warmup ("CUDA graphs must be captured on a
+non-default stream"), plugins disabled or not. At v0.33.0 it warms up (checked
+2026-11-25). The tests still pin FT-off baselines to the runner of their FT runs
+(`VLLM_USE_V2_MODEL_RUNNER`), since the two differ in bf16 numerics.
 
 **vLLM v0.33.0 port (2026-11-09):** every test passes (incl. the 2-GPU NCCL gates and the
 14B TP leak gate), and the TP=2 timeline A/B against the old pin is better on all three
@@ -254,7 +327,8 @@ tests/run_all.sh /tmp/ds-tests
 $P docs/figures/make_overview.py && $P docs/figures/make_architecture.py   # regenerate both figures
 ```
 
-Env switches: `DSERVE_TEST_FAIL_PROFILING=1` (tests: make the launch profiling pass raise),
+Env switches: `DSERVE_MODEL_RUNNER=v1|v2` (overrides `finetune_features.model_runner`;
+on v0.33 the tests and A/B runs use it), `DSERVE_TEST_FAIL_PROFILING=1` (tests: make the launch profiling pass raise),
 `DSERVE_BACKWARD_NCCL_PORT` (backward NCCL group, default 29677),
 `DSERVE_TP_DIAG=1` (remat-vs-captured activation check), `DSERVE_BWD_COMM_SYNC=1` /
 `DSERVE_BWD_COMM_DELAY=<cycles>` (comm-stream debugging).
