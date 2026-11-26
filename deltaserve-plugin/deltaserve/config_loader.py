@@ -64,6 +64,7 @@ FINETUNE_SECTIONS: dict[str, tuple[str, ...]] = {
         "enable_finetuning", "start_on_launch", "finetuning_lora_path",
         "data_path", "max_prepare", "num_epochs", "learning_rate",
         "weight_decay", "gamma", "max_saved_finetuning_tokens",
+        "ft_step_size", "bwd_batch_size", "ft_buffer_size", "bwd_batch_size_idle", "ft_tokens_per_step", "ft_only_tokens_per_step", "bwd_whole_batches",
         "adapter_save_path", "adapter_save_every_backwards",
         "adapter_save_every_epoch", "adapter_save_keep_last",
     ),
@@ -72,11 +73,12 @@ FINETUNE_SECTIONS: dict[str, tuple[str, ...]] = {
     "finetune_features": (
         "backward_mps_percentage", "backward_fp32", "backward_cuda_graph",
         "backward_cuda_graph_attn_bn_max", "backward_cuda_graph_attn_l_max",
+        "backward_disable_torch_native", "backward_cuda_graph_attn_shapes",
         "backward_run_ahead_boundaries", "save_activations", "save_attn_qkv",
-        "save_attn_ctx", "save_resid_mid", "graph_ft_batches",
+        "save_attn_ctx", "save_resid_mid", "graph_ft_batches", "fill_graph_padding", "ft_breakable_cudagraph",
         "graph_ft_max_tokens", "graph_ft_only_batches", "forward_interruptible",
         "ft_only_admission_grace_ms", "pause_on_arrival", "pause_prefill_always",
-        "pause_until_prefill_done",
+        "pause_until_prefill_done", "model_runner",
     ),
     "throttles": (
         "coserving_admission_phase", "ft_tokens_admission_constrain_factor",
@@ -86,7 +88,9 @@ FINETUNE_SECTIONS: dict[str, tuple[str, ...]] = {
         "rps_throttle_close_time",
     ),
     "slo": (
-        "ttft_slo", "avg_tbt_slo", "avg_tbt_window_s", "max_tbt_slo",
+        "ttft_slo", "avg_tbt_slo", "avg_tbt_window_s", "avg_tbt_pause_backward",
+        "avg_tbt_headroom", "avg_tbt_admission_headroom", "overload_hold_s", "profile_extra_shapes",
+        "max_tbt_slo",
         "decode_only_ft_safety_margin", "admission_margin", "admission_margin_k",
         "profile_on_launch", "profile_num_repeats", "validate_estimator",
         "estimator_validation_path", "estimator_state_save_path",

@@ -72,6 +72,7 @@ _TIE_NATS = 0.4
 _CONTROL_MIN_NATS = 5.0
 # Profiles (DSERVE_M1_PROFILE; the worker subprocesses inherit it):
 #   tp1  Qwen3-0.6B on one GPU, eager + graph, a minimal FT config (the default).
+#   llama3  Llama-3-8B on one GPU, the tp1 method.
 #   tp2  Qwen3-14B TP=2 with the production preset's FT config unchanged (graphs,
 #        rank-symmetric tier-C aborts, pause_on_arrival, every activation save),
 #        graph mode only. tests/test_tp_inference_leak.py runs it.
@@ -88,6 +89,23 @@ _PROFILES = {
         modes=("baseline", "ft", "ft-both", "control",
                "baseline-graph", "ft-graph", "ft-both-graph"),
         # (label, baseline mode, ft mode, step kind the ft run must co-batch with)
+        pairs=(("eager / prefill", "baseline", "ft", "prefill"),
+               ("eager / both", "baseline", "ft-both", "decode"),
+               ("graph / prefill", "baseline-graph", "ft-graph", "prefill"),
+               ("graph / both", "baseline-graph", "ft-both-graph", "decode")),
+    ),
+    # Llama-3-8B on one GPU: the tp1 method on the other model family (post-RoPE
+    # q/k/v saves; its mixed batches replay the has_ft graphs through the same
+    # hook-issued save op). DSERVE_M1_PROFILE=llama3.
+    "llama3": dict(
+        config="serving_config_finetuning_llama3.yaml",
+        preset=False,
+        mixed_on_graph=True,
+        amplify=10.0,
+        arrivals=[0.0, 0.0, 0.25, 0.5],
+        timeout=1200,
+        modes=("baseline", "ft", "ft-both", "control",
+               "baseline-graph", "ft-graph", "ft-both-graph"),
         pairs=(("eager / prefill", "baseline", "ft", "prefill"),
                ("eager / both", "baseline", "ft-both", "decode"),
                ("graph / prefill", "baseline-graph", "ft-graph", "prefill"),
@@ -116,6 +134,9 @@ _ARRIVALS = _PROFILE["arrivals"]
 _MODES = _PROFILE["modes"]
 _PAIRS = _PROFILE["pairs"]
 _BATCH_RE = re.compile(r"\[batch [^\]]*\] prefill=(\d+) ft=(\d+) decode=\[([^\]]*)\]")
+# the same line with the step's path (graph / eager) after the token total
+_PATH_RE = re.compile(r"\[batch [^\]]*\] prefill=(\d+) ft=(\d+) decode=\[([^\]]*)\]"
+                      r" \(total=\d+\) \| (\w+)[^|]*\|")
 
 _TTY = sys.stdout.isatty()
 _GREEN = "\033[92m" if _TTY else ""
@@ -162,12 +183,13 @@ def _serve(llm, lora) -> list:
 
 def run_worker(mode: str) -> None:
     """Build an LLM, serve the prompts, write token ids + logprobs."""
-    # Every run on the v1 model runner. FT runs land there anyway (the plugin
-    # routes finetuning to it), so the baselines must too: v2 differs in
-    # numerics, and at the pinned vLLM commit v2 + LoRA + CUDA graphs fails at
-    # warmup ("CUDA graphs must be captured on a non-default stream") even with
-    # plugins disabled (VLLM_PLUGINS=) — an upstream issue, not ours.
-    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+    # Every run of one gate on the same vLLM model runner — baselines and
+    # control included: v1 and v2 differ in bf16 numerics. On a vLLM with both
+    # (<= 0.33) that is v1, or v2 with DSERVE_MODEL_RUNNER=v2 (the plugin reads
+    # the same variable for the FT runs); later versions only have v2.
+    from deltaserve.runner_select import pin_vllm_runner
+
+    pin_vllm_runner()
     from vllm import LLM, SamplingParams
     from vllm.lora.request import LoRARequest
 
@@ -177,6 +199,11 @@ def run_worker(mode: str) -> None:
     engine_kwargs, ft_cfg, _ = split_config(raw)
     graph = mode.endswith("-graph")
     engine_kwargs["enforce_eager"] = not graph
+    # DSERVE_M1_GPU_MEM_UTIL: every mode (a larger FT buffer needs more of the
+    # GPU than the preset's first-bring-up value leaves the KV cache).
+    if os.environ.get("DSERVE_M1_GPU_MEM_UTIL"):
+        engine_kwargs["gpu_memory_utilization"] = float(
+            os.environ["DSERVE_M1_GPU_MEM_UTIL"])
     adapter = os.environ.get("DSERVE_M1_ADAPTER", ft_cfg.finetuning_lora_path)
     enabled = mode.startswith("ft")
     common = dict(
@@ -188,6 +215,16 @@ def run_worker(mode: str) -> None:
         print_engine_batch_exec=enabled,
         coserving_admission_phase="both" if "-both" in mode else "prefill",
     )
+    # DSERVE_M1_FT_SIZES="<ft_step_size>,<bwd_batch_size>": the gate with several
+    # backward batches per optimizer step (FT is then also admitted while a
+    # backward batch runs). Unset: the config's own single size.
+    sizes = os.environ.get("DSERVE_M1_FT_SIZES")
+    if sizes and enabled:
+        step, bwd = (int(x) for x in sizes.split(","))
+        common.update(ft_step_size=step, bwd_batch_size=bwd)
+    # DSERVE_M1_FT_EXTRA='{"key": value, ...}': more finetune keys for the ft runs.
+    if os.environ.get("DSERVE_M1_FT_EXTRA") and enabled:
+        common.update(json.loads(os.environ["DSERVE_M1_FT_EXTRA"]))
     if _PROFILE["preset"]:
         # the YAML's whole finetune / throttles / slo config, as served; only
         # admission opens at launch (no /start_finetuning offline)
@@ -257,6 +294,13 @@ def _spawn(mode: str, adapter: Path) -> dict:
     fd, result_path = tempfile.mkstemp(suffix=f"_m1_{mode}.json")
     os.close(fd)
     os.unlink(result_path)
+    # DSERVE_M1_BASELINE_ENV="NAME=value": an env variable for the runs WITHOUT
+    # finetuning (the ft runs get the same setting through a finetune key in
+    # DSERVE_M1_FT_EXTRA), so both sides run the same forward path.
+    base_env = os.environ.get("DSERVE_M1_BASELINE_ENV")
+    if base_env and not mode.startswith("ft"):
+        name, _, value = base_env.partition("=")
+        env[name] = value
     env["DSERVE_M1_RESULT"] = result_path
     env["DSERVE_M1_ADAPTER"] = str(adapter)
     proc = subprocess.run(
@@ -282,6 +326,13 @@ def _spawn(mode: str, adapter: Path) -> dict:
         "prefill": sum(1 for p, f, _ in steps if f and p),
         "decode": sum(1 for p, f, d in steps if f and not p and d),
     }
+    # how many of those mixed steps replayed a CUDA graph
+    result["mixed_graph"] = sum(
+        1 for p, f, d, path in _PATH_RE.findall(log[a:b] if 0 <= a < b else "")
+        if int(f) and (int(p) or d.strip()) and path == "graph")
+    # the most FT tokens any step carried, over the whole run (warm-up included)
+    result["max_ft"] = max((int(f) for _, f, _ in _BATCH_RE.findall(log)),
+                           default=0)
     return result
 
 
@@ -325,6 +376,14 @@ def main():
     for m in _MODES:
         check(f"{m}: one output per prompt (no FT output leak, no hang)",
               runs[m]["num_outputs"] == n)
+    sizes = os.environ.get("DSERVE_M1_FT_SIZES")
+    if sizes:
+        bwd = int(sizes.split(",")[1])
+        for m in _MODES:
+            if m.startswith("ft"):
+                check(f"{m}: no step carries more FT tokens than one backward "
+                      f"batch ({runs[m]['max_ft']} <= {bwd})",
+                      0 < runs[m]["max_ft"] <= bwd)
     ctl_m = next(m for m in _MODES if m.startswith("control"))
     ctl_base = "baseline-graph" if ctl_m.endswith("-graph") else "baseline"
     ctl = min(_drift(runs[ctl_base], runs[ctl_m], i, 0) for i in range(n))
@@ -336,7 +395,12 @@ def main():
         base, fton = runs[base_m], runs[ft_m]
         mixed = fton["mixed"]
         print(f"  -- {tag}: {base_m} vs {ft_m}  (mixed steps: {mixed['prefill']} "
-              f"with a real prefill, {mixed['decode']} decode-only)")
+              f"with a real prefill, {mixed['decode']} decode-only; "
+              f"{fton.get('mixed_graph', 0)} of them on a CUDA graph)")
+        if (_PROFILE.get("mixed_on_graph")
+                or os.environ.get("DSERVE_M1_EXPECT_GRAPH") == "1") and "graph" in ft_m:
+            check(f"[{tag}] the mixed steps replayed the has_ft CUDA graphs",
+                  fton.get("mixed_graph", 0) > 0)
         check(f"[{tag}] FT co-batched with real {kind} tokens", mixed[kind] > 0)
         for i, (b, f) in enumerate(zip(base["token_ids"], fton["token_ids"])):
             j = next((k for k in range(min(len(b), len(f))) if b[k] != f[k]), None)

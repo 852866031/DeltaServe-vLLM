@@ -289,7 +289,7 @@ function charts(){
  $('ttft_hdr').textContent='';
  $('tpot_hdr').textContent=`${nf} finished`;
  lineChart('ttft',['ttft50','ttft99'],1,w.ttft_slo,' s',3);
- lineChart('tpot',['tpot50','tpot99'],1000,w.max_tbt_slo?w.max_tbt_slo*1000:null,' ms',1);
+ lineChart('tpot',['tpot50','tpot99'],1000,w.avg_tbt_slo?w.avg_tbt_slo*1000:null,' ms',1);
 }
 
 function bar(f,n=18,col=C.ft){f=Math.max(0,Math.min(1,f||0));const k=Math.round(f*n);return `<span style="color:${col}">${'█'.repeat(k)}</span><span style="color:#2f2f2c">${'█'.repeat(n-k)}</span>`;}
@@ -373,7 +373,7 @@ rank ${a.rank} · ${a.cpu_mib} MiB in host RAM${a.pinned?'\npinned (never evicte
 let lastTbt=null;
 function kpi(){
  const L=V.latest,now=L.now||0,w=(L.window||{}).inference||{},t=(L.window||{}).totals||{},f=L.finetuning||{};
- const slo=w.ttft_slo,mslo=w.max_tbt_slo;
+ const slo=w.ttft_slo,mslo=w.avg_tbt_slo;
  const tv=V.series.filter(r=>r.t>now-60).flatMap(r=>r.tv||[]).sort((a,b)=>a-b);
  const p99=tv.length?tv[Math.min(tv.length-1,Math.ceil(.99*tv.length)-1)]:null;
  const met=t.first_tokens?t.ttft_slo_met/t.first_tokens:null;

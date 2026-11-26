@@ -13,6 +13,7 @@ translation corpus. Then, over HTTP:
     adapter (response headers + the response's ``model`` field);
   * a request naming the base model is untouched.
 
+    python tests/test_adapter_routing_live.py                  # GPU 0
     CUDA_VISIBLE_DEVICES=1 python tests/test_adapter_routing_live.py
     ... --api-servers 2      # several API server processes
     ... --router-device cuda:0      # or --router-gpu <physical index>
@@ -232,8 +233,11 @@ def external_main(args, out: Path) -> None:
           f"{os.environ['CUDA_VISIBLE_DEVICES']}, TP={args.tp}, "
           f"{args.api_servers} API server(s)) ===\n    out dir: {out}")
     env = dict(os.environ, HF_HUB_OFFLINE="1", VLLM_USE_FLASHINFER_SAMPLER="0",
-               TOKENIZERS_PARALLELISM="false",
-               VLLM_USE_V2_MODEL_RUNNER="0")   # v2 + LoRA + CUDA graphs fails upstream
+               TOKENIZERS_PARALLELISM="false")
+    # v1 runner unless DSERVE_MODEL_RUNNER=v2 (the plugin reads it too)
+    from deltaserve.runner_select import pin_vllm_runner
+
+    pin_vllm_runner(env)
     env.setdefault("HF_HOME", "/home/jiaxuan/.cache/huggingface")
     log = open(log_path, "w")
     server = subprocess.Popen(
@@ -768,7 +772,11 @@ def main() -> None:
     global _BASE, _PRESET
     _BASE, _PRESET = args.family, _REPO / "configs" / "preset" / _FAMILIES[args.family]
     if not os.environ.get("CUDA_VISIBLE_DEVICES"):
-        raise SystemExit("set CUDA_VISIBLE_DEVICES to the GPU this may use")
+        # One GPU is enough (TP=1): take GPU 0 unless told otherwise, so the
+        # test also runs inside tests/run_all.sh without extra setup.
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+        print("CUDA_VISIBLE_DEVICES not set: using GPU 0 "
+              "(set it to choose another one)")
 
     out = Path(args.out or tempfile.mkdtemp(prefix="ds-routing-live-"))
     out.mkdir(parents=True, exist_ok=True)

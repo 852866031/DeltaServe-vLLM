@@ -62,7 +62,10 @@ class ProfilingShapeGenerator:
         batch_max_tokens: int,
         max_saved_finetuning_tokens: int,
         max_req_len: int,
+        extra_shapes: bool = False,
     ) -> None:
+        # [profile_extra_shapes] the corners the base sweep leaves out
+        self.extra_shapes = bool(extra_shapes)
         self.batch_max_tokens = int(batch_max_tokens)
         self.ft_cap = max(1, int(max_saved_finetuning_tokens))
         # Reserve a small margin under the per-request hard cap.
@@ -227,6 +230,29 @@ class ProfilingShapeGenerator:
             inf_lens=[],
             ft_lens=self._partition(self.ft_cap, max(1, self.ft_cap // 64)))]
 
+    def _extra_shapes(self) -> list[ProfileShape]:
+        """[profile_extra_shapes] What served traffic looks like and the base
+        sweep does not reach (measured on Qwen3-14B TP=2 step traces,
+        actual / predicted):
+          * a prefill step of ONE short prompt with nothing decoding — the
+            first request after an idle moment; the sweep starts at 64 tokens
+            in ~128-token requests (1.12-1.23);
+          * MANY decode requests with SHORT contexts (a chat workload: 8-64
+            requests of ~50-150 tokens); the B_d sweep gives every request
+            ``inf_cap / B_d`` tokens of context, so B_d and K move together
+            and the K sweep stays at 4 requests (0.82-0.91).
+        Off by default: with these shapes the run-time ratios are the same
+        (the estimator refits on live steps) — see config.py."""
+        out: list[ProfileShape] = []
+        for total in (16, 32, 48):
+            out.append(ProfileShape("prefill", inf_lens=[total]))
+        out.append(ProfileShape("prefill", inf_lens=[24] * 4))
+        for b, per in ((8, 48), (16, 48), (32, 48), (64, 48), (16, 160), (32, 160)):
+            per = min(per, self.max_req_len)
+            if b * per <= self.batch_max_tokens:
+                out.append(ProfileShape("decode", inf_lens=[per] * b, n_decode=2))
+        return out
+
     def prepare(self) -> tuple[list[ProfileShape], list[ProfileShape]]:
         """Return (warmup_shapes, recorded_shapes).
 
@@ -241,6 +267,8 @@ class ProfilingShapeGenerator:
                     + self._ft_on_decode_shapes()
                     + self._ft_on_mixed_shapes()
                     + self._ft_only_idle_shapes())
+        if self.extra_shapes:
+            recorded += self._extra_shapes()
         # Warmup: one representative of each kind so JIT/autotune covers the
         # eager-with-FT-decode path too.
         warmup = [

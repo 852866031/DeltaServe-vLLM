@@ -23,6 +23,16 @@ finetune_param:
   weight_decay: 0.01                 # AdamW weight decay
   gamma: 0.9                         # StepLR decay applied once per epoch
   max_saved_finetuning_tokens: 256   # activation buffer in tokens = FT tokens per backward cycle (also sizes the backward graphs); samples longer than this are dropped
+  # ft_step_size: 1024             # FT tokens per optimizer step (= the activation buffer). Unset: max_saved_finetuning_tokens
+  # bwd_batch_size: 256            # FT tokens per backward batch; must divide ft_step_size. Gradients accumulate over the step's
+  #                                # batches, one update at its end. Smaller = the backward yields the GPU sooner. Unset: one backward per step
+  # ft_buffer_size: 512          # an activation buffer SMALLER than the step: a ring of batch slots, reused as their backwards finish (memory follows this, not the step)
+  # bwd_batch_size_idle: 1024      # a larger backward batch while no inference request is around (a second graph set in the child). Tested: below one
+  #                                # large backward at all times (FT 708 vs 795 tok/s, KV 6k vs 17k tokens on 2x 5090): off
+  # ft_tokens_per_step: 256        # FT tokens one forward step may carry (default: the backward batch). With a 1024-token buffer and this at 256
+  #                                # the backward stays one large (cheap per token) batch and no forward step is long: see preset/..._tp2_step1024.yaml
+  # ft_only_tokens_per_step: 1024  # FT tokens a step WITHOUT inference tokens may carry (default: ft_tokens_per_step); such a step is abortable, so it can be large
+  # bwd_whole_batches: true      # end the step when its batches are full (no small remainder backward at the price of a whole one)
   adapter_save_path: ../checkpoints/qwen3-0.6b   # where trained adapters go (PEFT format); also the default of POST /save_adapter
   adapter_save_every_backwards: 500  # save every N backward cycles as backward-<N> (0 = off)
   adapter_save_keep_last: 3          # keep only the newest 3 backward-* saves (0 = keep all)
@@ -34,8 +44,9 @@ finetune_features:
   backward_mps_percentage: 0         # 0 = no MPS (the pause contract protects prefill); >0 needs an MPS daemon and caps the child's SMs
   backward_fp32: false               # false = bf16 bulk backward GEMMs (scores, softmax, norms, LM head, masters stay fp32)
   backward_cuda_graph: false  # per-layer backward CUDA graphs; off here as in the validated 0.6B preset (the 0.6B backward is short)
-  backward_cuda_graph_attn_bn_max: 8 # padded attention graph fits ≤ 8 samples per cycle, else that cycle runs eager
-  backward_cuda_graph_attn_l_max: 64 # ... and samples ≤ 64 tokens (cost is quadratic in this)
+  backward_cuda_graph_attn_bn_max: auto # padded attention graph: most samples per backward cycle. auto = chosen from the dataset at launch; a cycle that does not fit runs its attention eager (slow)
+  backward_cuda_graph_attn_l_max: auto  # ... and the longest sample in tokens (cost is quadratic in this). The launch log prints the chosen values
+  backward_disable_torch_native: true   # backward child only: TORCH_DISABLE_NATIVE_JIT=1 (torch 2.14's per-call dispatch checks cost 13-18 % on a slow-CPU host)
   # activation saves (skip parts of the backward's forward recompute)
   save_activations: true             # false only to measure the save overhead (nothing is trained)
   save_attn_qkv: true                # save q/k/v: skips the Q/K/V projection (exact for Qwen3: saved before q_norm/k_norm)
@@ -43,12 +54,15 @@ finetune_features:
   save_resid_mid: true               # save the post-attention residual: skips the O projection + one all-reduce per layer (~100 MB)
   # forward graphs for batches carrying FT samples
   graph_ft_batches: true             # mixed (inference + FT) batches replay their own has_ft piecewise CUDA graphs
+  fill_graph_padding: false          # admit FT samples the SLO check refuses while they fit the padding of the graph size the step already runs at
+  ft_breakable_cudagraph: false      # serve + capture the FT graphs on vLLM's breakable CUDA graph. Tested, no gain over the compiled path (FT 595 vs 589 tok/s): off
   graph_ft_max_tokens: 512           # capture the has_ft graphs up to this padded batch size; larger mixed batches run without a graph
   graph_ft_only_batches: false  # FT-only batches (idle GPU) replay the has_ft graphs too; off here (eager)
   # protecting inference latency
   forward_interruptible: false  # tiers A/B/C: a request arriving during an FT-only step pre-empts it; off here (FT-only steps are short on 0.6B)
   ft_only_admission_grace_ms: 0  # tier A wait (needs forward_interruptible)
   pause_until_prefill_done: true     # the backward child stays paused until the inference prefill has finished on the GPU
+  model_runner: auto                 # vLLM model runner hosting the hooks: auto (v1 where vLLM has it, else v2) | v1 | v2
   pause_on_arrival: false  # yield the child as soon as a request arrives (on in the 14B template)
   pause_prefill_always: false        # pause the child on every prefill step, not only while a backward runs (fewer FT cycles)
   backward_run_ahead_boundaries: 2   # the child's CPU runs ≤ 2 pause boundaries ahead of its GPU, so a pause lands in ~3-6 ms
@@ -69,10 +83,16 @@ throttles:
 # ── slo: inference targets + the step-time estimator that enforces them ──────
 slo:
   ttft_slo: 0.25                      # time-to-first-token target (s): FT is admitted only while the predicted step keeps it
-  avg_tbt_slo: 0.02                  # average time-between-tokens target (s) for running decodes
-  max_tbt_slo: 0.05                  # max single-step time (s) while FT is admitted
+  avg_tbt_slo: 0.035                 # average time between tokens (s): the token-latency target, kept over a sliding window, and what the TBT attainment is measured against
+  avg_tbt_window_s: 1.0              # the window (s) avg_tbt_slo is kept over; 0 = not enforced
+  avg_tbt_pause_backward: true       # a decode step that would take the window average past the target pauses the backward (predicted with the overlap)
+  avg_tbt_headroom: 0.9              # ... steering the window average to this fraction of avg_tbt_slo (the SLO is met per request)
+  avg_tbt_admission_headroom: 1.0    # FT admission steers the window average to this fraction of avg_tbt_slo (1.0 = the target itself; 0.9 at a 20 ms target, 2x load: attainment 53 -> 68 %, FT -11 %)
+  overload_hold_s: 1.0               # FT stands down (no admission, backward paused) until this long after inference was last at / over its SLO; 0 = off
+  max_tbt_slo: 0.1                   # upper bound on ONE step with decodes + FT (s, predicted): a backstop, the average is the target
   profile_on_launch: true            # profile synthetic batches at launch to fit the estimator (~1-2 min)
   profile_num_repeats: 2             # recorded passes per profiling shape
+  profile_extra_shapes: false        # also profile one short prompt alone and many decode requests with short contexts. Tested: the estimator refits on live steps, runtime accuracy unchanged: off
   decode_only_ft_safety_margin: 0.7  # ("both" phase only) max_tbt_slo × this on decode-only steps
   admission_margin: relative         # prediction margin for SLO admission: relative = ×(1+k·relative error); absolute = +k·RMSE; legacy = ×(1+1.5·RMSE[s]) (≈ none, the original)
   admission_margin_k: 1.5            # k for relative / absolute

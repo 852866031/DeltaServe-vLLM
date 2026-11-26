@@ -24,8 +24,9 @@ around upstream methods, never replacing their bodies:
   change the traced forward) and apply the co-serving defaults
   (``engine_config.configure_vllm_config``) before the platform fills in its own.
   ``VllmConfig.finetune_config`` reads it back (a disabled config otherwise).
-- ``VllmConfig._get_v2_model_runner_unsupported_features``: co-serving runs on
-  the v1 model runner.
+- ``VllmConfig._get_v2_model_runner_unsupported_features`` /
+  ``use_v2_model_runner`` (vLLM <= 0.33, which ships both runners): co-serving
+  runs on the runner ``finetune_features.model_runner`` names.
 - ``EngineArgs.create_engine_config``: ``disable_log_stats`` defaults on (the
   per-step stats stream stalls the API frontend; see engine_config).
 - ``EngineCore`` / ``EngineCoreProc``: the ``EngineHooks`` (arrival signal
@@ -85,6 +86,11 @@ class DeltaServeConfig(Mapping):
         extra = json.dumps(self._extra, sort_keys=True, default=str)
         return safe_hash(f"{self.finetune.compute_hash()}|{extra}".encode(),
                          usedforsecurity=False).hexdigest()
+
+    def compile_factors(self) -> dict:
+        """The same, for vLLM >= 0.34 (``VllmConfig.compile_factors``; without
+        it vLLM would key the cache on every entry of the mapping)."""
+        return {"deltaserve": self.finetune.compute_hash(), "extra": self._extra}
 
     def __repr__(self) -> str:
         routing = ("" if self.adapter_routing is None
@@ -160,6 +166,7 @@ def _patch_config() -> None:
                 self.additional_config = DeltaServeConfig(
                     FinetuneConfig(**ac.get(DeltaServeConfig.KEY, {})), extra,
                     None if routing is None else AdapterRoutingConfig(**routing))
+                self.additional_config.finetune.check_step_sizes()
             configure_vllm_config(self)
             rc = self.adapter_routing_config
             lora = getattr(self, "lora_config", None)
@@ -175,17 +182,69 @@ def _patch_config() -> None:
 
     _wrap(VllmConfig, "__post_init__", post_init)
 
+    # [ft_breakable_cudagraph] (default off: measured, no gain) vLLM decides
+    # the breakable CUDA graph from the environment / the architecture in this
+    # small method; the key turns it on for the co-serving launch the same way
+    # the env variable would.
+    if hasattr(VllmConfig, "_maybe_enable_breakable_cudagraph"):
+        def breakable(orig):
+            def _maybe_enable_breakable_cudagraph(self):
+                import os
+
+                from deltaserve.runner_select import wants_v2
+
+                ft = self.finetune_config
+                name = "VLLM_USE_BREAKABLE_CUDAGRAPH"
+                if not (ft.enable_finetuning and ft.ft_breakable_cudagraph) \
+                        or name in os.environ:
+                    return orig(self)
+                if not wants_v2(ft):
+                    # The has_ft capture on the breakable graph lives in the
+                    # v2 host (cudagraph_v2.py) only.
+                    raise ValueError(
+                        "finetune_features.ft_breakable_cudagraph needs the v2 "
+                        "model runner (finetune_features.model_runner: v2)")
+                os.environ[name] = "1"
+                try:
+                    return orig(self)
+                finally:
+                    del os.environ[name]
+            return _maybe_enable_breakable_cudagraph
+
+        _wrap(VllmConfig, "_maybe_enable_breakable_cudagraph", breakable)
+
+    from deltaserve.runner_select import wants_v2
+
     def v2_unsupported(orig):
         def _get_v2_model_runner_unsupported_features(self):
             out = orig(self)
-            if self.finetune_config.enable_finetuning:
-                # Our hooks live in the v1 runner: route there, and make an
-                # explicit VLLM_USE_V2_MODEL_RUNNER=1 fail loudly.
-                out.append("DeltaServe co-serving finetuning")
+            ft = self.finetune_config
+            if ft.enable_finetuning and not wants_v2(ft):
+                # The hooks of this launch live in the v1 runner: route there,
+                # and make an explicit VLLM_USE_V2_MODEL_RUNNER=1 fail loudly.
+                out.append("DeltaServe co-serving finetuning on the v1 runner "
+                           "(finetune_features.model_runner)")
             return out
         return _get_v2_model_runner_unsupported_features
 
-    _wrap(VllmConfig, "_get_v2_model_runner_unsupported_features", v2_unsupported)
+    # vLLM <= 0.33 ships both runners and picks one per launch; later versions
+    # have only v2 (neither name exists there).
+    if hasattr(VllmConfig, "_get_v2_model_runner_unsupported_features"):
+        _wrap(VllmConfig, "_get_v2_model_runner_unsupported_features",
+              v2_unsupported)
+    use_v2 = VllmConfig.__dict__.get("use_v2_model_runner")
+    if isinstance(use_v2, property) and not getattr(
+            use_v2.fget, "_deltaserve", False):
+        def use_v2_model_runner(self):
+            ft = self.finetune_config
+            if ft.enable_finetuning and wants_v2(ft):
+                # finetune_features.model_runner: v2 — whatever vLLM would
+                # pick for this model.
+                return True
+            return use_v2.fget(self)
+
+        use_v2_model_runner._deltaserve = True
+        VllmConfig.use_v2_model_runner = property(use_v2_model_runner)
 
     def create_engine_config(orig):
         def wrapper(self, *args, **kwargs):

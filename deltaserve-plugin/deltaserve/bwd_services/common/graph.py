@@ -63,6 +63,29 @@ from deltaserve.bwd_services.common.ffn import ffn_backward_core
 from deltaserve.bwd_services.common.ops import rope_cos_sin
 
 
+class _AttnShape:
+    """One padded-attention shape: its input slabs, masks and graph. The first
+    one of a runner is the budget itself (the runner's ``static_*_pad``
+    buffers, which the forward graphs also write); the others are smaller
+    shapes inside it, each with slabs and a graph of its own, so a backward
+    pays for the padding of the smallest shape that holds it."""
+
+    __slots__ = ("bn", "l", "qh", "kh", "vh", "grad_ctx", "causal", "key_pad",
+                 "graph", "failed", "used")
+
+    def __init__(self, bn, l, qh, kh, vh, grad_ctx, causal, key_pad):
+        self.bn, self.l = int(bn), int(l)
+        self.qh, self.kh, self.vh, self.grad_ctx = qh, kh, vh, grad_ctx
+        self.causal, self.key_pad = causal, key_pad
+        self.graph = None
+        self.failed = False
+        self.used = 0
+
+    @property
+    def cost(self) -> int:
+        return self.bn * self.l * self.l
+
+
 class GraphedBackward:
     """Per-layer forward + FFN-bwd graphs and one shared padded-attention-bwd
     graph for the LoRA SFT backward of any family.
@@ -75,7 +98,8 @@ class GraphedBackward:
     # 2 eager warmup iterations before capture (prime Triton/cuBLAS autotuners).
     _N_WARMUP = 2
 
-    def __init__(self, svc, s_max: int, bn_max: int, l_max: int) -> None:
+    def __init__(self, svc, s_max: int, bn_max: int, l_max: int,
+                 extra_shapes=()) -> None:
         if not torch.cuda.is_available():
             raise RuntimeError(
                 "[backward_cuda_graph] CUDA is not available in this process")
@@ -158,6 +182,19 @@ class GraphedBackward:
         self._stream = torch.cuda.Stream(device=self.device)
 
         self._alloc_static_buffers()
+        # [backward_cuda_graph_attn_shapes] The budget, then the smaller
+        # shapes inside it, cheapest first when choosing.
+        self._shapes: list[_AttnShape] = [_AttnShape(
+            self.bn_max, self.l_max, self.static_qh_pad, self.static_kh_pad,
+            self.static_vh_pad, self.static_grad_ctx_pad,
+            self.static_causal_mask, self.static_key_pad_mask)]
+        for bn, lm in extra_shapes or ():
+            bn, lm = int(bn), int(lm)
+            if 0 < bn <= self.bn_max and 0 < lm <= self.l_max and (
+                    bn, lm) not in {(x.bn, x.l) for x in self._shapes}:
+                self._shapes.append(self._alloc_shape(bn, lm))
+        self._shapes.sort(key=lambda x: x.cost)
+        self._cur_shape: _AttnShape = self._shapes[-1]
 
         # Per-backward state (refilled in ``begin_backward``).
         self._cur_seq_lens: list[int] = []
@@ -169,7 +206,9 @@ class GraphedBackward:
 
         dprint(
             f"[bwd-graph] runner ready: s_max={self.s_max}, "
-            f"bn_max={self.bn_max}, l_max={self.l_max}, L={int(svc.L)}, "
+            f"bn_max={self.bn_max}, l_max={self.l_max}"
+            f"{', attention shapes ' + ' '.join(f'{x.bn}x{x.l}' for x in self._shapes) if len(self._shapes) > 1 else ''}"
+            f", L={int(svc.L)}, "
             f"model_dtype={self.model_dtype}, cdt={self.cdt}")
 
         # Eagerly capture every per-layer graph up-front so the first real
@@ -293,6 +332,20 @@ class GraphedBackward:
         # ``forward`` all-reduces it before ``forward_tail`` adds the residual.
         self.static_o = torch.zeros((s, D), dtype=mdt, device=dev)
 
+    def _alloc_shape(self, bn: int, lm: int) -> _AttnShape:
+        """Slabs + masks of one more attention shape (outside the graph pool)."""
+        Hq, Hkv, Hd = self.Hq, self.Hkv, self.Hd
+        dev, mdt, cdt = self.device, self.model_dtype, self.cdt
+        return _AttnShape(
+            bn, lm,
+            torch.zeros((bn, lm, Hq, Hd), dtype=mdt, device=dev),
+            torch.zeros((bn, lm, Hkv, Hd), dtype=mdt, device=dev),
+            torch.zeros((bn, lm, Hkv, Hd), dtype=mdt, device=dev),
+            torch.zeros((bn, lm, Hq, Hd), dtype=cdt, device=dev),
+            torch.triu(torch.ones((lm, lm), dtype=torch.bool, device=dev),
+                       diagonal=1),
+            torch.ones((bn, lm), dtype=torch.bool, device=dev))
+
     # ---------------------------------------------------------------- prepare
 
     def prepare(self) -> None:
@@ -321,15 +374,19 @@ class GraphedBackward:
         # indices, key-pad mask, AND cos/sin are valid for capture (kernels
         # still see zero values for everything else — only shapes/addresses
         # are captured).
-        dummy_l = min(self.l_max, self.s_max)
-        self.begin_backward(dummy_l, [dummy_l], [0])
-
-        try:
-            self._capture_attn()
-        except Exception as e:  # noqa: BLE001
-            self.attn_failed = True
-            dprint(f"[bwd-graph] attn startup capture failed: {e}; "
-                   f"all layers will fall back to eager at runtime")
+        # Every attention shape with a dummy batch of ITS size (the scatter /
+        # gather indices must lie inside the shape being captured); the budget
+        # last, so its indices and mask are the ones the forward captures see.
+        for sh in sorted(self._shapes, key=lambda x: x is self._shapes[-1]):
+            dummy_l = min(sh.l, self.s_max)
+            self.begin_backward(dummy_l, [dummy_l], [0])
+            try:
+                self._capture_attn(sh)
+            except Exception as e:  # noqa: BLE001
+                sh.failed = True
+                dprint(f"[bwd-graph] attn startup capture failed for "
+                       f"{sh.bn} x {sh.l}: {e}; it falls back to eager")
+        self.attn_failed = self._shapes[-1].failed
 
         # Forward: one graph per layer (Q/K/V/O base + LoRA addresses vary).
         # Same dummy-batch arming as attn — cos/sin already staged by
@@ -356,13 +413,17 @@ class GraphedBackward:
         self._cur_seq_lens = []
         self._cur_b_start = []
         self._attn_fit = False
+        self.cycles = self.eager_cycles = 0
+        for sh in self._shapes:
+            sh.used = 0
         # Zero the suppress-once warning flag in case the dummy batch's
         # log message printed; we want the real overflow warning at runtime.
         self._fallback_warned = False
 
         captured_ffn = L - len(self.ffn_failed)
         captured_fwd = L - len(self.fwd_failed)
-        attn_status = "0/1" if self.attn_failed else "1/1"
+        attn_status = (f"{sum(not x.failed for x in self._shapes)}/"
+                       f"{len(self._shapes)}")
         elapsed = (time.perf_counter() - t0) * 1000.0
         dprint(
             f"[bwd-graph] pre-captured forward {captured_fwd}/{L} + "
@@ -387,6 +448,17 @@ class GraphedBackward:
             and bn <= self.bn_max
             and max_l <= self.l_max
         )
+        # Never silent: count the cycles whose attention ran eager, and say so
+        # again every 200 cycles while it keeps happening.
+        self.cycles = getattr(self, "cycles", 0) + 1
+        if not self._attn_fit:
+            self.eager_cycles = getattr(self, "eager_cycles", 0) + 1
+        if self.cycles % 200 == 0 and getattr(self, "eager_cycles", 0):
+            dprint(f"[bwd-graph] !!! attention ran EAGER in {self.eager_cycles} of "
+                   f"{self.cycles} backward cycles (budget {self.bn_max} samples x "
+                   f"{self.l_max} tokens; last cycle {bn} x {max_l}). Set "
+                   f"finetune_features.backward_cuda_graph_attn_{{bn_max,l_max}} "
+                   f"to 'auto' or larger values.")
 
         # Stage cos/sin ALWAYS (used by both the graphed forward and the
         # eager forward fallback when the padded-attention budget overflows
@@ -449,6 +521,19 @@ class GraphedBackward:
             valid_bn = self.static_bn_idx[:n]
             valid_pos = self.static_pos_idx[:n]
             self.static_key_pad_mask[valid_bn, valid_pos] = False
+        # The cheapest shape that holds this backward (the budget does: it
+        # fits). The budget's mask above stays filled: the forward graphs use it.
+        sh = self._shapes[-1]
+        for cand in self._shapes:
+            if bn <= cand.bn and max_l <= cand.l and not cand.failed:
+                sh = cand
+                break
+        self._cur_shape = sh
+        sh.used += 1
+        if sh is not self._shapes[-1]:
+            sh.key_pad.fill_(True)
+            if n > 0:
+                sh.key_pad[valid_bn, valid_pos] = False
 
     # ------------------------------------------------------------- FFN region
 
@@ -529,33 +614,34 @@ class GraphedBackward:
 
     # ----------------------------------------------------- padded-attention
 
-    def _padded_attn_core(self) -> None:
+    def _padded_attn_core(self, sh: _AttnShape | None = None) -> None:
         """The shape-stable padded-attention backward CORE. Every tensor shape
         depends only on (bn_max, l_max, Hq, Hkv, Hd) — captureable as one CUDA
         graph per layer. Reads static_{qh,kh,vh,grad_ctx}_pad + masks/indices,
         writes static_grad_{qh,kh,vh} (flat layout via gather)."""
-        bn, lm = self.bn_max, self.l_max
+        sh = sh or self._shapes[-1]
+        bn, lm = sh.bn, sh.l
         Hq, Hkv, Hd = self.Hq, self.Hkv, self.Hd
         kv_repeat = self.kv_repeat
 
         # Combined mask: causal OR key-pad → [bn, 1, l, l] (broadcasts over heads).
-        attn_mask = (self.static_causal_mask.unsqueeze(0).unsqueeze(0)
-                     | self.static_key_pad_mask.unsqueeze(1).unsqueeze(1))
+        attn_mask = (sh.causal.unsqueeze(0).unsqueeze(0)
+                     | sh.key_pad.unsqueeze(1).unsqueeze(1))
 
         # GQA: expand kh/vh from Hkv to Hq via repeat_interleave on the head dim.
         if kv_repeat != 1:
-            kh_rep = self.static_kh_pad.repeat_interleave(kv_repeat, dim=2)
-            vh_rep = self.static_vh_pad.repeat_interleave(kv_repeat, dim=2)
+            kh_rep = sh.kh.repeat_interleave(kv_repeat, dim=2)
+            vh_rep = sh.vh.repeat_interleave(kv_repeat, dim=2)
         else:
-            kh_rep = self.static_kh_pad
-            vh_rep = self.static_vh_pad
+            kh_rep = sh.kh
+            vh_rep = sh.vh
 
         # → [bn, Hq, l, Hd] fp32 (scores/softmax/dQ/dK/dV always fp32 — load-
         # bearing GQA precision rule).
-        q_att = self.static_qh_pad.permute(0, 2, 1, 3).contiguous().float()
+        q_att = sh.qh.permute(0, 2, 1, 3).contiguous().float()
         k_att = kh_rep.permute(0, 2, 1, 3).contiguous().float()
         v_att = vh_rep.permute(0, 2, 1, 3).contiguous().float()
-        grad_ctx_att = (self.static_grad_ctx_pad
+        grad_ctx_att = (sh.grad_ctx
                         .permute(0, 2, 1, 3).contiguous().float())
 
         scores = (q_att @ k_att.transpose(-1, -2)) * self.scale
@@ -590,20 +676,23 @@ class GraphedBackward:
         self.static_grad_kh.copy_(grad_k_pad[self.static_bn_idx, self.static_pos_idx])
         self.static_grad_vh.copy_(grad_v_pad[self.static_bn_idx, self.static_pos_idx])
 
-    def _capture_attn(self) -> None:
+    def _capture_attn(self, sh: _AttnShape | None = None) -> None:
         """Capture the shared padded-attention graph (one for all layers).
         Inputs must be staged in the static_*_pad buffers + indices +
         key_pad_mask before this. ``_padded_attn_core`` reads no layer-
         specific weights, so the single captured graph replays correctly
         for every layer's attn-backward."""
+        sh = sh or self._shapes[-1]
         for _ in range(self._N_WARMUP):
-            self._padded_attn_core()
+            self._padded_attn_core(sh)
         torch.cuda.synchronize()
 
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g, pool=self._graph_pool, stream=self._stream):
-            self._padded_attn_core()
-        self._attn_graph = g
+            self._padded_attn_core(sh)
+        sh.graph = g
+        if sh is self._shapes[-1]:
+            self._attn_graph = g
 
     def _stage_attn_inputs(self, qh: torch.Tensor, kh: torch.Tensor,
                            vh: torch.Tensor, grad_ctx: torch.Tensor,
@@ -614,17 +703,18 @@ class GraphedBackward:
         # the gather drops those rows). Zero the pads instead for cleanliness
         # and to guarantee fully-masked rows produce zero gradients regardless
         # of garbage in the padded buffers.
-        self.static_qh_pad.zero_()
-        self.static_kh_pad.zero_()
-        self.static_vh_pad.zero_()
-        self.static_grad_ctx_pad.zero_()
+        sh = self._cur_shape
+        sh.qh.zero_()
+        sh.kh.zero_()
+        sh.vh.zero_()
+        sh.grad_ctx.zero_()
         if n > 0:
             valid_bn = self.static_bn_idx[:n]
             valid_pos = self.static_pos_idx[:n]
-            self.static_qh_pad[valid_bn, valid_pos] = qh.to(self.model_dtype)
-            self.static_kh_pad[valid_bn, valid_pos] = kh.to(self.model_dtype)
-            self.static_vh_pad[valid_bn, valid_pos] = vh.to(self.model_dtype)
-            self.static_grad_ctx_pad[valid_bn, valid_pos] = grad_ctx.to(self.cdt)
+            sh.qh[valid_bn, valid_pos] = qh.to(self.model_dtype)
+            sh.kh[valid_bn, valid_pos] = kh.to(self.model_dtype)
+            sh.vh[valid_bn, valid_pos] = vh.to(self.model_dtype)
+            sh.grad_ctx[valid_bn, valid_pos] = grad_ctx.to(self.cdt)
 
     def attn_backward(self, layer_id: int, qh: torch.Tensor, kh: torch.Tensor,
                       vh: torch.Tensor, grad_ctx: torch.Tensor,
@@ -642,40 +732,38 @@ class GraphedBackward:
         a graph (the same graph replays for every layer — see ``_capture_attn``
         docstring)."""
         n = qh.shape[0]
+        sh = self._cur_shape
 
-        if not self._attn_fit or self.attn_failed:
+        def eager():
             return attn_backward_core(qh, kh, vh, grad_ctx,
                                       seq_lens, b_start, dims, self.cdt,
                                       grad_qh_buf=self.static_grad_qh,
                                       grad_kh_buf=self.static_grad_kh,
                                       grad_vh_buf=self.static_grad_vh)
+
+        if not self._attn_fit or sh.failed:
+            return eager()
 
         self._stage_attn_inputs(qh, kh, vh, grad_ctx, n)
 
-        if self._attn_graph is None:
+        if sh.graph is None:
             try:
-                self._capture_attn()
+                self._capture_attn(sh)
             except Exception as e:  # noqa: BLE001
-                self.attn_failed = True
-                dprint(f"[bwd-graph] attn capture failed at layer {layer_id}: "
-                       f"{e}; all layers will fall back to eager")
-                return attn_backward_core(qh, kh, vh, grad_ctx,
-                                          seq_lens, b_start, dims, self.cdt,
-                                          grad_qh_buf=self.static_grad_qh,
-                                          grad_kh_buf=self.static_grad_kh,
-                                          grad_vh_buf=self.static_grad_vh)
+                sh.failed = True
+                self.attn_failed = self._shapes[-1].failed
+                dprint(f"[bwd-graph] attn capture failed at layer {layer_id} "
+                       f"({sh.bn} x {sh.l}): {e}; falling back to eager")
+                return eager()
 
         try:
-            self._attn_graph.replay()
+            sh.graph.replay()
         except Exception as e:  # noqa: BLE001
-            self.attn_failed = True
-            dprint(f"[bwd-graph] attn replay failed at layer {layer_id}: "
-                   f"{e}; all layers will fall back to eager")
-            return attn_backward_core(qh, kh, vh, grad_ctx,
-                                      seq_lens, b_start, dims, self.cdt,
-                                      grad_qh_buf=self.static_grad_qh,
-                                      grad_kh_buf=self.static_grad_kh,
-                                      grad_vh_buf=self.static_grad_vh)
+            sh.failed = True
+            self.attn_failed = self._shapes[-1].failed
+            dprint(f"[bwd-graph] attn replay failed at layer {layer_id} "
+                   f"({sh.bn} x {sh.l}): {e}; falling back to eager")
+            return eager()
 
         return (self.static_grad_qh[:n],
                 self.static_grad_kh[:n],

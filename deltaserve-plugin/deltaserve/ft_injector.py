@@ -11,6 +11,7 @@ to a per-step token budget, then mark them trained so the next step draws fresh
 samples (cycling epochs).
 """
 
+from deltaserve.ft_sizes import bwd_tokens_of, step_tokens_of
 from collections.abc import Callable
 
 from deltaserve import dprint
@@ -40,7 +41,7 @@ class FinetuneInjector:
             tokenize=tokenize,
             adapter=finetune_config.finetuning_lora_path,
             total_epochs=finetune_config.num_epochs,
-            max_saved_finetuning_tokens=finetune_config.max_saved_finetuning_tokens,
+            max_saved_finetuning_tokens=bwd_tokens_of(finetune_config),   # a sample must fit one backward
             max_prepare=finetune_config.max_prepare,
         )
         self.store.load()

@@ -63,21 +63,28 @@ def _weights(L_, hidden, Hq, Hkv, Hd, inter, r, seed):
             for _ in range(L_)]
 
 
-def test_forward_and_backward_graph_parity():
-    print("test_forward_and_backward_graph_parity (Qwen3, Hq*Hd != hidden):")
+def test_forward_and_backward_graph_parity(extra_shapes=()):
+    print("test_forward_and_backward_graph_parity (Qwen3, Hq*Hd != hidden"
+          f"{', attention shapes ' + str(list(extra_shapes)) if extra_shapes else ''}):")
     hidden, Hq, Hkv, Hd, inter, r = 24, 4, 2, 8, 32, 4     # q_size 32 != 24
     L_, eps, scaling, theta = 2, 1e-6, 2.0, 1e6
     s_max, bn_max, l_max = 16, 4, 8
     dims = (Hq, Hkv, Hd, Hkv * Hd)
     lws = _weights(L_, hidden, Hq, Hkv, Hd, inter, r, seed=3)
     svc = _mk_svc(hidden, L_, Hq, Hkv, Hd, inter, eps, lws, scaling, theta)
-    runner = GraphedBackward(svc, s_max=s_max, bn_max=bn_max, l_max=l_max)
+    runner = GraphedBackward(svc, s_max=s_max, bn_max=bn_max, l_max=l_max,
+                             extra_shapes=extra_shapes)
     C.ok("forward graphs captured for every layer", not runner.fwd_failed)
+    C.ok("every attention shape captured",
+         len(runner._shapes) == 1 + len(extra_shapes)
+         and all(x.graph is not None and not x.failed for x in runner._shapes))
+    picked = []
 
-    for batch_idx, seq_lens in enumerate([[5, 3], [8, 4]]):
+    for batch_idx, seq_lens in enumerate([[5, 3], [8, 4], [3, 3, 3, 3]]):
         n = sum(seq_lens)
         b_start = [sum(seq_lens[:i]) for i in range(len(seq_lens))]
         runner.begin_backward(n, seq_lens, b_start)
+        picked.append((runner._cur_shape.bn, runner._cur_shape.l))
         _, cos, sin = H.seq_layout(seq_lens, Hd, theta, device=DEVICE)
         g = torch.randn(n, hidden, device=DEVICE, dtype=CDT)
         for i in range(L_):
@@ -98,6 +105,11 @@ def test_forward_and_backward_graph_parity():
             C.check(f"b{batch_idx} L{i} bwd grad_x", gx, gx_ref)
             for k in H.LORA_KEYS:
                 C.check(f"b{batch_idx} L{i} bwd grad_{k}", grads[k], grads_ref[k])
+    if extra_shapes:
+        C.ok("each backward replayed the cheapest shape that holds it",
+             picked == [(2, 5), (3, 8), (4, 8)], str(picked))
+    else:
+        C.ok("one shape: the budget", picked == [(4, 8)] * 3, str(picked))
 
 
 def test_saved_ctx_forward_graph():
@@ -232,6 +244,7 @@ def test_saved_qkv_pre_norm(all_saves):
 
 if __name__ == "__main__":
     test_forward_and_backward_graph_parity()
+    test_forward_and_backward_graph_parity(extra_shapes=[(2, 5), (3, 8)])
     test_saved_ctx_forward_graph()
     test_saved_resid_mid_forward_graph()
     test_saved_qkv_pre_norm(all_saves=False)

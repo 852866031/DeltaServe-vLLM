@@ -50,7 +50,10 @@ _REQ_FIELDS = ("finish_unix_time", "request_id", "prompt_tokens",
 _BWD_FIELDS = ("unix_time", "cycle", "epoch", "tokens", "samples", "loss",
                "gpu_ms", "wall_ms", "train_tokens_per_gpu_s",
                "child_mem_alloc_gib", "child_mem_peak_gib",
-               "child_mem_reserved_gib")
+               "child_mem_reserved_gib",
+               # 1 = attention replayed its graph, 0 = fell back to eager
+               # (budget too small), empty = no backward graphs
+               "attn_graph")
 GIB = float(1 << 30)
 
 
@@ -140,13 +143,27 @@ class _Writer:
             self._files[name] = f
         return f
 
+    def drain(self, timeout: float) -> bool:
+        """Wait until everything queued so far is on disk (flushed). False on
+        a timeout."""
+        done = threading.Event()
+        self._q.put(("sync", None, None, done))
+        return done.wait(timeout)
+
     def _run(self) -> None:
+        dirty: set = set()        # files written to since their last flush
         while True:
             item = self._q.get()
             if item is None:
                 break
             kind, name, fields, payload = item
             try:
+                if kind == "sync":
+                    for f in dirty:
+                        f.flush()
+                    dirty.clear()
+                    payload.set()
+                    continue
                 if kind == "gz":
                     from deltaserve.live import RollingGz
                     g = self._gz.get(name)
@@ -156,14 +173,20 @@ class _Writer:
                     if time.monotonic() - self._gz_flushed > 5.0:   # stays readable
                         self._gz_flushed = time.monotonic()
                         g.flush()
-                    continue
-                f = self._open(name, fields)
-                if kind == "csv":
-                    csv.writer(f).writerow(payload)
                 else:
-                    f.write(json.dumps(payload) + "\n")
-                if self._q.empty():
-                    f.flush()
+                    f = self._open(name, fields)
+                    if kind == "csv":
+                        csv.writer(f).writerow(payload)
+                    else:
+                        f.write(json.dumps(payload) + "\n")
+                    dirty.add(f)
+                # Whenever the queue runs empty, whatever item emptied it: a
+                # line written while step-log items were still queued used to
+                # stay in its buffer until that file's next line.
+                if dirty and self._q.empty():
+                    for f in dirty:
+                        f.flush()
+                    dirty.clear()
             except Exception:  # noqa: BLE001 — metrics never break serving
                 pass
         for f in list(self._files.values()) + list(self._gz.values()):
@@ -186,6 +209,10 @@ class _Window:
         self.gaps = LogHistogram(max_tbt_slo)   # one per token: bucketed
         self.e2e: list[float] = []
         self.requests = 0
+        # requests finished here that had a token gap, and how many of them
+        # kept their mean gap within avg_tbt_slo
+        self.tbt_requests = 0
+        self.tbt_met = 0
         self.prompt_tokens = 0
         self.output_tokens = 0
         # forward steps: kind -> [count, gpu_s]
@@ -207,12 +234,14 @@ class MetricsRecorder:
 
     def __init__(self, root: str, interval_s: float = 10.0,
                  ttft_slo: float | None = None, max_tbt_slo: float | None = None,
+                 avg_tbt_slo: float | None = None,
                  clock=time.time, start_ticker: bool = True,
                  steps_log_max_mb: float = 256.0, meta: dict | None = None) -> None:
         self.root = root
         self.interval_s = max(0.5, float(interval_s))
         self.ttft_slo = ttft_slo
         self.max_tbt_slo = max_tbt_slo
+        self.avg_tbt_slo = avg_tbt_slo
         self._clock = clock
         self.meta = dict(meta or {})
         self._w = _Writer(root, steps_log_max_mb)
@@ -233,7 +262,9 @@ class MetricsRecorder:
         # requests = finished; first_tokens = requests that produced one (the
         # TTFT population); ttft_slo_met counts against first_tokens.
         self.tot = {"requests": 0, "first_tokens": 0, "prompt_tokens": 0,
-                    "output_tokens": 0, "ttft_slo_met": 0, "backwards": 0, "trained_tokens": 0,
+                    "output_tokens": 0, "ttft_slo_met": 0,
+                    "tbt_requests": 0, "avg_tbt_slo_met": 0,
+                    "backwards": 0, "trained_tokens": 0,
                     "ft_fwd_tokens": 0, "fwd_gpu_s": 0.0, "bwd_gpu_s": 0.0}
         # The window is touched by the engine loop and by the ticker that
         # closes windows while the engine idles (no steps → no flush otherwise).
@@ -259,6 +290,7 @@ class MetricsRecorder:
             with open(os.path.join(self.root, "run.json"), "w") as f:
                 json.dump({**self.meta, "start_unix_time": round(now, 3),
                            "interval_s": self.interval_s, "ttft_slo": self.ttft_slo,
+                           "avg_tbt_slo": self.avg_tbt_slo,
                            "max_tbt_slo": self.max_tbt_slo}, f, indent=2, default=str)
         except OSError:
             pass
@@ -345,6 +377,12 @@ class MetricsRecorder:
         t["requests"] += 1
         t["prompt_tokens"] += prompt
         t["output_tokens"] += n
+        if tbt_mean is not None:
+            met = bool(self.avg_tbt_slo and tbt_mean <= self.avg_tbt_slo)
+            w.tbt_requests += 1
+            w.tbt_met += met
+            t["tbt_requests"] += 1
+            t["avg_tbt_slo_met"] += met
         self.feed.finished(now, prompt, tbt_mean)
         self._w.row("requests.csv", _REQ_FIELDS, (
             round(now, 3), rid, prompt, n, round(ttft, 5),
@@ -440,7 +478,8 @@ class MetricsRecorder:
             r(n / (gpu_ms / 1000.0), 1) if gpu_ms else "",
             r(mem.get("alloc", 0) / GIB) if mem else "",
             r(mem.get("peak", 0) / GIB) if mem else "",
-            r(mem.get("reserved", 0) / GIB) if mem else ""))
+            r(mem.get("reserved", 0) / GIB) if mem else "",
+            "" if resp.get("attn_graph") is None else int(bool(resp["attn_graph"]))))
 
     # -- summaries ------------------------------------------------------------
 
@@ -498,9 +537,11 @@ class MetricsRecorder:
         slo = None
         if self.ttft_slo and ttft:
             slo = round(sum(1 for x in ttft if x <= self.ttft_slo) / len(ttft), 4)
+        # TBT attainment: the requests finished in this window whose own mean
+        # token gap is within avg_tbt_slo (per request, like the TTFT one).
         tbt_slo = None
-        if self.max_tbt_slo and gaps.n:
-            tbt_slo = round(gaps.at_or_below / gaps.n, 4)
+        if self.avg_tbt_slo and w.tbt_requests:
+            tbt_slo = round(w.tbt_met / w.tbt_requests, 4)
         return {
             "unix_time": round(now, 3),
             "window_s": round(dt, 3),
@@ -515,7 +556,8 @@ class MetricsRecorder:
                           "p99": rd(gaps.pct(99)), "max": rd(gaps.max if gaps.n else None),
                           "mean": rd(gaps.mean()), "tokens": gaps.n},
                 "ttft_slo": self.ttft_slo, "ttft_slo_attainment": slo,
-                "max_tbt_slo": self.max_tbt_slo, "tbt_slo_attainment": tbt_slo,
+                "avg_tbt_slo": self.avg_tbt_slo, "tbt_slo_attainment": tbt_slo,
+                "max_tbt_slo": self.max_tbt_slo,
                 "prompt_tokens_per_s": round(w.prompt_tokens / dt, 1),
                 "output_tokens_per_s": round(w.output_tokens / dt, 1),
                 "in_flight": len(self._live),
@@ -576,6 +618,11 @@ class MetricsRecorder:
             self._last = snap
             self._win = _Window(self._clock(), self.max_tbt_slo)
             self.feed.flush_open_run()
+        # The final window is the LAST line of summary.jsonl: let the writer
+        # put the windows it still holds on disk first (bounded — the process
+        # may be killed any moment, and the final line matters more than its
+        # place).
+        self._w.drain(0.5)
         try:
             with open(os.path.join(self.root, "summary.jsonl"), "a") as f:
                 f.write(json.dumps({**snap, "final": True}) + "\n")

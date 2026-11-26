@@ -544,7 +544,10 @@ def main():
     ap.add_argument("--keep", action="store_true")
     a = ap.parse_args()
     if a.worker:
-        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+        # v1 runner unless DSERVE_MODEL_RUNNER=v2 (the plugin reads it too)
+        from deltaserve.runner_select import pin_vllm_runner
+
+        pin_vllm_runner()
         tmp = Path(a.tmp)
         WORKERS[a.worker](tmp, Path(os.environ.get("DSERVE_E2E_OUT",
                                                    tmp / f"{a.worker}.json")))

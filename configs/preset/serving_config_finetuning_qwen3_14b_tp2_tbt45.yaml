@@ -54,8 +54,8 @@ throttles:
 slo:
   admission_margin: legacy           # pinned: reproduces the published runs (the default is now relative)
   ttft_slo: 0.4
-  avg_tbt_slo: 0.02
-  max_tbt_slo: 0.045                # [mixed-fwd-cuda-graph A/B] tighter TBT target to buy back the TBT cost of denser FT admission
+  avg_tbt_slo: 0.035                 # the token target (s): kept over avg_tbt_window_s, and what TBT attainment is measured against
+  max_tbt_slo: 0.1                  # [mixed-fwd-cuda-graph A/B] tighter TBT target to buy back the TBT cost of denser FT admission
   # M4.2: the runner's per-step timing samples and the profiling pass's
   # record gate now ride the TP relay (ModelRunnerOutput.finetune_timing /
   # SchedulerOutput.finetune_record_timing), so the launch-time profiling

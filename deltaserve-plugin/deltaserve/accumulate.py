@@ -68,8 +68,14 @@ class FinetuneAccumulator:
                  save_attn_ctx: bool = False,
                  save_resid_mid: bool = False,
                  attn_qkv_pre_transform: bool = False,
-                 save_final_hidden: bool = False) -> None:
+                 save_final_hidden: bool = False,
+                 op_rows: int | None = None) -> None:
         self.max_saved = int(max_saved)
+        # Rows the graph-capturable save op moves per step (its index
+        # tensors' fixed length): the most FT tokens one step carries, which
+        # is below the buffer's capacity when a step is trained in several
+        # backward batches.
+        self.op_rows = max(1, min(int(op_rows or max_saved), self.max_saved))
         self.hidden_size = int(hidden_size)
         self.intermediate_size = int(intermediate_size) if intermediate_size else 0
         self.q_size = int(q_size) if q_size else 0
@@ -255,11 +261,11 @@ class FinetuneAccumulator:
         # (fixed addresses — the has_ft graphs bake them in), a pinned ring
         # for the per-step host→device refresh, and the slot → buffer table.
         # ``install_save_points`` fills the table and marks the modules.
-        self.ft_src = torch.zeros(self.max_saved, device=device,
+        self.ft_src = torch.zeros(self.op_rows, device=device,
                                   dtype=torch.int64)
-        self.ft_dst = torch.full((self.max_saved,), self.max_saved,
+        self.ft_dst = torch.full((self.op_rows,), self.max_saved,
                                  device=device, dtype=torch.int64)
-        self._idx_pin = torch.empty((4, 2, self.max_saved), dtype=torch.int64,
+        self._idx_pin = torch.empty((4, 2, self.op_rows), dtype=torch.int64,
                                     pin_memory=(torch.device(device).type == "cuda"))
         self._idx_pin_pos = 0
         self.op_bufs: list = []
@@ -329,7 +335,7 @@ class FinetuneAccumulator:
         scratch row. One pinned staging slot + one non-blocking H2D copy on
         the current stream (ordered after the previous step's replay).
         Returns the save-op state for the step."""
-        n = min(int(num_ft), self.max_saved - int(offset))
+        n = min(int(num_ft), self.op_rows, self.max_saved - int(offset))
         slot = self._idx_pin_pos
         self._idx_pin_pos = (slot + 1) % self._idx_pin.shape[0]
         stage = self._idx_pin[slot]

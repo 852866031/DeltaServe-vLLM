@@ -109,16 +109,43 @@ class FinetuneConfig:
     backward-side reduces, run eagerly between the replays. Default
     off; mirrors DeltaServe's SFT_service_graph.py."""
 
-    backward_cuda_graph_attn_bn_max: int = 8
+    backward_cuda_graph_attn_bn_max: int | str = "auto"
     """[backward_cuda_graph] Padded-attention max distinct samples per backward.
-    Batches with more samples silently fall back to the eager per-sample attention
-    loop for that one backward. Mirrors DeltaServe's ATTN_BN_MAX (=8 default)."""
+    A backward with more samples runs its attention EAGER for that cycle (the
+    rest stays graphed) — several thousand Python-issued kernels instead of one
+    replay. ``auto`` (default) picks it, with ``_l_max``, from the finetuning
+    dataset at launch (``deltaserve/bwd_budget.py``: the cheapest shape that
+    holds 99 % of the epoch's backward batches); a number is taken as it is,
+    and the launch log says how much of the data it holds. (The old default
+    8 x 64 held no cycle of a 512-token buffer of ~20-token samples.)"""
 
-    backward_cuda_graph_attn_l_max: int = 64
-    """[backward_cuda_graph] Padded-attention max per-sample sequence length.
-    Batches whose max sample length exceeds this fall back to eager attention.
-    Quadratic in compute (scores tensor is [bn_max, Hq, l_max, l_max]); oversizing
-    tanks throughput. Mirrors DeltaServe's ATTN_L_MAX (=64 default)."""
+    backward_cuda_graph_attn_l_max: int | str = "auto"
+    """[backward_cuda_graph] Padded-attention max per-sample sequence length;
+    ``auto`` as above. A backward with a longer sample falls back to eager
+    attention. Quadratic in compute (the scores tensor is
+    [bn_max, Hq, l_max, l_max])."""
+
+    backward_cuda_graph_attn_shapes: int = 1
+    """[backward_cuda_graph] How many padded-attention shapes to capture. One
+    (the default) is the budget above alone: every backward pays for its whole
+    padding (15 x 57 on the alpaca corpus with 256-token batches, when a batch
+    is 13 samples of 19 tokens at the start of an epoch and 4 of 63 at its
+    end). With more, smaller shapes INSIDE the budget are chosen from the
+    dataset and a backward replays the cheapest one that holds it. The
+    attention graph is shared by all layers, so a shape costs its input slabs
+    (a few MB) and one graph, not a graph per layer. Qwen3-14B TP=2: the
+    attention backward of a cycle 8.6 ms -> ~4.2 ms."""
+
+    backward_disable_torch_native: bool = True
+    """Start the backward child with ``TORCH_DISABLE_NATIVE_JIT=1``. torch 2.14
+    added ``torch/_native``: Python-level overrides of bmm / sum / rmsnorm /
+    scatter_add / topk ... on CUDA that run a dispatch check before every
+    call. The eager parts of the backward issue thousands of small calls per
+    cycle; on a host with a slow CPU that check cost 13-18 % per token (A100
+    cloud VM, Qwen3-14B TP=4: 2111 -> 1764 µs/token with it off, vs 1801 on
+    torch 2.11). Only the child is affected — the variable is set around its
+    spawn, the serving processes keep torch's default — and for the child it
+    is the torch <= 2.13 behaviour. False: leave torch's default."""
 
     max_prepare: int | None = None
     """Cap on how many corpus lines to load (None = all). DeltaServe's
@@ -126,7 +153,123 @@ class FinetuneConfig:
 
     max_saved_finetuning_tokens: int = 256
     """Per-backward FT token budget. Also sizes the shared activation buffers and
-    bounds length-bucketed sample selection."""
+    bounds length-bucketed sample selection. The single-size form of
+    ``ft_step_size`` / ``bwd_batch_size`` below: with neither set, both are this
+    value (one backward per optimizer step, as before they existed)."""
+
+    ft_step_size: int | None = None
+    """FT tokens per optimizer step (None = ``max_saved_finetuning_tokens``).
+    Sizes the shared activation buffers: the forward collects a whole step's
+    activations, the backward child works through them ``bwd_batch_size`` tokens
+    at a time, accumulating gradients, and updates + publishes the adapter once
+    per step. The gradients are normalised over the step's tokens, so k
+    backward batches equal one backward of k times the size."""
+
+    bwd_batch_size: int | None = None
+    """FT tokens per backward batch (None = the step size: one backward per
+    step). Must divide ``ft_step_size``. It sets how long the backward child
+    holds the GPU between two points where it can yield (and how much it slows
+    the decode steps it overlaps), the size of the backward graphs, and the
+    longest sample that can be trained. With several batches per step FT
+    admission stays open while the earlier batches run (the weights do not
+    change until the step's update), and a step that carries FT tokens pauses
+    the child like an inference prefill does."""
+
+    ft_buffer_size: int | None = None
+    """Rows of the activation buffer when it is SMALLER than the step (None =
+    ``ft_step_size``). A multiple of ``bwd_batch_size``; needs several
+    backward batches per step. The buffer then is a ring of batch slots: batch
+    j of a step is filled in slot j mod (ft_buffer_size / bwd_batch_size), and
+    a slot is given to a later batch once its backward is acked — nothing is
+    allocated or freed while serving, the forward waits when every slot is
+    still being trained. The buffer's memory follows this size, not the step:
+    Qwen3-14B TP=2, 2.70 MB per token per GPU, so a 1024-token step in a
+    512-token buffer is 1.3 GiB instead of 2.6, and a 4096-token step costs no
+    more. Not together with ``bwd_batch_size_idle`` (a larger backward needs
+    its rows in one piece).
+    Measured (2026-11-26, production timeline, 0.88): 1024 / 256 with the whole
+    step buffered -> in 512 rows: FT 624 -> 659 tok/s, FT only 1276 -> 1286,
+    KV cache 53,248 tokens; 2048 / 256 in 512 rows: 670 tok/s, the same KV.
+    Off by default (the buffer holds the step), as before the key."""
+
+    bwd_batch_size_idle: int | None = None
+    """FT tokens per backward batch while NO inference request is running or
+    waiting (None = ``bwd_batch_size``: off). Up to ``ft_step_size``. A larger
+    backward costs less per token; with this the child keeps the small batch
+    (a short yield, a small share of a decode step's time) whenever inference
+    is present and takes what the step holds, up to this size, when it is not.
+    The backward graphs are padded to one batch size, so the child captures a
+    second set for this size and needs the memory of the larger backward
+    (Qwen3-14B TP=2: ~2.25 GiB for 256, ~5.2 GiB for 1024) on top.
+    OFF BY DEFAULT: MEASURED, WORSE THAN ONE LARGE BACKWARD ALWAYS. Qwen3-14B
+    TP=2, 1024 / 256 without -> with an idle size of 1024: FT only 1276 -> 1619
+    tok/s, production 624 -> 708, loose-half 882 — but
+    ``max_saved_finetuning_tokens: 1024`` with ``ft_tokens_per_step: 256``
+    (preset ..._tp2_step1024) gives 1877 / 795 / 922 with a KV cache of 17,408
+    tokens, against 6,144 here (two graph sets in 32 GB). For a deployment
+    that must keep the small backward while inference is present."""
+
+    ft_tokens_per_step: int | None = None
+    """FT tokens ONE forward step may carry (None = ``bwd_batch_size``: a
+    step fills a whole backward batch when nothing else limits it). Smaller
+    than the backward batch, it separates the two costs of a large batch: the
+    backward of 1024 tokens is far cheaper per token than four of 256 (bigger
+    GEMMs, one LM head, one publish), and it yields between its per-layer
+    graphs anyway, while a FORWARD step of 1024 FT tokens is 200 ms that an
+    arriving request waits behind or has to abort. With ``ft_step_size`` =
+    ``bwd_batch_size`` = 1024 and this at 256, the buffer fills over four
+    steps and trains in one backward."""
+
+    ft_only_tokens_per_step: int | None = None
+    """FT tokens a step WITHOUT inference tokens may carry (None =
+    ``ft_tokens_per_step``; at most a backward batch). An FT-only forward is
+    abandoned when a request arrives (``forward_interruptible``), so it can be
+    large — a 1024-token one costs less per token than four of 256 — while a
+    step that also carries inference tokens keeps the smaller cap."""
+
+    bwd_whole_batches: bool = False
+    """With several backward batches per step: end the step when its
+    ``ft_step_size / bwd_batch_size`` batches are full, not when its rows are.
+    A batch is whole samples, so filling the rows leaves a remainder (1024 rows
+    of ~19-token samples: four batches of 247 and 36 rows over) that becomes a
+    fifth backward of a few dozen tokens at the price of a whole one — the
+    backward graphs are padded to the batch size. On: no such batch; a step
+    trains slightly fewer tokens. False: the behaviour before this key."""
+
+    @property
+    def step_tokens(self) -> int:
+        """Tokens per optimizer step = the activation buffer's capacity."""
+        return max(1, int(self.ft_step_size if self.ft_step_size is not None
+                          else self.max_saved_finetuning_tokens))
+
+    @property
+    def bwd_tokens(self) -> int:
+        """Tokens per backward batch."""
+        return max(1, int(self.bwd_batch_size if self.bwd_batch_size is not None
+                          else self.step_tokens))
+
+    def check_step_sizes(self) -> None:
+        step, bwd = self.step_tokens, self.bwd_tokens
+        if bwd > step or step % bwd:
+            raise ValueError(
+                f"finetune_param.ft_step_size ({step}) must be a multiple of "
+                f"finetune_param.bwd_batch_size ({bwd})")
+        buf = self.ft_buffer_size
+        if buf is not None and (int(buf) < bwd or int(buf) % bwd
+                                or int(buf) > step):
+            raise ValueError(
+                f"finetune_param.ft_buffer_size ({buf}) must be a multiple of "
+                f"bwd_batch_size ({bwd}) and at most ft_step_size ({step})")
+        if (buf is not None and int(buf) < step
+                and self.bwd_batch_size_idle not in (None, bwd)):
+            raise ValueError(
+                "finetune_param.ft_buffer_size below the step and "
+                "bwd_batch_size_idle cannot be combined")
+        idle = self.bwd_batch_size_idle
+        if idle is not None and not (bwd <= int(idle) <= step):
+            raise ValueError(
+                f"finetune_param.bwd_batch_size_idle ({idle}) must lie between "
+                f"bwd_batch_size ({bwd}) and ft_step_size ({step})")
 
     save_activations: bool = True
     """Whether to actually accumulate FT activations into the shared buffers.
@@ -188,19 +331,72 @@ class FinetuneConfig:
     DeltaServe slo.ttft_slo."""
 
     avg_tbt_slo: float = 0.1
-    """Average time-between-tokens SLO (seconds) for running decode requests."""
+    """Average time-between-tokens SLO (seconds) for running decode requests:
+    THE token-latency target. Enforced over a sliding window
+    (``avg_tbt_window_s``), and what the TBT attainment is measured against (a
+    request meets it when the mean of its own token gaps is within it)."""
 
-    avg_tbt_window_s: float = 0.0
-    """Enforce ``avg_tbt_slo``: FT is admitted to a step with decode requests
-    only while the average time between tokens over the last
+    avg_tbt_window_s: float = 1.0
+    """How ``avg_tbt_slo`` is enforced: FT is admitted to a step with decode
+    requests only while the average time between tokens over the last
     ``avg_tbt_window_s`` seconds, that step included, stays within
     ``avg_tbt_slo`` (``deltaserve/tbt_window.py``: every decode token of the
-    window, averaged). 0 (default) = off: only the per-step ``max_tbt_slo``
-    check runs and ``avg_tbt_slo`` is not enforced, as before."""
+    window, averaged). Default 1 s. 0 = off: only the per-step ``max_tbt_slo``
+    bound runs and ``avg_tbt_slo`` is not enforced."""
 
-    max_tbt_slo: float = 0.2
-    """Max time-between-tokens SLO (seconds): a single step's predicted time must
-    not exceed this while FT tokens are admitted."""
+    avg_tbt_pause_backward: bool = True
+    """Keep ``avg_tbt_slo`` against the backward too. A decode-only step that
+    shares the GPU with a running backward takes about twice as long, and FT
+    admission has no say in it: the backward was triggered earlier. With this
+    on, the scheduler predicts such a step WITH the overlap (the estimator's
+    decode-with-backward regime) and, if the window's average time between
+    tokens would then pass ``avg_tbt_headroom`` × ``avg_tbt_slo``, the step
+    pauses the backward child, exactly as an inference prefill does. The
+    backward so uses only the slack the target leaves and gives way when it is
+    gone. Needs ``avg_tbt_window_s`` > 0. False: the backward overlaps decode
+    steps freely (the behaviour before this key)."""
+
+    avg_tbt_headroom: float = 0.9
+    """The fraction of ``avg_tbt_slo`` the backward gate above steers the
+    window average to. Below 1 because the SLO is met per request: with the
+    window average ON the target, about half the requests' own averages are
+    above it."""
+
+    profile_extra_shapes: bool = False
+    """Add to the launch profiling pass the shapes served traffic has and the
+    base sweep leaves out: one short prompt prefilled alone (16-48 tokens) and
+    many decode requests with short contexts (8-64 requests of 48 / 160
+    tokens). ~10 shapes, 2 s. OFF BY DEFAULT: MEASURED, NO GAIN — the estimator
+    is refit on live steps while serving, so what it predicts at run time does
+    not depend on the launch sweep (Qwen3-14B TP=2, actual / predicted with
+    and without: prefill + decode steps 1.02-1.08 vs 0.98-1.04, decode-only
+    with 17-48 requests 0.82 vs 0.84, a lone short prefill 1.13 vs 1.10). The
+    base sweep is enough; what is left is the model's form, not its data.
+    False: the sweep before this key."""
+
+    overload_hold_s: float = 0.0
+    """FT stands down while inference is at or over its SLO. When the window's
+    average time between tokens is above ``avg_tbt_slo``, or the oldest
+    waiting inference request has waited 0.9 x ``ttft_slo``, no FT is admitted
+    and the backward stays paused until this many seconds after the last such
+    moment. The per-step checks only ask whether one more step fits, so
+    without this FT keeps a share of a system that cannot meet its SLO even
+    alone (Qwen3-14B TP=2 at an overloading request rate: TTFT attainment 96 %
+    inference only, 81.5 % with FT at 275 tok/s). 0 = off, the behaviour
+    before this key."""
+
+    avg_tbt_admission_headroom: float = 1.0
+    """The fraction of ``avg_tbt_slo`` FT ADMISSION steers the window average
+    to (the check that decides how many FT tokens join a step with decode
+    requests). 1.0 = the target itself (the behaviour before this key); below
+    1 for the same reason as ``avg_tbt_headroom``."""
+
+    max_tbt_slo: float = 0.1
+    """Upper bound on ONE step that carries decode requests and FT tokens
+    (seconds, predicted). A backstop, not the target: a step that carries an
+    inference prefill next to decodes is slow whatever FT does, so a tight
+    value here mostly shuts FT out of the steps it rides best. The average is
+    what ``avg_tbt_slo`` keeps."""
 
     ft_tokens_admission_constrain_factor: float = -1.0
     """Cap FT tokens admitted per step relative to that step's INFERENCE PREFILL
@@ -517,8 +713,10 @@ class FinetuneConfig:
     the graph-capturable ``dserve_save_rows`` op (``deltaserve/ft_save_op.py``)
     fed by persistent index tensors, and a second piecewise capture set keyed
     ``has_ft`` is captured at startup. FT-ONLY batches stay eager (they are
-    the ones the mid-forward abort applies to). Requires a model family with
-    the save call sites (Qwen3); other families silently keep the eager path.
+    the ones the mid-forward abort applies to; ``graph_ft_only_batches`` puts
+    them on the graphs too). The op is issued by the accumulator's hooks, so
+    it works for every family (Qwen3 and Llama-3 are both gated:
+    ``tests/test_phase1_m1.py``, ``tests/test_llama3_inference_leak.py``).
     Off (default) is bit-identical to before."""
 
     graph_ft_max_tokens: int = 512
@@ -526,6 +724,30 @@ class FinetuneConfig:
     ``has_ft`` piecewise graphs for (capped by the compilation config's
     ``max_cudagraph_capture_size``). Mixed FT steps above it run the compiled
     forward without a graph."""
+
+    ft_breakable_cudagraph: bool = False
+    """Serve on vLLM's breakable CUDA graph (what ``VLLM_USE_BREAKABLE_CUDAGRAPH=1``
+    selects: the forward is recorded as it runs, no ``torch.compile`` split)
+    and capture the ``has_ft`` graph set on it — the hooks' save op is executed
+    during the capture pass, so no Dynamo trace is involved, and the tier-C
+    abort poll runs between the replayed segments.
+    OFF BY DEFAULT: MEASURED, NO GAIN. Qwen3-14B TP=2, compiled -> breakable:
+    production FT 595 -> 589 tok/s, TTFT p50 / p99 72.9 / 112.5 -> 74.5 / 113.2
+    ms, FT-only step 53.5 -> 53.2 ms, graphs 4.18 -> 4.26 GiB (2026-11-26). It
+    runs the same kernels; kept for a vLLM that makes the breakable graph the
+    default for these models. With this off and the env variable set by hand,
+    vLLM serves on the breakable graph and FT batches run without a graph
+    (the behaviour before this key)."""
+
+    fill_graph_padding: bool = False
+    """A step that replays a ``has_ft`` graph is padded to a captured size and
+    pays for all of its rows. With this on, an FT sample the SLO check would
+    refuse is admitted anyway while it fits the rows of the size the step
+    already runs at (inference tokens + the FT admitted so far, rounded up to
+    the next captured size): it adds no kernel work, only its activation
+    saves. Applies once the step carries FT (the first sample still has to
+    pass the SLO check). Requires ``graph_ft_batches``. Off: the behaviour
+    before this key."""
 
     graph_ft_only_batches: bool = False
     """FT-ONLY steps (no inference tokens) replay the same ``has_ft`` graphs as
@@ -563,6 +785,14 @@ class FinetuneConfig:
     the next execute_model / sample_tokens call; idle steps keep the engine
     stepping while a backward is outstanding, so the check always runs). Cost:
     the child yields for the whole prefill instead of one layer."""
+
+    model_runner: str = "auto"
+    """Which vLLM model runner hosts the co-serving hooks: ``v1``
+    (``gpu_model_runner.py``; ``deltaserve/model_runner.py``), ``v2``
+    (``vllm/v1/worker/gpu``; ``deltaserve/model_runner_v2.py``) or ``auto``
+    (default): v1 where vLLM still ships it (up to v0.33), else v2. vLLM
+    removed the v1 runner after v0.33, so v2 is the only choice from v0.34 on;
+    on v0.33 both exist, which is what lets the two be compared on one vLLM."""
 
     # --- fwd-token throttle (extends the prefill-gated pause) ---
     fwd_token_throttle_enable: bool = False

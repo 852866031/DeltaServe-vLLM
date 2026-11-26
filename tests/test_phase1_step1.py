@@ -11,6 +11,7 @@ graph-affecting settings only. CPU-only, no model load.
 Exits 0 if all checks pass, 1 otherwise.
 """
 
+import os
 import sys
 
 _passed = 0
@@ -71,6 +72,8 @@ def _config(additional_config):
 
 
 def test_engine_config():
+    # The defaults are checked here; the variable would override the config key.
+    os.environ.pop("DSERVE_MODEL_RUNNER", None)
     green("engine config via additional_config:")
     import pickle
 
@@ -92,18 +95,27 @@ def test_engine_config():
     check("scheduler_cls = FinetuneScheduler",
           "FinetuneScheduler" in str(on.scheduler_config.scheduler_cls))
     check("async scheduling defaults on", on.scheduler_config.async_scheduling)
-    check("v1 model runner", not on.use_v2_model_runner)
+    # vLLM <= 0.33 ships both runners (default: v1); later versions only v2.
+    check("default model runner (v1 where vLLM has it)",
+          not getattr(on, "use_v2_model_runner", False))
     back = pickle.loads(pickle.dumps(on))
     check("finetune_config survives pickling",
           back.finetune_config.ttft_slo == 0.4)
 
     import vllm.kernels  # noqa: F401  (registers the IR op providers the hash reads)
 
-    h = on.compute_hash()
+    def _hash(cfg):
+        # vLLM <= 0.33: VllmConfig.compute_hash; later: its compile factors
+        if hasattr(cfg, "compute_hash"):
+            return cfg.compute_hash()
+        from vllm.config.utils import hash_config
+        return hash_config(cfg)
+
+    h = _hash(on)
     check("an SLO knob does not change the compile hash",
-          _config(_ft(ttft_slo=0.2)).compute_hash() == h)
+          _hash(_config(_ft(ttft_slo=0.2))) == h)
     check("graph_ft_batches does",
-          _config(_ft(ttft_slo=0.4, graph_ft_batches=True)).compute_hash() != h)
+          _hash(_config(_ft(ttft_slo=0.4, graph_ft_batches=True))) != h)
 
 
 def test_cli_parse():

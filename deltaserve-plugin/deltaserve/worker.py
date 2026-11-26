@@ -16,6 +16,8 @@ code. On top of the stock worker it
 - answers the ``deltaserve_{start,stop}_finetuning`` collective RPCs.
 """
 
+from deltaserve.ft_sizes import (buffer_tokens_of, bwd_tokens_of, ft_only_tokens_of,
+                                fwd_tokens_of, ring_slots_of, step_tokens_of)
 import os
 
 import torch
@@ -37,13 +39,30 @@ class DeltaServeWorker(RouteEncodeMixin, Worker):
 
             arm_parent_death_signal(f"worker rank={self.rank}")
 
+    def _ds_use_v2_runner(self) -> bool:
+        # vLLM <= 0.33 decides per launch (the plugin steers it by
+        # finetune_features.model_runner); later versions only have v2.
+        return bool(getattr(self.vllm_config, "use_v2_model_runner", True))
+
+    def _make_model_runner(self):
+        if (self._ds_use_v2_runner()
+                and not getattr(self.vllm_config, "is_mm_encoder_only", False)):
+            from deltaserve.model_runner_v2 import DeltaServeModelRunnerV2
+
+            return DeltaServeModelRunnerV2(self.vllm_config, self.device)
+        return super()._make_model_runner()
+
     def init_device(self):
         super().init_device()
         from deltaserve import dprint
         from deltaserve.backward_process import BackwardProcess
-        from deltaserve.model_runner import DeltaServeModelRunner
 
-        DeltaServeModelRunner.adopt(self.model_runner)
+        if not self._ds_use_v2_runner():
+            from deltaserve.model_runner import DeltaServeModelRunner
+
+            DeltaServeModelRunner.adopt(self.model_runner)
+        dprint(f"Worker rank={self.rank}: co-serving hooks on the "
+               f"{type(self.model_runner).__name__}")
 
         ft_cfg = self.vllm_config.finetune_config
         arch = self.model_config.hf_config.architectures[0]
@@ -55,6 +74,8 @@ class DeltaServeWorker(RouteEncodeMixin, Worker):
             mps_percentage=ft_cfg.backward_mps_percentage,
             device_index=self.local_rank,
             service_name=arch,
+            disable_torch_native=bool(
+                getattr(ft_cfg, "backward_disable_torch_native", True)),
         )
         self.backward_process.start()
         dprint(f"Worker rank={self.rank} local_rank={self.local_rank}: backward "
@@ -236,7 +257,10 @@ class DeltaServeWorker(RouteEncodeMixin, Worker):
             embed_weight_key=embed_weight_key,
             has_final_norm="model.norm.weight" in _norm2raw,
             lora_scaling=read_lora_scaling(path),
-            tp_size=tp_size, tp_rank=tp_rank)
+            tp_size=tp_size, tp_rank=tp_rank,
+            tokenizer=getattr(self.model_config, "tokenizer", None))
+        if meta.get("attn_budget_note") and tp_rank == 0:
+            dprint(f"[bwd-graph] {meta['attn_budget_note']}")
 
         dprint(
             f"sharing weights with backward process: base={len(base_state)} "
@@ -320,7 +344,8 @@ class DeltaServeWorker(RouteEncodeMixin, Worker):
 
         accumulator = FinetuneAccumulator(
             model=model,
-            max_saved=ft_cfg.max_saved_finetuning_tokens,
+            max_saved=buffer_tokens_of(ft_cfg),   # the step, or a ring of batch slots
+            op_rows=ft_only_tokens_of(ft_cfg),
             hidden_size=hidden_size,
             device=self.device,
             dtype=dtype,
@@ -349,11 +374,16 @@ class DeltaServeWorker(RouteEncodeMixin, Worker):
         # FinetuneScheduler reuses the same instance (and sets min_sample_len).
         from deltaserve.coordinator import get_coordinator
 
-        cap = int(ft_cfg.max_saved_finetuning_tokens)
+        cap = int(step_tokens_of(ft_cfg))
         # per-step budget = full capacity (max_saved_finetuning_tokens): an
         # idle/FT-only step can fill the buffer in one eager forward. During
         # co-serving the SLO gate caps FT tokens once the estimator is warm.
-        coordinator = get_coordinator(capacity=cap, per_step_budget=cap)
+        coordinator = get_coordinator(capacity=cap,
+                                      per_step_budget=fwd_tokens_of(ft_cfg))
+        coordinator.bwd_batch = bwd_tokens_of(ft_cfg)
+        coordinator.ft_only_budget = ft_only_tokens_of(ft_cfg)
+        coordinator.whole_batches = bool(getattr(ft_cfg, "bwd_whole_batches", False))
+        coordinator.ring_slots = ring_slots_of(ft_cfg)
         coordinator.backward_process = backward_process
         # [DeltaServe] Phase 7 / M4.1: under TP>1 this worker-side coordinator is
         # a DIFFERENT process from the EngineCore scheduler. Relay mode makes it

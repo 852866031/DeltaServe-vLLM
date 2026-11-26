@@ -85,7 +85,7 @@ def _compact_window(w: dict) -> dict:
     kept separately, only when it changes)."""
     inf, ft, tot = w.get("inference") or {}, w.get("finetune") or {}, w.get("totals") or {}
     return {"inference": {k: inf.get(k) for k in
-                          ("ttft_slo", "max_tbt_slo", "tbt_slo_attainment")},
+                          ("ttft_slo", "avg_tbt_slo", "max_tbt_slo", "tbt_slo_attainment")},
             "finetune": {k: ft.get(k) for k in
                          ("backward_gpu_ms_mean", "backward_wall_ms_mean")},
             "totals": {k: tot.get(k) for k in ("first_tokens", "ttft_slo_met", "requests")}}

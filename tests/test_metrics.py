@@ -65,8 +65,8 @@ def rows(path):
 def part_a_to_d(root):
     print("A-D. recorder")
     clk = Clock()
-    m = MetricsRecorder(root, interval_s=10, ttft_slo=0.4, max_tbt_slo=0.05, clock=clk,
-                        start_ticker=False)
+    m = MetricsRecorder(root, interval_s=10, ttft_slo=0.4, max_tbt_slo=0.05,
+                        avg_tbt_slo=0.04, clock=clk, start_ticker=False)
     reqs = {"a": types.SimpleNamespace(arrival_time=1000.0, num_prompt_tokens=50),
             "b": types.SimpleNamespace(arrival_time=1000.5, num_prompt_tokens=20)}
     # a: arrives 1000.0, first token 1000.3, then 1000.32, 1000.36 (finished)
@@ -112,11 +112,16 @@ def part_a_to_d(root):
     C.ok("TTFT p50 / max", abs(inf["ttft_s"]["p50"] - 0.3) < 1e-9
          and abs(inf["ttft_s"]["max"] - 0.5) < 1e-9, json.dumps(inf["ttft_s"]))
     C.ok("TTFT SLO attainment 1/2", inf["ttft_slo_attainment"] == 0.5)
-    # gaps: a: 0.02, 0.04; b: 0.1  → TBT SLO 0.05: 2/3
+    # gaps: a: 0.02, 0.04; b: 0.1
     C.ok("inter-token gaps (max exact, percentiles within a 2 % bucket)",
          abs(inf["tbt_s"]["max"] - 0.1) < 1e-9 and inf["tbt_s"]["tokens"] == 3
-         and 0.04 <= inf["tbt_s"]["p50"] <= 0.04 * 1.0201
-         and abs(inf["tbt_slo_attainment"] - 0.6667) < 1e-4, json.dumps(inf["tbt_s"]))
+         and 0.04 <= inf["tbt_s"]["p50"] <= 0.04 * 1.0201, json.dumps(inf["tbt_s"]))
+    # per request: a's mean gap is 0.03, b's 0.05 (0.1 over 2 gaps); avg SLO 0.04
+    C.ok("TBT attainment = requests whose mean token gap is within avg_tbt_slo: 1/2",
+         inf["tbt_slo_attainment"] == 0.5 and inf["avg_tbt_slo"] == 0.04
+         and snap["totals"]["tbt_requests"] == 2
+         and snap["totals"]["avg_tbt_slo_met"] == 1,
+         f"{inf['tbt_slo_attainment']} {snap['totals']}")
     C.ok("throughputs over the 10 s window",
          inf["prompt_tokens_per_s"] == 7.0 and inf["output_tokens_per_s"] == 0.6
          and ft["trained_tokens_per_s"] == 51.2
@@ -271,6 +276,28 @@ def part_idle(root):
     m.close()
 
 
+def part_final_order(root):
+    print("\nH2. the final window is the last line, behind a slow writer")
+    import time as _t
+    m = MetricsRecorder(root, interval_s=10.0, start_ticker=False)
+    m.start_serving()
+    m.on_step(feats(t_in=10), 0.01)
+    opened = m._w._open
+
+    def slow_open(name, fields):       # the writer thread is busy elsewhere
+        _t.sleep(0.2)
+        return opened(name, fields)
+
+    m._w._open = slow_open
+    m.maybe_flush(force=True)          # a periodic window, still with the writer
+    m.on_step(feats(t_in=20), 0.02)
+    m.final_flush()                    # the stop request arrives right behind it
+    w = [json.loads(l) for l in open(os.path.join(root, "summary.jsonl"))]
+    C.ok("the periodic window, then the final one",
+         len(w) == 2 and w[0].get("final") is None and w[1].get("final") is True,
+         str([x.get("final") for x in w]))
+
+
 def part_live_ttft(root):
     print("\nI. TTFT counts where the first token came out")
     clk = Clock(0.0)
@@ -363,5 +390,6 @@ if __name__ == "__main__":
         part_live_ttft(os.path.join(root, "live"))
         part_hist()
         part_idle(os.path.join(root, "idle"))
+        part_final_order(os.path.join(root, "final_order"))
         part_f(os.path.join(root, "perf"))
     C.finish()

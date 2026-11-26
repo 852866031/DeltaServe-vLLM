@@ -12,6 +12,8 @@ trainer's ``_build_state`` consumes.
 
 from __future__ import annotations
 
+from deltaserve.ft_sizes import bwd_tokens_of, idle_bwd_tokens_of, step_tokens_of
+
 import json
 import os
 from typing import Any
@@ -130,7 +132,8 @@ def saved_qkv_pre_transform(arch: str) -> bool:
 
 def build_backward_meta(hf_config: Any, ft_cfg: Any, *, lm_head_key: str | None,
                         embed_weight_key: str | None, has_final_norm: bool,
-                        lora_scaling: float, tp_size: int, tp_rank: int) -> dict:
+                        lora_scaling: float, tp_size: int, tp_rank: int,
+                        tokenizer: str | None = None) -> dict:
     """The ``meta`` dict shipped to the backward child with the shared weights.
 
     Model dims (for the per-layer forward rematerialization), the LM-head /
@@ -140,6 +143,38 @@ def build_backward_meta(hf_config: Any, ft_cfg: Any, *, lm_head_key: str | None,
     ``head_dim`` falls back to ``hidden_size // num_attention_heads`` for
     configs that omit it (Llama-3); Qwen3 states it explicitly (and its
     ``head_dim * num_heads`` may differ from ``hidden_size``)."""
+    # The padded-attention budget of the backward graph: numbers from the
+    # config, or chosen from the dataset (``auto``). Only looked at when the
+    # backward graphs are on (it tokenizes the corpus).
+    attn_bn, attn_l, attn_note = 8, 64, None
+    attn_extra: list = []
+    if bool(getattr(ft_cfg, "backward_cuda_graph", False)):
+        from deltaserve import bwd_budget
+
+        _heads = int(hf_config.num_attention_heads) // max(1, int(tp_size))
+        # A budget given as numbers needs the corpus only for its coverage
+        # note: one rank prints it, the others skip the tokenization.
+        attn_bn, attn_l, _info = bwd_budget.resolve(
+            ft_cfg, tokenizer, local_heads=_heads, diagnose=int(tp_rank) == 0)
+        attn_note = bwd_budget.describe(attn_bn, attn_l, _info)
+        attn_extra = [list(x) for x in bwd_budget.extra_shapes(
+            ft_cfg, attn_bn, attn_l, tokenizer)]
+        if attn_extra:
+            attn_note += ("; smaller shapes inside it: "
+                          + ", ".join(f"{b} x {l}" for b, l in attn_extra))
+    # [bwd_batch_size_idle] a second graph set for the larger backward
+    idle_tokens = int(idle_bwd_tokens_of(ft_cfg))
+    idle_bn = idle_l = 0
+    if idle_tokens <= int(bwd_tokens_of(ft_cfg)):
+        idle_tokens = 0
+    elif bool(getattr(ft_cfg, "backward_cuda_graph", False)):
+        from deltaserve import bwd_budget
+
+        idle_bn, idle_l = bwd_budget.resolve_idle(
+            ft_cfg, tokenizer,
+            local_heads=int(hf_config.num_attention_heads) // max(1, int(tp_size)))
+        attn_note = ((attn_note or "") + f"; idle backward of <= {idle_tokens} "
+                     f"tokens: {idle_bn} samples x {idle_l} tokens")
     num_heads = int(hf_config.num_attention_heads)
     head_dim = int(getattr(hf_config, "head_dim", None)
                    or hf_config.hidden_size // num_heads)
@@ -180,18 +215,25 @@ def build_backward_meta(hf_config: Any, ft_cfg: Any, *, lm_head_key: str | None,
         "gamma": float(ft_cfg.gamma),
         "backward_fp32": bool(ft_cfg.backward_fp32),
         # CUDA-graph backward (Phase 5): bn_max/l_max bound the padded-attention
-        # region; s_max comes from max_saved_finetuning_tokens (the same value
-        # sizes the activation buffers, so graphs and the pool are aligned).
+        # region; s_max is the backward batch (``bwd_tokens``: all of the
+        # activation buffer unless ``bwd_batch_size`` splits a step).
         "backward_cuda_graph": bool(ft_cfg.backward_cuda_graph),
         "backward_run_ahead_boundaries":
             int(getattr(ft_cfg, "backward_run_ahead_boundaries", 0)),
         "pause_on_arrival": bool(getattr(ft_cfg, "pause_on_arrival", False)),
-        "backward_cuda_graph_attn_bn_max":
-            int(ft_cfg.backward_cuda_graph_attn_bn_max),
-        "backward_cuda_graph_attn_l_max":
-            int(ft_cfg.backward_cuda_graph_attn_l_max),
-        "max_saved_finetuning_tokens":
-            int(ft_cfg.max_saved_finetuning_tokens),
+        "backward_cuda_graph_attn_bn_max": attn_bn,
+        "backward_cuda_graph_attn_l_max": attn_l,
+        # [backward_cuda_graph_attn_shapes] smaller shapes inside the budget
+        "backward_cuda_graph_attn_extra_shapes": attn_extra,
+        # one line for the launch log (how the budget was chosen / what it holds)
+        "attn_budget_note": attn_note,
+        # the child's sizes follow the backward batch, not the step
+        "max_saved_finetuning_tokens": int(bwd_tokens_of(ft_cfg)),
+        # [bwd_batch_size_idle] 0 = off; else the largest backward and the
+        # attention budget of its graph set
+        "bwd_batch_idle_tokens": idle_tokens,
+        "bwd_batch_idle_attn_bn_max": idle_bn,
+        "bwd_batch_idle_attn_l_max": idle_l,
         # Forward-side activation saves the backward may short-circuit on:
         # post-RoPE q/k/v per layer (``attn_qh/kh/vh``) and the attention
         # context (``attn_ctx``). The child re-checks ``save_attn_qkv`` against

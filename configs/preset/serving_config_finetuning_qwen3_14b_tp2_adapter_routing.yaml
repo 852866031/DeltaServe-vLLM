@@ -67,7 +67,7 @@ slo:
   ttft_slo: 0.5
   avg_tbt_slo: 0.035
   avg_tbt_window_s: 1.0               # enforce it: every decode token of the last second, averaged
-  max_tbt_slo: 0.07
+  max_tbt_slo: 0.1 
   # M4.2: the runner's per-step timing samples and the profiling pass's
   # record gate now ride the TP relay (ModelRunnerOutput.finetune_timing /
   # SchedulerOutput.finetune_record_timing), so the launch-time profiling

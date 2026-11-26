@@ -16,7 +16,8 @@ finetune_param:
   start_on_launch: false             # hold FT admission closed (M1: launch-only)
   finetuning_lora_path: /home/jiaxuan_chen/DeltaServe-Baselines/deltaserve/adapters/qwen3-14b-lora-r8-ft
   data_path: /home/jiaxuan_chen/DeltaServe-Baselines/common/data/alpaca.txt
-  max_saved_finetuning_tokens: 512
+  ft_step_size: 2048                 # FT tokens per optimizer step (= the activation buffer)
+  bwd_batch_size: 512                # FT tokens per backward batch: 4 accumulated backwards per step (was one 512-token buffer)
   num_epochs: 20
   learning_rate: 0.0003
   weight_decay: 0.01
@@ -50,8 +51,8 @@ throttles:
 slo:
   admission_margin: legacy           # pinned: reproduces the published runs (the default is now relative)
   ttft_slo: 0.25
-  avg_tbt_slo: 0.02
-  max_tbt_slo: 0.05
+  avg_tbt_slo: 0.035                 # the token target (s): kept over avg_tbt_window_s, and what TBT attainment is measured against
+  max_tbt_slo: 0.1 
   # M4.2: the runner's per-step timing samples and the profiling pass's
   # record gate now ride the TP relay (ModelRunnerOutput.finetune_timing /
   # SchedulerOutput.finetune_record_timing), so the launch-time profiling
