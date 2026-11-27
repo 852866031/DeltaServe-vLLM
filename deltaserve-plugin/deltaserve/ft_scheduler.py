@@ -400,7 +400,9 @@ class FinetuneScheduler(AsyncScheduler):
                     adapter=job.spec.adapter_path,
                     total_epochs=job.spec.num_epochs,
                     max_saved_finetuning_tokens=bwd_tokens_of(ft_cfg),
-                    max_prepare=ft_cfg.max_prepare)
+                    max_prepare=ft_cfg.max_prepare,
+                    sample_order=getattr(ft_cfg, "ft_sample_order", "shortest"),
+                    order_window=getattr(ft_cfg, "ft_sample_order_window", 64))
                 store.load()
                 state["store"] = store
             except Exception as e:  # noqa: BLE001 — surfaced through the stage
@@ -838,6 +840,12 @@ class FinetuneScheduler(AsyncScheduler):
             candidate = store.pop_next(exclude=admitted)
             if candidate is None:
                 break
+            if (cur_t_ft + candidate.input_len > token_cap
+                    and store.sample_order == "file"):
+                # [ft_sample_order: file] fill the rest of the budget from
+                # the lookahead window instead of stopping on a long sample.
+                candidate = store.pop_best_under(
+                    int(token_cap - cur_t_ft), exclude=admitted) or candidate
             if cur_t_ft + candidate.input_len > token_cap:
                 stop = cap_code
                 break

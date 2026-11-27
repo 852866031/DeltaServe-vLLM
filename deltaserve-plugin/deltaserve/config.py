@@ -151,6 +151,21 @@ class FinetuneConfig:
     """Cap on how many corpus lines to load (None = all). DeltaServe's
     finetune.prepare_size."""
 
+    ft_sample_order: str = "shortest"
+    """Order the FT samples are trained in within an epoch. ``shortest``: the
+    smallest untrained sample first (the original policy; an epoch runs from
+    batches of many short samples to batches of few long ones). ``file``: corpus
+    order, as LLMStation and torchtune read it; a step whose remaining budget is
+    smaller than the next sample takes the largest one that fits from the next
+    ``ft_sample_order_window`` untrained samples. Measured on Qwen3-14B TP=4
+    A100 with yahma/alpaca-cleaned (cut to 128 tokens): shortest-first spends a
+    60 s trace on 12-30-token samples, 19-25 per 512-token backward, which
+    overflows the attention graph budget (eager attention, ~2 ms/token)."""
+
+    ft_sample_order_window: int = 64
+    """``ft_sample_order: file`` only: how many untrained samples past the next
+    one may be taken out of order to fill a step's remaining budget."""
+
     max_saved_finetuning_tokens: int = 256
     """Per-backward FT token budget. Also sizes the shared activation buffers and
     bounds length-bucketed sample selection. The single-size form of

@@ -62,7 +62,7 @@ FINETUNE_SECTIONS: dict[str, tuple[str, ...]] = {
     # and where the trained adapter goes.
     "finetune_param": (
         "enable_finetuning", "start_on_launch", "finetuning_lora_path",
-        "data_path", "max_prepare", "num_epochs", "learning_rate",
+        "data_path", "max_prepare", "ft_sample_order", "ft_sample_order_window", "num_epochs", "learning_rate",
         "weight_decay", "gamma", "max_saved_finetuning_tokens",
         "ft_step_size", "bwd_batch_size", "ft_buffer_size", "bwd_batch_size_idle", "ft_tokens_per_step", "ft_only_tokens_per_step", "bwd_whole_batches",
         "adapter_save_path", "adapter_save_every_backwards",

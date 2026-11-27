@@ -59,7 +59,14 @@ class FinetuningStore:
         total_epochs: int = 1,
         max_saved_finetuning_tokens: int = 256,
         max_prepare: int | None = None,
+        sample_order: str = "shortest",
+        order_window: int = 64,
     ) -> None:
+        if sample_order not in ("shortest", "file"):
+            raise ValueError(f"ft_sample_order must be 'shortest' or 'file', not {sample_order!r}")
+        self.sample_order = sample_order
+        self.order_window = max(0, int(order_window))
+        self._cursor = 0          # [file order] first possibly untrained index
         self.data_path = data_path
         self.tokenize = tokenize
         self.adapter = adapter
@@ -159,6 +166,7 @@ class FinetuningStore:
             length: deque(idxs) for length, idxs in self._bucket_template.items()
         }
         self.sorted_lengths = list(self._sorted_template)
+        self._cursor = 0
         # Defensive: advance_epoch refuses to fire with _claimed non-empty, so
         # this should already be (). Clearing anyway to keep state coherent
         # if the guard is ever bypassed (e.g. profiling reset paths).
@@ -166,13 +174,39 @@ class FinetuningStore:
 
     # -- selection ---------------------------------------------------------
 
+    def _file_candidates(self, exclude_ids: set, limit: int):
+        """[file order] Up to ``limit`` selectable sample indices, in corpus
+        order from the cursor (skips trained, claimed and excluded ones)."""
+        n = len(self.samples)
+        while self._cursor < n and self.trained[self._cursor]:
+            self._cursor += 1
+        i, found = self._cursor, 0
+        while i < n and found < limit:
+            if (not self.trained[i] and i not in self._claimed
+                    and self.samples[i].request_id not in exclude_ids):
+                found += 1
+                yield i
+            i += 1
+
     def pop_best_under(self, max_tokens: int,
                        exclude: list[FinetuningSample] | None = None
                        ) -> FinetuningSample | None:
-        """Largest untrained sample with input_len <= max_tokens (peek, no mark)."""
+        """Largest untrained sample with input_len <= max_tokens (peek, no mark).
+        [file order] the next sample if it fits, else the largest that fits
+        among the following ``order_window`` ones."""
         if not self.sorted_lengths:
             return None
         exclude_ids = {s.request_id for s in exclude} if exclude else set()
+        if self.sample_order == "file":
+            best = None
+            for k, i in enumerate(self._file_candidates(exclude_ids, 1 + self.order_window)):
+                length = self.samples[i].input_len
+                if length <= max_tokens:
+                    if k == 0:
+                        return self.samples[i]
+                    if best is None or length > self.samples[best].input_len:
+                        best = i
+            return self.samples[best] if best is not None else None
         pos = bisect_right(self.sorted_lengths, max_tokens) - 1
         while pos >= 0:
             length = self.sorted_lengths[pos]
@@ -187,10 +221,15 @@ class FinetuningStore:
 
     def pop_next(self, exclude: list[FinetuningSample] | None = None
                  ) -> FinetuningSample | None:
-        """Smallest untrained sample (ascending length; peek, no mark)."""
+        """Smallest untrained sample (ascending length; peek, no mark).
+        [file order] the next untrained sample in corpus order."""
         if not self.sorted_lengths:
             return None
         exclude_ids = {s.request_id for s in exclude} if exclude else set()
+        if self.sample_order == "file":
+            for i in self._file_candidates(exclude_ids, 1):
+                return self.samples[i]
+            return None
         for length in self.sorted_lengths:
             dq = self.len_buckets.get(length)
             if not dq:

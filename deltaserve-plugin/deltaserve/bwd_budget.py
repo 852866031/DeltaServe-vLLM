@@ -49,9 +49,14 @@ def _pack(lengths, cap: int) -> list[list[int]]:
     return groups
 
 
+def _file_order(ft_cfg) -> bool:
+    return getattr(ft_cfg, "ft_sample_order", "shortest") == "file"
+
+
 def simulate_batches(lengths, batch_tokens: int,
                      step_tokens: int | None = None,
-                     whole_batches: bool = False) -> list[tuple[int, int]]:
+                     whole_batches: bool = False,
+                     file_order: bool = False) -> list[tuple[int, int]]:
     """One epoch packed the way it is trained — the admission loop takes the
     SMALLEST untrained sample first (``FinetuningStore.pop_next``) until the
     step's buffer (``step_tokens``) is full, and a backward batch is whole
@@ -64,20 +69,23 @@ def simulate_batches(lengths, batch_tokens: int,
     if whole_batches:                 # the step ends on a batch boundary
         step_tokens = None
     step = max(cap, int(step_tokens or cap))
-    order = sorted(int(x) for x in lengths if 0 < int(x) <= cap)
+    order = [int(x) for x in lengths if 0 < int(x) <= cap]
+    if not file_order:                # [ft_sample_order: file] corpus order
+        order.sort()
     return [(len(b), max(b)) for st in _pack(order, step) for b in _pack(st, cap)]
 
 
 def choose_budget(lengths, batch_tokens: int, *, step_tokens: int | None = None,
                   coverage: float = 0.99,
                   margin: float = 1.15, local_heads: int = 1,
-                  max_scores_mb: float = 256.0) -> dict:
+                  max_scores_mb: float = 256.0, file_order: bool = False) -> dict:
     """The cheapest ``(bn_max, l_max)`` — cost ``bn · l²``, what the padded
     attention computes — under which at least ``coverage`` of the simulated
     batches fit, with ``margin`` on the sample count and the scores tensor
     (``bn · heads · l · l`` fp32) within ``max_scores_mb``. Returns the choice
     and what it was based on."""
-    batches = simulate_batches(lengths, batch_tokens, step_tokens)
+    batches = simulate_batches(lengths, batch_tokens, step_tokens,
+                               file_order=file_order)
     info = {"batches": len(batches), "batch_tokens": int(batch_tokens),
             "samples": sum(b for b, _ in batches)}
     if not batches:
@@ -201,7 +209,8 @@ def extra_shapes(ft_cfg, bn_max: int, l_max: int, tokenizer_name=None, *,
         return []
     if not lengths:
         return []
-    batches = simulate_batches(lengths, batch_tokens_of(ft_cfg), _step_of(ft_cfg))
+    batches = simulate_batches(lengths, batch_tokens_of(ft_cfg), _step_of(ft_cfg),
+                               file_order=_file_order(ft_cfg))
     return choose_shapes(batches, int(bn_max), int(l_max), k)
 
 
@@ -219,9 +228,10 @@ def _step_of(ft_cfg) -> int | None:
 
 
 def coverage_of(lengths, batch_tokens: int, bn_max: int, l_max: int,
-                step_tokens: int | None = None) -> float:
+                step_tokens: int | None = None, file_order: bool = False) -> float:
     """Share of the simulated backward batches a given budget holds."""
-    batches = simulate_batches(lengths, batch_tokens, step_tokens)
+    batches = simulate_batches(lengths, batch_tokens, step_tokens,
+                               file_order=file_order)
     if not batches:
         return 1.0
     return sum(1 for bn, lo in batches if bn <= bn_max and lo <= l_max) / len(batches)
@@ -274,7 +284,8 @@ def resolve_idle(ft_cfg, tokenizer_name: str | None = None, *, lengths=None,
         lengths = []
     if not lengths:
         return DEFAULT_BN_MAX * max(1, big // max(1, small)), DEFAULT_L_MAX
-    info = choose_budget(lengths, big, local_heads=local_heads)
+    info = choose_budget(lengths, big, local_heads=local_heads,
+                         file_order=_file_order(ft_cfg))
     return int(info["bn_max"]), int(info["l_max"])
 
 
@@ -297,10 +308,12 @@ def resolve(ft_cfg, tokenizer_name: str | None = None, *, lengths=None,
                 info = {"configured": True, "batch_tokens": batch_tokens_of(ft_cfg),
                         "coverage": coverage_of(lengths, batch_tokens_of(ft_cfg),
                                                 int(bn), int(l),
-                                                _step_of(ft_cfg)),
+                                                _step_of(ft_cfg),
+                                                file_order=_file_order(ft_cfg)),
                         "suggest": choose_budget(lengths, batch_tokens_of(ft_cfg),
                                                  step_tokens=_step_of(ft_cfg),
-                                                 local_heads=local_heads)}
+                                                 local_heads=local_heads,
+                                                 file_order=_file_order(ft_cfg))}
         except Exception:  # noqa: BLE001 — only a diagnostic
             info = None
         return int(bn), int(l), info
@@ -319,7 +332,8 @@ def resolve(ft_cfg, tokenizer_name: str | None = None, *, lengths=None,
         return (DEFAULT_BN_MAX if _is_auto(bn) else int(bn),
                 DEFAULT_L_MAX if _is_auto(l) else int(l), info)
     info = choose_budget(lengths, batch_tokens_of(ft_cfg),
-                         step_tokens=_step_of(ft_cfg), local_heads=local_heads)
+                         step_tokens=_step_of(ft_cfg), local_heads=local_heads,
+                         file_order=_file_order(ft_cfg))
     return (info["bn_max"] if _is_auto(bn) else int(bn),
             info["l_max"] if _is_auto(l) else int(l), info)
 

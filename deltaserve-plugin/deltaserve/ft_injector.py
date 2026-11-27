@@ -43,6 +43,8 @@ class FinetuneInjector:
             total_epochs=finetune_config.num_epochs,
             max_saved_finetuning_tokens=bwd_tokens_of(finetune_config),   # a sample must fit one backward
             max_prepare=finetune_config.max_prepare,
+            sample_order=getattr(finetune_config, "ft_sample_order", "shortest"),
+            order_window=getattr(finetune_config, "ft_sample_order_window", 64),
         )
         self.store.load()
 
